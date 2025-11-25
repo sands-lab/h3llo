@@ -1,23 +1,23 @@
-## 内部实现
+## Internals
 
-### 依赖
+### Dependencies
 
-h3llo主要依赖tun-rs和cloudflare的tokio-quiche。
+h3llo primarily depends on tun-rs and Cloudflare's tokio-quiche.
 
-### 递归路由
+### Recursive Routing
 
-由于h3llo默认会接管系统路由，将默认路由修改为全部outbound流量发送给TUN接口，这使得h3llo在创建到peers的HTTP/3连接时可能会被系统路由送到TUN接口而不是WAN接口，也就是递归路由问题。
+Because h3llo takes over the system routing table and switches the default route so that all outbound traffic goes to the TUN interface, HTTP/3 connections to peers might be routed back into the TUN instead of out the WAN interface—i.e., a recursive routing problem.
 
-h3llo通过将强制绑定HTTP/3 Dialer的UDP Socket到WAN接口这种措施来预防该问题。这种措施应适用于Linux，Darwin和Windows平台。
+h3llo prevents this by forcing the UDP socket used by the HTTP/3 dialer to bind to the WAN interface. This should work on Linux, Darwin, and Windows.
 
-具体来说，任何时候创建HTTP/3连接（重连）都需要进行以下几步操作：
+Whenever an HTTP/3 connection (or reconnection) is created, h3llo should perform:
 
-1. 解析DNS。为了应对在HTTP/3建连（特别是重连）时可能存在的网络中断，h3llo应缓存endpoints的DNS解析结果，并在解析结果过期后立刻更新该条目的缓存。在首次连接前，h3llo需要在修改默认路由前解析所有endpoints的域名并缓存。
-2. 探测WAN接口名。h3llo应执行各平台对应的命令，如`ip route show match <ip>`，来探测连接到endpoints的IPs原本使用的网络接口名。注意这里需要排除TUN接口。
-3. 强制绑定HTTP/3连接使用的UDP Socket到探测到的WAN接口。应使用`SO_BINDTODEVICE`，`IP_UNICAST_IF`，`IP_BOUND_IF`等option。
+1. DNS resolution. To handle possible network interruptions during connection setup (especially reconnects), h3llo should cache DNS results for endpoints and refresh an entry immediately after it expires. Before the first connection, resolve and cache all endpoint hostnames before changing the default route.
+2. Probe the WAN interface name. On each platform, run the corresponding command (such as `ip route show match <ip>`) to discover the interface originally used to reach the endpoint IPs, excluding the TUN interface.
+3. Force the UDP socket for HTTP/3 to bind to the detected WAN interface, using options such as `SO_BINDTODEVICE`, `IP_UNICAST_IF`, or `IP_BOUND_IF`.
 
 
-### 线程模型
+### Thread Model
 
 ```mermaid
 flowchart TB
@@ -69,23 +69,23 @@ flowchart TB
     ctrl1 -. update peers and route -.-> hh1 -.-> q2 -.-> r1 -. sync -.-> r2
     t1 -. update DNS records -.-> q3 -.-> dns1
     dns1 -. update bareudp endpoint -.-> q2
-    
+
 ```
 
-h3llo使用tokio运行时调度协程，并且h3llo应使用MPSC Queue代替所有的锁以降低异步实现的复杂度，得益于MPSC Queue显式线性化了异步操作。
+h3llo uses the tokio runtime to schedule coroutines, and should rely on MPSC queues instead of locks to reduce async complexity, since MPSC queues explicitly linearize async operations.
 
-应当为每个I/O读创建一个协程来驱动程序的运行，比如在有多个peers的情况下，我们会创建多个HTTP/3连接。在这种情况下我们需要为每个连接创建一个协程来进行I/O读。
+Create a coroutine for every I/O reader to drive the program. For example, when multiple peers exist, multiple HTTP/3 connections are created; each connection should have its own coroutine dedicated to I/O reads.
 
-控制面上，外部控制器发送POST请求或者初始化时，需要先更新内部路由表，再更新系统路由表，并且在需要连接到新的peers时，建立HTTP/3连接，并创建新的协程接收这个连接的datagram。
+On the control plane, when an external controller sends a POST request or during initialization, update the internal routing table first, then the system routing table. When connecting to new peers, establish HTTP/3 connections and spawn new coroutines to receive datagrams from those connections.
 
-数据面上，在发送IP包时，通过内部路由表找到目标节点的HTTP/3连接。接收IP包时，通过写入Coroutine 2的MPSC Queue保证写入TUN接口的线程安全。
+On the data plane, when sending IP packets, find the target peer’s HTTP/3 connection through the internal routing table. When receiving IP packets, write them into Coroutine 2’s MPSC queue to keep writes to the TUN interface thread-safe.
 
-另外，还应有协程作为迷你服务在后台维护DNS缓存，通过MPSC Queue处理Timer的事件或者来自Coroutine 1建连时的DNS解析请求。
+Additionally, a coroutine should act as a mini-service to maintain the DNS cache in the background, handling timer events via an MPSC queue or DNS requests from Coroutine 1 during connection setup.
 
-### 系统路由更新
+### System Route Updates
 
-h3llo应通过执行系统命令来对单条路由进行无中断更新，如Linux的`ip route replace`，并且实现一个简单的跨平台抽象。
+h3llo should update individual routes without interruptions by executing system commands—such as `ip route replace` on Linux—and provide a simple cross-platform abstraction.
 
-### 最大前缀匹配算法
+### Longest-Prefix-Match Algorithm
 
-h3llo在进行内部路由表的匹配时应使用和wireguard相同的算法。
+h3llo should use the same longest-prefix-match algorithm as WireGuard when matching entries in the internal routing table.
