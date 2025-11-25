@@ -1,20 +1,20 @@
 ## Protocol
 
+Protocol overview: HTTP Basic Auth with UUID pairs, HTTP/3 CONNECT-IP as the encrypted default path, BareUDP as an optional fast path (details TBD), and POST-driven peer refresh on the HTTP path.
+
 h3llo uses HTTP Basic Auth for authentication and a subset of MASQUE/CONNECT-IP ([RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484)) to encapsulate IP packets and deliver them to peers.
 
 ### Authentication
+
+Authentication summary: clients present `uuid` pairs via HTTP Basic Auth on the configured path; servers validate the client UUID and the expected server UUID before allowing CONNECT-IP.
 
 When the HTTP/3 initiator (client) requests the configured HTTP path, the receiver (server) performs HTTP Basic Auth. The client sends its own UUID as the username and the server’s UUID as the password, and the server validates both.
 
 On authentication failure, the server requests Basic Auth again. The client waits for a period (default 5 seconds) before attempting to reconnect.
 
-### Control Plane: Dynamic Reconfiguration
+### HTTP/3 Transport (CONNECT-IP)
 
-POSTing to h3llo’s HTTP path with a full YAML configuration containing only the `peers` key dynamically refreshes peers and routes (both system and h3llo internal routes).
-
-Dynamic reconfiguration in h3llo is designed to be zero-downtime. Peer and internal route updates are atomic and apply to all subsequent outgoing IP packets. h3llo does not proactively close connections to removed peers until they drop naturally, draining in-flight packets. System route updates are not guaranteed to be atomic but are performed without interruptions.
-
-### Data Plane: CONNECT-IP Protocol
+HTTP/3 summary: h3llo speaks CONNECT-IP over HTTP/3 with datagrams enabled; only mandatory pieces stay to minimize latency and complexity.
 
 Issuing an Extended CONNECT request to h3llo’s HTTP path uses the standard CONNECT-IP protocol to transport IP packets.
 
@@ -63,3 +63,19 @@ sequenceDiagram
         P-)C: HTTP/3 DATAGRAM<br>Context ID = 0<br>Payload = IP packet (from target)
     end
 ```
+
+### BareUDP Transport (TBD)
+
+BareUDP summary: plaintext fast path for trusted networks; mechanics are pending.
+
+- TBD: handshake or session setup, if any.
+- TBD: datagram encapsulation format and mapping from peers to UDP endpoints.
+- TBD: security constraints and when BareUDP should be preferred or avoided relative to HTTP/3.
+
+### Dynamic Reconfiguration
+
+Reconfiguration summary: POST-only peer refreshes apply atomically to internal routes first, then update system routes without dropping active traffic.
+
+POSTing to h3llo’s HTTP path with a YAML body containing only the `peers` key refreshes peers and routes (both system and h3llo internal routes).
+
+Dynamic reconfiguration targets zero downtime: internal route updates are atomic and affect all subsequent packets; existing connections for removed peers drain naturally instead of being actively closed. System route updates are not guaranteed to be atomic but are applied without intentional interruption.
