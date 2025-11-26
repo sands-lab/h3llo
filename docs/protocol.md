@@ -68,9 +68,52 @@ sequenceDiagram
 
 BareUDP summary: plaintext fast path for trusted networks; mechanics are pending.
 
-- TBD: handshake or session setup, if any.
-- TBD: datagram encapsulation format and mapping from peers to UDP endpoints.
-- TBD: security constraints and when BareUDP should be preferred or avoided relative to HTTP/3.
+BareUDP moves IP packets without extra framing: each IP packet read from the TUN becomes the UDP payload sent to the peer’s BareUDP listener, and the listener injects the payload directly into its TUN device. BareUDP only runs when `local.bare.listen` is configured on the node.
+
+- Encapsulation: The sender copies the raw IP packet from the TUN and uses it as the UDP payload to the peer’s `peers[].bare.endpoint`; there is no handshake or session setup.
+- Receive path: The BareUDP listener accepts the UDP payload and writes it directly to the TUN as an IP packet, without reassembly or additional validation.
+- Security model: BareUDP performs no encryption or authentication. The listener filters by the UDP source IP, dropping packets whose source IP does not match configured BareUDP peer endpoints. Because source IPs can be spoofed, avoid exposing BareUDP to the public Internet and prefer HTTP/3 whenever confidentiality or peer authenticity is required.
+
+### Datagram Formats
+
+Datagram format summary: HTTP/3 CONNECT-IP wraps inner IP packets in QUIC DATAGRAM frames with Context ID 0; BareUDP sends the inner IP packet as the UDP payload with only the outer IP/UDP headers.
+
+#### HTTP/3 CONNECT-IP Datagram Layout
+
+CONNECT-IP over HTTP/3 uses QUIC DATAGRAM frames with Context ID set to `0`; no additional MASQUE headers or capsules are present.
+
+[Outer IP Header; (v4)20B/(v6)40B]
+[Outer UDP Header; 8B]
+[QUIC Short Header; 2-25B]
+[QUIC Datagram Frame Header; 1-9B]
+[H3 Datagram Header (Context ID); 1-8B]
+[Inner IP Packet]
+
+- Outer IP header: IPv4 is 20 bytes; IPv6 is 40 bytes.
+- Outer UDP header: always 8 bytes.
+- QUIC Short header: 2-25 bytes depending on connection ID length, packet number length, and spin/reserved bits.
+- QUIC DATAGRAM frame header: 1-9 bytes depending on length encoding and whether DATAGRAM length is present.
+- H3 datagram header: MASQUE Context ID varint; Context ID `0` encodes to a single byte (`0x00`).
+- Payload: the inner IP packet read from the TUN (IPv4 or IPv6).
+
+#### BareUDP Datagram Layout
+
+BareUDP sends the inner IP packet directly as the UDP payload; there is no QUIC or MASQUE framing.
+
+[Outer IP Header; (v4)20B/(v6)40B]
+[Outer UDP Header; 8B]
+[Inner IP Packet]
+
+- Outer headers: IPv4 is 20 bytes; IPv6 is 40 bytes; UDP is 8 bytes.
+- Payload: raw IP packet from the TUN; the receiver injects it unchanged into the local TUN.
+
+#### MTU Guidance
+
+MTU summary: worst-case CONNECT-IP overhead is 70 bytes (IPv4) / 90 bytes (IPv6), yielding TUN MTU up to 1430 / 1410 when the WAN MTU is 1500; BareUDP overhead is 28 / 48 bytes, so TUN MTU can reach 1472 / 1452 without H3 peers.
+
+- CONNECT-IP overhead: 20/40 (outer IP) + 8 (UDP) + 25 (max QUIC Short) + 9 (max DATAGRAM frame) + 8 (max H3 datagram Context ID) = 70/90 bytes.
+- With WAN MTU 1500: TUN MTU up to 1500 - 70 = 1430 (IPv4) and 1500 - 90 = 1410 (IPv6).
+- BareUDP overhead: 20/40 (outer IP) + 8 (UDP) = 28/48 bytes; with WAN MTU 1500 and only BareUDP peers, TUN MTU up to 1472 (IPv4) and 1452 (IPv6).
 
 ### Dynamic Reconfiguration
 
