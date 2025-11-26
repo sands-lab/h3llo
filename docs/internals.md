@@ -1,24 +1,21 @@
 ## Internals
 
-Internals overview: runtime dependencies, guards against recursive routing, coroutine layout for packet flow, route update strategy, longest-prefix matching, and DNS cache servicing (TBD).
+Internals overview: runtime dependencies, guards against recursive routing and DNS resolution loops, coroutine layout for packet flow, route update strategy, and longest-prefix matching.
 
 ### Dependencies
 
 h3llo primarily depends on tun-rs and Cloudflare's tokio-quiche.
 
-### Recursive Routing
+### Recursive Routing and DNS Resolution
 
-Recursive routing summary: bind HTTP/3 dialer sockets to the WAN interface so default-route changes do not loop connections back into the TUN.
+Recursive routing and DNS resolution summary: probe WAN-facing interfaces while excluding the TUN for both the DNS resolver and each resolved endpoint IP; bind per-transport sockets (HTTP/3, BareUDP, DNS) to the matching interface to avoid tunneling loops.
 
-Because h3llo takes over the system routing table and switches the default route so that all outbound traffic goes to the TUN interface, HTTP/3 connections to peers might be routed back into the TUN instead of out the WAN interface—i.e., a recursive routing problem.
+Because h3llo can redirect the default route into the TUN, outbound sockets might otherwise loop back through the tunnel. h3llo avoids this by consistently probing interfaces and binding sockets per destination.
 
-h3llo prevents this by forcing the UDP socket used by the HTTP/3 dialer to bind to the WAN interface. This should work on Linux, Darwin, and Windows.
-
-Whenever an HTTP/3 connection (or reconnection) is created, h3llo should:
-
-1. Resolve and cache endpoint hostnames; refresh immediately on expiry to ride out transient network loss, and pre-resolve before switching the default route.
-2. Probe the WAN interface name (for example, `ip route show match <ip>`) to find the original egress interface while excluding the TUN.
-3. Bind the HTTP/3 UDP socket to that WAN interface via `SO_BINDTODEVICE`, `IP_UNICAST_IF`, or `IP_BOUND_IF`.
+Binding workflow for HTTP/3, BareUDP, and DNS:
+1. Probe the default route to `local.dns` (e.g., `ip route show match <local.dns>`) excluding the TUN to pick the WAN-facing interface for DNS.
+2. Bind a DNS UDP socket to that interface via `SO_BINDTODEVICE`, `IP_UNICAST_IF`, or `IP_BOUND_IF`, then resolve peer endpoints through `local.dns` (default `1.1.1.1`). BareUDP only accepts a single IP and panics on multiple answers; HTTP/3 keeps the first IP. DNS rotation only happens when reconnects trigger re-resolution.
+3. For each endpoint IP, probe the WAN-facing interface (e.g., `ip route show match <endpoint IP>`) excluding the TUN; bind each transport socket to that interface with the same method. Every HTTP/3 connect or reconnect re-resolves before binding its QUIC UDP socket to the chosen IP; each BareUDP socket binds per endpoint. Transport sockets stay separate from the DNS socket and from each other.
 
 ### Thread Model
 
@@ -30,10 +27,7 @@ flowchart TB
         wan1[WAN Interface]@{shape: h-cyl}
         tun1[TUN Interface]@{shape: h-cyl}
         prog1[Programs]@{shape: processes}
-        r2[/System<br>Route Table\]
-        
-        
-            
+        r2[/System<br>Route Table\]    
 
         subgraph cr1["Coroutine 1"]
             tr1[TUN Reader]
@@ -51,30 +45,16 @@ flowchart TB
             tw1[TUN Writer]
         end
 
-        subgraph cra[Coroutine A]
-            q3[MPSC Queue]@{shape: h-cyl}
-            dns1[DNS Cache]@{shape: lin-cyl}
-        end
-
-        subgraph crb["Coroutine B"]
-            t1[Timer]
-        end
-
         ctrl1["External Controller"]
 
-        subgraph crc["Coroutine C"]
+        subgraph crc["Coroutine"]
             hh1[H3 POST Handler]
         end
-
-        
 
     prog1 <--> r2 <--> tun1
     tun1 --> tr1 --> r1 --> hw1 --> wan1 --> hr1 --> q1 --> tw1 --> tun1
     
     ctrl1 -. update peers and route -.-> hh1 -.-> q2 -.-> r1 -. sync -.-> r2
-    t1 -. update DNS records -.-> q3 -.-> dns1
-    dns1 -. update bareudp endpoint -.-> q2
-
 ```
 
 h3llo uses the tokio runtime to schedule coroutines and should rely on MPSC queues instead of locks to reduce async complexity, since MPSC queues explicitly linearize async operations.
@@ -91,8 +71,6 @@ Key flows:
 - H3/Bare datagram reader → queue → TUN Writer.
 - Controller updates → internal routes → system routes.
 
-See DNS cache service for resolver behavior.
-
 ### System Route Updates
 
 Route update summary: replace per-route entries with platform commands while keeping traffic uninterrupted. Typical commands: `ip route replace` on Linux, `route -n add -net` / `route -n change` on Darwin, and `netsh interface ipv4 add route` on Windows.
@@ -104,11 +82,3 @@ h3llo should update individual routes without interruptions by executing platfor
 LPM summary: reuse WireGuard’s longest-prefix-match behavior when choosing peers for IP packets.
 
 h3llo should use the same longest-prefix-match algorithm as WireGuard when matching entries in the internal routing table.
-
-### DNS Cache Service (TBD)
-
-DNS cache summary: a coroutine maintains endpoint resolution in the background; cache invalidation and negative caching specifics are pending.
-
-- Handles timer-driven refresh events via an MPSC queue.
-- Responds to resolution requests from the coroutine that sets up HTTP/3 connections.
-- TBD: cache invalidation strategy, negative cache lifetime, and pre-resolution timing before default-route changes.

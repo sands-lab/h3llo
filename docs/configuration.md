@@ -6,6 +6,7 @@ This page shows a full configuration sample, then explains each field and its de
 local:
   id: example-node-02
   table: true # optional, default: true (manage system routes)
+  dns: 1.1.1.1 # optional, default: 1.1.1.1 (single resolver for peer endpoints)
   h3: # optional
     listen: https://[::]:443/path
     cert: ./cert.pem
@@ -35,6 +36,7 @@ peers:
 
 - `local.id`: Unique node identifier validated by peers; must be globally unique; use a string of at least 6 characters.
 - `local.table` (default `true`): Update the system routing table to steer matching traffic into the h3llo TUN. When `false`, h3llo does not touch system routes; the OS still installs connected routes for `local.tun.addr` (for example, `192.168.180.1/24` adds `192.168.180.0/24`).
+- `local.dns` (default `1.1.1.1`): Single DNS server address (IPv4 or IPv6 literal) used only to resolve peer `endpoint` hostnames.
 - `local.h3.listen`: HTTP/3 listen address (scheme/host/port/path) for inbound peers when H3 is enabled.
 - `local.h3.cert` / `local.h3.key`: Certificate and private key for QUIC/TLS, enabling encryption and peer authentication.
 - `local.bare.listen`: BareUDP listen address when using the plaintext fast path; required to start BareUDP and optional alongside `local.h3`.
@@ -44,10 +46,10 @@ peers:
 - `peers[]`: Remote peer entries.
 - `peers[].id`: Remote node ID; must match the peer’s local.id.
 - `peers[].enabled` (default `true`): Whether this peer entry is active.
-- `peers[].h3.endpoint` (optional): HTTP/3 dialing address (scheme/host/port/path); omit to wait for inbound HTTP/3 from the peer. Mutually exclusive with peers[].bare.
+- `peers[].h3.endpoint` (optional): HTTP/3 dialing address (scheme/host/port/path); omit to wait for inbound HTTP/3 from the peer. Mutually exclusive with peers[].bare. Hostnames may resolve to multiple IPs; HTTP/3 dials the first result, and each reconnect re-resolves to pick up DNS rotation.
 - `peers[].h3.ca`: Custom CA bundle path for validating the peer’s certificate (useful for self-signed certs); otherwise the system trust store is used.
 - `peers[].h3.insecure` (default `false`): Skip TLS certificate validation (not recommended; prefer `ca`).
-- `peers[].bare.endpoint`: BareUDP dialing address; mutually exclusive with peers[].h3. If DNS resolution returns multiple IPs on the common resolver path, h3llo panics; DNS changes after startup are not detected (undefined behavior).
+- `peers[].bare.endpoint`: BareUDP dialing address; mutually exclusive with peers[].h3. Resolution uses `local.dns`; if it returns multiple IPs, h3llo panics, and DNS changes after startup are not detected.
 - `peers[].tun.allowedIPs`: Prefixes routed via this peer; longest-prefix wins when multiple peers overlap.
 
 ## Notes
@@ -58,10 +60,10 @@ Use both transports on the local side if needed; choose exactly one per peer ent
 - Peer exclusivity: For each `peers[]`, configure exactly one of `peers[].h3` or `peers[].bare`; do not leave both empty and do not enable both.
 - Dynamic updates: Require `local.h3.listen`; when `local.table=true`, dynamic updates also synchronize system routes.
 - H3 endpoint optionality: If `peers[].h3` is present but `peers[].h3.endpoint` is omitted, the node waits for the peer to initiate an HTTP/3 connection (listener-only posture).
+- Endpoint DNS: h3llo resolves peer `endpoint` hostnames through `local.dns` (default `1.1.1.1`) via a UDP socket bound to the probed default-route interface; system DNS remains untouched. HTTP/3 reconnections re-resolve endpoint hostnames.
 - BareUDP constraints:
   - Activation: BareUDP only starts when `local.bare.listen` is configured; omitting it keeps BareUDP disabled even if peers specify BareUDP endpoints.
-  - Stable resolution only: the hostname in `peers[].bare.endpoint` must not change over time (DDNS or rotating IPs are unsupported); BareUDP does not re-resolve endpoints after startup.
-  - Single address: do not use hostnames that resolve to multiple IPs; if resolution returns multiple IPs, h3llo panics.
+  - Stable single-address resolution: the hostname in `peers[].bare.endpoint` resolves once via `local.dns`; h3llo panics on multiple answers and does not track DNS rotation after startup (keep hostnames static).
   - NAT-unfriendly: requires mutually reachable static IP addresses; do not expect BareUDP to traverse NAT.
   - Explicit on both ends: specify `peers[].bare.endpoint` on both peers when using BareUDP; BareUDP will not auto-discover.
   - Plaintext pass-through: BareUDP sends each IP packet from the TUN as the UDP payload to the peer’s BareUDP listener and injects received payloads directly into the local TUN. No encryption or authentication is applied.

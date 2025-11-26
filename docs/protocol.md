@@ -130,6 +130,8 @@ Update rules:
 - `enabled`, `h3`, `bare`, and `tun` fields can be combined in one update; keep the one-transport rule so only one of `peers[].h3` or `peers[].bare` is present after the merge.
 - Use `null` to remove optional transport blocks (`peers[].h3` or `peers[].bare`); other fields clear only when explicitly overwritten.
 - Route refresh is zero-downtime: internal route tables update atomically; existing traffic to removed peers drains naturally; system route updates are applied without intentional interruption but may not be atomic.
+- If an update payload includes `peers[].h3.endpoint`, h3llo re-resolves the endpoint and rebuilds the HTTP/3 connection even when the endpoint string is unchanged; HTTP/3 accepts multiple DNS answers and dials the first. The old connection keeps forwarding until the new one is ready, then TUN traffic naturally shifts to the new HTTP/3 datagram writer.
+- If an update payload includes `peers[].bare.endpoint`, the BareUDP source-IP filter refreshes and re-resolves the endpoint even when the endpoint value does not change.
 
 Examples:
 ```yaml
