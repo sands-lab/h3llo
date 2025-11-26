@@ -6,9 +6,9 @@ h3llo uses HTTP Basic Auth for authentication and a subset of MASQUE/CONNECT-IP 
 
 ### Authentication
 
-Authentication summary: clients present `id` pairs via HTTP Basic Auth on the configured path; servers validate the client ID and the expected server ID before allowing CONNECT-IP.
+Authentication summary: clients present `id` pairs via HTTP Basic Auth on the configured path; servers check that the username exists in `peers[].id` and that the password matches the server’s `local.id`. CONNECT, GET, and POST all share the same HTTP path and all require Basic Auth; HTTP requests do not apply source-IP filtering (unlike BareUDP).
 
-When the HTTP/3 initiator (client) requests the configured HTTP path, the receiver (server) performs HTTP Basic Auth. The client sends its own ID as the username and the server’s ID as the password, and the server validates both.
+When the HTTP/3 initiator (client) requests the configured HTTP path, the receiver (server) performs HTTP Basic Auth. For CONNECT-IP, the client sends `username = client local.id` and `password = server local.id`; the server validates the username against `peers[].id` and the password against its own `local.id`. For GET/POST on the same path, set both `username` and `password` to the target server’s `local.id`.
 
 On authentication failure, the server requests Basic Auth again. The client waits for a period (default 5 seconds) before attempting to reconnect.
 
@@ -66,13 +66,13 @@ sequenceDiagram
 
 ### BareUDP Transport (TBD)
 
-BareUDP summary: plaintext fast path for trusted networks; mechanics are pending.
+BareUDP summary: plaintext fast path for trusted networks; not NAT-friendly and requires mutually reachable static IPs. DNS resolution runs once; if it returns multiple IPs, h3llo panics. h3llo does not watch for DNS rotation after startup (undefined behavior).
 
 BareUDP moves IP packets without extra framing: each IP packet read from the TUN becomes the UDP payload sent to the peer’s BareUDP listener, and the listener injects the payload directly into its TUN device. BareUDP only runs when `local.bare.listen` is configured on the node.
 
 - Encapsulation: The sender copies the raw IP packet from the TUN and uses it as the UDP payload to the peer’s `peers[].bare.endpoint`; there is no handshake or session setup.
 - Receive path: The BareUDP listener accepts the UDP payload and writes it directly to the TUN as an IP packet, without reassembly or additional validation.
-- Security model: BareUDP performs no encryption or authentication. The listener filters by the UDP source IP, dropping packets whose source IP does not match configured BareUDP peer endpoints. Because source IPs can be spoofed, avoid exposing BareUDP to the public Internet and prefer HTTP/3 whenever confidentiality or peer authenticity is required.
+- Security model: BareUDP performs no encryption or authentication. The listener filters by the UDP source IP, dropping packets whose source IP does not match configured BareUDP peer endpoints. Because source IPs can be spoofed, avoid exposing BareUDP to the public Internet and prefer HTTP/3 whenever confidentiality or peer authenticity is required. BareUDP does not attempt NAT traversal.
 
 ### Datagram Formats
 
@@ -109,16 +109,57 @@ BareUDP sends the inner IP packet directly as the UDP payload; there is no QUIC 
 
 #### MTU Guidance
 
-MTU summary: worst-case CONNECT-IP overhead is 70 bytes (IPv4) / 90 bytes (IPv6), yielding TUN MTU up to 1430 / 1410 when the WAN MTU is 1500; BareUDP overhead is 28 / 48 bytes, so TUN MTU can reach 1472 / 1452 without H3 peers.
+MTU summary: pick the lowest MTU across transports using IPv4/IPv6 figures per endpoint’s resolved family; default `1410` is safe for IPv6 CONNECT-IP, IPv4-only CONNECT-IP can go higher, BareUDP-only can go higher still, and mixed H3/BareUDP should stick to the H3 lower bound.
 
 - CONNECT-IP overhead: 20/40 (outer IP) + 8 (UDP) + 25 (max QUIC Short) + 9 (max DATAGRAM frame) + 8 (max H3 datagram Context ID) = 70/90 bytes.
-- With WAN MTU 1500: TUN MTU up to 1500 - 70 = 1430 (IPv4) and 1500 - 90 = 1410 (IPv6).
-- BareUDP overhead: 20/40 (outer IP) + 8 (UDP) = 28/48 bytes; with WAN MTU 1500 and only BareUDP peers, TUN MTU up to 1472 (IPv4) and 1452 (IPv6).
+    - With WAN MTU 1500: TUN MTU up to 1500 - 70 = 1430 (IPv4) and 1500 - 90 = 1410 (IPv6).
+- BareUDP overhead: 20/40 (outer IP) + 8 (UDP) = 28/48 bytes.
+    - with WAN MTU 1500 and only BareUDP peers: TUN MTU up to 1472 (IPv4) and 1452 (IPv6).
+
+Address family: the IPv4/IPv6 values above depend on the resolved address family of each endpoint; use the IPv4 numbers for IPv4 endpoints and the IPv6 numbers for IPv6 endpoints, then pick the lowest applicable MTU across peers.
 
 ### Dynamic Reconfiguration
 
-Reconfiguration summary: POST-only peer refreshes apply atomically to internal routes first, then update system routes without dropping active traffic.
+Reconfiguration summary: `GET` returns the current configuration, and `POST` accepts partial `peers` updates that apply atomically to internal routes first, then update system routes without dropping active traffic.
 
-POSTing to h3llo’s HTTP path with a YAML body containing only the `peers` key refreshes peers and routes (both system and h3llo internal routes).
+`GET https://node1.example.com:443/path` returns the full configuration snapshot in YAML, matching the shape documented in `docs/configuration.md`, and requires Basic Auth with both credentials set to the server’s `local.id`.
 
-Dynamic reconfiguration targets zero downtime: internal route updates are atomic and affect all subsequent packets; existing connections for removed peers drain naturally instead of being actively closed. System route updates are not guaranteed to be atomic but are applied without intentional interruption.
+`POST https://node1.example.com:443/path` accepts YAML containing only the `peers` key and merges entries by `peers[].id`. Omitted fields stay unchanged; send only the fields you intend to modify. Basic Auth is mandatory on the same HTTP path; set `username = server local.id` and `password = server local.id`.
+
+Update rules:
+- `enabled`, `h3`, `bare`, and `tun` fields can be combined in one update; keep the one-transport rule so only one of `peers[].h3` or `peers[].bare` is present after the merge.
+- Use `null` to remove optional transport blocks (`peers[].h3` or `peers[].bare`); other fields clear only when explicitly overwritten.
+- Route refresh is zero-downtime: internal route tables update atomically; existing traffic to removed peers drains naturally; system route updates are applied without intentional interruption but may not be atomic.
+
+Examples:
+```yaml
+# GET returns the current configuration
+local:
+  id: example-node-01
+  ...
+peers:
+- id: example-node-02
+  ...
+
+# POST partial update: disable a peer
+peers:
+- id: example-node-01
+  enabled: false
+
+# POST partial update: enable H3 with custom trust
+peers:
+- id: example-node-01
+  enabled: true
+  h3:
+    endpoint: https://node1.example.com:443/path
+    ca: ./ca.pem
+    insecure: false
+
+# POST partial update: switch to BareUDP (null clears H3)
+peers:
+- id: example-node-01
+  enabled: true
+  h3: null
+  bare:
+    endpoint: udp://node1.example.com:6635
+```

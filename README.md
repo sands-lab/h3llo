@@ -26,11 +26,11 @@ local:
     addr:
     - 192.168.180.1/32
 peers:
-  example-node-02:
-    h3:
-    tun:
-      allowedIPs:
-      - 192.168.180.2/32
+- id: example-node-02
+  h3:
+  tun:
+    allowedIPs:
+    - 192.168.180.2/32
 ```
 ```yaml
 # Configuration on node2
@@ -41,12 +41,12 @@ local:
     addr:
     - 192.168.180.2/32
 peers:
-  example-node-01:
-    h3:
-      endpoint: https://node1.example.com:443/path
-    tun:
-      allowedIPs:
-      - 192.168.180.1/32
+- id: example-node-01
+  h3:
+    endpoint: https://node1.example.com:443/path
+  tun:
+    allowedIPs:
+    - 192.168.180.1/32
 ```
 
 Save the configuration as `host/config.yaml`, then start the h3llo container:
@@ -66,7 +66,7 @@ This section sketches how nodes connect, authenticate, and route traffic; see `d
 
 ### Authentication and Security
 
-- Identity: every node needs a unique `id` (string length >= 6); peers validate each other with these IDs.
+- Identity and Basic Auth: every node needs a unique `id` (string length >= 6). h3llo derives HTTP Basic Auth automatically on the HTTP path: for CONNECT, the client sends `username = client local.id`, `password = server local.id`; for GET/POST, both credentials are the server’s `local.id`. HTTP requests do not filter source IPs (BareUDP relies on source-IP filtering instead).
 - Transport security: QUIC/TLS is mandatory; provide valid `cert`/`key` pairs to avoid MitM.
 - HTTP path: `listen`/`endpoint` include a path; any path works as long as both ends match.
 
@@ -77,7 +77,7 @@ This section sketches how nodes connect, authenticate, and route traffic; see `d
 
 ## BareUDP Mode
 
-BareUDP is an opt-in plaintext fast path for controlled networks where confidentiality is not required. Prefer HTTP/3 for encrypted transport; use BareUDP only when you accept the throughput/latency vs. security trade-off.
+BareUDP is an opt-in plaintext fast path for controlled networks where confidentiality is not required. Prefer HTTP/3 for encrypted transport; use BareUDP only when you accept the throughput/latency vs. security trade-off. BareUDP is not NAT-friendly—ensure both peers have mutually reachable static IPs.
 
 ## Interoperability
 

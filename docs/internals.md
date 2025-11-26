@@ -95,9 +95,9 @@ See DNS cache service for resolver behavior.
 
 ### System Route Updates
 
-Route update summary: replace per-route entries with platform commands while keeping traffic uninterrupted.
+Route update summary: replace per-route entries with platform commands while keeping traffic uninterrupted. Typical commands: `ip route replace` on Linux, `route -n add -net` / `route -n change` on Darwin, and `netsh interface ipv4 add route` on Windows.
 
-h3llo should update individual routes without interruptions by executing system commands—such as `ip route replace` on Linux—and provide a simple cross-platform abstraction.
+h3llo should update individual routes without interruptions by executing platform commands best-effort: failures are logged as warnings and processing continues. If the platform lacks a usable route update mechanism, h3llo panics.
 
 ### Longest-Prefix-Match Algorithm
 
