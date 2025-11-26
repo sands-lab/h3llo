@@ -16,7 +16,7 @@ Below is a minimal two-node example. If you know `wg-quick`, the structure shoul
 ```yaml
 # Configuration on node1
 local:
-  uuid: e41a6f46-c132-4d0e-9b38-34ed4a000001
+  id: example-node-01
   h3:
     listen: https://[::]:443/path
     cert: ./cert.pem
@@ -26,7 +26,7 @@ local:
     addr:
     - 192.168.180.1/32
 peers:
-  e41a6f46-c132-4d0e-9b38-34ed4a000002:
+  example-node-02:
     h3:
     tun:
       allowedIPs:
@@ -35,13 +35,13 @@ peers:
 ```yaml
 # Configuration on node2
 local:
-  uuid: e41a6f46-c132-4d0e-9b38-34ed4a000002
+  id: example-node-02
   tun:
     ifname: h3llo0
     addr:
     - 192.168.180.2/32
 peers:
-  e41a6f46-c132-4d0e-9b38-34ed4a000001:
+  example-node-01:
     h3:
       endpoint: https://node1.example.com:443/path
     tun:
@@ -66,7 +66,7 @@ This section sketches how nodes connect, authenticate, and route traffic; see `d
 
 ### Authentication and Security
 
-- Identity: every node needs a unique `uuid`; peers validate each other with these IDs.
+- Identity: every node needs a unique `id` (string length >= 6); peers validate each other with these IDs.
 - Transport security: QUIC/TLS is mandatory; provide valid `cert`/`key` pairs to avoid MitM.
 - HTTP path: `listen`/`endpoint` include a path; any path works as long as both ends match.
 

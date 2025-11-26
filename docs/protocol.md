@@ -1,14 +1,14 @@
 ## Protocol
 
-Protocol overview: HTTP Basic Auth with UUID pairs, HTTP/3 CONNECT-IP as the encrypted default path, BareUDP as an optional fast path (details TBD), and POST-driven peer refresh on the HTTP path.
+Protocol overview: HTTP Basic Auth with ID pairs, HTTP/3 CONNECT-IP as the encrypted default path, BareUDP as an optional fast path (details TBD), and POST-driven peer refresh on the HTTP path.
 
 h3llo uses HTTP Basic Auth for authentication and a subset of MASQUE/CONNECT-IP ([RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484)) to encapsulate IP packets and deliver them to peers.
 
 ### Authentication
 
-Authentication summary: clients present `uuid` pairs via HTTP Basic Auth on the configured path; servers validate the client UUID and the expected server UUID before allowing CONNECT-IP.
+Authentication summary: clients present `id` pairs via HTTP Basic Auth on the configured path; servers validate the client ID and the expected server ID before allowing CONNECT-IP.
 
-When the HTTP/3 initiator (client) requests the configured HTTP path, the receiver (server) performs HTTP Basic Auth. The client sends its own UUID as the username and the server’s UUID as the password, and the server validates both.
+When the HTTP/3 initiator (client) requests the configured HTTP path, the receiver (server) performs HTTP Basic Auth. The client sends its own ID as the username and the server’s ID as the password, and the server validates both.
 
 On authentication failure, the server requests Basic Auth again. The client waits for a period (default 5 seconds) before attempting to reconnect.
 

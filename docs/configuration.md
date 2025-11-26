@@ -4,7 +4,7 @@ This page shows a full configuration sample, then explains each field and its de
 
 ```yaml
 local:
-  uuid: e41a6f46-c132-4d0e-9b38-34ed4a000002
+  id: example-node-02
   table: true # optional, default: true (manage system routes)
   h3: # optional
     listen: https://[::]:443/path
@@ -18,7 +18,7 @@ local:
     - 192.168.180.2/32
     mtu: 1410 # optional, default: 1410 (see docs/protocol.md for MTU sizing)
 peers:
-- uuid: e41a6f46-c132-4d0e-9b38-34ed4a000001
+- id: example-node-01
   enabled: true # optional, default: true
   h3: # optional, conflicts with peers.bare; endpoint optional (listen-only if omitted)
     endpoint: https://node1.example.com:443/path # optional
@@ -33,7 +33,7 @@ peers:
 
 ## Field notes
 
-- `local.uuid`: Unique node identifier validated by peers; must be globally unique.
+- `local.id`: Unique node identifier validated by peers; must be globally unique; use a string of at least 6 characters.
 - `local.table` (default `true`): Update the system routing table to steer matching traffic into the h3llo TUN.
 - `local.h3.listen`: HTTP/3 listen address (scheme/host/port/path) for inbound peers when H3 is enabled.
 - `local.h3.cert` / `local.h3.key`: Certificate and private key for QUIC/TLS, enabling encryption and peer authentication.
@@ -42,7 +42,7 @@ peers:
 - `local.tun.addr`: IP/prefix assignments for the TUN interface; multiple entries allowed.
 - `local.tun.mtu` (default `1410`): MTU for the TUN interface; see `docs/protocol.md` for sizing guidance.
 - `peers[]`: Remote peer entries.
-- `peers[].uuid`: Remote node ID; must match the peer’s local.uuid.
+- `peers[].id`: Remote node ID; must match the peer’s local.id.
 - `peers[].enabled` (default `true`): Whether this peer entry is active.
 - `peers[].h3.endpoint` (optional): HTTP/3 dialing address (scheme/host/port/path); omit to wait for inbound HTTP/3 from the peer. Mutually exclusive with peers[].bare.
 - `peers[].h3.ca`: Custom CA bundle path for validating the peer’s certificate (useful for self-signed certs).
