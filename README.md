@@ -11,7 +11,7 @@ h3llo is a lightweight overlay network that rides on standard HTTP/3 (MASQUE/CON
 
 ## Quick Start
 
-Below is a minimal two-node example. If you know `wg-quick`, the structure should feel familiar.
+Below is a minimal two-node example. If you know `wg-quick`, the structure should feel familiar. Provide valid QUIC/TLS assets for `cert`/`key` (self-signed is fine if both peers trust the same CA); see docs for certificate options.
 
 ```yaml
 # Configuration on node1
@@ -57,7 +57,7 @@ docker run -d --name h3llo --restart always --network host --cap-add=NET_ADMIN -
 
 ## Configuration Overview
 
-This section sketches how nodes connect, authenticate, and route traffic; see `docs/` for full schemas.
+How nodes connect, authenticate, and route traffic at a glance; see `docs/` for schemas and edge cases.
 
 ### Architecture
 
@@ -66,7 +66,7 @@ This section sketches how nodes connect, authenticate, and route traffic; see `d
 
 ### Authentication and Security
 
-- Identity and Basic Auth: every node needs a unique `id` (string length >= 6). h3llo derives HTTP Basic Auth automatically on the HTTP path: for CONNECT, the client sends `username = client local.id`, `password = server local.id`; for GET/POST, both credentials are the server’s `local.id`. HTTP requests do not filter source IPs (BareUDP relies on source-IP filtering instead).
+- Identity and Basic Auth: every node needs a unique `id` (>= 6 chars). h3llo derives HTTP Basic Auth automatically on the HTTP path: CONNECT uses `username = client local.id`, `password = server local.id`; GET/POST use both credentials set to the server’s `local.id`. HTTP requests do not filter source IPs (BareUDP relies on source-IP filtering instead).
 - Transport security: QUIC/TLS is mandatory; provide valid `cert`/`key` pairs to avoid MitM.
 - HTTP path: `listen`/`endpoint` include a path; any path works as long as both ends match.
 

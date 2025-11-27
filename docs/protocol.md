@@ -1,14 +1,16 @@
 ## Protocol
 
-Protocol overview: HTTP Basic Auth with ID pairs, HTTP/3 CONNECT-IP as the encrypted default path, BareUDP as an optional fast path (details TBD), and POST-driven peer refresh on the HTTP path.
+Protocol overview: HTTP Basic Auth with ID pairs, HTTP/3 CONNECT-IP as the encrypted default path, BareUDP as an optional fast path, and POST-driven peer refresh on the shared HTTP path.
 
 h3llo uses HTTP Basic Auth for authentication and a subset of MASQUE/CONNECT-IP ([RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484)) to encapsulate IP packets and deliver them to peers.
 
 ### Authentication
 
-Authentication summary: clients present `id` pairs via HTTP Basic Auth on the configured path; servers check that the username exists in `peers[].id` and that the password matches the server’s `local.id`. CONNECT, GET, and POST all share the same HTTP path and all require Basic Auth; HTTP requests do not apply source-IP filtering (unlike BareUDP).
+Authentication summary: CONNECT and GET/POST all ride the same HTTP path and require Basic Auth; CONNECT validates peer identity, while GET/POST accept server-only credentials. HTTP requests do not apply source-IP filtering (unlike BareUDP).
 
-When the HTTP/3 initiator (client) requests the configured HTTP path, the receiver (server) performs HTTP Basic Auth. For CONNECT-IP, the client sends `username = client local.id` and `password = server local.id`; the server validates the username against `peers[].id` and the password against its own `local.id`. For GET/POST on the same path, set both `username` and `password` to the target server’s `local.id`.
+When the HTTP/3 initiator (client) requests the configured HTTP path, the receiver (server) performs HTTP Basic Auth:
+- CONNECT-IP: client sends `username = client local.id`, `password = server local.id`; server checks `username ∈ peers[].id` and `password == local.id`.
+- GET/POST: client sends `username = server local.id`, `password = server local.id`; server checks both against its own `local.id` and does not require the username to appear in `peers[].id`.
 
 On authentication failure, the server requests Basic Auth again. The client waits for a period (default 5 seconds) before attempting to reconnect.
 
@@ -41,14 +43,14 @@ sequenceDiagram
     Note over C,P: SETTINGS<br>H3_DATAGRAM = 1
 
     %% 2. First CONNECT-IP attempt (credentials may be absent)
-    C->>P: HEADERS (CONNECT)<br>:method = CONNECT<br>:protocol = connect-ip<br>:scheme = https<br>:authority = node1.example.com<br>:path = /path/<br>Capsule-Protocol: ?1<br>Datagram-Format: 1<br>Authorization: ...
+    C->>P: HEADERS (CONNECT)<br>:method = CONNECT<br>:protocol = connect-ip<br>:scheme = https<br>:authority = node1.example.com<br>:path = /path<br>Capsule-Protocol: ?1<br>Datagram-Format: 1<br>Authorization: ...
 
     alt Missing or invalid credentials
         %% 3. Server challenges with Basic Auth
         P-->>C: HEADERS<br>:status = 401 Unauthorized<br>WWW-Authenticate: Basic realm="masque"
 
         %% 4. Client retries CONNECT-IP with Basic Auth
-        C->>P: HEADERS (CONNECT)<br>:method = CONNECT<br>:protocol = connect-ip<br>:scheme = https<br>:authority = node1.example.com<br>:path = /path/<br>Capsule-Protocol: ?1<br>Datagram-Format: 1<br>Authorization: Basic base64(user:pass)
+        C->>P: HEADERS (CONNECT)<br>:method = CONNECT<br>:protocol = connect-ip<br>:scheme = https<br>:authority = node1.example.com<br>:path = /path<br>Capsule-Protocol: ?1<br>Datagram-Format: 1<br>Authorization: Basic base64(user:pass)
     end
 
     %% 5. CONNECT-IP established
@@ -64,7 +66,7 @@ sequenceDiagram
     end
 ```
 
-### BareUDP Transport (TBD)
+### BareUDP Transport
 
 BareUDP summary: plaintext fast path for trusted networks; not NAT-friendly and requires mutually reachable static IPs. DNS resolution runs once; if it returns multiple IPs, h3llo panics. h3llo does not watch for DNS rotation after startup (undefined behavior).
 

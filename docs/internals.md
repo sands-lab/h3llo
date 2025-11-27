@@ -4,7 +4,7 @@ Internals overview: runtime dependencies, guards against recursive routing and D
 
 ### Dependencies
 
-h3llo primarily depends on tun-rs and Cloudflare's tokio-quiche.
+h3llo primarily depends on tun-rs and Cloudflare's tokio-quiche (HTTP/3 with DATAGRAM support enabled).
 
 ### Recursive Routing and DNS Resolution
 
@@ -75,7 +75,7 @@ Key flows:
 
 Route update summary: replace per-route entries with platform commands while keeping traffic uninterrupted. Typical commands: `ip route replace` on Linux, `route -n add -net` / `route -n change` on Darwin, and `netsh interface ipv4 add route` on Windows.
 
-h3llo should update individual routes without interruptions by executing platform commands best-effort: failures are logged as warnings and processing continues. If the platform lacks a usable route update mechanism, h3llo panics.
+h3llo updates individual routes best-effort: command failures log warnings and continue; retries piggyback on future config refreshes or reconnections. If the platform lacks a usable route update mechanism, h3llo logs a warning, skips the system-route change, and continues running.
 
 ### Longest-Prefix-Match Algorithm
 

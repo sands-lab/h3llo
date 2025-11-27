@@ -59,6 +59,7 @@ Use both transports on the local side if needed; choose exactly one per peer ent
 - Transport selection: `local.h3` and `local.bare` can both be configured so the node offers HTTP/3 and BareUDP concurrently.
 - Peer exclusivity: For each `peers[]`, configure exactly one of `peers[].h3` or `peers[].bare`; do not leave both empty and do not enable both.
 - Dynamic updates: Require `local.h3.listen`; when `local.table=true`, dynamic updates also synchronize system routes.
+- Routing scope with `local.table=false`: POST still refreshes internal routes and peer transports, but system routes remain untouched (only connected routes from `local.tun.addr` stay).
 - H3 endpoint optionality: If `peers[].h3` is present but `peers[].h3.endpoint` is omitted, the node waits for the peer to initiate an HTTP/3 connection (listener-only posture).
 - Endpoint DNS: h3llo resolves peer `endpoint` hostnames through `local.dns` (default `1.1.1.1`) via a UDP socket bound to the probed default-route interface; system DNS remains untouched. HTTP/3 reconnections re-resolve endpoint hostnames.
 - BareUDP constraints:
