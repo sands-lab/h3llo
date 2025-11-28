@@ -44,3 +44,10 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Generation: use a Rust library (e.g., `rcgen`) to create short-lived certs at runtime; clean up after tests.
 - Server config: point `cert`/`key` to generated files for H3; Bare UDP does not need certificates.
 - Client config: prefer loading the test CA/cert; if unavailable, set `insecure = true` only for tests and still enforce hostname checks where possible.
+
+## Current Tests
+
+- Linux CI: `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test` (covers unit and integration tests for configuration parsing/validation).
+- Unit: `src/config.rs` tests for defaults, admin/listener coupling, peer transport exclusivity, BareUDP endpoint requirement, and allowed IP presence.
+- Integration: `tests/config_integration.rs` loads valid/invalid YAML samples to assert validation behavior.
+- Other platforms: TODO for macOS/Windows when platform-specific code is introduced.

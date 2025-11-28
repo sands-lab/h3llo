@@ -15,3 +15,8 @@
   - `docs/test.md`：测试分层指南、容器化多节点测试思路、证书策略示例。
   - `docs/memo.md`：项目记忆与约束汇总，文档与流程约定的唯一来源。
 - 若新增文档或更新任何现有文档，需同步在此 memo 更新文档索引说明。
+- 依赖选择：优先使用 tokio 生态中仍活跃维护的成熟 crates（如 `serde`、`serde_yaml`、`thiserror`、`tokio` 等）。
+- 测试平台：非平台相关代码默认在 Linux 下测试；仅平台相关代码需要补充 macOS/Windows 测试，并在 `docs/test.md` 标记 TODO。
+- CI：使用 GitHub Actions（Linux）运行 `cargo fmt -- --check`、`cargo clippy -- -D warnings`、`cargo test`。
+- 性能准则：避免频繁跨线程共享引用计数更新，优先通过所有权转移或消息传递移动数据；小且高频状态可按线程/协程维护副本。
+- 许可证：MIT，存放于 `LICENSE`。

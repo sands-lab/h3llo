@@ -32,3 +32,6 @@ Iterative delivery of h3llo by building one module at a time, gating each step w
 - Two-node BareUDP: static IP reachability, invalid source drop, MTU boundary checks.
 - Mixed mode: POST-driven transport/peer changes with zero-downtime goal and route drift checks.
 - Observability: structured logs and metrics hooks emit expected events under the above scenarios.
+
+## Progress Log
+- Config and validation: crate scaffolded with YAML parsing, defaults, and validation checks; unit and integration tests added; Linux CI workflow configured.
