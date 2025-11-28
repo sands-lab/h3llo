@@ -9,6 +9,7 @@ local:
   dns: 1.1.1.1 # optional, default: 1.1.1.1 (single resolver for peer endpoints)
   h3: # optional
     listen: https://[::]:443/path
+    admin: admin-username # optional, enables control-plane API when set (must be longer than 8 characters)
     cert: ./cert.pem
     key: ./key.pem
   bare: # optional
@@ -38,6 +39,7 @@ peers:
 - `local.table` (default `true`): Update the system routing table to steer matching traffic into the h3llo TUN. When `false`, h3llo does not touch system routes; the OS still installs connected routes for `local.tun.addr` (for example, `192.168.180.1/24` adds `192.168.180.0/24`).
 - `local.dns` (default `1.1.1.1`): Single DNS server address (IPv4 or IPv6 literal) used only to resolve peer `endpoint` hostnames.
 - `local.h3.listen`: HTTP/3 listen address (scheme/host/port/path) for inbound peers when H3 is enabled.
+- `local.h3.admin`: Optional control-plane username; must be longer than 8 characters. Enables GET/POST APIs when set. Basic Auth uses `username = local.h3.admin`, `password = local.id`; when omitted, the control-plane API stays disabled.
 - `local.h3.cert` / `local.h3.key`: Certificate and private key for QUIC/TLS, enabling encryption and peer authentication.
 - `local.bare.listen`: BareUDP listen address when using the plaintext fast path; required to start BareUDP and optional alongside `local.h3`.
 - `local.tun.ifname` (default `h3llo0`): Name of the TUN interface created by h3llo.
@@ -58,7 +60,7 @@ Use both transports on the local side if needed; choose exactly one per peer ent
 
 - Transport selection: `local.h3` and `local.bare` can both be configured so the node offers HTTP/3 and BareUDP concurrently.
 - Peer exclusivity: For each `peers[]`, configure exactly one of `peers[].h3` or `peers[].bare`; do not leave both empty and do not enable both.
-- Dynamic updates: Require `local.h3.listen`; when `local.table=true`, dynamic updates also synchronize system routes.
+- Dynamic updates: Require both `local.h3.listen` and `local.h3.admin`; when `local.h3.admin` is absent, the control-plane API remains disabled. When `local.table=true`, dynamic updates also synchronize system routes.
 - Routing scope with `local.table=false`: POST still refreshes internal routes and peer transports, but system routes remain untouched (only connected routes from `local.tun.addr` stay).
 - H3 endpoint optionality: If `peers[].h3` is present but `peers[].h3.endpoint` is omitted, the node waits for the peer to initiate an HTTP/3 connection (listener-only posture).
 - Endpoint DNS: h3llo resolves peer `endpoint` hostnames through `local.dns` (default `1.1.1.1`) via a UDP socket bound to the probed default-route interface; system DNS remains untouched. HTTP/3 reconnections re-resolve endpoint hostnames.

@@ -6,11 +6,11 @@ h3llo uses HTTP Basic Auth for authentication and a subset of MASQUE/CONNECT-IP 
 
 ### Authentication
 
-Authentication summary: CONNECT and GET/POST all ride the same HTTP path and require Basic Auth; CONNECT validates peer identity, while GET/POST accept server-only credentials. HTTP requests do not apply source-IP filtering (unlike BareUDP).
+Authentication summary: CONNECT and GET/POST all ride the same HTTP path and require Basic Auth; CONNECT validates peer identity, while control-plane GET/POST are available only when `local.h3.admin` (longer than 8 characters) is configured and use an admin username with the server ID as the password. HTTP requests do not apply source-IP filtering (unlike BareUDP).
 
 When the HTTP/3 initiator (client) requests the configured HTTP path, the receiver (server) performs HTTP Basic Auth:
 - CONNECT-IP: client sends `username = client local.id`, `password = server local.id`; server checks `username ∈ peers[].id` and `password == local.id`.
-- GET/POST: client sends `username = server local.id`, `password = server local.id`; server checks both against its own `local.id` and does not require the username to appear in `peers[].id`.
+- Control plane GET/POST (enabled only when `local.h3.admin` is set): client sends `username = local.h3.admin`, `password = server local.id`; server checks `username` against `local.h3.admin` (must be longer than 8 characters) and `password == local.id`.
 
 On authentication failure, the server requests Basic Auth again. The client waits for a period (default 5 seconds) before attempting to reconnect.
 
@@ -122,11 +122,13 @@ Address family: the IPv4/IPv6 values above depend on the resolved address family
 
 ### Dynamic Reconfiguration
 
-Reconfiguration summary: `GET` returns the current configuration, and `POST` accepts partial `peers` updates that apply atomically to internal routes first, then update system routes without dropping active traffic.
+Reconfiguration summary: `GET` returns the current configuration, and `POST` accepts partial `peers` updates that apply atomically to internal routes first, then update system routes without dropping active traffic; control-plane endpoints exist only when `local.h3.admin` is configured.
 
-`GET https://node1.example.com:443/path` returns the full configuration snapshot in YAML, matching the shape documented in `docs/configuration.md`, and requires Basic Auth with both credentials set to the server’s `local.id`.
+Control-plane endpoints are available only when `local.h3.admin` is configured.
 
-`POST https://node1.example.com:443/path` accepts YAML containing only the `peers` key and merges entries by `peers[].id`. Omitted fields stay unchanged; send only the fields you intend to modify. Basic Auth is mandatory on the same HTTP path; set `username = server local.id` and `password = server local.id`.
+`GET https://node1.example.com:443/path` returns the full configuration snapshot in YAML, matching the shape documented in `docs/configuration.md`, and requires Basic Auth with `username = local.h3.admin` and `password = server local.id`.
+
+`POST https://node1.example.com:443/path` accepts YAML containing only the `peers` key and merges entries by `peers[].id`. Omitted fields stay unchanged; send only the fields you intend to modify. Basic Auth is mandatory on the same HTTP path; set `username = local.h3.admin` and `password = server local.id`.
 
 Update rules:
 - `enabled`, `h3`, `bare`, and `tun` fields can be combined in one update; keep the one-transport rule so only one of `peers[].h3` or `peers[].bare` is present after the merge.

@@ -66,7 +66,7 @@ How nodes connect, authenticate, and route traffic at a glance; see `docs/` for 
 
 ### Authentication and Security
 
-- Identity and Basic Auth: every node needs a unique `id` (>= 6 chars). h3llo derives HTTP Basic Auth automatically on the HTTP path: CONNECT uses `username = client local.id`, `password = server local.id`; GET/POST use both credentials set to the server’s `local.id`. HTTP requests do not filter source IPs (BareUDP relies on source-IP filtering instead).
+- Identity and Basic Auth: every node needs a unique `id` (>= 6 chars). h3llo derives HTTP Basic Auth automatically on the HTTP path: CONNECT uses `username = client local.id`, `password = server local.id`; control-plane GET/POST enable only when `local.h3.admin` (longer than 8 characters) is configured and use `username = local.h3.admin`, `password = server local.id`. HTTP requests do not filter source IPs (BareUDP relies on source-IP filtering instead).
 - Transport security: QUIC/TLS is mandatory; provide valid `cert`/`key` pairs to avoid MitM.
 - HTTP path: `listen`/`endpoint` include a path; any path works as long as both ends match.
 
