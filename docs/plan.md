@@ -6,6 +6,7 @@ Iterative delivery of h3llo by building one module at a time, gating each step w
 - Sequence: implement one module, add/update its tests, run them, and proceed only when green.
 - Tests first: favor fast unit and mocked component tests; align with docs/test.md’s layered approach.
 - Interfaces: each module exposes clear interfaces to keep later composition minimal.
+- Progress logging: as you move through the plan, promptly record the current completion status here to keep progress visible.
 
 ## Module Order and Expected Tests
 - Config and validation: YAML load/validate, defaults, peer exclusivity; unit tests for success/failure cases and merge rules.
