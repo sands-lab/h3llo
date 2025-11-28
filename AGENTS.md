@@ -129,7 +129,7 @@
 - 执行【Commit】相关任务时：
     - 【必须】对变更进行【Review】，总结变更范围和影响。
     - 【必须】按照【提交规范】编写 commit message。
-    - 【必须】在无需我再确认的前提下，一次性执行的 one-liner 命令（如 `git add . && git commit -m "..." && git push`），默认提交所有变动文件，由我在 IDE 中批准执行。
+    - 【必须】在无需我再确认的前提下，一次性生成和执行 one-liner 命令（如 `git add . && git commit -m "..." && git push`），默认提交所有变动文件，由我在 IDE 中批准执行。
 
 ## 提交规范
 
