@@ -1,4 +1,6 @@
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::io::Read;
 use thiserror::Error;
@@ -21,9 +23,9 @@ pub struct Local {
     /// Whether to manage system routes (default: true).
     #[serde(default = "default_true")]
     pub table: bool,
-    /// DNS resolver address (default: 1.1.1.1).
+    /// DNS resolver settings.
     #[serde(default = "default_dns")]
-    pub dns: String,
+    pub dns: LocalDns,
     /// HTTP/3 server options.
     #[serde(default)]
     pub h3: Option<LocalH3>,
@@ -52,6 +54,19 @@ pub struct LocalH3 {
 pub struct LocalBare {
     /// BareUDP listen address.
     pub listen: Option<String>,
+}
+
+/// DNS resolver settings for the local node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalDns {
+    /// DNS server address (IPv4/IPv6 literal).
+    #[serde(default = "default_dns_server")]
+    pub server: String,
+    /// DNS refresh interval in seconds (`0` disables; minimum 30 when nonzero).
+    #[serde(default = "default_dns_refresh")]
+    pub refresh: u64,
+    /// Optional outbound interface binding for DNS resolution.
+    pub bindif: Option<String>,
 }
 
 /// TUN settings for the local node.
@@ -88,13 +103,20 @@ pub struct Peer {
 /// HTTP/3 options per peer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerH3 {
-    /// Optional dialing endpoint (scheme/host/port/path); omit for listen-only posture.
-    pub endpoint: Option<String>,
+    /// Optional dialing endpoints (scheme/host/port/path); omit or leave empty for listen-only posture.
+    #[serde(default, deserialize_with = "deserialize_endpoints")]
+    pub endpoints: Vec<String>,
+    /// Seconds between reconnect attempts when dialing fails (default: 10).
+    #[serde(default = "default_peer_h3_retry_secs")]
+    pub retry: u64,
     /// Optional custom CA bundle.
     pub ca: Option<String>,
     /// Whether to skip TLS validation (default: false).
     #[serde(default)]
     pub insecure: bool,
+    /// Optional list of interfaces to bind HTTP/3 dialers.
+    #[serde(default)]
+    pub bindifs: Vec<String>,
 }
 
 /// BareUDP options per peer.
@@ -102,6 +124,8 @@ pub struct PeerH3 {
 pub struct PeerBare {
     /// BareUDP dialing endpoint (required when BareUDP is configured).
     pub endpoint: Option<String>,
+    /// Optional interface binding for BareUDP dialing.
+    pub bindif: Option<String>,
 }
 
 /// Peer routing details.
@@ -155,6 +179,9 @@ pub enum ValidationError {
     /// `local.h3.admin` requires a listener.
     #[error("local.h3.admin requires local.h3.listen to be set")]
     LocalAdminMissingListener,
+    /// `local.dns.refresh` is too small.
+    #[error("local.dns.refresh must be 0 or at least 30 seconds (got {refresh})")]
+    LocalDnsRefreshTooShort { refresh: u64 },
     /// TUN addresses are missing.
     #[error("local.tun.addr must include at least one address")]
     MissingLocalTunAddr,
@@ -197,6 +224,12 @@ impl Config {
 
         if self.local.tun.addr.is_empty() {
             errors.push(ValidationError::MissingLocalTunAddr);
+        }
+
+        if self.local.dns.refresh != 0 && self.local.dns.refresh < 30 {
+            errors.push(ValidationError::LocalDnsRefreshTooShort {
+                refresh: self.local.dns.refresh,
+            });
         }
 
         if let Some(h3) = &self.local.h3 {
@@ -252,8 +285,20 @@ fn default_true() -> bool {
     true
 }
 
-fn default_dns() -> String {
+fn default_dns() -> LocalDns {
+    LocalDns {
+        server: default_dns_server(),
+        refresh: default_dns_refresh(),
+        bindif: None,
+    }
+}
+
+fn default_dns_server() -> String {
     "1.1.1.1".to_string()
+}
+
+fn default_dns_refresh() -> u64 {
+    60
 }
 
 fn default_ifname() -> String {
@@ -262,6 +307,25 @@ fn default_ifname() -> String {
 
 fn default_mtu() -> u16 {
     1410
+}
+
+fn default_peer_h3_retry_secs() -> u64 {
+    10
+}
+
+fn deserialize_endpoints<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let endpoints: Vec<String> = Vec::deserialize(deserializer)?;
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for ep in endpoints {
+        if seen.insert(ep.clone()) {
+            deduped.push(ep);
+        }
+    }
+    Ok(deduped)
 }
 
 #[cfg(test)]
@@ -273,7 +337,11 @@ mod tests {
             local: Local {
                 id: "example-node-01".to_string(),
                 table: true,
-                dns: "1.1.1.1".to_string(),
+                dns: LocalDns {
+                    server: "1.1.1.1".to_string(),
+                    refresh: 60,
+                    bindif: None,
+                },
                 h3: Some(LocalH3 {
                     listen: Some("https://[::]:443/path".to_string()),
                     admin: Some("admin-username".to_string()),
@@ -291,9 +359,11 @@ mod tests {
                 id: "example-node-02".to_string(),
                 enabled: true,
                 h3: Some(PeerH3 {
-                    endpoint: Some("https://peer.example.com:443/path".to_string()),
+                    endpoints: vec!["https://peer.example.com:443/path".to_string()],
+                    retry: 10,
                     ca: None,
                     insecure: false,
+                    bindifs: Vec::new(),
                 }),
                 bare: None,
                 tun: PeerTun {
@@ -339,6 +409,7 @@ mod tests {
         let mut config = sample_h3_config();
         config.peers[0].bare = Some(PeerBare {
             endpoint: Some("udp://peer.example.com:6635".to_string()),
+            bindif: None,
         });
         let err = config.validate().unwrap_err();
         assert!(matches!(
@@ -351,11 +422,25 @@ mod tests {
     fn rejects_missing_bare_endpoint() {
         let mut config = sample_h3_config();
         config.peers[0].h3 = None;
-        config.peers[0].bare = Some(PeerBare { endpoint: None });
+        config.peers[0].bare = Some(PeerBare {
+            endpoint: None,
+            bindif: None,
+        });
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerBareMissingEndpoint { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_dns_refresh_too_small() {
+        let mut config = sample_h3_config();
+        config.local.dns.refresh = 10;
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::LocalDnsRefreshTooShort { refresh: 10 }))
         ));
     }
 
@@ -387,10 +472,59 @@ peers:
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.local.table, true);
-        assert_eq!(cfg.local.dns, "1.1.1.1");
+        assert_eq!(cfg.local.dns.server, "1.1.1.1");
+        assert_eq!(cfg.local.dns.refresh, 60);
+        assert_eq!(cfg.local.dns.bindif, None);
         assert_eq!(cfg.local.tun.ifname, "h3llo0");
         assert_eq!(cfg.local.tun.mtu, 1410);
         assert_eq!(cfg.peers[0].enabled, true);
         assert_eq!(cfg.peers[0].h3.is_some(), true);
+        if let Some(h3) = cfg.peers[0].h3.as_ref() {
+            assert!(h3.endpoints.is_empty());
+            assert_eq!(h3.retry, 10);
+            assert!(h3.bindifs.is_empty());
+        } else {
+            panic!("peer h3 should be present");
+        }
+    }
+
+    #[test]
+    fn deduplicates_endpoints_and_applies_dns_defaults() {
+        let yaml = r#"
+local:
+  id: example-node-01
+  dns:
+    server: 8.8.8.8
+  tun:
+    addr:
+      - 192.168.180.1/32
+peers:
+- id: example-node-02
+  h3:
+    retry: 5
+    endpoints:
+      - https://peer.example.com/path
+      - https://peer.example.com/path
+      - https://peer2.example.com/path
+    bindifs:
+      - eth0
+      - eth0
+  tun:
+    allowedIPs:
+      - 192.168.180.2/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert_eq!(cfg.local.dns.server, "8.8.8.8");
+        assert_eq!(cfg.local.dns.refresh, 60);
+        let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
+        assert_eq!(h3.retry, 5);
+        assert_eq!(
+            h3.endpoints,
+            vec![
+                "https://peer.example.com/path".to_string(),
+                "https://peer2.example.com/path".to_string()
+            ]
+        );
+        assert_eq!(h3.bindifs, vec!["eth0".to_string(), "eth0".to_string()]);
     }
 }

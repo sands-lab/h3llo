@@ -43,7 +43,8 @@ local:
 peers:
 - id: example-node-01
   h3:
-    endpoint: https://node1.example.com:443/path
+    endpoints:
+    - https://node1.example.com:443/path
   tun:
     allowedIPs:
     - 192.168.180.1/32
@@ -57,27 +58,26 @@ docker run -d --name h3llo --restart always --network host --cap-add=NET_ADMIN -
 
 ## Configuration Overview
 
-How nodes connect, authenticate, and route traffic at a glance; see `docs/` for schemas and edge cases.
+High-level connection/auth/routing summary; see `docs/protocol.md` for auth/transport semantics and `docs/internals.md` for runtime behavior.
 
 ### Architecture
 
-- Client/server-style: One side only listens (`listen`); the other only dials (`endpoint`). Suitable for hub-and-spoke.
-- Peer-to-peer: Both sides listen and dial each other for symmetry; h3llo maintains two connections and selects one at random.
+- Client/server-style: One side only listens (`listen`); the other only dials via `endpoints`. Suitable for hub-and-spoke.
+- Peer-to-peer: Both sides listen and dial each other for symmetry; multipath/connection selection details live in `docs/internals.md`.
 
 ### Authentication and Security
 
-- Identity and Basic Auth: every node needs a unique `id` (>= 6 chars). h3llo derives HTTP Basic Auth automatically on the HTTP path: CONNECT uses `username = client local.id`, `password = server local.id`; control-plane GET/POST enable only when `local.h3.admin` (longer than 8 characters) is configured and use `username = local.h3.admin`, `password = server local.id`. HTTP requests do not filter source IPs (BareUDP relies on source-IP filtering instead).
-- Transport security: QUIC/TLS is mandatory; provide valid `cert`/`key` pairs to avoid MitM.
-- HTTP path: `listen`/`endpoint` include a path; any path works as long as both ends match.
+- Identity: every node needs a unique `id` (>= 6 chars).
+- Basic Auth derivation and control-plane enablement are described in `docs/protocol.md`; QUIC/TLS certificates are required for HTTP/3.
 
 ### Routing
 
 - System routes: optional table updates steer matching `allowedIPs` into the h3llo TUN.
-- Internal routing: longest-prefix matching selects the peer for each packet when multiple peers exist.
+- Internal routing: longest-prefix matching across peers; route update flow is documented in `docs/internals.md`.
 
 ## BareUDP Mode
 
-BareUDP is an opt-in plaintext fast path for controlled networks where confidentiality is not required. Prefer HTTP/3 for encrypted transport; use BareUDP only when you accept the throughput/latency vs. security trade-off. BareUDP is not NAT-friendly—ensure both peers have mutually reachable static IPs.
+BareUDP is an opt-in plaintext fast path for controlled networks where confidentiality is not required; security constraints, DNS handling, and MTU guidance are covered in `docs/protocol.md`.
 
 ## Interoperability
 

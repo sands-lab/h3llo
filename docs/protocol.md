@@ -1,6 +1,6 @@
 ## Protocol
 
-Protocol overview: HTTP Basic Auth with ID pairs, HTTP/3 CONNECT-IP as the encrypted default path, BareUDP as an optional fast path, and POST-driven peer refresh on the shared HTTP path.
+Protocol overview: HTTP Basic Auth with ID pairs, HTTP/3 CONNECT-IP as the encrypted default path, BareUDP as an optional fast path, and POST-driven peer refresh on the shared HTTP path. Runtime connection selection and binding behavior are detailed in `docs/internals.md`.
 
 h3llo uses HTTP Basic Auth for authentication and a subset of MASQUE/CONNECT-IP ([RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484)) to encapsulate IP packets and deliver them to peers.
 
@@ -30,6 +30,11 @@ h3llo intentionally omits the following optional features from RFC 9484:
 - HTTP/2 and HTTP/1.1 fallback: the standard fallback causes TCP-over-TCP, severely degrading latency and throughput.
 - All Capsule Types: IP addresses and routes are statically configured, so `ROUTE_ADVERTISEMENT`, `ADDRESS_REQUEST`, and `ADDRESS_ASSIGN` are unnecessary.
 - URI template parameters `target` and `ipproto`.
+
+H3 connection management and multipath:
+- Dialing set: build one connection for every combination of DNS answer, `peers[].h3.endpoints`, and `peers[].h3.bindifs` (auto-detected bindif yields at most one entry). Deduplicate endpoints before dialing.
+- Preference: no endpoint priority is implied; TUN-Rx prefers the earliest-established connection until it disconnects or is invalidated because the IP left the DNS result set or the interface is not within `bindifs`. New connections join the end of the ordering; warn if more than `10` connections exist for a peer.
+- Failures: TLS/handshake failures count as dial failures and retry every `peers[].h3.retry` seconds. Bind failures warn and fall back to unbound sockets, which can risk recursive routing if the system route points to the TUN.
 
 ```mermaid
 sequenceDiagram
@@ -68,11 +73,11 @@ sequenceDiagram
 
 ### BareUDP Transport
 
-BareUDP summary: plaintext fast path for trusted networks; not NAT-friendly and requires mutually reachable static IPs. DNS resolution runs once; if it returns multiple IPs, h3llo panics. h3llo does not watch for DNS rotation after startup (undefined behavior).
+BareUDP summary: plaintext fast path for trusted networks; not NAT-friendly and requires mutually reachable static IPs. DNS refresh runs on the global timer when enabled; multiple answers are allowed with warnings, filters track the full set, and the first answer becomes the outbound destination.
 
 BareUDP moves IP packets without extra framing: each IP packet read from the TUN becomes the UDP payload sent to the peer’s BareUDP listener, and the listener injects the payload directly into its TUN device. BareUDP only runs when `local.bare.listen` is configured on the node.
 
-- Encapsulation: The sender copies the raw IP packet from the TUN and uses it as the UDP payload to the peer’s `peers[].bare.endpoint`; there is no handshake or session setup.
+- Encapsulation: The sender copies the raw IP packet from the TUN and uses it as the UDP payload to the peer’s `peers[].bare.endpoint`; there is no handshake or session setup. The resolver keeps the full DNS answer set for filtering; outbound chooses the first answer with a warning and rebinds per-interface sockets when the chosen IP changes.
 - Receive path: The BareUDP listener accepts the UDP payload and writes it directly to the TUN as an IP packet, without reassembly or additional validation.
 - Security model: BareUDP performs no encryption or authentication. The listener filters by the UDP source IP, dropping packets whose source IP does not match configured BareUDP peer endpoints. Because source IPs can be spoofed, avoid exposing BareUDP to the public Internet and prefer HTTP/3 whenever confidentiality or peer authenticity is required. BareUDP does not attempt NAT traversal.
 
@@ -134,8 +139,8 @@ Update rules:
 - `enabled`, `h3`, `bare`, and `tun` fields can be combined in one update; keep the one-transport rule so only one of `peers[].h3` or `peers[].bare` is present after the merge.
 - Use `null` to remove optional transport blocks (`peers[].h3` or `peers[].bare`); other fields clear only when explicitly overwritten.
 - Route refresh is zero-downtime: internal route tables update atomically; existing traffic to removed peers drains naturally; system route updates are applied without intentional interruption but may not be atomic.
-- If an update payload includes `peers[].h3.endpoint`, h3llo re-resolves the endpoint and rebuilds the HTTP/3 connection even when the endpoint string is unchanged; HTTP/3 accepts multiple DNS answers and dials the first. The old connection keeps forwarding until the new one is ready, then TUN traffic naturally shifts to the new HTTP/3 datagram writer.
-- If an update payload includes `peers[].bare.endpoint`, the BareUDP source-IP filter refreshes and re-resolves the endpoint even when the endpoint value does not change.
+- If an update payload includes `peers[].h3.endpoints` or `peers[].h3.bindifs`, h3llo deduplicates endpoints, re-resolves DNS, and rebuilds the full connection set across DNS answers, endpoints, and bindifs. Existing traffic keeps flowing until new connections are ready; TUN traffic then follows the earliest-established valid connection.
+- If an update payload includes `peers[].bare.endpoint` or DNS refresh changes its answers, the BareUDP source-IP filter refreshes with the full answer set, warns when multiple answers exist, picks the first for outbound, and re-probes interfaces and sockets when the chosen IP changes.
 
 Examples:
 ```yaml
@@ -156,8 +161,10 @@ peers:
 peers:
 - id: example-node-01
   enabled: true
+  retry: 10
   h3:
-    endpoint: https://node1.example.com:443/path
+    endpoints:
+    - https://node1.example.com:443/path
     ca: ./ca.pem
     insecure: false
 
@@ -168,4 +175,5 @@ peers:
   h3: null
   bare:
     endpoint: udp://node1.example.com:6635
+    # bindif: eth0
 ```
