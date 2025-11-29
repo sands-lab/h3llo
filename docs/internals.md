@@ -21,40 +21,105 @@ Binding workflow for HTTP/3, BareUDP, and DNS:
 
 Thread model overview: h3llo schedules a coroutine per I/O source (TUN, each HTTP/3 connection, BareUDP endpoint) and uses MPSC queues to serialize cross-component communication; configuration updates flow from the controller into routing tables before affecting system routes.
 
+**Inbound Datapath**
+
 ```mermaid
 flowchart TB
+    wan[WAN Interface]@{shape: h-cyl}
+    tun[TUN Interface]@{shape: h-cyl}
+    prog[Programs]@{shape: processes}
+    cmd["Commands"]@{shape: braces}
 
-        wan1[WAN Interface]@{shape: h-cyl}
-        tun1[TUN Interface]@{shape: h-cyl}
-        prog1[Programs]@{shape: processes}
-        r2[/System<br>Route Table\]    
+    subgraph cr-h3-1["Coroutine (H3-Rx)"]
+        hr1[H3 Datagram Reader]
+    end
 
-        subgraph cr1["Coroutine 1"]
-            tr1[TUN Reader]
-            q2[MPSC Queue]@{shape: h-cyl}
-            r1[/Internal<br>Route Table\]
-            hw1[H3/Bare Datagram Writer]@{shape: st-rect}
-        end
+    subgraph cr-h3-2["Coroutine (H3-Rx)"]
+        hr2[H3 Datagram Reader]
+    end
 
-        subgraph cr4["Coroutine 3...n+2"]
-            hr1[H3/Bare Datagram Reader]@{shape: st-rect}
-        end
+    subgraph cr-bare["Coroutine (Bare-Rx)"]
+        bq[Command Queue]@{shape: h-cyl}
+        bsf[Source IP Filter]
+        br[Bare Datagram Reader]
+    end
 
-        subgraph cr2["Coroutine 2"]
-            q1[MPSC Queue]@{shape: h-cyl}
-            tw1[TUN Writer]
-        end
+    subgraph cr-tun["Coroutine (TUN-Tx)"]
+        tq[MPSC Queue]@{shape: h-cyl}
+        tw[TUN Writer]
+    end
 
-        ctrl1["External Controller"]
+    wan --> bsf --> br ---> tq --> tw --> tun --> prog
+    wan --> hr1 & hr2 --> tq
+    cmd -.-> bq -.-> bsf
+```
 
-        subgraph crc["Coroutine"]
-            hh1[H3 POST Handler]
-        end
+**Outbound Datapath**
 
-    prog1 <--> r2 <--> tun1
-    tun1 --> tr1 --> r1 --> hw1 --> wan1 --> hr1 --> q1 --> tw1 --> tun1
+```mermaid
+flowchart TB
+    wan[WAN Interface]@{shape: h-cyl}
+    tun[TUN Interface]@{shape: h-cyl}
+    prog[Programs]@{shape: processes}
+    rsys[/System<br>Route Table\]
+    cmd["Commands"]@{shape: braces}
+
+    subgraph cr-tun["Coroutine (TUN-Rx)"]
+        tr[TUN Reader]
+        tq[Command Queue]@{shape: h-cyl}
+        rint[/Internal<br>Route Table\]
+    end
+
+    subgraph cr-h3-1["Coroutine (H3-Tx)"]
+        hw1[H3 Datagram Writer]
+    end
+
+    subgraph cr-h3-2["Coroutine (H3-Tx)"]
+        hw2[H3 Datagram Writer]
+    end
+
+    subgraph cr-bare["Coroutine (Bare-Tx)"]
+        bw[Bare Datagram Writer]
+    end
+
+    cmd -.-> tq -.-> rint
+    prog --> rsys --> tun --> tr --> rint --> bw & hw1
+    rint -. backup path -.-> hw2
+    hw1 & hw2 & bw -- bypass system route table --> wan
+```
+
+**Control Path**
+
+```mermaid
+flowchart TB
+    subgraph cr-orch["Coroutine (Orchestrator)"]
+        oq[Command Queue]@{shape: h-cyl}
+        hcp[H3 Conn Pool]
+        dr[DNS Records]
+        conf[Configuration]
+        oq ~~~ conf ~~~ dr ~~~ hcp
+    end
+
+    ctrl["External Controller"]
+    cr-h3h["Coroutine<br>(H3-Handler)"]
+    cr-h3r["Coroutine (H3-Rx)"]
+    cr-timer["Coroutine (Timer)"]
+
+    rsys[/System<br>Route Table\]
+    cr-tun["Coroutine<br>(TUN-Rx)"]
+    cr-bare["Coroutine<br>(Bare-Rx)"]
+    cr-dns["Coroutine<br>(DNS-Resolver)"]
+    cr-h3d["Coroutine<br>(H3-Dialer)"]
+
+    ctrl -- HTTP GET/POST --> cr-h3h -- emit(conf-update) --> cr-orch
+    cr-h3r -- emit(conn-close) --> cr-orch
+    cr-timer -- emit(dns-refresh) --> cr-orch
     
-    ctrl1 -. update peers and route -.-> hh1 -.-> q2 -.-> r1 -. sync -.-> r2
+    cr-orch -- exec(ip route replace) --> rsys
+    cr-orch -- emit(route-update) --> cr-tun
+    cr-orch -- emit(query) --> cr-dns -- emit(dns-update)--> cr-orch
+    cr-orch -- spawn --> cr-h3d -- emit(conn-estab) --> cr-orch
+    cr-orch -- emit(filter-update) --> cr-bare
 ```
 
 h3llo uses the tokio runtime to schedule coroutines and should rely on MPSC queues instead of locks to reduce async complexity, since MPSC queues explicitly linearize async operations.
