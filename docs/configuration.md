@@ -4,32 +4,32 @@ This page shows a full configuration sample, then explains each field and its de
 
 ```yaml
 local:
-  id: example-node-2
+  id: example-node-2 # required
   table: true # optional, default: true (manage system routes)
   dns: # optional
     server: 1.1.1.1 # optional, default: 1.1.1.1
     refresh: 60 # optional, default: 60 (seconds; 0 disables; minimum 30 when nonzero)
     bindif: eth0 # optional, default: auto-detect; warn and fallback to unbound on failure
-  h3: # optional
-    listen: https://[::]:443/path
-    cert: ./cert.pem
-    key: ./key.pem
-    secret: example-node-2-secret
+  h3: # optional; when present, all fields below are required unless noted
+    listen: https://[::]:443/path # required when local.h3 is set
+    cert: ./cert.pem # required when local.h3 is set
+    key: ./key.pem # required when local.h3 is set
+    secret: example-node-2-secret # required when local.h3 is set; longer than 8 characters
     admin: # optional; enables control-plane API when set (requires both name and pass, each longer than 8 characters)
       name: admin-username
       pass: admin-password
   bare: # optional
-    listen: udp://[::]:6635
-  tun:
+    listen: udp://[::]:6635 # required when local.bare is set
+  tun: # required
     ifname: h3llo0 # optional, default: h3llo0
-    addr:
-      - 192.168.180.2/32
+    addr: # required
+      - 192.168.180.2/32 # required
     mtu: 1410 # optional, default: 1410 (see docs/protocol.md for MTU sizing)
-peers:
+peers: # optional, default: []
 - id: example-node-1
   enabled: true # optional, default: true
   h3: # optional, conflicts with peers.bare; endpoints optional (listen-only if omitted)
-    secret: example-node-1-secret
+    secret: example-node-1-secret # required when dialing endpoints (peers[].h3.endpoints non-empty)
     endpoints:
       - https://node1.example.com:443/path # optional; deduped; order does not imply priority
     retry: 10 # optional, default: 10 (seconds between reconnect attempts)
@@ -38,27 +38,29 @@ peers:
     bindifs:
       - eth0 # optional; when absent, auto-detects at most one interface; use list only when provided
   bare: # optional, conflicts with peers.h3
-    endpoint: udp://node1.example.com:6635
+    endpoint: udp://node1.example.com:6635 # required when peers.bare is set
     bindif: eth0 # optional; auto-detect when absent; warn and fallback to unbound on failure
-  tun:
-    allowedIPs:
-      - 192.168.180.1/32
+  tun: # required
+    allowedIPs: # required
+      - 192.168.180.1/32 # required
 ```
 
 ## Field notes
 
 - `local.id`: Unique node identifier validated by peers; must be globally unique; use a string of at least 6 characters.
-- `local.h3.secret`: Authentication secret for inbound HTTP Basic Auth; must be longer than 8 characters when `local.h3.listen` is set. Peers must configure matching `peers[].h3.secret`. Choose a strong value to avoid credential reuse; required when HTTP/3 is enabled.
+- `peers` (default `[]`): Optional peer list; omit entirely when running standalone.
+- `local.h3` / `local.bare` (optional): Omit to disable the corresponding listener. When `local.h3` is present, `local.h3.listen`, `local.h3.cert`, `local.h3.key`, and `local.h3.secret` are all required and must be non-empty; `local.h3.secret` must be longer than 8 characters. When `local.bare` is present, `local.bare.listen` is required.
+- `local.h3.secret`: Authentication secret for inbound HTTP Basic Auth; must be longer than 8 characters when `local.h3` is set. Peers must configure matching `peers[].h3.secret`. Choose a strong value to avoid credential reuse.
 - `local.table` (default `true`): Update the system routing table to steer matching traffic into the h3llo TUN. When `false`, h3llo does not touch system routes; the OS still installs connected routes for `local.tun.addr` (for example, `192.168.180.1/24` adds `192.168.180.0/24`).
 - `local.h3.admin.name` / `local.h3.admin.pass` (optional; both longer than 8 characters): Control-plane Basic Auth credentials bound to HTTP/3. Enable GET/POST APIs only when both are set; authentication matrix is described in `docs/protocol.md`.
 - `local.dns.server` (default `1.1.1.1`): DNS server address (IPv4 or IPv6 literal) used to resolve peer hostnames; outbound binding/recursive-routing guards are detailed in `docs/internals.md`.
 - `local.dns.refresh` (default `60`): DNS refresh timer in seconds (`0` disables). Nonzero values are clamped to a minimum of `30`; the resolver batches hostnames per tick (see `docs/internals.md`).
 - `local.dns.bindif` (optional): Outbound interface for DNS resolution; auto-detects at most one interface when omitted. Binding behavior and fallbacks are in `docs/internals.md`.
-- `local.h3.listen`: HTTP/3 listen address (scheme/host/port/path) for inbound peers when H3 is enabled.
+- `local.h3.listen`: HTTP/3 listen address (scheme/host/port/path) for inbound peers when H3 is enabled; required when `local.h3` is set.
 - `local.h3.cert` / `local.h3.key`: Certificate and private key for QUIC/TLS, enabling encryption and peer authentication.
 - `local.bare.listen`: BareUDP listen address when using the plaintext fast path; required to start BareUDP and optional alongside `local.h3`.
 - `local.tun.ifname` (default `h3llo0`): Name of the TUN interface created by h3llo.
-- `local.tun.addr`: IP/prefix assignments (IPv4/IPv6, dual-stack, multiple prefixes) for the TUN interface. h3llo only relies on the connected routes created with the TUN; extra system routes come from `peers[].tun.allowedIPs` when `local.table=true`.
+- `local.tun.addr` (required): IP/prefix assignments (IPv4/IPv6, dual-stack, multiple prefixes) for the TUN interface. h3llo only relies on the connected routes created with the TUN; extra system routes come from `peers[].tun.allowedIPs` when `local.table=true`.
 - `local.tun.mtu` (default `1410`): MTU for the TUN interface; see `docs/protocol.md` for sizing guidance.
 - `peers[]`: Remote peer entries.
 - `peers[].id`: Remote node ID; must match the peer’s `local.id`.
@@ -71,7 +73,7 @@ peers:
 - `peers[].h3.insecure` (default `false`): Skip TLS certificate validation (not recommended; prefer `ca`).
 - `peers[].bare.endpoint`: BareUDP dialing address; mutually exclusive with peers[].h3. DNS handling, source-IP filtering, and multi-answer behavior are detailed in `docs/protocol.md`.
 - `peers[].bare.bindif` (optional): Interface for BareUDP dialing. Auto-detect when absent; binding and fallback behavior is in `docs/internals.md`.
-- `peers[].tun.allowedIPs`: Prefixes routed via this peer; longest-prefix wins when multiple peers overlap.
+- `peers[].tun.allowedIPs` (required): Prefixes routed via this peer; longest-prefix wins when multiple peers overlap.
 
 ## Notes
 

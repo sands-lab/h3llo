@@ -7,6 +7,8 @@ local:
   id: node-aaa01
   h3:
     listen: https://[::]:443/path
+    cert: ./cert.pem
+    key: ./key.pem
     secret: node-aaa01-secret
     admin:
       name: admin-username

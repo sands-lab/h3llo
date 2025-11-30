@@ -19,3 +19,4 @@
 - CI：使用 GitHub Actions（Linux）运行 `cargo fmt -- --check`、`cargo clippy -- -D warnings`、`cargo test`。
 - 性能准则：避免频繁跨线程共享引用计数更新，优先通过所有权转移或消息传递移动数据；小且高频状态可按线程/协程维护副本。
 - 许可证：MIT，存放于 `LICENSE`。
+-  `cargo test`需在提升权限的环境下运行

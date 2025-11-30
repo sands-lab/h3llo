@@ -39,13 +39,13 @@ pub struct Local {
 /// HTTP/3 settings for the local node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalH3 {
-    /// HTTP/3 listen address (scheme/host/port/path).
+    /// HTTP/3 listen address (scheme/host/port/path); required when HTTP/3 is configured.
     pub listen: Option<String>,
-    /// Certificate path for QUIC/TLS.
+    /// Certificate path for QUIC/TLS; required when HTTP/3 is configured.
     pub cert: Option<String>,
-    /// Private key path for QUIC/TLS.
+    /// Private key path for QUIC/TLS; required when HTTP/3 is configured.
     pub key: Option<String>,
-    /// Authentication secret for inbound HTTP Basic Auth (> 8 characters when HTTP/3 listens).
+    /// Authentication secret for inbound HTTP Basic Auth (> 8 characters; required when HTTP/3 is configured).
     pub secret: Option<String>,
     /// Optional control-plane credentials scoped to HTTP/3.
     pub admin: Option<LocalAdmin>,
@@ -63,7 +63,7 @@ pub struct LocalAdmin {
 /// BareUDP settings for the local node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalBare {
-    /// BareUDP listen address.
+    /// BareUDP listen address (required when BareUDP is configured).
     pub listen: Option<String>,
 }
 
@@ -186,8 +186,19 @@ pub enum ValidationError {
     /// `local.id` is missing or too short.
     #[error("local.id must be at least 6 characters")]
     LocalIdTooShort,
+    /// `local.h3.listen` is missing when HTTP/3 is configured.
+    #[error("local.h3.listen must be set when local.h3 is configured")]
+    LocalH3MissingListen,
+    /// `local.h3.cert` is missing when HTTP/3 is configured.
+    #[error("local.h3.cert must be set when local.h3 is configured")]
+    LocalH3MissingCert,
+    /// `local.h3.key` is missing when HTTP/3 is configured.
+    #[error("local.h3.key must be set when local.h3 is configured")]
+    LocalH3MissingKey,
     /// `local.h3.secret` is missing or too short when HTTP/3 listen is configured.
-    #[error("local.h3.secret must be set and longer than 8 characters when local.h3.listen is configured")]
+    #[error(
+        "local.h3.secret must be set and longer than 8 characters when local.h3 is configured"
+    )]
     LocalSecretTooShort,
     /// `local.h3.admin` is present but too short.
     #[error(
@@ -203,6 +214,9 @@ pub enum ValidationError {
     /// TUN addresses are missing.
     #[error("local.tun.addr must include at least one address")]
     MissingLocalTunAddr,
+    /// `local.bare.listen` is missing when BareUDP is configured.
+    #[error("local.bare.listen must be set when local.bare is configured")]
+    LocalBareMissingListen,
     /// Peer identifier is missing or too short.
     #[error("peer id '{peer_id}' must be at least 6 characters")]
     PeerIdTooShort { peer_id: String },
@@ -244,14 +258,37 @@ impl Config {
         }
 
         let h3 = self.local.h3.as_ref();
-        let has_h3_listener = h3.and_then(|h3| h3.listen.as_ref()).is_some();
+        let has_h3_listener = h3
+            .and_then(|h3| h3.listen.as_ref())
+            .map(|listen| !listen.trim().is_empty())
+            .unwrap_or(false);
 
         if let Some(h3) = h3 {
-            if has_h3_listener {
-                let secret_len = h3.secret.as_ref().map(|s| s.trim().len()).unwrap_or(0);
-                if secret_len <= 8 {
-                    errors.push(ValidationError::LocalSecretTooShort);
-                }
+            if !has_h3_listener {
+                errors.push(ValidationError::LocalH3MissingListen);
+            }
+
+            let has_cert = h3
+                .cert
+                .as_ref()
+                .map(|cert| !cert.trim().is_empty())
+                .unwrap_or(false);
+            if !has_cert {
+                errors.push(ValidationError::LocalH3MissingCert);
+            }
+
+            let has_key = h3
+                .key
+                .as_ref()
+                .map(|key| !key.trim().is_empty())
+                .unwrap_or(false);
+            if !has_key {
+                errors.push(ValidationError::LocalH3MissingKey);
+            }
+
+            let secret_len = h3.secret.as_ref().map(|s| s.trim().len()).unwrap_or(0);
+            if secret_len <= 8 {
+                errors.push(ValidationError::LocalSecretTooShort);
             }
 
             if let Some(admin) = &h3.admin {
@@ -261,6 +298,17 @@ impl Config {
                 if !has_h3_listener {
                     errors.push(ValidationError::LocalAdminMissingListener);
                 }
+            }
+        }
+
+        if let Some(bare) = self.local.bare.as_ref() {
+            let has_bare_listener = bare
+                .listen
+                .as_ref()
+                .map(|listen| !listen.trim().is_empty())
+                .unwrap_or(false);
+            if !has_bare_listener {
+                errors.push(ValidationError::LocalBareMissingListen);
             }
         }
 
@@ -464,6 +512,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_required_local_h3_fields() {
+        let mut config = sample_h3_config();
+        config.local.h3 = Some(LocalH3 {
+            listen: None,
+            cert: None,
+            key: None,
+            secret: None,
+            admin: None,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.contains(&ValidationError::LocalH3MissingListen)
+                    && errs.contains(&ValidationError::LocalH3MissingCert)
+                    && errs.contains(&ValidationError::LocalH3MissingKey)
+                    && errs.contains(&ValidationError::LocalSecretTooShort)
+        ));
+    }
+
+    #[test]
     fn rejects_short_admin_credentials() {
         let mut config = sample_h3_config();
         if let Some(h3) = config.local.h3.as_mut() {
@@ -476,6 +545,18 @@ mod tests {
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs)) if errs.contains(&ValidationError::LocalAdminTooShort)
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_local_bare_listener() {
+        let mut config = sample_h3_config();
+        config.local.h3 = None;
+        config.local.bare = Some(LocalBare { listen: None });
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.contains(&ValidationError::LocalBareMissingListen)
         ));
     }
 
@@ -560,6 +641,9 @@ mod tests {
 local:
   id: example-node-1
   h3:
+    listen: https://[::]:443/path
+    cert: ./cert.pem
+    key: ./key.pem
     secret: example-node-1-secret
   tun:
     addr:
