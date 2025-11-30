@@ -7,14 +7,19 @@ local:
   id: node-aaa01
   h3:
     listen: https://[::]:443/path
-    admin: admin-username
+    secret: node-aaa01-secret
+    admin:
+      name: admin-username
+      pass: admin-password
   tun:
     addr:
       - 192.168.180.1/32
 peers:
 - id: node-aaa02
   h3:
-    endpoint: https://peer.example.com:443/path
+    secret: node-aaa02-secret
+    endpoints:
+      - https://peer.example.com:443/path
   tun:
     allowedIPs:
       - 192.168.180.2/32

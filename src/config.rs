@@ -26,7 +26,7 @@ pub struct Local {
     /// DNS resolver settings.
     #[serde(default = "default_dns")]
     pub dns: LocalDns,
-    /// HTTP/3 server options.
+    /// HTTP/3 server options and credentials.
     #[serde(default)]
     pub h3: Option<LocalH3>,
     /// BareUDP listener options.
@@ -41,12 +41,23 @@ pub struct Local {
 pub struct LocalH3 {
     /// HTTP/3 listen address (scheme/host/port/path).
     pub listen: Option<String>,
-    /// Optional admin username (> 8 characters) enabling control-plane.
-    pub admin: Option<String>,
     /// Certificate path for QUIC/TLS.
     pub cert: Option<String>,
     /// Private key path for QUIC/TLS.
     pub key: Option<String>,
+    /// Authentication secret for inbound HTTP Basic Auth (> 8 characters when HTTP/3 listens).
+    pub secret: Option<String>,
+    /// Optional control-plane credentials scoped to HTTP/3.
+    pub admin: Option<LocalAdmin>,
+}
+
+/// Control-plane Basic Auth credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalAdmin {
+    /// Stores the admin username (> 8 characters) enabling control-plane.
+    pub name: String,
+    /// Stores the admin password (> 8 characters) enabling control-plane.
+    pub pass: String,
 }
 
 /// BareUDP settings for the local node.
@@ -109,6 +120,8 @@ pub struct PeerH3 {
     /// Seconds between reconnect attempts when dialing fails (default: 10).
     #[serde(default = "default_peer_h3_retry_secs")]
     pub retry: u64,
+    /// Remote peer secret (> 8 characters) required when dialing endpoints; must match the peer's `local.h3.secret`.
+    pub secret: Option<String>,
     /// Optional custom CA bundle.
     pub ca: Option<String>,
     /// Whether to skip TLS validation (default: false).
@@ -173,8 +186,13 @@ pub enum ValidationError {
     /// `local.id` is missing or too short.
     #[error("local.id must be at least 6 characters")]
     LocalIdTooShort,
+    /// `local.h3.secret` is missing or too short when HTTP/3 listen is configured.
+    #[error("local.h3.secret must be set and longer than 8 characters when local.h3.listen is configured")]
+    LocalSecretTooShort,
     /// `local.h3.admin` is present but too short.
-    #[error("local.h3.admin must be longer than 8 characters when set")]
+    #[error(
+        "local.h3.admin.name and local.h3.admin.pass must be longer than 8 characters when set"
+    )]
     LocalAdminTooShort,
     /// `local.h3.admin` requires a listener.
     #[error("local.h3.admin requires local.h3.listen to be set")]
@@ -188,6 +206,9 @@ pub enum ValidationError {
     /// Peer identifier is missing or too short.
     #[error("peer id '{peer_id}' must be at least 6 characters")]
     PeerIdTooShort { peer_id: String },
+    /// Peer secret missing or too short.
+    #[error("peer '{peer_id}' requires h3.secret longer than 8 characters when dialing endpoints")]
+    PeerSecretTooShort { peer_id: String },
     /// Peer transport fields conflict.
     #[error("peer '{peer_id}' must configure exactly one of h3 or bare")]
     PeerTransportConflict { peer_id: String },
@@ -222,6 +243,27 @@ impl Config {
             errors.push(ValidationError::LocalIdTooShort);
         }
 
+        let h3 = self.local.h3.as_ref();
+        let has_h3_listener = h3.and_then(|h3| h3.listen.as_ref()).is_some();
+
+        if let Some(h3) = h3 {
+            if has_h3_listener {
+                let secret_len = h3.secret.as_ref().map(|s| s.trim().len()).unwrap_or(0);
+                if secret_len <= 8 {
+                    errors.push(ValidationError::LocalSecretTooShort);
+                }
+            }
+
+            if let Some(admin) = &h3.admin {
+                if admin.name.trim().len() <= 8 || admin.pass.trim().len() <= 8 {
+                    errors.push(ValidationError::LocalAdminTooShort);
+                }
+                if !has_h3_listener {
+                    errors.push(ValidationError::LocalAdminMissingListener);
+                }
+            }
+        }
+
         if self.local.tun.addr.is_empty() {
             errors.push(ValidationError::MissingLocalTunAddr);
         }
@@ -232,22 +274,21 @@ impl Config {
             });
         }
 
-        if let Some(h3) = &self.local.h3 {
-            if let Some(admin) = &h3.admin {
-                if admin.len() <= 8 {
-                    errors.push(ValidationError::LocalAdminTooShort);
-                }
-                if h3.listen.is_none() {
-                    errors.push(ValidationError::LocalAdminMissingListener);
-                }
-            }
-        }
-
         for peer in &self.peers {
             if peer.id.trim().len() < 6 {
                 errors.push(ValidationError::PeerIdTooShort {
                     peer_id: peer.id.clone(),
                 });
+            }
+
+            if let Some(h3) = peer.h3.as_ref() {
+                let peer_secret_len = h3.secret.as_ref().map(|s| s.trim().len()).unwrap_or(0);
+                let requires_peer_secret = !h3.endpoints.is_empty() || h3.secret.is_some();
+                if requires_peer_secret && peer_secret_len <= 8 {
+                    errors.push(ValidationError::PeerSecretTooShort {
+                        peer_id: peer.id.clone(),
+                    });
+                }
             }
 
             match (&peer.h3, &peer.bare) {
@@ -335,7 +376,7 @@ mod tests {
     fn sample_h3_config() -> Config {
         Config {
             local: Local {
-                id: "example-node-01".to_string(),
+                id: "example-node-1".to_string(),
                 table: true,
                 dns: LocalDns {
                     server: "1.1.1.1".to_string(),
@@ -344,9 +385,13 @@ mod tests {
                 },
                 h3: Some(LocalH3 {
                     listen: Some("https://[::]:443/path".to_string()),
-                    admin: Some("admin-username".to_string()),
                     cert: Some("./cert.pem".to_string()),
                     key: Some("./key.pem".to_string()),
+                    secret: Some("example-node-1-secret".to_string()),
+                    admin: Some(LocalAdmin {
+                        name: "admin-username".to_string(),
+                        pass: "admin-password".to_string(),
+                    }),
                 }),
                 bare: None,
                 tun: LocalTun {
@@ -356,9 +401,10 @@ mod tests {
                 },
             },
             peers: vec![Peer {
-                id: "example-node-02".to_string(),
+                id: "example-node-2".to_string(),
                 enabled: true,
                 h3: Some(PeerH3 {
+                    secret: Some("example-node-2-secret".to_string()),
                     endpoints: vec!["https://peer.example.com:443/path".to_string()],
                     retry: 10,
                     ca: None,
@@ -405,6 +451,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_local_secret_when_listening() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.local.h3.as_mut() {
+            h3.secret = None;
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.contains(&ValidationError::LocalSecretTooShort)
+        ));
+    }
+
+    #[test]
+    fn rejects_short_admin_credentials() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.local.h3.as_mut() {
+            h3.admin = Some(LocalAdmin {
+                name: "short".to_string(),
+                pass: "short".to_string(),
+            });
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.contains(&ValidationError::LocalAdminTooShort)
+        ));
+    }
+
+    #[test]
     fn rejects_peer_transport_conflict() {
         let mut config = sample_h3_config();
         config.peers[0].bare = Some(PeerBare {
@@ -434,6 +509,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_peer_secret() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.secret = None;
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerSecretTooShort { .. }))
+        ));
+    }
+
+    #[test]
+    fn allows_listen_only_peer_without_secret() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.secret = None;
+            h3.endpoints.clear();
+        }
+        let result = config.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn rejects_dns_refresh_too_small() {
         let mut config = sample_h3_config();
         config.local.dns.refresh = 10;
@@ -459,13 +558,16 @@ mod tests {
     fn parse_from_str_applies_defaults() {
         let yaml = r#"
 local:
-  id: example-node-01
+  id: example-node-1
+  h3:
+    secret: example-node-1-secret
   tun:
     addr:
       - 192.168.180.1/32
 peers:
-- id: example-node-02
-  h3: {}
+- id: example-node-2
+  h3:
+    secret: example-node-2-secret
   tun:
     allowedIPs:
       - 192.168.180.2/32
@@ -492,15 +594,16 @@ peers:
     fn deduplicates_endpoints_and_applies_dns_defaults() {
         let yaml = r#"
 local:
-  id: example-node-01
+  id: example-node-1
   dns:
     server: 8.8.8.8
   tun:
     addr:
       - 192.168.180.1/32
 peers:
-- id: example-node-02
+- id: example-node-2
   h3:
+    secret: example-node-2-secret
     retry: 5
     endpoints:
       - https://peer.example.com/path

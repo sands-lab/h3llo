@@ -16,38 +16,40 @@ Below is a minimal two-node example. If you know `wg-quick`, the structure shoul
 ```yaml
 # Configuration on node1
 local:
-  id: example-node-01
+  id: example-node-1
   h3:
     listen: https://[::]:443/path
     cert: ./cert.pem
     key: ./key.pem
+    secret: example-node-1-secret
   tun:
     ifname: h3llo0
     addr:
-    - 192.168.180.1/32
+      - 192.168.180.1/32
 peers:
-- id: example-node-02
+- id: example-node-2
   h3:
   tun:
     allowedIPs:
-    - 192.168.180.2/32
+      - 192.168.180.2/32
 ```
 ```yaml
 # Configuration on node2
 local:
-  id: example-node-02
+  id: example-node-2
   tun:
     ifname: h3llo0
     addr:
-    - 192.168.180.2/32
+      - 192.168.180.2/32
 peers:
-- id: example-node-01
+- id: example-node-1
   h3:
+    secret: example-node-1-secret
     endpoints:
-    - https://node1.example.com:443/path
+      - https://node1.example.com:443/path
   tun:
     allowedIPs:
-    - 192.168.180.1/32
+      - 192.168.180.1/32
 ```
 
 Save the configuration as `host/config.yaml`, then start the h3llo container:
@@ -68,7 +70,7 @@ High-level connection/auth/routing summary; see `docs/protocol.md` for auth/tran
 ### Authentication and Security
 
 - Identity: every node needs a unique `id` (>= 6 chars).
-- Basic Auth derivation and control-plane enablement are described in `docs/protocol.md`; QUIC/TLS certificates are required for HTTP/3.
+- Basic Auth uses `local.id` + `local.h3.secret` (secret must be longer than 8 characters when `local.h3.listen` is set) for CONNECT and `local.h3.admin` (`name`/`pass`) for control-plane GET/POST. Provide `peers[].h3.secret` only on dialing nodes (when `peers[].h3.endpoints` is set) and keep it equal to the remote `local.h3.secret`; listen-only peers can omit both `endpoints` and `secret`. Full derivation and control-plane enablement live in `docs/protocol.md`. QUIC/TLS certificates are required for HTTP/3.
 
 ### Routing
 
