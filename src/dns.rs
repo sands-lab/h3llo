@@ -1,107 +1,257 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, ToSocketAddrs};
+use std::ffi::CString;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
-use crate::bind::{BindDecision, RouteProbe};
-use crate::config::LocalDns;
+use crate::bind::{BindDecision, BindWarning, RouteProbe};
+use crate::config::{parse_dns_server_uri, LocalDns};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{Name, RData, RecordType};
+use rand::Rng;
+use socket2::{Domain, Protocol, Socket, Type};
 use thiserror::Error;
+use tokio::net::UdpSocket;
+use tokio::time;
 
-/// Describes DNS resolution errors.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum ResolveError {
-    /// DNS resolution failed.
-    #[error("failed to resolve {host}: {error}")]
-    Failed { host: String, error: String },
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
+/// Performs DNS resolution over UDP sockets bound to the chosen interface.
+#[derive(Debug, Clone)]
+pub struct DnsResolver {
+    server: SocketAddr,
+    timeout: Duration,
 }
 
-/// Provides a hostname resolver abstraction to allow deterministic tests.
-pub trait HostResolver: Send + Sync {
-    /// Resolves a hostname into IP addresses.
-    fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError>;
-}
+impl DnsResolver {
+    /// Creates a resolver targeting `server` with the provided timeout.
+    pub fn new(server: SocketAddr, timeout: Duration) -> Self {
+        Self { server, timeout }
+    }
 
-/// Uses the platform DNS settings to resolve hostnames.
-#[derive(Debug, Default, Clone)]
-pub struct SystemResolver;
+    /// Builds a resolver from `local_dns` configuration, parsing the UDP URI.
+    pub fn from_config(local_dns: &LocalDns, timeout: Duration) -> Result<Self, ResolveInitError> {
+        let server =
+            parse_dns_server_uri(&local_dns.server).map_err(ResolveInitError::InvalidServer)?;
+        Ok(Self::new(server, timeout))
+    }
 
-impl HostResolver for SystemResolver {
-    fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {
-        let addrs = (host, 0)
-            .to_socket_addrs()
-            .map_err(|e| ResolveError::Failed {
-                host: host.to_string(),
-                error: e.to_string(),
-            })?;
+    /// Resolves `hosts` sequentially using a socket bound according to `bind`, skipping the TUN when possible.
+    pub async fn resolve_hosts(&self, hosts: &[String], bind: &BindDecision) -> ResolveOutcome {
+        let mut warnings = Vec::new();
+        if let Some(warning) = bind.warning.clone() {
+            warnings.push(DnsWarning::Bind(warning));
+        }
 
-        let mut seen = HashSet::new();
-        let mut ips = Vec::new();
-        for addr in addrs {
-            if seen.insert(addr.ip()) {
-                ips.push(addr.ip());
+        let (socket, mut bind_warnings) = match self.prepare_socket(bind) {
+            Ok(pair) => pair,
+            Err(err) => {
+                return ResolveOutcome {
+                    records: HashMap::new(),
+                    errors: vec![err],
+                    warnings,
+                };
             }
-        }
-        Ok(ips)
-    }
-}
+        };
+        warnings.append(&mut bind_warnings);
 
-/// Stores cached DNS answers and refreshes them on demand.
-#[derive(Debug)]
-pub struct DnsResolver<R: HostResolver> {
-    cache: HashMap<String, Vec<IpAddr>>,
-    resolver: R,
-}
-
-impl<R: HostResolver> DnsResolver<R> {
-    /// Creates a new DNS resolver with an empty cache.
-    pub fn new(resolver: R) -> Self {
-        Self {
-            cache: HashMap::new(),
-            resolver,
-        }
-    }
-
-    /// Returns a bind decision using `local_dns` and the provided `probe`.
-    pub fn decide_binding<P: RouteProbe>(
-        local_dns: &LocalDns,
-        tun_if: &str,
-        probe: &P,
-    ) -> BindDecision {
-        decide_dns_binding(local_dns, tun_if, probe)
-    }
-
-    /// Refreshes DNS answers for `hosts`, returning whether any entry changed and the current cache.
-    pub fn refresh(&mut self, hosts: &[String]) -> RefreshOutcome {
+        let mut records = HashMap::new();
         let mut errors = Vec::new();
-        let mut changed = false;
-        let mut next_cache = self.cache.clone();
 
         for host in hosts {
-            match self.resolver.resolve(host) {
+            match self.resolve_single(&socket, host).await {
                 Ok(ips) => {
-                    let deduped = dedup_ips(ips);
-                    let cached = self.cache.get(host);
-                    if cached.map(|c| c != &deduped).unwrap_or(true) {
-                        changed = true;
+                    if !ips.is_empty() {
+                        records.insert(host.clone(), ips);
                     }
-                    next_cache.insert(host.clone(), deduped);
                 }
                 Err(err) => errors.push(err),
             }
         }
 
-        let records = if changed {
-            self.cache = next_cache.clone();
-            next_cache
-        } else {
-            // Keep original cache if nothing changed to preserve previous answers on errors.
-            self.cache.clone()
-        };
-
-        RefreshOutcome {
+        ResolveOutcome {
             records,
-            changed,
             errors,
+            warnings,
         }
     }
+
+    fn prepare_socket(
+        &self,
+        bind: &BindDecision,
+    ) -> Result<(UdpSocket, Vec<DnsWarning>), ResolveError> {
+        let mut warnings = Vec::new();
+
+        let domain = match self.server {
+            SocketAddr::V4(_) => Domain::IPV4,
+            SocketAddr::V6(_) => Domain::IPV6,
+        };
+        let bind_addr: SocketAddr = match self.server {
+            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
+        };
+
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(|e| {
+            ResolveError::Resolver {
+                error: e.to_string(),
+            }
+        })?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| ResolveError::Resolver {
+                error: e.to_string(),
+            })?;
+        socket
+            .bind(&bind_addr.into())
+            .map_err(|e| ResolveError::Resolver {
+                error: e.to_string(),
+            })?;
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(interface) = bind.interface.as_ref() {
+                if let Err(err) = bind_to_device(&socket, interface) {
+                    warnings.push(DnsWarning::BindSocket {
+                        interface: interface.clone(),
+                        error: err.to_string(),
+                    });
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Some(interface) = bind.interface.as_ref() {
+                warnings.push(DnsWarning::BindUnsupported {
+                    interface: interface.clone(),
+                });
+            }
+        }
+
+        socket
+            .connect(&self.server.into())
+            .map_err(|e| ResolveError::Resolver {
+                error: e.to_string(),
+            })?;
+
+        let udp = UdpSocket::from_std(socket.into()).map_err(|e| ResolveError::Resolver {
+            error: e.to_string(),
+        })?;
+
+        Ok((udp, warnings))
+    }
+
+    async fn resolve_single(
+        &self,
+        socket: &UdpSocket,
+        host: &str,
+    ) -> Result<Vec<IpAddr>, ResolveError> {
+        let name = Name::from_ascii(host).map_err(|e| ResolveError::InvalidHost {
+            host: host.to_string(),
+            error: e.to_string(),
+        })?;
+
+        let mut ips = Vec::new();
+
+        for record_type in [RecordType::A, RecordType::AAAA] {
+            let mut result = self.query(socket, host, &name, record_type).await?;
+            ips.append(&mut result);
+        }
+
+        Ok(dedup_ips(ips))
+    }
+
+    async fn query(
+        &self,
+        socket: &UdpSocket,
+        host: &str,
+        name: &Name,
+        record_type: RecordType,
+    ) -> Result<Vec<IpAddr>, ResolveError> {
+        let mut message = Message::new();
+        let id = rand::thread_rng().gen::<u16>();
+        message.set_id(id);
+        message.set_message_type(MessageType::Query);
+        message.set_op_code(OpCode::Query);
+        message.set_recursion_desired(true);
+        message.add_query(record_type_query(name.clone(), record_type));
+
+        let outbound = message.to_vec().map_err(|e| ResolveError::QueryFailed {
+            host: host.to_string(),
+            error: e.to_string(),
+        })?;
+
+        let mut inbound = vec![0u8; 1500];
+        let send_recv = async {
+            socket
+                .send(&outbound)
+                .await
+                .map_err(|e| ResolveError::QueryFailed {
+                    host: host.to_string(),
+                    error: e.to_string(),
+                })?;
+            let len = socket
+                .recv(&mut inbound)
+                .await
+                .map_err(|e| ResolveError::QueryFailed {
+                    host: host.to_string(),
+                    error: e.to_string(),
+                })?;
+            Ok(len)
+        };
+
+        let len = match time::timeout(self.timeout, send_recv).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(ResolveError::Timeout {
+                    host: host.to_string(),
+                })
+            }
+        };
+
+        let response =
+            Message::from_vec(&inbound[..len]).map_err(|e| ResolveError::QueryFailed {
+                host: host.to_string(),
+                error: e.to_string(),
+            })?;
+
+        if response.id() != id {
+            return Err(ResolveError::QueryFailed {
+                host: host.to_string(),
+                error: "response id mismatch".to_string(),
+            });
+        }
+
+        if response.response_code() != ResponseCode::NoError {
+            return Err(ResolveError::QueryFailed {
+                host: host.to_string(),
+                error: format!("dns error: {:?}", response.response_code()),
+            });
+        }
+
+        let mut ips = Vec::new();
+        for answer in response.answers() {
+            match answer.data() {
+                RData::A(addr) if record_type == RecordType::A => {
+                    ips.push(IpAddr::V4(ipv4_from_rdata(&addr)));
+                }
+                RData::AAAA(addr) if record_type == RecordType::AAAA => {
+                    ips.push(IpAddr::V6(ipv6_from_rdata(&addr)));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(ips)
+    }
+}
+
+fn record_type_query(name: Name, record_type: RecordType) -> Query {
+    let mut query = Query::new();
+    query.set_name(name);
+    query.set_query_type(record_type);
+    query
 }
 
 fn dedup_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
@@ -115,141 +265,213 @@ fn dedup_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
     out
 }
 
+#[cfg(target_os = "linux")]
+fn bind_to_device(socket: &Socket, interface: &str) -> io::Result<()> {
+    use libc::{c_void, setsockopt, socklen_t, SOL_SOCKET, SO_BINDTODEVICE};
+
+    let name = CString::new(interface)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface contains null"))?;
+    let ret = unsafe {
+        setsockopt(
+            socket.as_raw_fd(),
+            SOL_SOCKET,
+            SO_BINDTODEVICE,
+            name.as_ptr() as *const c_void,
+            name.as_bytes_with_nul().len() as socklen_t,
+        )
+    };
+    if ret == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn ipv4_from_rdata(data: &hickory_proto::rr::rdata::A) -> Ipv4Addr {
+    data.0
+}
+
+fn ipv6_from_rdata(data: &hickory_proto::rr::rdata::AAAA) -> Ipv6Addr {
+    data.0
+}
+
 /// Returns a DNS bind decision preferring the configured interface when present and skipping the TUN.
 pub fn decide_dns_binding<P: RouteProbe>(
     local_dns: &LocalDns,
     tun_if: &str,
     probe: &P,
 ) -> BindDecision {
+    let target = match parse_dns_server_uri(&local_dns.server) {
+        Ok(addr) => addr.ip().to_string(),
+        Err(reason) => {
+            return BindDecision {
+                interface: None,
+                warning: Some(BindWarning::ProbeFailed(format!(
+                    "invalid dns server: {}",
+                    reason
+                ))),
+            };
+        }
+    };
     BindDecision::choose(
         local_dns.bindif.as_deref(),
-        &local_dns.server,
+        &target,
         tun_if,
         probe,
     )
 }
 
-/// Tracks the result of a DNS refresh.
+/// Tracks the result of DNS resolution attempts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefreshOutcome {
-    /// Latest answers per host (cached on success; unchanged on all-failure paths).
+pub struct ResolveOutcome {
+    /// Latest answers per host (empty when a host failed).
     pub records: HashMap<String, Vec<IpAddr>>,
-    /// True when at least one hostname updated its answers.
-    pub changed: bool,
-    /// Errors encountered during refresh.
+    /// Errors encountered during resolution.
     pub errors: Vec<ResolveError>,
+    /// Warnings about binding or platform limitations.
+    pub warnings: Vec<DnsWarning>,
+}
+
+/// Describes DNS resolution errors.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    /// DNS resolver socket could not be prepared.
+    #[error("dns resolver failed to initialize: {error}")]
+    Resolver { error: String },
+    /// Hostname was not valid.
+    #[error("invalid host {host}: {error}")]
+    InvalidHost { host: String, error: String },
+    /// DNS exchange failed.
+    #[error("failed to resolve {host}: {error}")]
+    QueryFailed { host: String, error: String },
+    /// DNS response timed out.
+    #[error("dns query for {host} timed out")]
+    Timeout { host: String },
+}
+
+/// Captures warnings raised during DNS resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsWarning {
+    /// Binding decision emitted a warning.
+    Bind(BindWarning),
+    /// Binding to a device failed; continuing unbound.
+    BindSocket { interface: String, error: String },
+    /// Binding is not supported on this platform.
+    BindUnsupported { interface: String },
+}
+
+/// Describes resolver construction errors.
+#[derive(Debug, Error)]
+pub enum ResolveInitError {
+    /// DNS server URI could not be parsed.
+    #[error("invalid dns server: {0}")]
+    InvalidServer(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::rr::rdata::{A, AAAA};
+    use hickory_proto::rr::Record;
+    use tokio::net::UdpSocket;
 
-    #[derive(Clone, Default)]
-    struct FakeResolver {
-        results:
-            std::sync::Arc<std::sync::Mutex<HashMap<String, Result<Vec<IpAddr>, ResolveError>>>>,
+    fn make_decision() -> BindDecision {
+        BindDecision {
+            interface: None,
+            warning: None,
+        }
     }
 
-    impl FakeResolver {
-        fn new(results: HashMap<String, Result<Vec<IpAddr>, ResolveError>>) -> Self {
-            Self {
-                results: std::sync::Arc::new(std::sync::Mutex::new(results)),
+    #[tokio::test]
+    async fn resolves_a_and_aaaa_records() {
+        let (server, handle) = start_dns_stub(
+            Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            2,
+        )
+        .await;
+
+        let resolver = DnsResolver::new(server, Duration::from_secs(1));
+        let outcome = resolver
+            .resolve_hosts(&vec!["example.com".to_string()], &make_decision())
+            .await;
+
+        assert!(outcome.errors.is_empty());
+        let ips = outcome
+            .records
+            .get("example.com")
+            .cloned()
+            .unwrap_or_default();
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(ips.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn times_out_on_silent_server() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        // Drop the socket to leave an unresponsive endpoint.
+        drop(socket);
+
+        let resolver = DnsResolver::new(addr, Duration::from_millis(50));
+        let outcome = resolver
+            .resolve_hosts(&vec!["example.com".to_string()], &make_decision())
+            .await;
+        assert_eq!(outcome.records.len(), 0);
+        assert!(!outcome.errors.is_empty());
+    }
+
+    async fn start_dns_stub(
+        ipv4: Option<IpAddr>,
+        ipv6: Option<IpAddr>,
+        expected_queries: usize,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1500];
+            for _ in 0..expected_queries {
+                if let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+                    let request = Message::from_vec(&buf[..len]).unwrap();
+                    let mut response = Message::new();
+                    response.set_id(request.id());
+                    response.set_message_type(MessageType::Response);
+                    response.set_op_code(OpCode::Query);
+                    response.set_response_code(ResponseCode::NoError);
+
+                    for query in request.queries() {
+                        response.add_query(query.clone());
+                        match query.query_type() {
+                            RecordType::A => {
+                                if let Some(IpAddr::V4(ip)) = ipv4 {
+                                    response.add_answer(Record::from_rdata(
+                                        query.name().clone().into(),
+                                        60,
+                                        RData::A(A(ip)),
+                                    ));
+                                }
+                            }
+                            RecordType::AAAA => {
+                                if let Some(IpAddr::V6(ip)) = ipv6 {
+                                    response.add_answer(Record::from_rdata(
+                                        query.name().clone().into(),
+                                        60,
+                                        RData::AAAA(AAAA(ip)),
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if let Ok(out) = response.to_vec() {
+                        let _ = socket.send_to(&out, peer).await;
+                    }
+                }
             }
-        }
-
-        fn set(&self, host: &str, result: Result<Vec<IpAddr>, ResolveError>) {
-            let mut guard = self.results.lock().unwrap();
-            guard.insert(host.to_string(), result);
-        }
-    }
-
-    impl HostResolver for FakeResolver {
-        fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {
-            let guard = self.results.lock().unwrap();
-            guard.get(host).cloned().unwrap_or_else(|| {
-                Err(ResolveError::Failed {
-                    host: host.to_string(),
-                    error: "missing".to_string(),
-                })
-            })
-        }
-    }
-
-    fn ip(ip: &str) -> IpAddr {
-        ip.parse().unwrap()
-    }
-
-    #[test]
-    fn dns_refresh_updates_changed_hosts() {
-        let mut resolver = DnsResolver::new(FakeResolver {
-            results: std::sync::Arc::new(std::sync::Mutex::new(HashMap::from([(
-                "example.com".to_string(),
-                Ok(vec![ip("1.1.1.1")]),
-            )]))),
         });
-        let first = resolver.refresh(&vec!["example.com".to_string()]);
-        assert!(first.changed);
-        assert_eq!(first.records["example.com"], vec![ip("1.1.1.1")]);
 
-        // No change on same answer.
-        let second = resolver.refresh(&vec!["example.com".to_string()]);
-        assert!(!second.changed);
-        assert_eq!(second.records["example.com"], vec![ip("1.1.1.1")]);
-
-        // Change when answer differs.
-        resolver
-            .resolver
-            .set("example.com", Ok(vec![ip("2.2.2.2")]));
-        let third = resolver.refresh(&vec!["example.com".to_string()]);
-        assert!(third.changed);
-        assert_eq!(third.records["example.com"], vec![ip("2.2.2.2")]);
-    }
-
-    #[test]
-    fn dns_refresh_deduplicates_addresses() {
-        let resolver = FakeResolver::new(HashMap::from([(
-            "example.com".to_string(),
-            Ok(vec![ip("1.1.1.1"), ip("1.1.1.1"), ip("2.2.2.2")]),
-        )]));
-        let mut dns = DnsResolver::new(resolver);
-        let outcome = dns.refresh(&vec!["example.com".to_string()]);
-        assert!(outcome.changed);
-        assert_eq!(
-            outcome.records["example.com"],
-            vec![ip("1.1.1.1"), ip("2.2.2.2")]
-        );
-    }
-
-    #[test]
-    fn dns_refresh_preserves_cache_on_error() {
-        let resolver = FakeResolver::new(HashMap::from([(
-            "example.com".to_string(),
-            Err(ResolveError::Failed {
-                host: "example.com".to_string(),
-                error: "boom".to_string(),
-            }),
-        )]));
-        let mut dns = DnsResolver::new(resolver.clone());
-        // Seed cache with a good value.
-        dns.cache
-            .insert("example.com".to_string(), vec![ip("1.1.1.1")]);
-
-        let outcome = dns.refresh(&vec!["example.com".to_string()]);
-        assert!(!outcome.changed);
-        assert_eq!(outcome.records["example.com"], vec![ip("1.1.1.1")]);
-        assert_eq!(outcome.errors.len(), 1);
-    }
-
-    #[test]
-    fn dns_refresh_adds_new_host() {
-        let resolver = FakeResolver::new(HashMap::from([
-            ("example.com".to_string(), Ok(vec![ip("1.1.1.1")])),
-            ("example.net".to_string(), Ok(vec![ip("2.2.2.2")])),
-        ]));
-        let mut dns = DnsResolver::new(resolver);
-        let outcome = dns.refresh(&vec!["example.com".to_string(), "example.net".to_string()]);
-        assert!(outcome.changed);
-        assert_eq!(outcome.records["example.com"], vec![ip("1.1.1.1")]);
-        assert_eq!(outcome.records["example.net"], vec![ip("2.2.2.2")]);
+        (addr, handle)
     }
 }

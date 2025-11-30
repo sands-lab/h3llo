@@ -165,10 +165,14 @@ mod tests {
     #[derive(Clone)]
     struct FakeRouteProbe {
         result: Result<Vec<String>, RouteProbeError>,
+        expected_target: Option<String>,
     }
 
     impl RouteProbe for FakeRouteProbe {
         fn probe_interfaces(&self, _target: &str) -> Result<Vec<String>, RouteProbeError> {
+            if let Some(expected) = &self.expected_target {
+                assert_eq!(_target, expected);
+            }
             self.result.clone()
         }
     }
@@ -177,6 +181,7 @@ mod tests {
     fn binding_prefers_explicit_interface() {
         let probe = FakeRouteProbe {
             result: Ok(vec!["eth0".to_string(), "eth1".to_string()]),
+            expected_target: None,
         };
         let decision = BindDecision::choose(Some("eth1"), "1.1.1.1", "tun0", &probe);
         assert_eq!(decision.interface.as_deref(), Some("eth1"));
@@ -187,6 +192,7 @@ mod tests {
     fn binding_uses_probe_when_no_preference() {
         let probe = FakeRouteProbe {
             result: Ok(vec!["eth0".to_string()]),
+            expected_target: None,
         };
         let decision = BindDecision::choose(None, "1.1.1.1", "tun0", &probe);
         assert_eq!(decision.interface.as_deref(), Some("eth0"));
@@ -197,6 +203,7 @@ mod tests {
     fn binding_warns_when_preferred_missing() {
         let probe = FakeRouteProbe {
             result: Ok(vec!["eth0".to_string(), "eth2".to_string()]),
+            expected_target: None,
         };
         let decision = BindDecision::choose(Some("eth1"), "1.1.1.1", "tun0", &probe);
         assert_eq!(decision.interface.as_deref(), Some("eth0"));
@@ -210,6 +217,7 @@ mod tests {
     fn binding_skips_tun_when_alternative_exists() {
         let probe = FakeRouteProbe {
             result: Ok(vec!["tun0".to_string(), "eth0".to_string()]),
+            expected_target: None,
         };
         let decision = BindDecision::choose(None, "1.1.1.1", "tun0", &probe);
         assert_eq!(decision.interface.as_deref(), Some("eth0"));
@@ -220,6 +228,7 @@ mod tests {
     fn binding_filters_tun_probe() {
         let probe = FakeRouteProbe {
             result: Ok(vec!["tun0".to_string()]),
+            expected_target: None,
         };
         let decision = BindDecision::choose(None, "1.1.1.1", "tun0", &probe);
         assert!(decision.interface.is_none());
@@ -230,6 +239,7 @@ mod tests {
     fn binding_warns_on_probe_error() {
         let probe = FakeRouteProbe {
             result: Err(RouteProbeError::InvalidOutput),
+            expected_target: None,
         };
         let decision = BindDecision::choose(None, "1.1.1.1", "tun0", &probe);
         assert!(decision.interface.is_none());
@@ -243,10 +253,11 @@ mod tests {
     fn decide_dns_binding_bridges_to_choose() {
         let probe = FakeRouteProbe {
             result: Ok(vec!["eth0".to_string()]),
+            expected_target: Some("1.1.1.1".to_string()),
         };
         let decision = crate::dns::decide_dns_binding(
             &LocalDns {
-                server: "1.1.1.1".to_string(),
+                server: "udp://1.1.1.1:53".to_string(),
                 refresh: 60,
                 bindif: Some("eth1".to_string()),
             },
@@ -279,7 +290,10 @@ default via 172.18.0.11 dev eno1 proto static
             ]
         );
 
-        let probe = FakeRouteProbe { result: Ok(ifaces) };
+        let probe = FakeRouteProbe {
+            result: Ok(ifaces),
+            expected_target: None,
+        };
         let decision = BindDecision::choose(None, "10.200.2.27", "tun0", &probe);
         assert_eq!(decision.interface.as_deref(), Some("eno1"));
         assert!(decision.warning.is_none());

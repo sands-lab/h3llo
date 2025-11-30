@@ -13,8 +13,8 @@ Recursive routing and DNS resolution summary: probe WAN-facing interfaces (exclu
 Why recursive routing happens: if h3llo installs the default route into the TUN and outbound sockets (DNS, HTTP/3, BareUDP) are not explicitly bound to a WAN-facing interface, their traffic can re-enter the tunnel and get forwarded again, creating loops and blocking connectivity. Binding per interface (or at least warning on fallback to unbound) avoids the TUN from becoming both source and sink of control traffic.
 
 Binding workflow for HTTP/3, BareUDP, and DNS:
-1. Pick the DNS interface: prefer `local.dns.bindif` when provided and present in probe results; warn and fall back to the first probed non-TUN interface when the preferred one is missing. If no interface is available or probing fails, log a warning and continue with an unbound DNS socket. Probing uses `ip route show match <local.dns.server>` on Linux while excluding the TUN.
-2. DNS resolver coroutine: bind a UDP socket with `SO_BINDTODEVICE`, `IP_UNICAST_IF`, or `IP_BOUND_IF` when available. Every `local.dns.refresh` seconds (default `60`, minimum `30`; `0` disables the timer) enqueue a batched query of all hostnames. Resolve serially and stream each peer’s result back to the orchestrator via the DNS resolver’s command queue.
+1. Pick the DNS interface: prefer `local.dns.bindif` when provided and present in probe results; warn and fall back to the first probed non-TUN interface when the preferred one is missing. If no interface is available or probing fails, log a warning and continue with an unbound DNS socket. Probing uses `ip route show match <host part of local.dns.server>` on Linux while excluding the TUN.
+2. DNS resolver coroutine: bind a UDP socket with `SO_BINDTODEVICE`, `IP_UNICAST_IF`, or `IP_BOUND_IF` when available. Every `local.dns.refresh` seconds (default `60`, minimum `30`; `0` disables the timer) enqueue a batched Do53 query of all hostnames without caching; resolve serially and stream each peer’s result back to the orchestrator via the DNS resolver’s command queue.
 3. Transport binding: for each resolved IP (HTTP/3) or selected outbound IP (BareUDP), probe the WAN-facing interface excluding the TUN; bind transport sockets to that interface. HTTP/3 creates connections across the Cartesian product of DNS answers, `peers[].h3.endpoints`, and `peers[].h3.bindifs`; BareUDP binds one socket per outbound interface plus a dedicated listener socket. If probing or binding fails, warn and continue unbound.
 
 ### Thread Model
@@ -95,7 +95,7 @@ flowchart TB
     subgraph cr-orch["Coroutine (Orchestrator)"]
         oq[Command Queue]@{shape: h-cyl}
         hcp[H3 Conn Pool]
-        dr[DNS Records]
+        dr[DNS Answers]
         conf[Configuration]
         oq ~~~ conf ~~~ dr ~~~ hcp
     end
@@ -125,7 +125,7 @@ flowchart TB
 h3llo uses the tokio runtime to schedule coroutines and should rely on MPSC queues instead of locks to reduce async complexity, since MPSC queues explicitly linearize async operations.
 
 Orchestrator responsibilities and invariants:
-- Maintain the latest configuration snapshot, DNS cache, and H3 connection pool; receive commands from other coroutines through its MPSC queue.
+- Maintain the latest configuration snapshot and H3 connection pool; receive commands from other coroutines through its MPSC queue.
 - Stay fully async: handle config updates, DNS refresh results, connection close notifications, and timer ticks without blocking other commands.
 - Spawn new coroutines (DNS resolver, H3 dialers) and push newly established H3 connections to the TUN-Rx coroutine for routing decisions.
 

@@ -7,7 +7,7 @@ local:
   id: example-node-2 # required
   table: true # optional, default: true (manage system routes)
   dns: # optional
-    server: 1.1.1.1 # optional, default: 1.1.1.1
+    server: udp://1.1.1.1:53 # optional, default: udp://1.1.1.1:53
     refresh: 60 # optional, default: 60 (seconds; 0 disables; minimum 30 when nonzero)
     bindif: eth0 # optional, default: auto-detect; warn and fallback to unbound on failure
   h3: # optional; when present, all fields below are required unless noted
@@ -53,7 +53,7 @@ peers: # optional, default: []
 - `local.h3.secret`: Authentication secret for inbound HTTP Basic Auth; must be longer than 8 characters when `local.h3` is set. Peers must configure matching `peers[].h3.secret`. Choose a strong value to avoid credential reuse.
 - `local.table` (default `true`): Update the system routing table to steer matching traffic into the h3llo TUN. When `false`, h3llo does not touch system routes; the OS still installs connected routes for `local.tun.addr` (for example, `192.168.180.1/24` adds `192.168.180.0/24`).
 - `local.h3.admin.name` / `local.h3.admin.pass` (optional; both longer than 8 characters): Control-plane Basic Auth credentials bound to HTTP/3. Enable GET/POST APIs only when both are set; authentication matrix is described in `docs/protocol.md`.
-- `local.dns.server` (default `1.1.1.1`): DNS server address (IPv4 or IPv6 literal) used to resolve peer hostnames; outbound binding/recursive-routing guards are detailed in `docs/internals.md`.
+- `local.dns.server` (default `udp://1.1.1.1:53`): DNS server address as a UDP URI with an IP literal and port; outbound binding/recursive-routing guards are detailed in `docs/internals.md`.
 - `local.dns.refresh` (default `60`): DNS refresh timer in seconds (`0` disables). Nonzero values are clamped to a minimum of `30`; the resolver batches hostnames per tick (see `docs/internals.md`).
 - `local.dns.bindif` (optional): Outbound interface for DNS resolution; prefer it when present in probe results, otherwise warn and fall back to a probed interface. Auto-detects at most one interface when omitted. Binding behavior and fallbacks are in `docs/internals.md`.
 - `local.h3.listen`: HTTP/3 listen address (scheme/host/port/path) for inbound peers when H3 is enabled; required when `local.h3` is set.

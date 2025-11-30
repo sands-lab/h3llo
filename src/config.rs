@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::io::Read;
+use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
+use url::Url;
 
 /// Top-level configuration loaded from YAML.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,7 +72,7 @@ pub struct LocalBare {
 /// DNS resolver settings for the local node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalDns {
-    /// DNS server address (IPv4/IPv6 literal).
+    /// DNS server address as a UDP URI (IPv4/IPv6 literal), e.g., `udp://1.1.1.1:53`.
     #[serde(default = "default_dns_server")]
     pub server: String,
     /// DNS refresh interval in seconds (`0` disables; minimum 30 when nonzero).
@@ -211,6 +213,9 @@ pub enum ValidationError {
     /// `local.dns.refresh` is too small.
     #[error("local.dns.refresh must be 0 or at least 30 seconds (got {refresh})")]
     LocalDnsRefreshTooShort { refresh: u64 },
+    /// `local.dns.server` is not a valid UDP URI.
+    #[error("local.dns.server must be a udp:// URI with an IP literal and port: {reason}")]
+    LocalDnsServerInvalid { reason: String },
     /// TUN addresses are missing.
     #[error("local.tun.addr must include at least one address")]
     MissingLocalTunAddr,
@@ -322,6 +327,10 @@ impl Config {
             });
         }
 
+        if let Err(reason) = parse_dns_server_uri(&self.local.dns.server) {
+            errors.push(ValidationError::LocalDnsServerInvalid { reason });
+        }
+
         for peer in &self.peers {
             if peer.id.trim().len() < 6 {
                 errors.push(ValidationError::PeerIdTooShort {
@@ -383,7 +392,7 @@ fn default_dns() -> LocalDns {
 }
 
 fn default_dns_server() -> String {
-    "1.1.1.1".to_string()
+    "udp://1.1.1.1:53".to_string()
 }
 
 fn default_dns_refresh() -> u64 {
@@ -400,6 +409,35 @@ fn default_mtu() -> u16 {
 
 fn default_peer_h3_retry_secs() -> u64 {
     10
+}
+
+/// Parses a UDP DNS server URI (e.g., `udp://1.1.1.1:53`) into a socket address, enforcing IP literals.
+pub fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
+    let url = Url::parse(raw).map_err(|e| e.to_string())?;
+
+    if url.scheme() != "udp" {
+        return Err("scheme must be udp".to_string());
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| "host is required".to_string())?;
+
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| "host must be an IP literal".to_string())?;
+
+    let port = url
+        .port()
+        .ok_or_else(|| "port is required (e.g., udp://1.1.1.1:53)".to_string())?;
+    if url.path() != "/" && !url.path().is_empty() {
+        return Err("path must be empty".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("query and fragment are not supported".to_string());
+    }
+
+    Ok(SocketAddr::new(ip, port))
 }
 
 fn deserialize_endpoints<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -427,7 +465,7 @@ mod tests {
                 id: "example-node-1".to_string(),
                 table: true,
                 dns: LocalDns {
-                    server: "1.1.1.1".to_string(),
+                    server: "udp://1.1.1.1:53".to_string(),
                     refresh: 60,
                     bindif: None,
                 },
@@ -625,6 +663,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_dns_server_uri() {
+        let mut config = sample_h3_config();
+        config.local.dns.server = "tcp://1.1.1.1:53".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::LocalDnsServerInvalid { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_dns_server_without_port() {
+        let mut config = sample_h3_config();
+        config.local.dns.server = "udp://1.1.1.1".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::LocalDnsServerInvalid { reason } if reason.contains("port")))
+        ));
+    }
+
+    #[test]
     fn rejects_empty_allowed_ips() {
         let mut config = sample_h3_config();
         config.peers[0].tun.allowed_ips.clear();
@@ -658,7 +724,7 @@ peers:
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.local.table, true);
-        assert_eq!(cfg.local.dns.server, "1.1.1.1");
+        assert_eq!(cfg.local.dns.server, "udp://1.1.1.1:53");
         assert_eq!(cfg.local.dns.refresh, 60);
         assert_eq!(cfg.local.dns.bindif, None);
         assert_eq!(cfg.local.tun.ifname, "h3llo0");
@@ -680,7 +746,7 @@ peers:
 local:
   id: example-node-1
   dns:
-    server: 8.8.8.8
+    server: udp://8.8.8.8:53
   tun:
     addr:
       - 192.168.180.1/32
@@ -701,7 +767,7 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.local.dns.server, "8.8.8.8");
+        assert_eq!(cfg.local.dns.server, "udp://8.8.8.8:53");
         assert_eq!(cfg.local.dns.refresh, 60);
         let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
         assert_eq!(h3.retry, 5);

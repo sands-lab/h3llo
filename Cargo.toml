@@ -8,10 +8,15 @@ license = "MIT"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "1.0"
-tokio = { version = "1.48", features = ["rt", "macros"] }
+tokio = { version = "1.48", features = ["rt", "macros", "net", "time"] }
+socket2 = "0.5"
+hickory-proto = { version = "0.25", default-features = false }
+rand = "0.8"
+url = "2.5"
+libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1.48", features = ["rt", "macros"] }
+tokio = { version = "1.48", features = ["rt", "macros", "net", "time"] }
 
 [[bin]]
 name = "h3llo"

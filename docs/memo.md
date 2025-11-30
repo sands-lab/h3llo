@@ -22,3 +22,4 @@
 -  `cargo test`需在提升权限的环境下运行
 - 平台支持：优先提供 Linux 支持，同时为 macOS/Windows/BSD 预留实现扩展点（如路由探测/绑定）。
 - 迭代顺序：先完成 BareUDP 可运行 VPN，再补 HTTP/3（认证、传输、控制面）相关功能。
+- DNS 配置：`local.dns.server` 使用 `udp://<ip>:<port>` 形式；DNS 解析走绑定 UDP socket，不做缓存。
