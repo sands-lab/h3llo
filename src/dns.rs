@@ -170,7 +170,7 @@ impl DnsResolver {
         record_type: RecordType,
     ) -> Result<Vec<IpAddr>, ResolveError> {
         let mut message = Message::new();
-        let id = rand::thread_rng().gen::<u16>();
+        let id = rand::rng().random::<u16>();
         message.set_id(id);
         message.set_message_type(MessageType::Query);
         message.set_op_code(OpCode::Query);
