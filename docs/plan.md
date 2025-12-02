@@ -37,3 +37,4 @@ Iterative delivery of h3llo by building one module at a time, gating each step w
 ## Progress Log
 - Config and validation: crate scaffolded with YAML parsing, defaults, and validation checks; unit and integration tests added; Linux CI workflow configured.
 - Plan reordered to deliver a BareUDP-only VPN first, then add HTTP/3 features.
+- TUN management: implemented tun-rs based creation, address/MTU setup, read/write loops with backpressure, oversize drop counting, periodic metrics events, and unit tests with in-memory doubles.
