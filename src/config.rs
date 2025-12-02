@@ -1,3 +1,4 @@
+use ipnet::IpNet;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -237,6 +238,16 @@ pub enum ValidationError {
     /// Allowed IP list missing.
     #[error("peer '{peer_id}' must include at least one allowedIPs entry")]
     PeerMissingAllowedIps { peer_id: String },
+    /// Allowed IP entry is invalid.
+    #[error("peer '{peer_id}' has invalid allowedIPs entry '{cidr}': {error}")]
+    PeerInvalidAllowedIp {
+        peer_id: String,
+        cidr: String,
+        error: String,
+    },
+    /// Allowed IP entry duplicates another entry on the same peer.
+    #[error("peer '{peer_id}' has duplicate allowedIPs entry '{cidr}'")]
+    PeerDuplicateAllowedIp { peer_id: String, cidr: String },
 }
 
 impl Config {
@@ -368,6 +379,25 @@ impl Config {
                 errors.push(ValidationError::PeerMissingAllowedIps {
                     peer_id: peer.id.clone(),
                 });
+            }
+
+            let mut seen_allowed = HashSet::new();
+            for cidr in &peer.tun.allowed_ips {
+                match cidr.parse::<IpNet>() {
+                    Ok(net) => {
+                        if !seen_allowed.insert(net) {
+                            errors.push(ValidationError::PeerDuplicateAllowedIp {
+                                peer_id: peer.id.clone(),
+                                cidr: cidr.clone(),
+                            });
+                        }
+                    }
+                    Err(err) => errors.push(ValidationError::PeerInvalidAllowedIp {
+                        peer_id: peer.id.clone(),
+                        cidr: cidr.clone(),
+                        error: err.to_string(),
+                    }),
+                }
             }
         }
 
@@ -779,5 +809,36 @@ peers:
             ]
         );
         assert_eq!(h3.bindifs, vec!["eth0".to_string(), "eth0".to_string()]);
+    }
+
+    #[test]
+    fn rejects_invalid_allowed_ip() {
+        let mut config = sample_h3_config();
+        config.peers[0].tun.allowed_ips = vec!["10.0.0.1".to_string()];
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::PeerInvalidAllowedIp { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_allowed_ip_for_peer() {
+        let mut config = sample_h3_config();
+        config.peers[0].tun.allowed_ips = vec![
+            "192.168.180.2/32".to_string(),
+            "192.168.180.2/32".to_string(),
+        ];
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::PeerDuplicateAllowedIp { .. }))
+        ));
     }
 }

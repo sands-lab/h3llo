@@ -17,6 +17,7 @@ libc = "0.2"
 ipnet = "2.9"
 log = "0.4"
 tun-rs = { version = "2.7.5", features = ["async"] }
+ipnet-trie = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1.48", features = ["rt", "macros", "net", "time", "sync", "io-util"] }
