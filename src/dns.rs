@@ -312,12 +312,7 @@ pub fn decide_dns_binding<P: RouteProbe>(
             };
         }
     };
-    BindDecision::choose(
-        local_dns.bindif.as_deref(),
-        &target,
-        tun_if,
-        probe,
-    )
+    BindDecision::choose(local_dns.bindif.as_deref(), &target, tun_if, probe)
 }
 
 /// Tracks the result of DNS resolution attempts.

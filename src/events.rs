@@ -1,34 +1,45 @@
 //! Shared events flowing into the orchestrator.
 
-/// High-level events emitted by modules to the orchestrator.
+/// Carries high-level events emitted by modules to the orchestrator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// Events originating from the TUN module.
-    Tun(TunEvent),
+    /// Events originating from network interfaces (TUN or otherwise).
+    Interface(InterfaceEvent),
     /// Placeholder for future modules to extend the event stream without changing the channel type.
     Other(String),
 }
 
-/// TUN-specific events.
+/// Describes interface-level events.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TunEvent {
-    /// Latest TUN metrics snapshot emitted on a fixed cadence.
-    Metrics(TunMetricsUpdate),
+pub enum InterfaceEvent {
+    /// Latest cumulative receive metrics for an interface.
+    RxMetrics(RxMetrics),
+    /// Latest cumulative transmit metrics for an interface.
+    TxMetrics(TxMetrics),
 }
 
-/// Carries counters collected from the TUN coroutines.
+/// Carries cumulative receive counters collected from an interface loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TunMetricsUpdate {
-    /// Total packets read from the TUN.
-    pub rx_packets: u64,
-    /// Total packets written to the TUN.
-    pub tx_packets: u64,
-    /// Total bytes read from the TUN.
-    pub rx_bytes: u64,
-    /// Total bytes written to the TUN.
-    pub tx_bytes: u64,
-    /// Number of packets dropped because they exceeded the TUN MTU.
-    pub dropped_tx_packets: u64,
-    /// Number of bytes dropped because packets exceeded the TUN MTU.
-    pub dropped_tx_bytes: u64,
+pub struct RxMetrics {
+    /// Interface name that produced the metrics.
+    pub iface: String,
+    /// Total packets read from the interface.
+    pub packets: u64,
+    /// Total bytes read from the interface.
+    pub bytes: u64,
+}
+
+/// Carries cumulative transmit counters collected from an interface loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxMetrics {
+    /// Interface name that produced the metrics.
+    pub iface: String,
+    /// Total packets written to the interface.
+    pub packets: u64,
+    /// Total bytes written to the interface.
+    pub bytes: u64,
+    /// Packets dropped because they exceeded the interface MTU.
+    pub dropped_packets: u64,
+    /// Bytes dropped because packets exceeded the interface MTU.
+    pub dropped_bytes: u64,
 }
