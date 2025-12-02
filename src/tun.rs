@@ -21,7 +21,10 @@ pub trait TunRx: Send + 'static {
     /// Returns the interface name.
     fn name(&self) -> &str;
     /// Receives a packet into `buf`, returning the number of bytes read.
-    async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+    fn recv(
+        &mut self,
+        buf: &mut [u8],
+    ) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 }
 
 /// Provides send-only access to a TUN device for a single coroutine.
@@ -31,88 +34,57 @@ pub trait TunTx: Send + 'static {
     /// Returns the interface name.
     fn name(&self) -> &str;
     /// Sends a packet from `buf`, returning the number of bytes written.
-    async fn send(&mut self, buf: &[u8]) -> io::Result<usize>;
+    fn send(&mut self, buf: &[u8]) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 }
 
-/// Represents a configured TUN device and exposes exclusive RX/TX handles.
-pub struct TunDevice {
-    device: Arc<AsyncDevice>,
-    mtu: usize,
-    name: String,
-}
+/// Creates a TUN device from `local_tun` and returns exclusive RX/TX handles.
+pub async fn from_config(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), TunError> {
+    let (v4_addrs, v6_addrs) = parse_addrs(&local_tun.addr)?;
 
-impl TunDevice {
-    /// Creates a TUN device from `local_tun`, setting addresses and MTU via tun-rs.
-    pub async fn from_config(local_tun: &LocalTun) -> Result<Self, TunError> {
-        let (v4_addrs, v6_addrs) = parse_addrs(&local_tun.addr)?;
+    let mut builder = DeviceBuilder::new()
+        .name(local_tun.ifname.as_str())
+        .mtu(local_tun.mtu)
+        .enable(true)
+        .layer(Layer::L3);
 
-        let mut builder = DeviceBuilder::new()
-            .name(local_tun.ifname.as_str())
-            .mtu(local_tun.mtu)
-            .enable(true)
-            .layer(Layer::L3);
+    if let Some(first_v4) = v4_addrs.first() {
+        builder = builder.ipv4(first_v4.addr(), first_v4.prefix_len(), None);
+    }
 
-        if let Some(first_v4) = v4_addrs.first() {
-            builder = builder.ipv4(first_v4.addr(), first_v4.prefix_len(), None);
-        }
+    if !v6_addrs.is_empty() {
+        let ipv6_pairs: Vec<(Ipv6Addr, u8)> = v6_addrs
+            .iter()
+            .map(|net| (net.addr(), net.prefix_len()))
+            .collect();
+        builder = builder.ipv6_tuple(&ipv6_pairs);
+    }
 
-        if !v6_addrs.is_empty() {
-            let ipv6_pairs: Vec<(Ipv6Addr, u8)> = v6_addrs
-                .iter()
-                .map(|net| (net.addr(), net.prefix_len()))
-                .collect();
-            builder = builder.ipv6_tuple(&ipv6_pairs);
-        }
+    let device = builder
+        .build_async()
+        .map_err(|e| TunError::DeviceBuild(e.to_string()))?;
 
-        let device = builder
-            .build_async()
+    // Add remaining IPv4 addresses after initial build to avoid overwriting.
+    for extra in v4_addrs.iter().skip(1) {
+        device
+            .add_address_v4(extra.addr(), extra.prefix_len())
             .map_err(|e| TunError::DeviceBuild(e.to_string()))?;
-
-        // Add remaining IPv4 addresses after initial build to avoid overwriting.
-        for extra in v4_addrs.iter().skip(1) {
-            device
-                .add_address_v4(extra.addr(), extra.prefix_len())
-                .map_err(|e| TunError::DeviceBuild(e.to_string()))?;
-        }
-
-        let name = device.name().unwrap_or_else(|_| local_tun.ifname.clone());
-        let mtu = device
-            .mtu()
-            .map(|m| m as usize)
-            .unwrap_or(local_tun.mtu as usize);
-
-        Ok(Self {
-            device: Arc::new(device),
-            mtu,
-            name,
-        })
     }
 
-    /// Returns the interface name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
+    let name = device.name().unwrap_or_else(|_| local_tun.ifname.clone());
+    let mtu = device
+        .mtu()
+        .map(|m| m as usize)
+        .unwrap_or(local_tun.mtu as usize);
 
-    /// Returns the MTU.
-    pub fn mtu(&self) -> usize {
-        self.mtu
-    }
+    let device = Arc::new(device);
+    let reader = TunReader {
+        device: device.clone(),
+        mtu,
+        name: name.clone(),
+    };
+    let writer = TunWriter { device, mtu, name };
 
-    /// Splits the device into exclusive RX and TX handles to avoid sharing across coroutines.
-    pub fn split(self) -> (TunReader, TunWriter) {
-        let name = self.name;
-        let mtu = self.mtu;
-        let device = self.device;
-
-        (
-            TunReader {
-                device: device.clone(),
-                mtu,
-                name: name.clone(),
-            },
-            TunWriter { device, mtu, name },
-        )
-    }
+    Ok((reader, writer))
 }
 
 /// Provides a receive-only handle for a TUN device.
@@ -263,10 +235,11 @@ pub(crate) fn spawn_reader<T: TunRx>(
                             if len == 0 {
                                 continue;
                             }
-                            let packet = buf[..len].to_vec();
-                            if outbound.send(packet).await.is_err() {
+                            buf.truncate(len);
+                            if outbound.send(buf).await.is_err() {
                                 break;
                             }
+                            buf = Vec::with_capacity(mtu);
                             counters.record(len);
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
