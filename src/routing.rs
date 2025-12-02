@@ -95,7 +95,7 @@ impl RoutingTable {
     ///
     /// Returns `RoutingError::ConflictingPrefix` when the prefix already belongs to another peer.
     pub fn insert(&mut self, prefix: IpNet, entry: RouteEntry) -> Result<(), RoutingError> {
-        if let Some(existing) = self.trie.exact_match(prefix.clone()) {
+        if let Some(existing) = self.trie.exact_match(prefix) {
             if existing.peer_id == entry.peer_id {
                 log_duplicate_allowed(&entry.peer_id, &prefix.to_string());
                 return Ok(());

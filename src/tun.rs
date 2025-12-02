@@ -294,7 +294,7 @@ pub(crate) fn spawn_writer<T: TunTx>(
                     }
 
                     match tun.send(&packet).await {
-                        Ok(written) => counters.record_success(written as usize),
+                        Ok(written) => counters.record_success(written),
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
                     }

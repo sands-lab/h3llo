@@ -234,10 +234,10 @@ impl DnsResolver {
         for answer in response.answers() {
             match answer.data() {
                 RData::A(addr) if record_type == RecordType::A => {
-                    ips.push(IpAddr::V4(ipv4_from_rdata(&addr)));
+                    ips.push(IpAddr::V4(ipv4_from_rdata(addr)));
                 }
                 RData::AAAA(addr) if record_type == RecordType::AAAA => {
-                    ips.push(IpAddr::V6(ipv6_from_rdata(&addr)));
+                    ips.push(IpAddr::V6(ipv6_from_rdata(addr)));
                 }
                 _ => {}
             }
