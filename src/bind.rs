@@ -1,9 +1,10 @@
 //! Provides interface-binding helpers for DNS sockets and route probing.
-use socket2::{Domain, Socket};
+use socket2::{Domain, Protocol, Socket, Type};
 use thiserror::Error;
 
+use std::collections::HashSet;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 #[cfg(target_os = "windows")]
 use std::ffi::CStr;
@@ -19,81 +20,6 @@ use ipnet::{Ipv4Net, Ipv6Net};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use net_route::{Handle, Route};
 
-/// Decides how to bind outbound sockets for DNS queries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BindDecision {
-    /// Optional interface name to bind.
-    pub interface: Option<String>,
-    /// Warning emitted when probing fails and we fall back to unbound.
-    pub warning: Option<BindWarning>,
-}
-
-impl BindDecision {
-    /// Chooses a bind interface using the preferred configuration or a route probe, ignoring the TUN.
-    ///
-    /// # Arguments
-    /// - `preferred`: Optional interface name from configuration; trimmed and validated before use.
-    /// - `server`: DNS server address used as the probe target.
-    /// - `tun_if`: TUN interface name to exclude from probe results.
-    /// - `probe`: Route probe implementation used to gather interface candidates.
-    ///
-    /// # Returns
-    /// A bind decision containing the selected interface, if any, and warnings describing fallbacks.
-    pub async fn choose<P: RouteProbe>(
-        preferred: Option<&str>,
-        server: &str,
-        tun_if: &str,
-        probe: &P,
-    ) -> Self {
-        match probe.probe_interfaces(server, Some(tun_if)).await {
-            Ok(ifaces) => {
-                let cleaned: Vec<String> = ifaces
-                    .into_iter()
-                    .map(|iface| iface.trim().to_string())
-                    .filter(|iface| !iface.is_empty())
-                    .collect();
-
-                let mut warning = None;
-                if let Some(preferred_iface) = preferred
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string)
-                {
-                    let matched = cleaned.iter().any(|iface| iface == &preferred_iface);
-                    if matched && preferred_iface != tun_if {
-                        return BindDecision {
-                            interface: Some(preferred_iface),
-                            warning: None,
-                        };
-                    }
-                    if !matched {
-                        warning = Some(BindWarning::PreferredNotFound {
-                            interface: preferred_iface,
-                        });
-                    }
-                }
-
-                for iface in cleaned.into_iter() {
-                    if iface != tun_if {
-                        return BindDecision {
-                            interface: Some(iface),
-                            warning,
-                        };
-                    }
-                }
-                BindDecision {
-                    interface: None,
-                    warning,
-                }
-            }
-            Err(err) => BindDecision {
-                interface: None,
-                warning: Some(BindWarning::ProbeFailed(err.to_string())),
-            },
-        }
-    }
-}
-
 /// Captures warnings emitted during bind decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindWarning {
@@ -105,6 +31,107 @@ pub enum BindWarning {
     BindFailed { interface: String, error: String },
     /// Binding is not supported on this platform; continuing unbound.
     BindUnsupported { interface: String, platform: String },
+    /// Socket remains unbound to any interface; continuing unbound.
+    Unbound { reason: String },
+    /// Multiple interfaces were found; using the first entry.
+    AmbiguousInterfaces {
+        chosen: String,
+        alternatives: Vec<String>,
+    },
+}
+
+/// Creates a UDP socket bound to `bind_addr` and optionally pinned to `bind_interface`.
+///
+/// # Arguments
+/// - `bind_addr`: Local address to bind.
+/// - `bind_interface`: Optional interface name for binding.
+///
+/// # Returns
+/// A tokio `UdpSocket` plus accumulated bind warnings.
+///
+/// # Errors
+/// Returns an `io::Error` when socket creation or binding fails.
+pub fn bind_udp_socket(
+    bind_addr: SocketAddr,
+    bind_interface: Option<&str>,
+) -> io::Result<(tokio::net::UdpSocket, Vec<BindWarning>)> {
+    let domain = match bind_addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+
+    let mut warnings = Vec::new();
+
+    if let Some(interface) = bind_interface {
+        if let Err(warning) = bind_to_device(&socket, domain, interface) {
+            warnings.push(warning);
+        }
+    }
+
+    socket.bind(&bind_addr.into())?;
+    let udp = tokio::net::UdpSocket::from_std(socket.into())?;
+    Ok((udp, warnings))
+}
+
+/// Selects a bind interface by probing routes toward `target`, emitting warnings on probe failures, empty sets, or ambiguity.
+///
+/// # Arguments
+/// - `target`: Destination IP used for route probing.
+/// - `tun_if`: Optional TUN interface name to exclude.
+/// - `preferred_if`: Optional preferred interface; blank values are ignored. Missing preferred entries emit warnings and fall back to probed results.
+/// - `probe`: Route probe implementation.
+///
+/// # Returns
+/// The chosen interface name (first entry) and accumulated warnings; returns `None` when probing fails or yields no match.
+pub async fn select_bind_interface<P: RouteProbe>(
+    target: IpAddr,
+    tun_if: Option<&str>,
+    preferred_if: Option<&str>,
+    probe: &P,
+) -> (Option<String>, Vec<BindWarning>) {
+    match probe.probe_interfaces(&target.to_string(), tun_if).await {
+        Ok(interfaces) => {
+            if interfaces.is_empty() {
+                return (
+                    None,
+                    vec![BindWarning::Unbound {
+                        reason: format!("no interface found for {target}"),
+                    }],
+                );
+            }
+
+            let mut warnings = Vec::new();
+            let mut candidates = if let Some(preferred) = preferred_if {
+                let filtered = filter_preferred_interfaces(
+                    interfaces.clone(),
+                    Some(vec![preferred.to_string()]),
+                );
+                if filtered.is_empty() {
+                    warnings.push(BindWarning::PreferredNotFound {
+                        interface: preferred.to_string(),
+                    });
+                    interfaces
+                } else {
+                    filtered
+                }
+            } else {
+                interfaces
+            };
+
+            let chosen = candidates.remove(0);
+            if !candidates.is_empty() {
+                warnings.push(BindWarning::AmbiguousInterfaces {
+                    chosen: chosen.clone(),
+                    alternatives: candidates,
+                });
+            }
+            (Some(chosen), warnings)
+        }
+        Err(err) => (None, vec![BindWarning::ProbeFailed(err.to_string())]),
+    }
 }
 
 /// Binds `socket` to `interface` for the given `domain` using platform-specific mechanisms.
@@ -326,6 +353,31 @@ async fn probe_interfaces_impl(
     })
 }
 
+/// Filters probed interfaces against an optional preferred list while preserving route order.
+fn filter_preferred_interfaces(
+    names: Vec<String>,
+    preferred_ifs: Option<Vec<String>>,
+) -> Vec<String> {
+    let Some(preferred) = preferred_ifs else {
+        return names;
+    };
+
+    let allowed: HashSet<String> = preferred
+        .into_iter()
+        .map(|iface| iface.trim().to_string())
+        .filter(|iface| !iface.is_empty())
+        .collect();
+
+    if allowed.is_empty() {
+        return Vec::new();
+    }
+
+    names
+        .into_iter()
+        .filter(|name| allowed.contains(name))
+        .collect()
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 /// Returns interface indexes ordered by longest-prefix match while skipping the TUN index.
 fn matching_route_indexes(routes: &[Route], target: IpAddr, tun_index: Option<u32>) -> Vec<u32> {
@@ -436,130 +488,102 @@ fn ifindex_to_name(ifindex: u32) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LocalDns;
 
-    /// Test double that returns a preconfigured route probe result.
+    /// Test double that returns a fixed probe result.
     #[derive(Clone)]
     struct FakeRouteProbe {
         result: Result<Vec<String>, RouteProbeError>,
-        expected_target: Option<String>,
     }
 
     impl RouteProbe for FakeRouteProbe {
-        /// Returns the canned probe result and optionally asserts the requested target.
         async fn probe_interfaces(
             &self,
             _target: &str,
             _tun_if: Option<&str>,
         ) -> Result<Vec<String>, RouteProbeError> {
-            let expected = self.expected_target.clone();
-            let result = self.result.clone();
-            if let Some(expected) = expected {
-                assert_eq!(_target, expected);
-            }
-            result
+            self.result.clone()
         }
     }
 
-    /// Prefers the explicitly configured interface when it is present in probe results.
+    #[test]
+    fn filters_interfaces_by_preference() {
+        let names = vec!["eth0".to_string(), "eth1".to_string(), "wlan0".to_string()];
+        let preferred = Some(vec![" wlan0".to_string(), "eth1".to_string()]);
+        let filtered = filter_preferred_interfaces(names, preferred);
+        assert_eq!(filtered, vec!["eth1".to_string(), "wlan0".to_string()]);
+    }
+
+    #[test]
+    fn returns_empty_when_preferences_provided_but_no_match() {
+        let names = vec!["eth0".to_string(), "eth1".to_string()];
+        let filtered = filter_preferred_interfaces(names, Some(Vec::new()));
+        assert!(filtered.is_empty());
+    }
+
     #[tokio::test]
-    async fn binding_prefers_explicit_interface() {
+    async fn select_bind_interface_warns_on_empty_results() {
+        let probe = FakeRouteProbe {
+            result: Ok(Vec::new()),
+        };
+        let (iface, warnings) =
+            select_bind_interface(IpAddr::V4("1.1.1.1".parse().unwrap()), None, None, &probe).await;
+        assert!(iface.is_none());
+        assert!(matches!(
+            warnings.as_slice(),
+            [BindWarning::Unbound { reason }] if reason.contains("no interface")
+        ));
+    }
+
+    #[tokio::test]
+    async fn select_bind_interface_warns_on_missing_preference_and_falls_back() {
         let probe = FakeRouteProbe {
             result: Ok(vec!["eth0".to_string(), "eth1".to_string()]),
-            expected_target: None,
         };
-        let decision = BindDecision::choose(Some("eth1"), "1.1.1.1", "tun0", &probe).await;
-        assert_eq!(decision.interface.as_deref(), Some("eth1"));
-        assert!(decision.warning.is_none());
-    }
-
-    /// Binds to the first probed interface when no preference is supplied.
-    #[tokio::test]
-    async fn binding_uses_probe_when_no_preference() {
-        let probe = FakeRouteProbe {
-            result: Ok(vec!["eth0".to_string()]),
-            expected_target: None,
-        };
-        let decision = BindDecision::choose(None, "1.1.1.1", "tun0", &probe).await;
-        assert_eq!(decision.interface.as_deref(), Some("eth0"));
-        assert!(decision.warning.is_none());
-    }
-
-    /// Emits a warning and falls back when the preferred interface is missing.
-    #[tokio::test]
-    async fn binding_warns_when_preferred_missing() {
-        let probe = FakeRouteProbe {
-            result: Ok(vec!["eth0".to_string(), "eth2".to_string()]),
-            expected_target: None,
-        };
-        let decision = BindDecision::choose(Some("eth1"), "1.1.1.1", "tun0", &probe).await;
-        assert_eq!(decision.interface.as_deref(), Some("eth0"));
-        assert!(matches!(
-            decision.warning,
-            Some(BindWarning::PreferredNotFound { interface }) if interface == "eth1"
-        ));
-    }
-
-    /// Skips the TUN interface when an alternative exists.
-    #[tokio::test]
-    async fn binding_skips_tun_when_alternative_exists() {
-        let probe = FakeRouteProbe {
-            result: Ok(vec!["tun0".to_string(), "eth0".to_string()]),
-            expected_target: None,
-        };
-        let decision = BindDecision::choose(None, "1.1.1.1", "tun0", &probe).await;
-        assert_eq!(decision.interface.as_deref(), Some("eth0"));
-        assert!(decision.warning.is_none());
-    }
-
-    /// Leaves binding unset when only the TUN interface is found.
-    #[tokio::test]
-    async fn binding_filters_tun_probe() {
-        let probe = FakeRouteProbe {
-            result: Ok(vec!["tun0".to_string()]),
-            expected_target: None,
-        };
-        let decision = BindDecision::choose(None, "1.1.1.1", "tun0", &probe).await;
-        assert!(decision.interface.is_none());
-        assert!(decision.warning.is_none());
-    }
-
-    /// Reports probe failures as warnings and avoids binding.
-    #[tokio::test]
-    async fn binding_warns_on_probe_error() {
-        let probe = FakeRouteProbe {
-            result: Err(RouteProbeError::Probe("route probe failed".to_string())),
-            expected_target: None,
-        };
-        let decision = BindDecision::choose(None, "1.1.1.1", "tun0", &probe).await;
-        assert!(decision.interface.is_none());
-        assert!(matches!(
-            decision.warning,
-            Some(BindWarning::ProbeFailed(msg)) if msg.contains("route probe failed")
-        ));
-    }
-
-    /// Ensures DNS binding delegates to the shared chooser and propagates warnings.
-    #[tokio::test]
-    async fn decide_dns_binding_bridges_to_choose() {
-        let probe = FakeRouteProbe {
-            result: Ok(vec!["eth0".to_string()]),
-            expected_target: Some("1.1.1.1".to_string()),
-        };
-        let decision = crate::dns::decide_dns_binding(
-            &LocalDns {
-                server: "udp://1.1.1.1:53".to_string(),
-                refresh: 60,
-                bindif: Some("eth1".to_string()),
-            },
-            "tun0",
+        let (iface, warnings) = select_bind_interface(
+            IpAddr::V4("8.8.4.4".parse().unwrap()),
+            None,
+            Some("wlan0"),
             &probe,
         )
         .await;
-        assert_eq!(decision.interface.as_deref(), Some("eth0"));
+        assert_eq!(iface.as_deref(), Some("eth0"));
+        assert!(warnings.iter().any(|warn| matches!(
+            warn,
+            BindWarning::PreferredNotFound { interface } if interface == "wlan0"
+        )));
+        assert!(warnings.iter().any(|warn| matches!(
+            warn,
+            BindWarning::AmbiguousInterfaces { chosen, alternatives }
+                if chosen == "eth0" && alternatives == &vec!["eth1".to_string()]
+        )));
+    }
+
+    #[tokio::test]
+    async fn select_bind_interface_warns_on_ambiguity_and_picks_first() {
+        let probe = FakeRouteProbe {
+            result: Ok(vec!["eth0".to_string(), "eth1".to_string()]),
+        };
+        let (iface, warnings) =
+            select_bind_interface(IpAddr::V4("8.8.8.8".parse().unwrap()), None, None, &probe).await;
+        assert_eq!(iface.as_deref(), Some("eth0"));
         assert!(matches!(
-            decision.warning,
-            Some(BindWarning::PreferredNotFound { interface }) if interface == "eth1"
+            warnings.as_slice(),
+            [BindWarning::AmbiguousInterfaces { chosen, alternatives }]
+                if chosen == "eth0" && alternatives == &vec!["eth1".to_string()]
+        ));
+    }
+
+    #[tokio::test]
+    async fn select_bind_interface_warns_on_probe_error() {
+        let probe = FakeRouteProbe {
+            result: Err(RouteProbeError::Probe("boom".into())),
+        };
+        let (iface, warnings) =
+            select_bind_interface(IpAddr::V4("9.9.9.9".parse().unwrap()), None, None, &probe).await;
+        assert!(iface.is_none());
+        assert!(matches!(
+            warnings.as_slice(),
+            [BindWarning::ProbeFailed(msg)] if msg.contains("boom")
         ));
     }
 

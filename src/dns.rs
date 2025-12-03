@@ -2,12 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use crate::bind::{bind_to_device, BindDecision, BindWarning, RouteProbe};
+use crate::bind::{bind_udp_socket, select_bind_interface, BindWarning, RouteProbe};
 use crate::config::{parse_dns_server_uri, LocalDns};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use rand::Rng;
-use socket2::{Domain, Protocol, Socket, Type};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::time;
@@ -32,23 +31,35 @@ impl DnsResolver {
         Ok(Self::new(server, timeout))
     }
 
-    /// Resolves `hosts` sequentially using a socket bound according to `bind`, skipping the TUN when possible.
-    pub async fn resolve_hosts(&self, hosts: &[String], bind: &BindDecision) -> ResolveOutcome {
-        let mut warnings = Vec::new();
-        if let Some(warning) = bind.warning.clone() {
-            warnings.push(DnsWarning::Bind(warning));
-        }
+    /// Resolves `hosts` sequentially using a socket bound according to `bind_interface`.
+    ///
+    /// The resolver probes outbound interfaces toward the DNS server IP before socket creation;
+    /// when probing yields zero or multiple interfaces it emits warnings and chooses the first (if any).
+    pub async fn resolve_hosts<P: RouteProbe>(
+        &self,
+        hosts: &[String],
+        bind_interface: Option<&str>,
+        tun_if: Option<&str>,
+        probe: &P,
+    ) -> ResolveOutcome {
+        let (selected_interface, interface_warnings) =
+            select_bind_interface(self.server.ip(), tun_if, bind_interface, probe).await;
+        let mut warnings: Vec<DnsWarning> = interface_warnings
+            .into_iter()
+            .map(DnsWarning::Bind)
+            .collect();
 
-        let (socket, mut bind_warnings) = match self.prepare_socket(bind) {
-            Ok(pair) => pair,
-            Err(err) => {
-                return ResolveOutcome {
-                    records: HashMap::new(),
-                    errors: vec![err],
-                    warnings,
-                };
-            }
-        };
+        let (socket, mut bind_warnings) =
+            match self.prepare_socket(selected_interface.as_deref()).await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    return ResolveOutcome {
+                        records: HashMap::new(),
+                        errors: vec![err],
+                        warnings,
+                    };
+                }
+            };
         warnings.append(&mut bind_warnings);
 
         let mut records = HashMap::new();
@@ -72,58 +83,30 @@ impl DnsResolver {
         }
     }
 
-    fn prepare_socket(
+    /// Prepares and connects the UDP socket while capturing bind warnings.
+    async fn prepare_socket(
         &self,
-        bind: &BindDecision,
+        bind_interface: Option<&str>,
     ) -> Result<(UdpSocket, Vec<DnsWarning>), ResolveError> {
-        let mut warnings = Vec::new();
-
-        let domain = match self.server {
-            SocketAddr::V4(_) => Domain::IPV4,
-            SocketAddr::V6(_) => Domain::IPV6,
-        };
         let bind_addr: SocketAddr = match self.server {
             SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
             SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
         };
 
-        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(|e| {
-            ResolveError::Resolver {
-                error: e.to_string(),
-            }
-        })?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| ResolveError::Resolver {
+        let (socket, bind_warnings) =
+            bind_udp_socket(bind_addr, bind_interface).map_err(|e| ResolveError::Resolver {
                 error: e.to_string(),
             })?;
-        socket
-            .bind(&bind_addr.into())
-            .map_err(|e| ResolveError::Resolver {
-                error: e.to_string(),
-            })?;
-
-        if let Some(interface) = bind.interface.as_ref() {
-            let domain = match self.server {
-                SocketAddr::V4(_) => Domain::IPV4,
-                SocketAddr::V6(_) => Domain::IPV6,
-            };
-            if let Err(warning) = bind_to_device(&socket, domain, interface) {
-                warnings.push(DnsWarning::Bind(warning));
-            }
-        }
+        let warnings: Vec<DnsWarning> = bind_warnings.into_iter().map(DnsWarning::Bind).collect();
 
         socket
-            .connect(&self.server.into())
+            .connect(self.server)
+            .await
             .map_err(|e| ResolveError::Resolver {
                 error: e.to_string(),
             })?;
 
-        let udp = UdpSocket::from_std(socket.into()).map_err(|e| ResolveError::Resolver {
-            error: e.to_string(),
-        })?;
-
-        Ok((udp, warnings))
+        Ok((socket, warnings))
     }
 
     async fn resolve_single(
@@ -257,27 +240,6 @@ fn ipv6_from_rdata(data: &hickory_proto::rr::rdata::AAAA) -> Ipv6Addr {
     data.0
 }
 
-/// Returns a DNS bind decision preferring the configured interface when present and skipping the TUN.
-pub async fn decide_dns_binding<P: RouteProbe>(
-    local_dns: &LocalDns,
-    tun_if: &str,
-    probe: &P,
-) -> BindDecision {
-    let target = match parse_dns_server_uri(&local_dns.server) {
-        Ok(addr) => addr.ip().to_string(),
-        Err(reason) => {
-            return BindDecision {
-                interface: None,
-                warning: Some(BindWarning::ProbeFailed(format!(
-                    "invalid dns server: {}",
-                    reason
-                ))),
-            };
-        }
-    };
-    BindDecision::choose(local_dns.bindif.as_deref(), &target, tun_if, probe).await
-}
-
 /// Tracks the result of DNS resolution attempts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveOutcome {
@@ -324,14 +286,23 @@ pub enum ResolveInitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bind::RouteProbeError;
     use hickory_proto::rr::rdata::{A, AAAA};
     use hickory_proto::rr::Record;
     use tokio::net::UdpSocket;
 
-    fn make_decision() -> BindDecision {
-        BindDecision {
-            interface: None,
-            warning: None,
+    #[derive(Clone)]
+    struct FakeRouteProbe {
+        result: Result<Vec<String>, RouteProbeError>,
+    }
+
+    impl RouteProbe for FakeRouteProbe {
+        async fn probe_interfaces(
+            &self,
+            _target: &str,
+            _tun_if: Option<&str>,
+        ) -> Result<Vec<String>, RouteProbeError> {
+            self.result.clone()
         }
     }
 
@@ -345,8 +316,11 @@ mod tests {
         .await;
 
         let resolver = DnsResolver::new(server, Duration::from_secs(1));
+        let probe = FakeRouteProbe {
+            result: Ok(Vec::new()),
+        };
         let outcome = resolver
-            .resolve_hosts(&vec!["example.com".to_string()], &make_decision())
+            .resolve_hosts(&vec!["example.com".to_string()], None, None, &probe)
             .await;
 
         assert!(outcome.errors.is_empty());
@@ -357,6 +331,10 @@ mod tests {
             .unwrap_or_default();
         assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
         assert!(ips.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(outcome
+            .warnings
+            .iter()
+            .any(|warn| matches!(warn, DnsWarning::Bind(BindWarning::Unbound { .. }))));
 
         handle.abort();
     }
@@ -369,8 +347,11 @@ mod tests {
         drop(socket);
 
         let resolver = DnsResolver::new(addr, Duration::from_millis(50));
+        let probe = FakeRouteProbe {
+            result: Ok(Vec::new()),
+        };
         let outcome = resolver
-            .resolve_hosts(&vec!["example.com".to_string()], &make_decision())
+            .resolve_hosts(&vec!["example.com".to_string()], None, None, &probe)
             .await;
         assert_eq!(outcome.records.len(), 0);
         assert!(!outcome.errors.is_empty());

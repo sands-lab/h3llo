@@ -1,8 +1,7 @@
 //! BareUDP transport: socket setup, source-IP filtering, and send/receive loops.
 
-use crate::bind::{bind_to_device, BindWarning};
+use crate::bind::{bind_udp_socket, select_bind_interface, BindWarning, RouteProbe};
 use log::warn;
-use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -79,38 +78,30 @@ pub enum BareError {
 
 /// Binds a UDP socket to `listen` and optionally to `bind_interface`, returning the socket and any binding warnings.
 ///
-/// Binding to an interface is best-effort: failures produce warnings and the socket continues unbound.
-pub fn bind_socket(
+/// Binding to an interface is best-effort: missing or ambiguous probe results emit warnings and the socket continues unbound.
+///
+/// # Arguments
+/// - `listen`: Local socket address to bind.
+/// - `bind_interface`: Optional preferred interface; treated as a filter during probing.
+/// - `target`: Remote server IP used for route probing.
+/// - `tun_if`: Optional TUN interface name to exclude from probing.
+/// - `probe`: Route probe implementation.
+pub async fn bind_socket<P: RouteProbe>(
     listen: SocketAddr,
     bind_interface: Option<&str>,
+    target: IpAddr,
+    tun_if: Option<&str>,
+    probe: &P,
 ) -> Result<(UdpSocket, Vec<BindWarning>), BareError> {
-    let domain = match listen {
-        SocketAddr::V4(_) => Domain::IPV4,
-        SocketAddr::V6(_) => Domain::IPV6,
-    };
+    // Probe using the remote server IP to avoid recursive routing; pick the first match and warn on ambiguity.
+    let (selected_interface, mut warnings) =
+        select_bind_interface(target, tun_if, bind_interface, probe).await;
 
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+    let (socket, mut bind_warnings) = bind_udp_socket(listen, selected_interface.as_deref())
         .map_err(|e| BareError::Socket(e.to_string()))?;
-    socket
-        .set_reuse_address(true)
-        .map_err(|e| BareError::Socket(e.to_string()))?;
-    socket
-        .set_nonblocking(true)
-        .map_err(|e| BareError::Socket(e.to_string()))?;
+    warnings.append(&mut bind_warnings);
 
-    let mut warnings = Vec::new();
-    if let Some(interface) = bind_interface {
-        if let Err(warning) = bind_to_device(&socket, domain, interface) {
-            warnings.push(warning);
-        }
-    }
-
-    socket
-        .bind(&listen.into())
-        .map_err(|e| BareError::Socket(e.to_string()))?;
-
-    let udp = UdpSocket::from_std(socket.into()).map_err(|e| BareError::Socket(e.to_string()))?;
-    Ok((udp, warnings))
+    Ok((socket, warnings))
 }
 
 /// Spawns the BareUDP receive loop, dropping packets whose source IP is not in `allowed_sources`.

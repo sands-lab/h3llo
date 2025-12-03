@@ -24,3 +24,4 @@
 - 迭代顺序：先完成 BareUDP 可运行 VPN，再补 HTTP/3（认证、传输、控制面）相关功能。
 - 优先使用 RPITIT/GAT 返回 Future，非必要不要引入 `Pin<Box<dyn Future>>`。可参考 `RouteProbe` 和 `DefaultRouteProbe`。
 - 无论方法是否公开，都需要添加注释，统一使用英文 docstring。
+- 当前阶段不考虑向前兼容。
