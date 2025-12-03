@@ -1,7 +1,8 @@
 //! TUN management: device creation, read/write loops with backpressure, and metrics reporting.
 
 use crate::config::LocalTun;
-use crate::events::{Event, InterfaceEvent, RxMetrics, TxMetrics};
+use crate::events::{Event, InterfaceEvent};
+use crate::metrics::{RxCounters, TxCounters};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use log::warn;
 use std::io;
@@ -157,59 +158,6 @@ fn parse_addrs(raw_addrs: &[String]) -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Tun
         }
     }
     Ok((v4, v6))
-}
-
-#[allow(dead_code)]
-#[derive(Default)]
-struct RxCounters {
-    packets: u64,
-    bytes: u64,
-}
-
-impl RxCounters {
-    fn record(&mut self, len: usize) {
-        self.packets = self.packets.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(len as u64);
-    }
-
-    fn snapshot(&self, iface: &str) -> RxMetrics {
-        RxMetrics {
-            iface: iface.to_string(),
-            packets: self.packets,
-            bytes: self.bytes,
-        }
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Default)]
-struct TxCounters {
-    packets: u64,
-    bytes: u64,
-    dropped_packets: u64,
-    dropped_bytes: u64,
-}
-
-impl TxCounters {
-    fn record_success(&mut self, len: usize) {
-        self.packets = self.packets.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(len as u64);
-    }
-
-    fn record_drop(&mut self, len: usize) {
-        self.dropped_packets = self.dropped_packets.saturating_add(1);
-        self.dropped_bytes = self.dropped_bytes.saturating_add(len as u64);
-    }
-
-    fn snapshot(&self, iface: &str) -> TxMetrics {
-        TxMetrics {
-            iface: iface.to_string(),
-            packets: self.packets,
-            bytes: self.bytes,
-            dropped_packets: self.dropped_packets,
-            dropped_bytes: self.dropped_bytes,
-        }
-    }
 }
 
 /// Spawns the TUN read loop, pushing packets into `outbound` with backpressure and emitting RX metrics.

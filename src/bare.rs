@@ -1,14 +1,18 @@
 //! BareUDP transport: socket setup, source-IP filtering, and send/receive loops.
 
 use crate::bind::{bind_udp_socket, select_bind_interface, BindWarning, RouteProbe};
+use crate::events::{Event, InterfaceEvent};
+use crate::metrics::{RxCounters, TxCounters};
 use log::warn;
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time;
 
 /// Collects resolved peer addresses, preserving the first entry as outbound destination and all IPs for source filtering.
 #[derive(Debug, Clone)]
@@ -104,44 +108,115 @@ pub async fn bind_socket<P: RouteProbe>(
     Ok((socket, warnings))
 }
 
-/// Spawns the BareUDP receive loop, dropping packets whose source IP is not in `allowed_sources`.
+/// Collects socket, MTU, and interface label shared by BareUDP loops.
+#[derive(Debug)]
+pub struct BareUdpContext {
+    /// Bound UDP socket for BareUDP traffic.
+    pub socket: UdpSocket,
+    /// Buffer size for inbound packets, typically the TUN MTU.
+    pub mtu: usize,
+    /// Label used in metrics emission.
+    pub iface: String,
+}
+
+/// Spawns the BareUDP receive loop, filtering on source IPs, emitting metrics, and forwarding packets.
+///
+/// # Arguments
+/// - `context`: Bundled socket, MTU, and interface label.
+/// - `allowed_sources`: Initial allowed source IP set.
+/// - `allowed_updates`: Channel delivering full replacements for the allowed source set.
+/// - `outbound`: Channel to push accepted packets into.
+/// - `events_tx`: Channel for emitting receive metrics.
+/// - `interval`: Metrics emission interval.
 pub fn spawn_receiver(
-    socket: UdpSocket,
-    allowed_sources: HashSet<IpAddr>,
+    context: BareUdpContext,
+    mut allowed_sources: HashSet<IpAddr>,
+    mut allowed_updates: mpsc::Receiver<HashSet<IpAddr>>,
     outbound: mpsc::Sender<Vec<u8>>,
+    events_tx: mpsc::Sender<Event>,
+    interval: Duration,
 ) -> JoinHandle<()> {
+    let BareUdpContext { socket, mtu, iface } = context;
+
     tokio::spawn(async move {
-        let mut buf = vec![0u8; u16::MAX as usize];
+        let mut buf = vec![0u8; mtu];
+        let mut counters = RxCounters::default();
+        let mut ticker = time::interval(interval);
+
         loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((len, remote)) => {
-                    if len == 0 || !allowed_sources.contains(&remote.ip()) {
-                        continue;
+            tokio::select! {
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, remote)) => {
+                            if len == 0 || !allowed_sources.contains(&remote.ip()) {
+                                continue;
+                            }
+                            let packet = buf[..len].to_vec();
+                            if outbound.send(packet).await.is_err() {
+                                break;
+                            }
+                            counters.record(len);
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
                     }
-                    let packet = buf[..len].to_vec();
-                    if outbound.send(packet).await.is_err() {
+                }
+                Some(update) = allowed_updates.recv() => {
+                    allowed_sources = update;
+                }
+                _ = ticker.tick() => {
+                    if events_tx.send(Event::Interface(InterfaceEvent::RxMetrics(counters.snapshot(&iface)))).await.is_err() {
                         break;
                     }
                 }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
             }
         }
     })
 }
 
-/// Spawns the BareUDP send loop, forwarding packets from `inbound` to `destination`.
+/// Spawns the BareUDP send loop, emitting metrics while forwarding packets to `destination`.
+///
+/// # Arguments
+/// - `context`: Bundled socket, MTU, and interface label.
+/// - `destination`: Remote peer socket address.
+/// - `inbound`: Channel supplying packets to send.
+/// - `events_tx`: Channel for emitting transmit metrics.
+/// - `interval`: Metrics emission interval.
 pub fn spawn_sender(
-    socket: UdpSocket,
+    context: BareUdpContext,
     destination: SocketAddr,
     mut inbound: mpsc::Receiver<Vec<u8>>,
+    events_tx: mpsc::Sender<Event>,
+    interval: Duration,
 ) -> JoinHandle<()> {
+    let BareUdpContext { socket, iface, .. } = context;
+
     tokio::spawn(async move {
-        while let Some(packet) = inbound.recv().await {
-            match socket.send_to(&packet, destination).await {
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+        let mut counters = TxCounters::default();
+        let mut ticker = time::interval(interval);
+
+        loop {
+            tokio::select! {
+                maybe_packet = inbound.recv() => {
+                    let packet = match maybe_packet {
+                        Some(packet) => packet,
+                        None => break,
+                    };
+
+                    match socket.send_to(&packet, destination).await {
+                        Ok(written) => counters.record_success(written),
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => {
+                            counters.record_drop(packet.len());
+                            break;
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    if events_tx.send(Event::Interface(InterfaceEvent::TxMetrics(counters.snapshot(&iface)))).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     })
@@ -183,7 +258,21 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(4);
         let allowed = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))]);
-        let handle = spawn_receiver(socket, allowed, tx);
+        let (_allow_tx, allowed_updates) = mpsc::channel(1);
+        let (events_tx, mut _events_rx) = mpsc::channel(4);
+        let context = BareUdpContext {
+            socket,
+            mtu: 64,
+            iface: "bare0".to_string(),
+        };
+        let handle = spawn_receiver(
+            context,
+            allowed,
+            allowed_updates,
+            tx,
+            events_tx,
+            Duration::from_millis(200),
+        );
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sender
@@ -199,13 +288,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receiver_updates_allowed_sources() {
+        let (socket, addr) = {
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            (sock, addr)
+        };
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let (update_tx, allowed_updates) = mpsc::channel(1);
+        let (events_tx, mut _events_rx) = mpsc::channel(4);
+        let context = BareUdpContext {
+            socket,
+            mtu: 64,
+            iface: "bare1".to_string(),
+        };
+        let handle = spawn_receiver(
+            context,
+            HashSet::new(),
+            allowed_updates,
+            tx,
+            events_tx,
+            Duration::from_millis(200),
+        );
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(&[5, 4, 3], addr)
+            .await
+            .expect("initial send should succeed");
+
+        // First packet should be dropped.
+        let first = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            first.is_err(),
+            "no packet should be delivered before update"
+        );
+
+        update_tx
+            .send(HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]))
+            .await
+            .unwrap();
+
+        sender
+            .send_to(&[7, 8, 9], addr)
+            .await
+            .expect("second send should succeed");
+
+        let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("packet should arrive after update")
+            .expect("channel should carry packet");
+        assert_eq!(second, vec![7, 8, 9]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn sender_forwards_packets_to_destination() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (tx, rx) = mpsc::channel(4);
-        let handle = spawn_sender(sender_socket, dest, rx);
+        let (events_tx, mut _events_rx) = mpsc::channel(4);
+        let context = BareUdpContext {
+            socket: sender_socket,
+            mtu: 64,
+            iface: "bare2".to_string(),
+        };
+        let handle = spawn_sender(context, dest, rx, events_tx, Duration::from_millis(200));
 
         tx.send(vec![9, 8, 7]).await.unwrap();
 
@@ -215,6 +367,108 @@ mod tests {
             .await
             .expect("receiver should get packet");
         assert_eq!(&buf[..len], &[9, 8, 7]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn receiver_emits_metrics() {
+        let (socket, addr) = {
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            (sock, addr)
+        };
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let (_update_tx, allowed_updates) = mpsc::channel(1);
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let context = BareUdpContext {
+            socket,
+            mtu: 128,
+            iface: "bare-metrics-rx".to_string(),
+        };
+        let handle = spawn_receiver(
+            context,
+            HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]),
+            allowed_updates,
+            tx,
+            events_tx,
+            Duration::from_millis(10),
+        );
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(&[1, 2, 3, 4], addr)
+            .await
+            .expect("send should succeed");
+
+        // Drain the forwarded packet to avoid channel backpressure.
+        let forwarded = rx.recv().await.expect("packet should be forwarded");
+        assert_eq!(forwarded, vec![1, 2, 3, 4]);
+
+        let metrics = tokio::time::timeout(Duration::from_millis(100), async {
+            while let Some(event) = events_rx.recv().await {
+                if let Event::Interface(InterfaceEvent::RxMetrics(m)) = event {
+                    if m.packets >= 1 {
+                        return Some(m);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .expect("rx metrics should arrive")
+        .expect("rx metrics should not be None");
+
+        assert_eq!(metrics.iface, "bare-metrics-rx");
+        assert_eq!(metrics.packets, 1);
+        assert_eq!(metrics.bytes, 4);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn sender_emits_metrics() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let context = BareUdpContext {
+            socket: sender_socket,
+            mtu: 64,
+            iface: "bare-metrics-tx".to_string(),
+        };
+        let handle = spawn_sender(context, dest, rx, events_tx, Duration::from_millis(10));
+
+        tx.send(vec![5, 4, 3, 2]).await.unwrap();
+
+        let mut buf = vec![0u8; 16];
+        let _ = receiver
+            .recv_from(&mut buf)
+            .await
+            .expect("receiver should get packet");
+
+        let metrics = tokio::time::timeout(Duration::from_millis(100), async {
+            while let Some(event) = events_rx.recv().await {
+                if let Event::Interface(InterfaceEvent::TxMetrics(m)) = event {
+                    if m.packets >= 1 {
+                        return Some(m);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .expect("tx metrics should arrive")
+        .expect("tx metrics should not be None");
+
+        assert_eq!(metrics.iface, "bare-metrics-tx");
+        assert_eq!(metrics.packets, 1);
+        assert_eq!(metrics.bytes, 4);
+        assert_eq!(metrics.dropped_packets, 0);
+        assert_eq!(metrics.dropped_bytes, 0);
 
         handle.abort();
     }
