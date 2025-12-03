@@ -79,6 +79,7 @@ BareUDP moves IP packets without extra framing: each IP packet read from the TUN
 
 - Encapsulation: The sender copies the raw IP packet from the TUN and uses it as the UDP payload to the peer’s `peers[].bare.endpoint`; there is no handshake or session setup. The resolver keeps the full DNS answer set for filtering; outbound chooses the first answer with a warning and rebinds per-interface sockets when the chosen IP changes.
 - Receive path: The BareUDP listener accepts the UDP payload and writes it directly to the TUN as an IP packet, without reassembly or additional validation.
+- Resolution and binding: The orchestrator resolves BareUDP endpoints before constructing transport sockets; the BareUDP module consumes resolved IPs, binds listener and outbound sockets to the selected WAN interface when available, and logs warnings on binding failures or multi-answer DNS results (first answer used for outbound, full set kept for filtering).
 - Security model: BareUDP performs no encryption or authentication. The listener filters by the UDP source IP, dropping packets whose source IP does not match configured BareUDP peer endpoints. Because source IPs can be spoofed, avoid exposing BareUDP to the public Internet and prefer HTTP/3 whenever confidentiality or peer authenticity is required. BareUDP does not attempt NAT traversal.
 
 ### Datagram Formats

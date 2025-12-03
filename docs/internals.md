@@ -141,7 +141,7 @@ H3 connection pooling and selection:
 DNS refresh loop:
 - Every `local.dns.refresh` seconds (when nonzero), the DNS resolver coroutine batches all hostnames, resolves serially, and streams results to the orchestrator over its command queue.
 - On changes (new IPs), the orchestrator spawns H3 dialers to create new connections and updates BareUDP filters; newly established connections flow back into the pool and are pushed to TUN-Rx.
-- BareUDP keeps the full DNS answer set for filtering. On outbound path, choose the first answer as the destination, warn with the full set, and re-probe outbound interfaces and sockets when the chosen IP changes.
+- The orchestrator resolves BareUDP endpoints, keeps the full DNS answer set for filtering, and hands resolved addresses to the BareUDP transport. On outbound path, choose the first answer as the destination, warn with the full set, and re-probe outbound interfaces and sockets when the chosen IP changes.
 
 During packet forwarding, TUN-Rx chooses the active H3 connection for the peer based on the pool ordering above; it enqueues received IP packets into the TUN-Tx queue to keep TUN writes thread-safe.
 

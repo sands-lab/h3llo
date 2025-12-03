@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use crate::bind::{BindDecision, BindWarning, RouteProbe};
+use crate::bind::{bind_to_device, BindDecision, BindWarning, RouteProbe};
 use crate::config::{parse_dns_server_uri, LocalDns};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
@@ -13,9 +11,6 @@ use socket2::{Domain, Protocol, Socket, Type};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::time;
-
-#[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
 
 /// Performs DNS resolution over UDP sockets bound to the chosen interface.
 #[derive(Debug, Clone)]
@@ -108,24 +103,9 @@ impl DnsResolver {
                 error: e.to_string(),
             })?;
 
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(interface) = bind.interface.as_ref() {
-                if let Err(err) = bind_to_device(&socket, interface) {
-                    warnings.push(DnsWarning::BindSocket {
-                        interface: interface.clone(),
-                        error: err.to_string(),
-                    });
-                }
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            if let Some(interface) = bind.interface.as_ref() {
-                warnings.push(DnsWarning::BindUnsupported {
-                    interface: interface.clone(),
-                });
+        if let Some(interface) = bind.interface.as_ref() {
+            if let Err(warning) = bind_to_device(&socket, interface) {
+                warnings.push(DnsWarning::Bind(warning));
             }
         }
 
@@ -265,27 +245,6 @@ fn dedup_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
     out
 }
 
-#[cfg(target_os = "linux")]
-fn bind_to_device(socket: &Socket, interface: &str) -> io::Result<()> {
-    use libc::{c_void, setsockopt, socklen_t, SOL_SOCKET, SO_BINDTODEVICE};
-
-    let name = CString::new(interface)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface contains null"))?;
-    let ret = unsafe {
-        setsockopt(
-            socket.as_raw_fd(),
-            SOL_SOCKET,
-            SO_BINDTODEVICE,
-            name.as_ptr() as *const c_void,
-            name.as_bytes_with_nul().len() as socklen_t,
-        )
-    };
-    if ret == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 fn ipv4_from_rdata(data: &hickory_proto::rr::rdata::A) -> Ipv4Addr {
     data.0
 }
@@ -348,10 +307,6 @@ pub enum ResolveError {
 pub enum DnsWarning {
     /// Binding decision emitted a warning.
     Bind(BindWarning),
-    /// Binding to a device failed; continuing unbound.
-    BindSocket { interface: String, error: String },
-    /// Binding is not supported on this platform.
-    BindUnsupported { interface: String },
 }
 
 /// Describes resolver construction errors.

@@ -1,4 +1,11 @@
+use socket2::Socket;
 use thiserror::Error;
+
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 
 /// Decides how to bind outbound sockets for DNS queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +80,32 @@ pub enum BindWarning {
     ProbeFailed(String),
     /// Preferred interface was not found in probe results.
     PreferredNotFound { interface: String },
+    /// Binding to the requested interface failed; continuing unbound.
+    BindFailed { interface: String, error: String },
+    /// Binding is not supported on this platform; continuing unbound.
+    BindUnsupported { interface: String, platform: String },
+}
+
+/// Attempts to bind `socket` to `interface` using platform-specific mechanisms.
+///
+/// Returns `Ok(())` when binding succeeds, or `Err(BindWarning)` when binding is
+/// unsupported or fails (callers should log and continue unbound).
+pub fn bind_to_device(socket: &Socket, interface: &str) -> Result<(), BindWarning> {
+    #[cfg(target_os = "linux")]
+    {
+        bind_to_device_impl(socket, interface).map_err(|err| BindWarning::BindFailed {
+            interface: interface.to_string(),
+            error: err.to_string(),
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(BindWarning::BindUnsupported {
+            interface: interface.to_string(),
+            platform: std::env::consts::OS.to_string(),
+        })
+    }
 }
 
 /// Probes the system routing table to identify the outbound interface.
@@ -106,6 +139,27 @@ pub enum RouteProbeError {
     /// Route probing is not supported on this platform (placeholder for macOS/Windows/BSD backends).
     #[error("route probe is not supported on this platform: {platform}")]
     UnsupportedPlatform { platform: String },
+}
+
+#[cfg(target_os = "linux")]
+fn bind_to_device_impl(socket: &Socket, interface: &str) -> io::Result<()> {
+    use libc::{c_void, setsockopt, socklen_t, SOL_SOCKET, SO_BINDTODEVICE};
+
+    let name = CString::new(interface)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface contains null"))?;
+    let ret = unsafe {
+        setsockopt(
+            socket.as_raw_fd(),
+            SOL_SOCKET,
+            SO_BINDTODEVICE,
+            name.as_ptr() as *const c_void,
+            name.as_bytes_with_nul().len() as socklen_t,
+        )
+    };
+    if ret == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
