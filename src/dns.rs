@@ -258,7 +258,7 @@ fn ipv6_from_rdata(data: &hickory_proto::rr::rdata::AAAA) -> Ipv6Addr {
 }
 
 /// Returns a DNS bind decision preferring the configured interface when present and skipping the TUN.
-pub fn decide_dns_binding<P: RouteProbe>(
+pub async fn decide_dns_binding<P: RouteProbe>(
     local_dns: &LocalDns,
     tun_if: &str,
     probe: &P,
@@ -275,7 +275,7 @@ pub fn decide_dns_binding<P: RouteProbe>(
             };
         }
     };
-    BindDecision::choose(local_dns.bindif.as_deref(), &target, tun_if, probe)
+    BindDecision::choose(local_dns.bindif.as_deref(), &target, tun_if, probe).await
 }
 
 /// Tracks the result of DNS resolution attempts.

@@ -22,4 +22,5 @@
 -  `cargo` 命令可能需在提升权限的环境下运行，特别是 `cargo check`，`cargo test`，否则可能遇到 `Invalid cross-device link` 问题。 
 - 平台支持分梯队：第一梯队 Linux（主力平台），第二梯队 macOS/Windows（尽力支持），第三梯队 BSD（预留扩展与告警降级）。
 - 迭代顺序：先完成 BareUDP 可运行 VPN，再补 HTTP/3（认证、传输、控制面）相关功能。
-- DNS 配置：`local.dns.server` 使用 `udp://<ip>:<port>` 形式；DNS 解析走绑定 UDP socket，不做缓存。
+- 优先使用 RPITIT/GAT 返回 Future，非必要不要引入 `Pin<Box<dyn Future>>`。可参考 `RouteProbe` 和 `DefaultRouteProbe`。
+- 无论方法是否公开，都需要添加注释，统一使用英文 docstring。
