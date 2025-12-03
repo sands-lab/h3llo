@@ -104,7 +104,11 @@ impl DnsResolver {
             })?;
 
         if let Some(interface) = bind.interface.as_ref() {
-            if let Err(warning) = bind_to_device(&socket, interface) {
+            let domain = match self.server {
+                SocketAddr::V4(_) => Domain::IPV4,
+                SocketAddr::V6(_) => Domain::IPV6,
+            };
+            if let Err(warning) = bind_to_device(&socket, domain, interface) {
                 warnings.push(DnsWarning::Bind(warning));
             }
         }

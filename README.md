@@ -92,6 +92,7 @@ BareUDP is an opt-in plaintext fast path for controlled networks where confident
 - MASQUE optional Capsule Types are not implemented (`ROUTE_ADVERTISEMENT`, `ADDRESS_REQUEST`, `ADDRESS_ASSIGN`), and URI templates for `target` / `ipproto` are unsupported.
 - BareUDP is plaintext; only use in trusted environments.
 - CDN Layer-7 forwarding without HTTP/3 origin fetch is unsupported; Cloudflare WARP auth is incompatible.
+- Platform tiers: Linux is first-class and the primary target; macOS and Windows are second-tier with best-effort support; BSD derivatives are third-tier with planned extensions only.
 
 ## Further Reading
 

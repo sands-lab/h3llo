@@ -14,8 +14,14 @@ Why recursive routing happens: if h3llo installs the default route into the TUN 
 
 Binding workflow for HTTP/3, BareUDP, and DNS:
 1. Pick the DNS interface: prefer `local.dns.bindif` when provided and present in probe results; warn and fall back to the first probed non-TUN interface when the preferred one is missing. If no interface is available or probing fails, log a warning and continue with an unbound DNS socket. Probing uses `ip route show match <host part of local.dns.server>` on Linux while excluding the TUN.
-2. DNS resolver coroutine: bind a UDP socket with `SO_BINDTODEVICE`, `IP_UNICAST_IF`, or `IP_BOUND_IF` when available. Every `local.dns.refresh` seconds (default `60`, minimum `30`; `0` disables the timer) enqueue a batched Do53 query of all hostnames without caching; resolve serially and stream each peer’s result back to the orchestrator via the DNS resolver’s command queue.
+2. DNS resolver coroutine: bind a UDP socket by interface index (Linux/macOS via `bind_device_by_index_v4/6`, Windows via `IP_UNICAST_IF` / `IPV6_UNICAST_IF`) when available. Every `local.dns.refresh` seconds (default `60`, minimum `30`; `0` disables the timer) enqueue a batched Do53 query of all hostnames without caching; resolve serially and stream each peer’s result back to the orchestrator via the DNS resolver’s command queue.
 3. Transport binding: for each resolved IP (HTTP/3) or selected outbound IP (BareUDP), probe the WAN-facing interface excluding the TUN; bind transport sockets to that interface. HTTP/3 creates connections across the Cartesian product of DNS answers, `peers[].h3.endpoints`, and `peers[].h3.bindifs`; BareUDP binds one socket per outbound interface plus a dedicated listener socket. If probing or binding fails, warn and continue unbound.
+
+Platform tiers and binding behavior:
+- Linux (primary): uses `bind_device_by_index_v4` / `bind_device_by_index_v6` with `if_nametoindex` to pin sockets by interface index.
+- macOS (second tier): same index-based binding as Linux; warnings on failures or missing interfaces fall back to unbound sockets.
+- Windows (second tier): binds via `IP_UNICAST_IF` / `IPV6_UNICAST_IF` using interface index; failures degrade to unbound sockets with warnings.
+- BSD (third tier): planned support; current builds log unsupported binding and continue unbound.
 
 ### Thread Model
 

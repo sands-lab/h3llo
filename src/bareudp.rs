@@ -100,7 +100,7 @@ pub fn bind_socket(
 
     let mut warnings = Vec::new();
     if let Some(interface) = bind_interface {
-        if let Err(warning) = bind_to_device(&socket, interface) {
+        if let Err(warning) = bind_to_device(&socket, domain, interface) {
             warnings.push(warning);
         }
     }

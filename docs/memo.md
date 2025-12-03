@@ -19,7 +19,7 @@
 - CI：使用 GitHub Actions（Linux）运行 `cargo fmt -- --check`、`cargo clippy -- -D warnings`、`cargo test`。
 - 性能准则：避免频繁跨线程共享引用计数更新，优先通过所有权转移或消息传递移动数据；小且高频状态可按线程/协程维护副本。
 - 许可证：MIT，存放于 `LICENSE`。
--  `cargo test`需在提升权限的环境下运行
-- 平台支持：优先提供 Linux 支持，同时为 macOS/Windows/BSD 预留实现扩展点（如路由探测/绑定）。
+-  `cargo` 命令可能需在提升权限的环境下运行，特别是 `cargo check`，`cargo test`，否则可能遇到 `Invalid cross-device link` 问题。 
+- 平台支持分梯队：第一梯队 Linux（主力平台），第二梯队 macOS/Windows（尽力支持），第三梯队 BSD（预留扩展与告警降级）。
 - 迭代顺序：先完成 BareUDP 可运行 VPN，再补 HTTP/3（认证、传输、控制面）相关功能。
 - DNS 配置：`local.dns.server` 使用 `udp://<ip>:<port>` 形式；DNS 解析走绑定 UDP socket，不做缓存。

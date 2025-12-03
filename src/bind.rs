@@ -1,11 +1,13 @@
-use socket2::Socket;
+use socket2::{Domain, Socket};
 use thiserror::Error;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
 use std::io;
-#[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::num::NonZeroU32;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawSocket;
 
 /// Decides how to bind outbound sockets for DNS queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,26 +88,40 @@ pub enum BindWarning {
     BindUnsupported { interface: String, platform: String },
 }
 
-/// Attempts to bind `socket` to `interface` using platform-specific mechanisms.
+/// Attempts to bind `socket` to `interface` for the given `domain` using platform-specific mechanisms.
 ///
 /// Returns `Ok(())` when binding succeeds, or `Err(BindWarning)` when binding is
 /// unsupported or fails (callers should log and continue unbound).
-pub fn bind_to_device(socket: &Socket, interface: &str) -> Result<(), BindWarning> {
-    #[cfg(target_os = "linux")]
-    {
-        bind_to_device_impl(socket, interface).map_err(|err| BindWarning::BindFailed {
+pub fn bind_to_device(socket: &Socket, domain: Domain, interface: &str) -> Result<(), BindWarning> {
+    let iface = interface.trim();
+    if iface.is_empty() {
+        return Err(BindWarning::BindFailed {
             interface: interface.to_string(),
+            error: "interface is empty".to_string(),
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        bind_to_device_impl(socket, domain, iface).map_err(|err| BindWarning::BindFailed {
+            interface: iface.to_string(),
             error: err.to_string(),
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
     {
-        Err(BindWarning::BindUnsupported {
-            interface: interface.to_string(),
-            platform: std::env::consts::OS.to_string(),
+        bind_to_device_impl(socket, domain, iface).map_err(|err| BindWarning::BindFailed {
+            interface: iface.to_string(),
+            error: err.to_string(),
         })
     }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    Err(BindWarning::BindUnsupported {
+        interface: iface.to_string(),
+        platform: std::env::consts::OS.to_string(),
+    })
 }
 
 /// Probes the system routing table to identify the outbound interface.
@@ -141,23 +157,74 @@ pub enum RouteProbeError {
     UnsupportedPlatform { platform: String },
 }
 
-#[cfg(target_os = "linux")]
-fn bind_to_device_impl(socket: &Socket, interface: &str) -> io::Result<()> {
-    use libc::{c_void, setsockopt, socklen_t, SOL_SOCKET, SO_BINDTODEVICE};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bind_to_device_impl(socket: &Socket, domain: Domain, interface: &str) -> io::Result<()> {
+    let index = interface_index(interface)?;
+    match domain {
+        Domain::IPV4 => socket.bind_device_by_index_v4(Some(index)),
+        Domain::IPV6 => socket.bind_device_by_index_v6(Some(index)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported domain for binding",
+        )),
+    }
+}
 
-    let name = CString::new(interface)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface contains null"))?;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn interface_index(interface: &str) -> io::Result<NonZeroU32> {
+    let name = CString::new(interface).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name contains interior null",
+        )
+    })?;
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    NonZeroU32::new(index)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "interface not found"))
+}
+
+#[cfg(target_os = "windows")]
+fn bind_to_device_impl(socket: &Socket, domain: Domain, interface: &str) -> io::Result<()> {
+    use std::mem::size_of;
+
+    use windows_sys::Win32::Networking::WinSock::{
+        if_nametoindex, setsockopt, WSAGetLastError, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF,
+        IP_UNICAST_IF, SOCKET_ERROR,
+    };
+
+    let mut wide: Vec<u16> = interface.encode_utf16().collect();
+    wide.push(0);
+
+    let index = unsafe { if_nametoindex(wide.as_ptr()) };
+    if index == 0 {
+        let code = unsafe { WSAGetLastError() };
+        return Err(io::Error::from_raw_os_error(code));
+    }
+
+    let raw = socket.as_raw_socket();
+    let (level, optname, value) = match domain {
+        Domain::IPV4 => (IPPROTO_IP as i32, IP_UNICAST_IF, index.to_be()),
+        Domain::IPV6 => (IPPROTO_IPV6 as i32, IPV6_UNICAST_IF, index),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported domain for binding",
+            ))
+        }
+    };
+
     let ret = unsafe {
         setsockopt(
-            socket.as_raw_fd(),
-            SOL_SOCKET,
-            SO_BINDTODEVICE,
-            name.as_ptr() as *const c_void,
-            name.as_bytes_with_nul().len() as socklen_t,
+            raw as _,
+            level,
+            optname,
+            &value as *const u32 as *const _,
+            size_of::<u32>() as i32,
         )
     };
-    if ret == -1 {
-        return Err(io::Error::last_os_error());
+    if ret == SOCKET_ERROR {
+        let code = unsafe { WSAGetLastError() };
+        return Err(io::Error::from_raw_os_error(code));
     }
     Ok(())
 }
