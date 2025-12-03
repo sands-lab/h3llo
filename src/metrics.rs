@@ -1,42 +1,29 @@
 //! Shared counters for interface receive/transmit loops.
 
-use crate::events::{RxMetrics, TxMetrics};
+use crate::events::{Direction, InterfaceMetrics};
 
-/// Tracks receive-side counters for interfaces.
-#[derive(Default)]
-pub(crate) struct RxCounters {
-    packets: u64,
-    bytes: u64,
-}
-
-impl RxCounters {
-    /// Records a received packet length with saturation.
-    pub(crate) fn record(&mut self, len: usize) {
-        self.packets = self.packets.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(len as u64);
-    }
-
-    /// Generates a metrics snapshot tagged with `iface`.
-    pub(crate) fn snapshot(&self, iface: &str) -> RxMetrics {
-        RxMetrics {
-            iface: iface.to_string(),
-            packets: self.packets,
-            bytes: self.bytes,
-        }
-    }
-}
-
-/// Tracks transmit-side counters for interfaces.
-#[derive(Default)]
-pub(crate) struct TxCounters {
+/// Tracks counters for an interface direction.
+pub(crate) struct InterfaceCounters {
+    direction: Direction,
     packets: u64,
     bytes: u64,
     dropped_packets: u64,
     dropped_bytes: u64,
 }
 
-impl TxCounters {
-    /// Records a successfully transmitted packet length with saturation.
+impl InterfaceCounters {
+    /// Builds counters for the given direction.
+    pub(crate) fn new(direction: Direction) -> Self {
+        Self {
+            direction,
+            packets: 0,
+            bytes: 0,
+            dropped_packets: 0,
+            dropped_bytes: 0,
+        }
+    }
+
+    /// Records a successfully handled packet length with saturation.
     pub(crate) fn record_success(&mut self, len: usize) {
         self.packets = self.packets.saturating_add(1);
         self.bytes = self.bytes.saturating_add(len as u64);
@@ -49,9 +36,10 @@ impl TxCounters {
     }
 
     /// Generates a metrics snapshot tagged with `iface`.
-    pub(crate) fn snapshot(&self, iface: &str) -> TxMetrics {
-        TxMetrics {
+    pub(crate) fn snapshot(&self, iface: &str) -> InterfaceMetrics {
+        InterfaceMetrics {
             iface: iface.to_string(),
+            direction: self.direction,
             packets: self.packets,
             bytes: self.bytes,
             dropped_packets: self.dropped_packets,

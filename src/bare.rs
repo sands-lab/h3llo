@@ -1,8 +1,8 @@
 //! BareUDP transport: socket setup, source-IP filtering, and send/receive loops.
 
 use crate::bind::{bind_udp_socket, select_bind_interface, BindWarning, RouteProbe};
-use crate::events::{Event, InterfaceEvent};
-use crate::metrics::{RxCounters, TxCounters};
+use crate::events::{Direction, Event, InterfaceEvent};
+use crate::metrics::InterfaceCounters;
 use log::warn;
 use std::collections::HashSet;
 use std::io;
@@ -140,7 +140,7 @@ pub fn spawn_receiver(
 
     tokio::spawn(async move {
         let mut buf = vec![0u8; mtu];
-        let mut counters = RxCounters::default();
+        let mut counters = InterfaceCounters::new(Direction::Rx);
         let mut ticker = time::interval(interval);
 
         loop {
@@ -148,14 +148,18 @@ pub fn spawn_receiver(
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, remote)) => {
-                            if len == 0 || !allowed_sources.contains(&remote.ip()) {
+                            if len == 0 {
+                                continue;
+                            }
+                            if !allowed_sources.contains(&remote.ip()) {
+                                counters.record_drop(len);
                                 continue;
                             }
                             let packet = buf[..len].to_vec();
                             if outbound.send(packet).await.is_err() {
                                 break;
                             }
-                            counters.record(len);
+                            counters.record_success(len);
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -165,7 +169,7 @@ pub fn spawn_receiver(
                     allowed_sources = update;
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Interface(InterfaceEvent::RxMetrics(counters.snapshot(&iface)))).await.is_err() {
+                    if events_tx.send(Event::Interface(InterfaceEvent::Metrics(counters.snapshot(&iface)))).await.is_err() {
                         break;
                     }
                 }
@@ -192,7 +196,7 @@ pub fn spawn_sender(
     let BareUdpContext { socket, iface, .. } = context;
 
     tokio::spawn(async move {
-        let mut counters = TxCounters::default();
+        let mut counters = InterfaceCounters::new(Direction::Tx);
         let mut ticker = time::interval(interval);
 
         loop {
@@ -213,7 +217,7 @@ pub fn spawn_sender(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Interface(InterfaceEvent::TxMetrics(counters.snapshot(&iface)))).await.is_err() {
+                    if events_tx.send(Event::Interface(InterfaceEvent::Metrics(counters.snapshot(&iface)))).await.is_err() {
                         break;
                     }
                 }
@@ -408,8 +412,8 @@ mod tests {
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Interface(InterfaceEvent::RxMetrics(m)) = event {
-                    if m.packets >= 1 {
+                if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
+                    if m.direction == Direction::Rx && m.packets >= 1 {
                         return Some(m);
                     }
                 }
@@ -452,8 +456,8 @@ mod tests {
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Interface(InterfaceEvent::TxMetrics(m)) = event {
-                    if m.packets >= 1 {
+                if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
+                    if m.direction == Direction::Tx && m.packets >= 1 {
                         return Some(m);
                     }
                 }

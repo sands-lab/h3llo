@@ -1,8 +1,8 @@
 //! TUN management: device creation, read/write loops with backpressure, and metrics reporting.
 
 use crate::config::LocalTun;
-use crate::events::{Event, InterfaceEvent};
-use crate::metrics::{RxCounters, TxCounters};
+use crate::events::{Direction, Event, InterfaceEvent};
+use crate::metrics::InterfaceCounters;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use log::warn;
 use std::io;
@@ -171,7 +171,7 @@ pub(crate) fn spawn_reader<T: TunRx>(
     tokio::spawn(async move {
         let mtu = tun.mtu();
         let iface = tun.name().to_string();
-        let mut counters = RxCounters::default();
+        let mut counters = InterfaceCounters::new(Direction::Rx);
         let mut ticker = time::interval(interval);
         let mut buf = vec![0u8; mtu];
 
@@ -188,14 +188,14 @@ pub(crate) fn spawn_reader<T: TunRx>(
                                 break;
                             }
                             buf = Vec::with_capacity(mtu);
-                            counters.record(len);
+                            counters.record_success(len);
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Interface(InterfaceEvent::RxMetrics(counters.snapshot(&iface)))).await.is_err() {
+                    if events_tx.send(Event::Interface(InterfaceEvent::Metrics(counters.snapshot(&iface)))).await.is_err() {
                         break;
                     }
                 }
@@ -216,7 +216,7 @@ pub(crate) fn spawn_writer<T: TunTx>(
         let mtu = tun.mtu();
         let iface = tun.name().to_string();
         let mut warned_oversize = false;
-        let mut counters = TxCounters::default();
+        let mut counters = InterfaceCounters::new(Direction::Tx);
         let mut ticker = time::interval(interval);
 
         loop {
@@ -244,11 +244,14 @@ pub(crate) fn spawn_writer<T: TunTx>(
                     match tun.send(&packet).await {
                         Ok(written) => counters.record_success(written),
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
+                        Err(_) => {
+                            counters.record_drop(packet.len());
+                            break;
+                        }
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Interface(InterfaceEvent::TxMetrics(counters.snapshot(&iface)))).await.is_err() {
+                    if events_tx.send(Event::Interface(InterfaceEvent::Metrics(counters.snapshot(&iface)))).await.is_err() {
                         break;
                     }
                 }
@@ -358,8 +361,8 @@ mod tests {
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Interface(InterfaceEvent::RxMetrics(m)) = event {
-                    if m.packets >= 1 {
+                if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
+                    if m.direction == Direction::Rx && m.packets >= 1 {
                         snapshot = Some(m);
                         break;
                     }
@@ -397,8 +400,8 @@ mod tests {
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Interface(InterfaceEvent::TxMetrics(m)) = event {
-                    if m.packets >= 1 && m.dropped_packets >= 1 {
+                if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
+                    if m.direction == Direction::Tx && m.packets >= 1 && m.dropped_packets >= 1 {
                         snapshot = Some(m);
                         break;
                     }

@@ -12,34 +12,32 @@ pub enum Event {
 /// Describes interface-level events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterfaceEvent {
-    /// Latest cumulative receive metrics for an interface.
-    RxMetrics(RxMetrics),
-    /// Latest cumulative transmit metrics for an interface.
-    TxMetrics(TxMetrics),
+    /// Latest cumulative metrics for an interface.
+    Metrics(InterfaceMetrics),
 }
 
-/// Carries cumulative receive counters collected from an interface loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RxMetrics {
-    /// Interface name that produced the metrics.
-    pub iface: String,
-    /// Total packets read from the interface.
-    pub packets: u64,
-    /// Total bytes read from the interface.
-    pub bytes: u64,
+/// Indicates whether metrics were collected on the receive or transmit path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Metrics from the receive side.
+    Rx,
+    /// Metrics from the transmit side.
+    Tx,
 }
 
-/// Carries cumulative transmit counters collected from an interface loop.
+/// Carries cumulative counters collected from an interface loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TxMetrics {
+pub struct InterfaceMetrics {
     /// Interface name that produced the metrics.
     pub iface: String,
-    /// Total packets written to the interface.
+    /// Direction (receive or transmit) of the collected metrics.
+    pub direction: Direction,
+    /// Total packets observed on the interface.
     pub packets: u64,
-    /// Total bytes written to the interface.
+    /// Total bytes observed on the interface.
     pub bytes: u64,
-    /// Packets dropped because they exceeded the interface MTU.
+    /// Packets dropped in this direction.
     pub dropped_packets: u64,
-    /// Bytes dropped because packets exceeded the interface MTU.
+    /// Bytes dropped in this direction.
     pub dropped_bytes: u64,
 }
