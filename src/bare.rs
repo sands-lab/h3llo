@@ -1,14 +1,16 @@
 //! BareUDP transport: socket setup, source-IP filtering, and send/receive loops.
 
-use crate::bind::{bind_udp_socket, select_bind_interface, BindWarning, RouteProbe};
+pub use crate::udp::bind_socket;
+
 use crate::events::{Direction, Event, InterfaceEvent};
 use crate::metrics::InterfaceCounters;
+use crate::udp::UdpError;
 use log::warn;
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
-use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -27,10 +29,10 @@ impl PeerEndpoints {
     ///
     /// # Errors
     ///
-    /// Returns `BareError::NoResolvedAddresses` when `endpoints` is empty.
-    pub fn new(endpoints: Vec<SocketAddr>) -> Result<Self, BareError> {
+    /// Returns `UdpError::NoResolvedAddresses` when `endpoints` is empty.
+    pub fn new(endpoints: Vec<SocketAddr>) -> Result<Self, UdpError> {
         if endpoints.is_empty() {
-            return Err(BareError::NoResolvedAddresses);
+            return Err(UdpError::NoResolvedAddresses);
         }
 
         let destination = endpoints[0];
@@ -69,50 +71,11 @@ impl PeerEndpoints {
     }
 }
 
-/// Represents BareUDP socket binding and loop construction errors.
-#[derive(Debug, Error)]
-pub enum BareError {
-    /// No resolved addresses were provided for the peer.
-    #[error("bareudp requires at least one resolved address")]
-    NoResolvedAddresses,
-    /// Socket creation, binding, or conversion failed.
-    #[error("bareudp socket setup failed: {0}")]
-    Socket(String),
-}
-
-/// Binds a UDP socket to `listen` and optionally to `bind_interface`, returning the socket and any binding warnings.
-///
-/// Binding to an interface is best-effort: missing or ambiguous probe results emit warnings and the socket continues unbound.
-///
-/// # Arguments
-/// - `listen`: Local socket address to bind.
-/// - `bind_interface`: Optional preferred interface; treated as a filter during probing.
-/// - `target`: Remote server IP used for route probing.
-/// - `tun_if`: Optional TUN interface name to exclude from probing.
-/// - `probe`: Route probe implementation.
-pub async fn bind_socket<P: RouteProbe>(
-    listen: SocketAddr,
-    bind_interface: Option<&str>,
-    target: IpAddr,
-    tun_if: Option<&str>,
-    probe: &P,
-) -> Result<(UdpSocket, Vec<BindWarning>), BareError> {
-    // Probe using the remote server IP to avoid recursive routing; pick the first match and warn on ambiguity.
-    let (selected_interface, mut warnings) =
-        select_bind_interface(target, tun_if, bind_interface, probe).await;
-
-    let (socket, mut bind_warnings) = bind_udp_socket(listen, selected_interface.as_deref())
-        .map_err(|e| BareError::Socket(e.to_string()))?;
-    warnings.append(&mut bind_warnings);
-
-    Ok((socket, warnings))
-}
-
 /// Collects socket, MTU, and interface label shared by BareUDP loops.
 #[derive(Debug)]
-pub struct BareUdpContext {
-    /// Bound UDP socket for BareUDP traffic.
-    pub socket: UdpSocket,
+pub struct UdpCtx {
+    /// Shared UDP socket for BareUDP traffic.
+    pub socket: Arc<UdpSocket>,
     /// Buffer size for inbound packets, typically the TUN MTU.
     pub mtu: usize,
     /// Label used in metrics emission.
@@ -129,14 +92,14 @@ pub struct BareUdpContext {
 /// - `events_tx`: Channel for emitting receive metrics.
 /// - `interval`: Metrics emission interval.
 pub fn spawn_receiver(
-    context: BareUdpContext,
+    context: UdpCtx,
     mut allowed_sources: HashSet<IpAddr>,
     mut allowed_updates: mpsc::Receiver<HashSet<IpAddr>>,
     outbound: mpsc::Sender<Vec<u8>>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
-    let BareUdpContext { socket, mtu, iface } = context;
+    let UdpCtx { socket, mtu, iface } = context;
 
     tokio::spawn(async move {
         let mut buf = vec![0u8; mtu];
@@ -187,13 +150,13 @@ pub fn spawn_receiver(
 /// - `events_tx`: Channel for emitting transmit metrics.
 /// - `interval`: Metrics emission interval.
 pub fn spawn_sender(
-    context: BareUdpContext,
+    context: UdpCtx,
     destination: SocketAddr,
     mut inbound: mpsc::Receiver<Vec<u8>>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
-    let BareUdpContext { socket, iface, .. } = context;
+    let UdpCtx { socket, iface, .. } = context;
 
     tokio::spawn(async move {
         let mut counters = InterfaceCounters::new(Direction::Tx);
@@ -264,8 +227,8 @@ mod tests {
         let allowed = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))]);
         let (_allow_tx, allowed_updates) = mpsc::channel(1);
         let (events_tx, mut _events_rx) = mpsc::channel(4);
-        let context = BareUdpContext {
-            socket,
+        let context = UdpCtx {
+            socket: Arc::new(socket),
             mtu: 64,
             iface: "bare0".to_string(),
         };
@@ -302,8 +265,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let (update_tx, allowed_updates) = mpsc::channel(1);
         let (events_tx, mut _events_rx) = mpsc::channel(4);
-        let context = BareUdpContext {
-            socket,
+        let context = UdpCtx {
+            socket: Arc::new(socket),
             mtu: 64,
             iface: "bare1".to_string(),
         };
@@ -356,8 +319,8 @@ mod tests {
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (tx, rx) = mpsc::channel(4);
         let (events_tx, mut _events_rx) = mpsc::channel(4);
-        let context = BareUdpContext {
-            socket: sender_socket,
+        let context = UdpCtx {
+            socket: Arc::new(sender_socket),
             mtu: 64,
             iface: "bare2".to_string(),
         };
@@ -386,8 +349,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let (_update_tx, allowed_updates) = mpsc::channel(1);
         let (events_tx, mut events_rx) = mpsc::channel(4);
-        let context = BareUdpContext {
-            socket,
+        let context = UdpCtx {
+            socket: Arc::new(socket),
             mtu: 128,
             iface: "bare-metrics-rx".to_string(),
         };
@@ -439,8 +402,8 @@ mod tests {
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (tx, rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(4);
-        let context = BareUdpContext {
-            socket: sender_socket,
+        let context = UdpCtx {
+            socket: Arc::new(sender_socket),
             mtu: 64,
             iface: "bare-metrics-tx".to_string(),
         };

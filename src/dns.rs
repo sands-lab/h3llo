@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use crate::bind::{bind_udp_socket, select_bind_interface, BindWarning, RouteProbe};
+use crate::bind::{BindWarning, RouteProbe};
 use crate::config::{parse_dns_server_uri, LocalDns};
+use crate::udp::bind_socket;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use rand::Rng;
@@ -42,25 +43,16 @@ impl DnsResolver {
         tun_if: Option<&str>,
         probe: &P,
     ) -> ResolveOutcome {
-        let (selected_interface, interface_warnings) =
-            select_bind_interface(self.server.ip(), tun_if, bind_interface, probe).await;
-        let mut warnings: Vec<DnsWarning> = interface_warnings
-            .into_iter()
-            .map(DnsWarning::Bind)
-            .collect();
-
-        let (socket, mut bind_warnings) =
-            match self.prepare_socket(selected_interface.as_deref()).await {
-                Ok(pair) => pair,
-                Err(err) => {
-                    return ResolveOutcome {
-                        records: HashMap::new(),
-                        errors: vec![err],
-                        warnings,
-                    };
-                }
-            };
-        warnings.append(&mut bind_warnings);
+        let (socket, warnings) = match self.prepare_socket(bind_interface, tun_if, probe).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                return ResolveOutcome {
+                    records: HashMap::new(),
+                    errors: vec![err],
+                    warnings: Vec::new(),
+                };
+            }
+        };
 
         let mut records = HashMap::new();
         let mut errors = Vec::new();
@@ -84,9 +76,11 @@ impl DnsResolver {
     }
 
     /// Prepares and connects the UDP socket while capturing bind warnings.
-    async fn prepare_socket(
+    async fn prepare_socket<P: RouteProbe>(
         &self,
         bind_interface: Option<&str>,
+        tun_if: Option<&str>,
+        probe: &P,
     ) -> Result<(UdpSocket, Vec<DnsWarning>), ResolveError> {
         let bind_addr: SocketAddr = match self.server {
             SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -94,9 +88,11 @@ impl DnsResolver {
         };
 
         let (socket, bind_warnings) =
-            bind_udp_socket(bind_addr, bind_interface).map_err(|e| ResolveError::Resolver {
-                error: e.to_string(),
-            })?;
+            bind_socket(bind_addr, bind_interface, self.server.ip(), tun_if, probe)
+                .await
+                .map_err(|e| ResolveError::Resolver {
+                    error: e.to_string(),
+                })?;
         let warnings: Vec<DnsWarning> = bind_warnings.into_iter().map(DnsWarning::Bind).collect();
 
         socket
