@@ -23,7 +23,7 @@ ipnet-trie = "0.3"
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-net-route = "0.4"
+route_manager = { version = "0.2.9", features = ["async"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [

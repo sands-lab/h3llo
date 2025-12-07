@@ -18,7 +18,7 @@ use std::os::windows::io::AsRawSocket;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use ipnet::{Ipv4Net, Ipv6Net};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-use net_route::{Handle, Route};
+use route_manager::{AsyncRouteManager, Route};
 
 /// Captures warnings emitted during bind decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,7 +195,7 @@ pub trait RouteProbe {
     ) -> impl std::future::Future<Output = Result<Vec<String>, RouteProbeError>> + Send;
 }
 
-/// Uses `net-route` to discover reachable outbound interfaces on supported platforms.
+/// Uses `route_manager` to discover reachable outbound interfaces on supported platforms.
 ///
 /// # Errors
 /// Returns `UnsupportedPlatform` on unsupported operating systems (BSD placeholder).
@@ -308,7 +308,7 @@ fn bind_to_device_impl(socket: &Socket, domain: Domain, interface: &str) -> io::
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-/// Probes outbound route candidates using `net-route`, excluding the provided TUN interface.
+/// Probes outbound route candidates using `route_manager`, excluding the provided TUN interface.
 async fn probe_interfaces_impl(
     target: &str,
     tun_if: Option<&str>,
@@ -323,8 +323,9 @@ async fn probe_interfaces_impl(
     let tun_index = tun_if.and_then(lookup_ifindex);
 
     let routes = {
-        let handle = Handle::new().map_err(|err| RouteProbeError::Probe(err.to_string()))?;
-        handle
+        let mut manager =
+            AsyncRouteManager::new().map_err(|err| RouteProbeError::Probe(err.to_string()))?;
+        manager
             .list()
             .await
             .map_err(|err| RouteProbeError::Probe(err.to_string()))?
@@ -343,7 +344,7 @@ async fn probe_interfaces_impl(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-/// Signals unsupported probing on platforms without a `net-route` backend.
+/// Signals unsupported probing on platforms without a `route_manager` backend.
 async fn probe_interfaces_impl(
     _target: &str,
     _tun_if: Option<&str>,
@@ -403,10 +404,10 @@ fn matching_route_indexes(routes: &[Route], target: IpAddr, tun_index: Option<u3
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 /// Returns the route's prefix length and ifindex when `target` fits the destination network.
 fn route_match(route: &Route, target: IpAddr) -> Option<(u8, u32)> {
-    let ifindex = route.ifindex?;
-    let prefix = route.prefix;
+    let ifindex = route.if_index()?;
+    let prefix = route.prefix();
 
-    match (route.destination, target) {
+    match (route.destination(), target) {
         (IpAddr::V4(dest), IpAddr::V4(target_v4)) => {
             let net = Ipv4Net::new(dest, prefix).ok()?;
             if net.contains(&target_v4) {
@@ -594,10 +595,10 @@ mod tests {
         use std::net::Ipv4Addr;
 
         let routes = vec![
-            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).with_ifindex(1),
-            Route::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8).with_ifindex(2),
-            Route::new(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16).with_ifindex(3),
-            Route::new(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 24).with_ifindex(3),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).with_if_index(1),
+            Route::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8).with_if_index(2),
+            Route::new(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 16).with_if_index(3),
+            Route::new(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0)), 24).with_if_index(3),
         ];
 
         let indexes = matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), None);
@@ -611,8 +612,8 @@ mod tests {
         use std::net::Ipv4Addr;
 
         let routes = vec![
-            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).with_ifindex(1),
-            Route::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 24).with_ifindex(2),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).with_if_index(1),
+            Route::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 24).with_if_index(2),
         ];
 
         let indexes =

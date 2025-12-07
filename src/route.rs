@@ -1,7 +1,7 @@
-//! System route synchronization using net-route.
+//! System route synchronization using route_manager.
 use crate::bind::lookup_ifindex;
 use ipnet::IpNet;
-use net_route::{Handle, Route};
+use route_manager::{AsyncRouteManager, Route};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
@@ -28,38 +28,39 @@ impl IfIndexResolver for PlatformIfIndexResolver {
 }
 
 /// Abstracts route operations for production and tests.
-pub trait RouteHandle: Send + Sync {
+pub trait RouteHandle: Send {
     /// Lists all routes on the host.
-    fn list(&self) -> impl std::future::Future<Output = io::Result<Vec<Route>>> + Send;
+    fn list(&mut self) -> impl std::future::Future<Output = io::Result<Vec<Route>>> + Send;
     /// Adds a route.
-    fn add(&self, route: &Route) -> impl std::future::Future<Output = io::Result<()>> + Send;
+    fn add(&mut self, route: &Route) -> impl std::future::Future<Output = io::Result<()>> + Send;
     /// Deletes a route.
-    fn delete(&self, route: &Route) -> impl std::future::Future<Output = io::Result<()>> + Send;
+    fn delete(&mut self, route: &Route)
+        -> impl std::future::Future<Output = io::Result<()>> + Send;
 }
 
-/// Wrapper around `net_route::Handle`.
-pub struct NetRouteHandle {
-    inner: Handle,
+/// Wrapper around `route_manager::AsyncRouteManager`.
+pub struct RouteManagerHandle {
+    inner: AsyncRouteManager,
 }
 
-impl NetRouteHandle {
-    /// Creates a handle backed by `net_route`.
+impl RouteManagerHandle {
+    /// Creates a handle backed by `route_manager`'s async API.
     pub fn new() -> io::Result<Self> {
-        let inner = Handle::new()?;
+        let inner = AsyncRouteManager::new()?;
         Ok(Self { inner })
     }
 }
 
-impl RouteHandle for NetRouteHandle {
-    async fn list(&self) -> io::Result<Vec<Route>> {
+impl RouteHandle for RouteManagerHandle {
+    async fn list(&mut self) -> io::Result<Vec<Route>> {
         self.inner.list().await
     }
 
-    async fn add(&self, route: &Route) -> io::Result<()> {
+    async fn add(&mut self, route: &Route) -> io::Result<()> {
         self.inner.add(route).await
     }
 
-    async fn delete(&self, route: &Route) -> io::Result<()> {
+    async fn delete(&mut self, route: &Route) -> io::Result<()> {
         self.inner.delete(route).await
     }
 }
@@ -111,7 +112,7 @@ pub enum RouteSyncError {
 pub async fn sync_tun_routes<H: RouteHandle>(
     tun_if: &str,
     allowed: &[IpNet],
-    handle: &H,
+    handle: &mut H,
 ) -> Result<Vec<RouteSyncWarning>, RouteSyncError> {
     let resolver = PlatformIfIndexResolver;
     sync_tun_routes_with_resolver(tun_if, allowed, handle, &resolver).await
@@ -121,7 +122,7 @@ pub async fn sync_tun_routes<H: RouteHandle>(
 pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
     tun_if: &str,
     allowed: &[IpNet],
-    handle: &H,
+    handle: &mut H,
     resolver: &R,
 ) -> Result<Vec<RouteSyncWarning>, RouteSyncError> {
     let tun_ifindex = resolver.resolve(tun_if)?;
@@ -137,7 +138,7 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
     // Collect existing TUN routes and drop stale ones.
     for route in routes
         .iter()
-        .filter(|route| route.ifindex == Some(tun_ifindex))
+        .filter(|route| route.if_index() == Some(tun_ifindex))
     {
         match ipnet_from_route(route) {
             Some(net) => {
@@ -172,7 +173,7 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
             });
         }
 
-        let route = Route::new(net.addr(), net.prefix_len()).with_ifindex(tun_ifindex);
+        let route = Route::new(net.addr(), net.prefix_len()).with_if_index(tun_ifindex);
         if let Err(err) = handle.add(&route).await {
             warnings.push(RouteSyncWarning::AddFailed {
                 prefix: net,
@@ -192,11 +193,15 @@ fn resolve_ifindex(name: &str) -> Result<u32, RouteSyncError> {
     })
 }
 
-/// Converts a `net_route::Route` into `IpNet` when the address family is supported.
+/// Converts a `route_manager::Route` into `IpNet` when the address family is supported.
 fn ipnet_from_route(route: &Route) -> Option<IpNet> {
-    match route.destination {
-        IpAddr::V4(addr) => ipnet::Ipv4Net::new(addr, route.prefix).ok().map(IpNet::V4),
-        IpAddr::V6(addr) => ipnet::Ipv6Net::new(addr, route.prefix).ok().map(IpNet::V6),
+    match route.destination() {
+        IpAddr::V4(addr) => ipnet::Ipv4Net::new(addr, route.prefix())
+            .ok()
+            .map(IpNet::V4),
+        IpAddr::V6(addr) => ipnet::Ipv6Net::new(addr, route.prefix())
+            .ok()
+            .map(IpNet::V6),
     }
 }
 
@@ -204,11 +209,11 @@ fn ipnet_from_route(route: &Route) -> Option<IpNet> {
 fn conflict_map(routes: &[Route], tun_ifindex: u32) -> HashMap<IpNet, u32> {
     let mut conflicts = HashMap::new();
     for route in routes {
-        if route.ifindex == Some(tun_ifindex) {
+        if route.if_index() == Some(tun_ifindex) {
             continue;
         }
         if let Some(net) = ipnet_from_route(route) {
-            if let Some(ifindex) = route.ifindex {
+            if let Some(ifindex) = route.if_index() {
                 conflicts.entry(net).or_insert(ifindex);
             }
         }
@@ -224,9 +229,10 @@ mod tests {
     /// Builds a route for tests.
     fn route(prefix: &str, ifindex: Option<u32>) -> Route {
         let net: IpNet = prefix.parse().unwrap();
-        let mut r = Route::new(net.addr(), net.prefix_len());
-        r.ifindex = ifindex;
-        r
+        match ifindex {
+            Some(idx) => Route::new(net.addr(), net.prefix_len()).with_if_index(idx),
+            None => Route::new(net.addr(), net.prefix_len()),
+        }
     }
 
     /// Returns a fixed interface index for tests.
@@ -277,15 +283,15 @@ mod tests {
     }
 
     impl RouteHandle for FakeHandle {
-        async fn list(&self) -> io::Result<Vec<Route>> {
+        async fn list(&mut self) -> io::Result<Vec<Route>> {
             Ok(self.routes.lock().unwrap().clone())
         }
 
-        async fn add(&self, route: &Route) -> io::Result<()> {
+        async fn add(&mut self, route: &Route) -> io::Result<()> {
             self.ops
                 .lock()
                 .unwrap()
-                .push(format!("add {}", route.prefix));
+                .push(format!("add {}", route.prefix()));
             if self.fail_add {
                 return Err(io::Error::new(io::ErrorKind::Other, "add failed"));
             }
@@ -293,11 +299,11 @@ mod tests {
             Ok(())
         }
 
-        async fn delete(&self, route: &Route) -> io::Result<()> {
+        async fn delete(&mut self, route: &Route) -> io::Result<()> {
             self.ops
                 .lock()
                 .unwrap()
-                .push(format!("del {}", route.prefix));
+                .push(format!("del {}", route.prefix()));
             if self.fail_delete {
                 return Err(io::Error::new(io::ErrorKind::Other, "delete failed"));
             }
@@ -313,13 +319,13 @@ mod tests {
     /// Adds missing routes while skipping already present TUN prefixes.
     async fn adds_missing_routes_and_skips_existing() {
         let resolver = FakeResolver { idx: 7 };
-        let handle = FakeHandle::new(vec![route("10.0.0.0/24", Some(7))]);
+        let mut handle = FakeHandle::new(vec![route("10.0.0.0/24", Some(7))]);
         let allowed: Vec<IpNet> = vec![
             "10.0.0.0/24".parse().unwrap(),
             "10.0.1.0/24".parse().unwrap(),
         ];
 
-        let warnings = sync_tun_routes_with_resolver("tun0", &allowed, &handle, &resolver)
+        let warnings = sync_tun_routes_with_resolver("tun0", &allowed, &mut handle, &resolver)
             .await
             .unwrap();
         assert!(warnings.is_empty());
@@ -331,10 +337,10 @@ mod tests {
     async fn deletes_stale_tun_routes() {
         let resolver = FakeResolver { idx: 9 };
         let stale = route("10.5.0.0/16", Some(9));
-        let handle = FakeHandle::new(vec![stale.clone()]);
+        let mut handle = FakeHandle::new(vec![stale.clone()]);
         let allowed: Vec<IpNet> = vec![];
 
-        let warnings = sync_tun_routes_with_resolver("tun0", &allowed, &handle, &resolver)
+        let warnings = sync_tun_routes_with_resolver("tun0", &allowed, &mut handle, &resolver)
             .await
             .unwrap();
         assert!(warnings.is_empty());
@@ -346,10 +352,10 @@ mod tests {
     /// Emits a conflict warning when another interface already owns the prefix and still adds the TUN route.
     async fn warns_on_conflict_but_leaves_existing_route() {
         let resolver = FakeResolver { idx: 3 };
-        let handle = FakeHandle::new(vec![route("192.168.0.0/24", Some(2))]);
+        let mut handle = FakeHandle::new(vec![route("192.168.0.0/24", Some(2))]);
         let allowed: Vec<IpNet> = vec!["192.168.0.0/24".parse().unwrap()];
 
-        let warnings = sync_tun_routes_with_resolver("tun0", &allowed, &handle, &resolver)
+        let warnings = sync_tun_routes_with_resolver("tun0", &allowed, &mut handle, &resolver)
             .await
             .unwrap();
         assert_eq!(
@@ -369,9 +375,9 @@ mod tests {
         let resolver = FakeResolver { idx: 11 };
         let stale = route("10.9.0.0/16", Some(11));
         let allowed: Vec<IpNet> = vec!["10.8.0.0/16".parse().unwrap()];
-        let handle = FakeHandle::with_failures(vec![stale.clone()], true, true);
+        let mut handle = FakeHandle::with_failures(vec![stale.clone()], true, true);
 
-        let warnings = sync_tun_routes_with_resolver("tun0", &allowed, &handle, &resolver)
+        let warnings = sync_tun_routes_with_resolver("tun0", &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
