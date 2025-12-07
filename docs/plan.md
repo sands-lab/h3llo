@@ -39,4 +39,4 @@ Iterative delivery of h3llo by building one module at a time, gating each step w
 - Plan reordered to deliver a BareUDP-only VPN first, then add HTTP/3 features.
 - TUN management: implemented tun-rs based creation, address/MTU setup, read/write loops with backpressure, oversize drop counting, periodic metrics events, and unit tests with in-memory doubles.
 - BareUDP transport: added socket binding helper reuse, outbound/receive loops with source-IP filtering, multi-answer warning, and unit tests covering allowed/blocked sources and forwarding.
-- System route sync: net-route-based TUN route reconciliation (add missing `allowedIPs`, delete stale TUN routes, warn on conflicts/failures).
+- System route sync: route_manager-based TUN route reconciliation (add missing `allowedIPs`, delete stale TUN routes, warn on conflicts/failures).

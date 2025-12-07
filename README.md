@@ -24,8 +24,8 @@ local:
     secret: example-node-1-secret
   tun:
     ifname: h3llo0
-    addr:
-      - 192.168.180.1/32
+    addrs:
+      - 192.168.180.1
 peers:
 - id: example-node-2
   h3:
@@ -39,8 +39,8 @@ local:
   id: example-node-2
   tun:
     ifname: h3llo0
-    addr:
-      - 192.168.180.2/32
+    addrs:
+      - 192.168.180.2
 peers:
 - id: example-node-1
   h3:

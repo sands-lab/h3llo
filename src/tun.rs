@@ -3,10 +3,10 @@
 use crate::config::LocalTun;
 use crate::events::{Direction, Event, InterfaceEvent};
 use crate::metrics::InterfaceCounters;
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use ipnet::{Ipv4Net, Ipv6Net};
 use log::warn;
 use std::io;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -40,7 +40,7 @@ pub trait TunTx: Send + 'static {
 
 /// Creates a TUN device from `local_tun` and returns exclusive RX/TX handles.
 pub async fn from_config(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), TunError> {
-    let (v4_addrs, v6_addrs) = parse_addrs(&local_tun.addr)?;
+    let (v4_addrs, v6_addrs) = parse_addrs(&local_tun.addrs)?;
 
     let mut builder = DeviceBuilder::new()
         .name(local_tun.ifname.as_str())
@@ -146,16 +146,28 @@ fn parse_addrs(raw_addrs: &[String]) -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Tun
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
     for addr in raw_addrs {
-        match addr.parse::<IpNet>() {
-            Ok(IpNet::V4(net)) => v4.push(net),
-            Ok(IpNet::V6(net)) => v6.push(net),
+        match addr.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) => {
+                let net = Ipv4Net::new(ip, 32).map_err(|e| TunError::InvalidAddress {
+                    addr: addr.clone(),
+                    error: e.to_string(),
+                })?;
+                v4.push(net);
+            }
+            Ok(IpAddr::V6(ip)) => {
+                let net = Ipv6Net::new(ip, 128).map_err(|e| TunError::InvalidAddress {
+                    addr: addr.clone(),
+                    error: e.to_string(),
+                })?;
+                v6.push(net);
+            }
             Err(e) => {
                 return Err(TunError::InvalidAddress {
                     addr: addr.clone(),
                     error: e.to_string(),
                 })
             }
-        }
+        };
     }
     Ok((v4, v6))
 }
@@ -338,13 +350,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parses_addresses_and_splits() {
-        let addrs = vec!["192.168.1.1/24".to_string(), "2001:db8::1/64".to_string()];
+    async fn parses_addresses_and_normalizes_to_host_prefix() {
+        let addrs = vec!["192.168.1.1".to_string(), "2001:db8::1".to_string()];
         let (v4, v6) = parse_addrs(&addrs).unwrap();
         assert_eq!(v4.len(), 1);
         assert_eq!(v4[0].addr(), Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(v4[0].prefix_len(), 32);
         assert_eq!(v6.len(), 1);
         assert_eq!(v6[0].addr(), "2001:db8::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(v6[0].prefix_len(), 128);
     }
 
     #[tokio::test]

@@ -14,8 +14,8 @@ local:
       name: admin-username
       pass: admin-password
   tun:
-    addr:
-      - 192.168.180.1/32
+    addrs:
+      - 192.168.180.1
 peers:
 - id: node-aaa02
   h3:
@@ -40,7 +40,7 @@ fn reject_invalid_configuration() {
 local:
   id: short
   tun:
-    addr: []
+    addrs: []
 peers: []
 "#;
 

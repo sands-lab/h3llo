@@ -89,8 +89,8 @@ pub struct LocalTun {
     /// TUN interface name (default: h3llo0).
     #[serde(default = "default_ifname")]
     pub ifname: String,
-    /// TUN addresses (IPv4/IPv6, required).
-    pub addr: Vec<String>,
+    /// TUN addresses without prefixes (IPv4/IPv6, required).
+    pub addrs: Vec<String>,
     /// TUN MTU (default: 1410).
     #[serde(default = "default_mtu")]
     pub mtu: u16,
@@ -218,8 +218,11 @@ pub enum ValidationError {
     #[error("local.dns.server must be a udp:// URI with an IP literal and port: {reason}")]
     LocalDnsServerInvalid { reason: String },
     /// TUN addresses are missing.
-    #[error("local.tun.addr must include at least one address")]
-    MissingLocalTunAddr,
+    #[error("local.tun.addrs must include at least one address")]
+    MissingLocalTunAddrs,
+    /// A local TUN address is invalid.
+    #[error("local.tun.addrs entry '{addr}' is invalid: {error}")]
+    InvalidLocalTunAddr { addr: String, error: String },
     /// `local.bare.listen` is missing when BareUDP is configured.
     #[error("local.bare.listen must be set when local.bare is configured")]
     LocalBareMissingListen,
@@ -328,8 +331,16 @@ impl Config {
             }
         }
 
-        if self.local.tun.addr.is_empty() {
-            errors.push(ValidationError::MissingLocalTunAddr);
+        if self.local.tun.addrs.is_empty() {
+            errors.push(ValidationError::MissingLocalTunAddrs);
+        }
+        for addr in &self.local.tun.addrs {
+            if let Err(err) = addr.parse::<IpAddr>() {
+                errors.push(ValidationError::InvalidLocalTunAddr {
+                    addr: addr.clone(),
+                    error: err.to_string(),
+                });
+            }
         }
 
         if self.local.dns.refresh != 0 && self.local.dns.refresh < 30 {
@@ -512,7 +523,7 @@ mod tests {
                 bare: None,
                 tun: LocalTun {
                     ifname: "h3llo0".to_string(),
-                    addr: vec!["192.168.180.1/32".to_string()],
+                    addrs: vec!["192.168.180.1".to_string()],
                     mtu: 1410,
                 },
             },
@@ -721,6 +732,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_local_tun_prefix_instead_of_host() {
+        let mut config = sample_h3_config();
+        config.local.tun.addrs = vec!["192.168.180.1/32".to_string()];
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::InvalidLocalTunAddr { .. }))
+        ));
+    }
+
+    #[test]
     fn rejects_empty_allowed_ips() {
         let mut config = sample_h3_config();
         config.peers[0].tun.allowed_ips.clear();
@@ -742,8 +767,8 @@ local:
     key: ./key.pem
     secret: example-node-1-secret
   tun:
-    addr:
-      - 192.168.180.1/32
+    addrs:
+      - 192.168.180.1
 peers:
 - id: example-node-2
   h3:
@@ -778,8 +803,8 @@ local:
   dns:
     server: udp://8.8.8.8:53
   tun:
-    addr:
-      - 192.168.180.1/32
+    addrs:
+      - 192.168.180.1
 peers:
 - id: example-node-2
   h3:
