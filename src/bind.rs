@@ -248,7 +248,7 @@ fn bind_to_device_impl(socket: &Socket, domain: Domain, interface: &str) -> io::
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 /// Resolves an interface name into a non-zero ifindex for binding.
-fn interface_index(interface: &str) -> io::Result<NonZeroU32> {
+pub(crate) fn interface_index(interface: &str) -> io::Result<NonZeroU32> {
     let name = CString::new(interface).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -429,13 +429,13 @@ fn route_match(route: &Route, target: IpAddr) -> Option<(u8, u32)> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 /// Looks up an interface index by name using libc on Unix platforms.
-fn lookup_ifindex(name: &str) -> Option<u32> {
+pub(crate) fn lookup_ifindex(name: &str) -> Option<u32> {
     interface_index(name).ok().map(NonZeroU32::get)
 }
 
 #[cfg(target_os = "windows")]
 /// Looks up an interface index by name using WinSock on Windows.
-fn lookup_ifindex(name: &str) -> Option<u32> {
+pub(crate) fn lookup_ifindex(name: &str) -> Option<u32> {
     use windows_sys::Win32::Networking::WinSock::if_nametoindex;
 
     let mut wide: Vec<u16> = name.encode_utf16().collect();

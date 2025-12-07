@@ -6,6 +6,7 @@ pub mod config;
 pub mod dns;
 pub mod events;
 mod metrics;
+pub mod route;
 pub mod routing;
 pub mod tun;
 pub mod udp;

@@ -159,9 +159,7 @@ Key flows:
 
 ### System Route Updates
 
-Route update summary: replace per-route entries with platform commands while keeping traffic uninterrupted. Typical commands: `ip route replace` on Linux, `route -n add -net` / `route -n change` on Darwin, and `netsh interface ipv4 add route` on Windows.
-
-h3llo updates individual routes best-effort: command failures log warnings and continue; retries piggyback on future config refreshes or reconnections. If the platform lacks a usable route update mechanism, h3llo logs a warning, skips the system-route change, and continues running.
+Route update summary: keep the TUN interface’s routes aligned with `peers[].tun.allowedIPs` using `net-route` APIs instead of shelling out (`ip route`, `route`, `netsh`). Flow: (1) resolve the TUN ifindex, (2) list system routes, (3) delete TUN routes not in `allowedIPs`, (4) add missing `allowedIPs` routes for the TUN, (5) warn on conflicts when the same prefix already exists on another interface (leave the existing route intact), and (6) warn on add/delete failures but continue running. If the platform lacks `net-route` support, h3llo logs a warning, skips system-route changes, and continues running.
 
 ### Longest-Prefix-Match Algorithm
 
