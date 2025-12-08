@@ -5,6 +5,7 @@ pub mod bind;
 pub mod config;
 pub mod dns;
 pub mod events;
+mod helpers;
 mod metrics;
 pub mod route;
 pub mod routing;

@@ -3,6 +3,7 @@
 pub use crate::udp::bind_socket;
 
 use crate::events::{Direction, Event, InterfaceEvent};
+use crate::helpers::retry_on_interrupted;
 use crate::metrics::InterfaceCounters;
 use crate::udp::UdpError;
 use log::warn;
@@ -157,6 +158,7 @@ pub fn spawn_sender(
     interval: Duration,
 ) -> JoinHandle<()> {
     let UdpCtx { socket, iface, .. } = context;
+    let socket = socket;
 
     tokio::spawn(async move {
         let mut counters = InterfaceCounters::new(Direction::Tx);
@@ -170,9 +172,8 @@ pub fn spawn_sender(
                         None => break,
                     };
 
-                    match socket.send_to(&packet, destination).await {
+                    match retry_on_interrupted!(socket.send_to(&packet, destination).await) {
                         Ok(written) => counters.record_success(written),
-                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => {
                             counters.record_drop(packet.len());
                             break;

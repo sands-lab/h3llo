@@ -2,6 +2,7 @@
 
 use crate::config::LocalTun;
 use crate::events::{Direction, Event, InterfaceEvent};
+use crate::helpers::retry_on_interrupted;
 use crate::metrics::InterfaceCounters;
 use ipnet::{Ipv4Net, Ipv6Net};
 use log::warn;
@@ -253,9 +254,8 @@ pub(crate) fn spawn_writer<T: TunTx>(
                         continue;
                     }
 
-                    match tun.send(&packet).await {
+                    match retry_on_interrupted!(tun.send(&packet).await) {
                         Ok(written) => counters.record_success(written),
-                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => {
                             counters.record_drop(packet.len());
                             break;
@@ -275,6 +275,8 @@ pub(crate) fn spawn_writer<T: TunTx>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::io;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -289,6 +291,7 @@ mod tests {
         name: String,
         mtu: usize,
         outbound: mpsc::Sender<Vec<u8>>,
+        send_errors: VecDeque<io::ErrorKind>,
     }
 
     fn memory_tun(name: &str, mtu: usize) -> (MemoryTunRx, MemoryTunTx) {
@@ -303,6 +306,28 @@ mod tests {
                 name: name.to_string(),
                 mtu,
                 outbound: out_tx,
+                send_errors: VecDeque::new(),
+            },
+        )
+    }
+
+    fn memory_tun_with_errors(
+        name: &str,
+        mtu: usize,
+        send_errors: Vec<io::ErrorKind>,
+    ) -> (MemoryTunRx, MemoryTunTx) {
+        let (out_tx, out_rx) = mpsc::channel(4);
+        (
+            MemoryTunRx {
+                name: name.to_string(),
+                mtu,
+                inbound: out_rx,
+            },
+            MemoryTunTx {
+                name: name.to_string(),
+                mtu,
+                outbound: out_tx,
+                send_errors: send_errors.into(),
             },
         )
     }
@@ -341,6 +366,9 @@ mod tests {
         }
 
         async fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(kind) = self.send_errors.pop_front() {
+                return Err(io::Error::new(kind, "injected send error"));
+            }
             self.outbound
                 .send(buf.to_vec())
                 .await
@@ -432,5 +460,42 @@ mod tests {
         assert_eq!(metrics.bytes, 3);
         assert_eq!(metrics.dropped_packets, 1);
         assert_eq!(metrics.dropped_bytes, 6);
+    }
+
+    #[tokio::test]
+    async fn writer_retries_interrupted_send() {
+        let (mut rx_tun, tx_tun) =
+            memory_tun_with_errors("mem-interrupt", 16, vec![io::ErrorKind::Interrupted]);
+        let (tx, rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let writer = spawn_writer(tx_tun, rx, events_tx, Duration::from_millis(5));
+
+        tx.send(vec![1, 2, 3]).await.unwrap();
+
+        let mut buf = vec![0u8; 16];
+        let len = rx_tun
+            .recv(&mut buf)
+            .await
+            .expect("should receive after retry");
+        assert_eq!(&buf[..len], &[1, 2, 3]);
+
+        let metrics = tokio::time::timeout(Duration::from_millis(100), async {
+            while let Some(event) = events_rx.recv().await {
+                if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
+                    if m.direction == Direction::Tx && m.packets >= 1 {
+                        return Some(m);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .expect("tx metrics should arrive")
+        .expect("tx metrics should not be None");
+
+        writer.abort();
+
+        assert_eq!(metrics.packets, 1);
+        assert_eq!(metrics.dropped_packets, 0);
     }
 }
