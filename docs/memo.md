@@ -25,3 +25,6 @@
 - 优先使用 RPITIT/GAT 返回 Future，非必要不要引入 `Pin<Box<dyn Future>>`。可参考 `RouteProbe` 和 `DefaultRouteProbe`。
 - 无论方法是否公开，都需要添加注释，统一使用英文 docstring。
 - 当前阶段不考虑向前兼容。
+- `local.tun.addrs` 仅接受无前缀的主机地址（IPv4/IPv6），创建 TUN 时自动补 `/32` 或 `/128`。
+- 系统路由同步：仅按前缀精确匹配判断是否需要保留/添加；默认路由会拆成两个 `/1`（含 IPv6），拆分时告警；若 `/1` 冲突则单独告警但不再继续拆分。
+- 路由探测与系统路由操作统一使用 `route_manager`，不再提及 `net-route`。
