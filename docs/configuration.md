@@ -14,7 +14,6 @@ local:
     listen: https://[::]:443/path # required when local.h3 is set
     cert: ./cert.pem # required when local.h3 is set
     key: ./key.pem # required when local.h3 is set
-    secret: example-node-2-secret # required when local.h3 is set; longer than 8 characters
     admin: # optional; enables control-plane API when set (requires both name and pass, each longer than 8 characters)
       name: admin-username
       pass: admin-password
@@ -29,7 +28,7 @@ peers: # optional, default: []
 - id: example-node-1
   enabled: true # optional, default: true
   h3: # optional, conflicts with peers.bare; endpoints optional (listen-only if omitted)
-    secret: example-node-1-secret # required when dialing endpoints (peers[].h3.endpoints non-empty)
+    secret: example-secret # required whenever peers[].h3 is set (including listen-only)
     endpoints:
       - https://node1.example.com:443/path # optional; deduped; order does not imply priority
     retry: 10 # optional, default: 10 (seconds between reconnect attempts)
@@ -49,8 +48,7 @@ peers: # optional, default: []
 
 - `local.id`: Unique node identifier validated by peers; must be globally unique; use a string of at least 6 characters.
 - `peers` (default `[]`): Optional peer list; omit entirely when running standalone.
-- `local.h3` / `local.bare` (optional): Omit to disable the corresponding listener. When `local.h3` is present, `local.h3.listen`, `local.h3.cert`, `local.h3.key`, and `local.h3.secret` are all required and must be non-empty; `local.h3.secret` must be longer than 8 characters. When `local.bare` is present, `local.bare.listen` is required.
-- `local.h3.secret`: Authentication secret for inbound HTTP Basic Auth; must be longer than 8 characters when `local.h3` is set. Peers must configure matching `peers[].h3.secret`. Choose a strong value to avoid credential reuse.
+- `local.h3` / `local.bare` (optional): Omit to disable the corresponding listener. When `local.h3` is present, `local.h3.listen`, `local.h3.cert`, and `local.h3.key` are required and must be non-empty. When `local.bare` is present, `local.bare.listen` is required.
 - `local.table` (default `true`): Update the system routing table to steer matching traffic into the h3llo TUN. When `false`, h3llo does not touch system routes; the OS still installs host routes (`/32` or `/128`) for `local.tun.addrs`.
 - `local.h3.admin.name` / `local.h3.admin.pass` (optional; both longer than 8 characters): Control-plane Basic Auth credentials bound to HTTP/3. Enable GET/POST APIs only when both are set; authentication matrix is described in `docs/protocol.md`.
 - `local.dns.server` (default `udp://1.1.1.1:53`): DNS server address as a UDP URI with an IP literal and port; outbound binding/recursive-routing guards are detailed in `docs/internals.md`.
@@ -64,7 +62,7 @@ peers: # optional, default: []
 - `local.tun.mtu` (default `1410`): MTU for the TUN interface; see `docs/protocol.md` for sizing guidance.
 - `peers[]`: Remote peer entries.
 - `peers[].id`: Remote node ID; must match the peer’s `local.id`.
-- `peers[].h3.secret`: Remote peer’s authentication secret; must exactly match that peer’s `local.h3.secret`. Required (and must be longer than 8 characters) when `peers[].h3.endpoints` is set for dialing; omit `secret` when `endpoints` is empty or absent and the peer is listen-only.
+- `peers[].h3.secret`: Remote peer authentication secret; required (and must be longer than 8 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. HTTP Basic Auth for CONNECT uses `username = remote local.id` and `password = peers[username].h3.secret` on the server side; clients send `password = peers[target].h3.secret`.
 - `peers[].enabled` (default `true`): Whether this peer entry is active.
 - `peers[].h3.endpoints` (optional, deduped): List of HTTP/3 dialing addresses (scheme/host/port/path); omit or leave empty to wait for inbound HTTP/3 from the peer. Mutually exclusive with peers[].bare; dialing/multipath details are in `docs/internals.md`.
 - `peers[].h3.retry` (default `10`): Seconds between reconnect attempts when dialing fails (including TLS/handshake errors); selection and rebuild behavior is in `docs/internals.md`.
@@ -78,7 +76,7 @@ peers: # optional, default: []
 ## Notes
 
 - Transport selection: `local.h3` and `local.bare` can both be configured so the node offers HTTP/3 and BareUDP concurrently; each `peers[]` entry must pick exactly one of H3 or BareUDP.
-- Dynamic updates: Require both `local.h3.listen` and `local.h3.admin` (with `name` and `pass` set and longer than 8 characters); when absent, the control-plane API remains disabled. Update semantics are described in `docs/protocol.md`; dynamic POST allows updating `local.h3.secret`, `local.h3.admin`, and `peers` (other `local` fields are rejected).
+- Dynamic updates: Require both `local.h3.listen` and `local.h3.admin` (with `name` and `pass` set and longer than 8 characters); when absent, the control-plane API remains disabled. Update semantics are described in `docs/protocol.md`; dynamic POST allows updating `local.h3.admin` and `peers` (other `local` fields are rejected).
 - Routing scope with `local.table=false`: POST still refreshes internal routes and peer transports, but system routes remain untouched (only host routes from `local.tun.addrs` stay).
 - H3 dialing optionality: If `peers[].h3` is present but `peers[].h3.endpoints` is empty or omitted, the node waits for the peer to initiate an HTTP/3 connection (listener-only posture). Connection set/selection rules live in `docs/internals.md`.
 - DNS resolution and binding behavior: summarized above; resolver cadence, binding probes, and recursion guards are detailed in `docs/internals.md`.

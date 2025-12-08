@@ -9,7 +9,6 @@ local:
     listen: https://[::]:443/path
     cert: ./cert.pem
     key: ./key.pem
-    secret: node-aaa01-secret
     admin:
       name: admin-username
       pass: admin-password

@@ -48,8 +48,6 @@ pub struct LocalH3 {
     pub cert: Option<String>,
     /// Private key path for QUIC/TLS; required when HTTP/3 is configured.
     pub key: Option<String>,
-    /// Authentication secret for inbound HTTP Basic Auth (> 8 characters; required when HTTP/3 is configured).
-    pub secret: Option<String>,
     /// Optional control-plane credentials scoped to HTTP/3.
     pub admin: Option<LocalAdmin>,
 }
@@ -123,8 +121,8 @@ pub struct PeerH3 {
     /// Seconds between reconnect attempts when dialing fails (default: 10).
     #[serde(default = "default_peer_h3_retry_secs")]
     pub retry: u64,
-    /// Remote peer secret (> 8 characters) required when dialing endpoints; must match the peer's `local.h3.secret`.
-    pub secret: Option<String>,
+    /// Remote peer secret (> 8 characters) required whenever HTTP/3 is configured, including listen-only peers.
+    pub secret: String,
     /// Optional custom CA bundle.
     pub ca: Option<String>,
     /// Whether to skip TLS validation (default: false).
@@ -197,11 +195,6 @@ pub enum ValidationError {
     /// `local.h3.key` is missing when HTTP/3 is configured.
     #[error("local.h3.key must be set when local.h3 is configured")]
     LocalH3MissingKey,
-    /// `local.h3.secret` is missing or too short when HTTP/3 listen is configured.
-    #[error(
-        "local.h3.secret must be set and longer than 8 characters when local.h3 is configured"
-    )]
-    LocalSecretTooShort,
     /// `local.h3.admin` is present but too short.
     #[error(
         "local.h3.admin.name and local.h3.admin.pass must be longer than 8 characters when set"
@@ -229,7 +222,7 @@ pub enum ValidationError {
     #[error("peer id '{peer_id}' must be at least 6 characters")]
     PeerIdTooShort { peer_id: String },
     /// Peer secret missing or too short.
-    #[error("peer '{peer_id}' requires h3.secret longer than 8 characters when dialing endpoints")]
+    #[error("peer '{peer_id}' requires h3.secret longer than 8 characters when h3 is configured")]
     PeerSecretTooShort { peer_id: String },
     /// Peer bindifs present but empty.
     #[error("peer '{peer_id}' requires h3.bindifs to include at least one interface when set")]
@@ -307,11 +300,6 @@ impl Config {
                 errors.push(ValidationError::LocalH3MissingKey);
             }
 
-            let secret_len = h3.secret.as_ref().map(|s| s.trim().len()).unwrap_or(0);
-            if secret_len <= 8 {
-                errors.push(ValidationError::LocalSecretTooShort);
-            }
-
             if let Some(admin) = &h3.admin {
                 if admin.name.trim().len() <= 8 || admin.pass.trim().len() <= 8 {
                     errors.push(ValidationError::LocalAdminTooShort);
@@ -363,9 +351,8 @@ impl Config {
             }
 
             if let Some(h3) = peer.h3.as_ref() {
-                let peer_secret_len = h3.secret.as_ref().map(|s| s.trim().len()).unwrap_or(0);
-                let requires_peer_secret = !h3.endpoints.is_empty() || h3.secret.is_some();
-                if requires_peer_secret && peer_secret_len <= 8 {
+                let peer_secret_len = h3.secret.trim().len();
+                if peer_secret_len <= 8 {
                     errors.push(ValidationError::PeerSecretTooShort {
                         peer_id: peer.id.clone(),
                     });
@@ -523,7 +510,6 @@ mod tests {
                     listen: Some("https://[::]:443/path".to_string()),
                     cert: Some("./cert.pem".to_string()),
                     key: Some("./key.pem".to_string()),
-                    secret: Some("example-node-1-secret".to_string()),
                     admin: Some(LocalAdmin {
                         name: "admin-username".to_string(),
                         pass: "admin-password".to_string(),
@@ -540,7 +526,7 @@ mod tests {
                 id: "example-node-2".to_string(),
                 enabled: true,
                 h3: Some(PeerH3 {
-                    secret: Some("example-node-2-secret".to_string()),
+                    secret: "example-node-2-secret".to_string(),
                     endpoints: vec!["https://peer.example.com:443/path".to_string()],
                     retry: 10,
                     ca: None,
@@ -587,26 +573,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_local_secret_when_listening() {
-        let mut config = sample_h3_config();
-        if let Some(h3) = config.local.h3.as_mut() {
-            h3.secret = None;
-        }
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.contains(&ValidationError::LocalSecretTooShort)
-        ));
-    }
-
-    #[test]
     fn rejects_missing_required_local_h3_fields() {
         let mut config = sample_h3_config();
         config.local.h3 = Some(LocalH3 {
             listen: None,
             cert: None,
             key: None,
-            secret: None,
             admin: None,
         });
         let err = config.validate().unwrap_err();
@@ -616,7 +588,6 @@ mod tests {
                 if errs.contains(&ValidationError::LocalH3MissingListen)
                     && errs.contains(&ValidationError::LocalH3MissingCert)
                     && errs.contains(&ValidationError::LocalH3MissingKey)
-                    && errs.contains(&ValidationError::LocalSecretTooShort)
         ));
     }
 
@@ -681,7 +652,7 @@ mod tests {
     fn rejects_missing_peer_secret() {
         let mut config = sample_h3_config();
         if let Some(h3) = config.peers[0].h3.as_mut() {
-            h3.secret = None;
+            h3.secret = "".to_string();
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
@@ -691,14 +662,17 @@ mod tests {
     }
 
     #[test]
-    fn allows_listen_only_peer_without_secret() {
+    fn rejects_listen_only_peer_without_secret() {
         let mut config = sample_h3_config();
         if let Some(h3) = config.peers[0].h3.as_mut() {
-            h3.secret = None;
+            h3.secret = "".to_string();
             h3.endpoints.clear();
         }
-        let result = config.validate();
-        assert!(result.is_ok());
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerSecretTooShort { .. }))
+        ));
     }
 
     #[test]
@@ -774,7 +748,6 @@ local:
     listen: https://[::]:443/path
     cert: ./cert.pem
     key: ./key.pem
-    secret: example-node-1-secret
   tun:
     addrs:
       - 192.168.180.1
