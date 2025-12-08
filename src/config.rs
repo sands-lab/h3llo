@@ -130,9 +130,8 @@ pub struct PeerH3 {
     /// Whether to skip TLS validation (default: false).
     #[serde(default)]
     pub insecure: bool,
-    /// Optional list of interfaces to bind HTTP/3 dialers.
-    #[serde(default)]
-    pub bindifs: Vec<String>,
+    /// Optional list of interfaces to bind HTTP/3 dialers; must not be empty when set.
+    pub bindifs: Option<Vec<String>>,
 }
 
 /// BareUDP options per peer.
@@ -232,6 +231,9 @@ pub enum ValidationError {
     /// Peer secret missing or too short.
     #[error("peer '{peer_id}' requires h3.secret longer than 8 characters when dialing endpoints")]
     PeerSecretTooShort { peer_id: String },
+    /// Peer bindifs present but empty.
+    #[error("peer '{peer_id}' requires h3.bindifs to include at least one interface when set")]
+    PeerH3BindifsEmpty { peer_id: String },
     /// Peer transport fields conflict.
     #[error("peer '{peer_id}' must configure exactly one of h3 or bare")]
     PeerTransportConflict { peer_id: String },
@@ -367,6 +369,13 @@ impl Config {
                     errors.push(ValidationError::PeerSecretTooShort {
                         peer_id: peer.id.clone(),
                     });
+                }
+                if let Some(bindifs) = h3.bindifs.as_ref() {
+                    if bindifs.is_empty() {
+                        errors.push(ValidationError::PeerH3BindifsEmpty {
+                            peer_id: peer.id.clone(),
+                        });
+                    }
                 }
             }
 
@@ -536,7 +545,7 @@ mod tests {
                     retry: 10,
                     ca: None,
                     insecure: false,
-                    bindifs: Vec::new(),
+                    bindifs: None,
                 }),
                 bare: None,
                 tun: PeerTun {
@@ -789,7 +798,7 @@ peers:
         if let Some(h3) = cfg.peers[0].h3.as_ref() {
             assert!(h3.endpoints.is_empty());
             assert_eq!(h3.retry, 10);
-            assert!(h3.bindifs.is_empty());
+            assert!(h3.bindifs.is_none());
         } else {
             panic!("peer h3 should be present");
         }
@@ -833,7 +842,26 @@ peers:
                 "https://peer2.example.com/path".to_string()
             ]
         );
-        assert_eq!(h3.bindifs, vec!["eth0".to_string(), "eth0".to_string()]);
+        assert_eq!(
+            h3.bindifs,
+            Some(vec!["eth0".to_string(), "eth0".to_string()])
+        );
+    }
+
+    #[test]
+    fn rejects_empty_bindifs_when_set() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.bindifs = Some(Vec::new());
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs
+                    .iter()
+                    .any(|e| matches!(e, ValidationError::PeerH3BindifsEmpty { .. }))
+        ));
     }
 
     #[test]

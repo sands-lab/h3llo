@@ -36,7 +36,7 @@ peers: # optional, default: []
     ca: ./ca.pem # optional
     insecure: false # optional, default: false
     bindifs:
-      - eth0 # optional; when absent, auto-detects at most one interface; use list only when provided
+      - eth0 # optional; omit to auto-detect at most one interface; when set, list must not be empty
   bare: # optional, conflicts with peers.h3
     endpoint: udp://node1.example.com:6635 # required when peers.bare is set
     bindif: eth0 # optional; auto-detect when absent; warn and fallback to unbound on failure
@@ -68,7 +68,7 @@ peers: # optional, default: []
 - `peers[].enabled` (default `true`): Whether this peer entry is active.
 - `peers[].h3.endpoints` (optional, deduped): List of HTTP/3 dialing addresses (scheme/host/port/path); omit or leave empty to wait for inbound HTTP/3 from the peer. Mutually exclusive with peers[].bare; dialing/multipath details are in `docs/internals.md`.
 - `peers[].h3.retry` (default `10`): Seconds between reconnect attempts when dialing fails (including TLS/handshake errors); selection and rebuild behavior is in `docs/internals.md`.
-- `peers[].h3.bindifs` (optional): Interface list for HTTP/3 dialers. When omitted or empty, auto-detects at most one interface. Probe/bind fallbacks and recursive-routing warnings are described in `docs/internals.md`.
+- `peers[].h3.bindifs` (optional): Interface list for HTTP/3 dialers. When omitted, auto-detects at most one interface; when set, the list must include at least one interface. Probe/bind fallbacks and recursive-routing warnings are described in `docs/internals.md`.
 - `peers[].h3.ca`: Custom CA bundle path for validating the peer’s certificate (useful for self-signed certs); otherwise the system trust store is used.
 - `peers[].h3.insecure` (default `false`): Skip TLS certificate validation (not recommended; prefer `ca`).
 - `peers[].bare.endpoint`: BareUDP dialing address; mutually exclusive with peers[].h3. DNS handling, source-IP filtering, and multi-answer behavior are detailed in `docs/protocol.md`.

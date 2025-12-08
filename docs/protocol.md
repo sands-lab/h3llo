@@ -32,7 +32,7 @@ h3llo intentionally omits the following optional features from RFC 9484:
 - URI template parameters `target` and `ipproto`.
 
 H3 connection management and multipath:
-- Dialing set: build one connection for every combination of DNS answer, `peers[].h3.endpoints`, and `peers[].h3.bindifs` (auto-detected bindif yields at most one entry). Deduplicate endpoints before dialing.
+- Dialing set: build one connection for every combination of DNS answer, `peers[].h3.endpoints`, and `peers[].h3.bindifs` when set (auto-detected bindif yields at most one entry when unspecified). Deduplicate endpoints before dialing.
 - Preference: no endpoint priority is implied; TUN-Rx prefers the earliest-established connection until it disconnects or is invalidated because the IP left the DNS result set or the interface is not within `bindifs`. New connections join the end of the ordering; warn if more than `10` connections exist for a peer.
 - Failures: TLS/handshake failures count as dial failures and retry every `peers[].h3.retry` seconds. Bind failures warn and fall back to unbound sockets, which can risk recursive routing if the system route points to the TUN.
 
@@ -142,7 +142,7 @@ Update rules:
 - `peers` merges entries by `peers[].id`; optional fields not present stay unchanged. Transport exclusivity (exactly one of `peers[].h3` or `peers[].bare`) still applies after the merge.
 - Use `null` to remove optional transport blocks (`peers[].h3` or `peers[].bare`); other fields clear only when explicitly overwritten.
 - Route refresh is zero-downtime: internal route tables update atomically; existing traffic to removed peers drains naturally; system route updates are applied without intentional interruption but may not be atomic.
-- If an update payload includes `peers[].h3.endpoints` or `peers[].h3.bindifs`, h3llo deduplicates endpoints, re-resolves DNS, and rebuilds the full connection set across DNS answers, endpoints, and bindifs. Existing traffic keeps flowing until new connections are ready; TUN traffic then follows the earliest-established valid connection.
+- If an update payload includes `peers[].h3.endpoints` or `peers[].h3.bindifs`, h3llo deduplicates endpoints, re-resolves DNS, and rebuilds the full connection set across DNS answers, endpoints, and provided bindifs (auto-detected bindif yields at most one entry when unspecified). Existing traffic keeps flowing until new connections are ready; TUN traffic then follows the earliest-established valid connection.
 - If an update payload includes `peers[].bare.endpoint` or DNS refresh changes its answers, the BareUDP source-IP filter refreshes with the full answer set, warns when multiple answers exist, picks the first for outbound, and re-probes interfaces and sockets when the chosen IP changes.
 - `POST` payloads containing top-level keys outside `local` (with only `h3.secret` / `h3.admin`) and `peers` are rejected with `400 Bad Request`.
 
