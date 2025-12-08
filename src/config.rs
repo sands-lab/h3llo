@@ -43,11 +43,11 @@ pub struct Local {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalH3 {
     /// HTTP/3 listen address (scheme/host/port/path); required when HTTP/3 is configured.
-    pub listen: Option<String>,
+    pub listen: String,
     /// Certificate path for QUIC/TLS; required when HTTP/3 is configured.
-    pub cert: Option<String>,
+    pub cert: String,
     /// Private key path for QUIC/TLS; required when HTTP/3 is configured.
-    pub key: Option<String>,
+    pub key: String,
     /// Optional control-plane credentials scoped to HTTP/3.
     pub admin: Option<LocalAdmin>,
 }
@@ -65,7 +65,7 @@ pub struct LocalAdmin {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalBare {
     /// BareUDP listen address (required when BareUDP is configured).
-    pub listen: Option<String>,
+    pub listen: String,
 }
 
 /// DNS resolver settings for the local node.
@@ -136,7 +136,7 @@ pub struct PeerH3 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerBare {
     /// BareUDP dialing endpoint (required when BareUDP is configured).
-    pub endpoint: Option<String>,
+    pub endpoint: String,
     /// Optional interface binding for BareUDP dialing.
     pub bindif: Option<String>,
 }
@@ -272,30 +272,19 @@ impl Config {
         }
 
         let h3 = self.local.h3.as_ref();
-        let has_h3_listener = h3
-            .and_then(|h3| h3.listen.as_ref())
-            .map(|listen| !listen.trim().is_empty())
-            .unwrap_or(false);
+        let has_h3_listener = h3.map(|h3| !h3.listen.trim().is_empty()).unwrap_or(false);
 
         if let Some(h3) = h3 {
             if !has_h3_listener {
                 errors.push(ValidationError::LocalH3MissingListen);
             }
 
-            let has_cert = h3
-                .cert
-                .as_ref()
-                .map(|cert| !cert.trim().is_empty())
-                .unwrap_or(false);
+            let has_cert = !h3.cert.trim().is_empty();
             if !has_cert {
                 errors.push(ValidationError::LocalH3MissingCert);
             }
 
-            let has_key = h3
-                .key
-                .as_ref()
-                .map(|key| !key.trim().is_empty())
-                .unwrap_or(false);
+            let has_key = !h3.key.trim().is_empty();
             if !has_key {
                 errors.push(ValidationError::LocalH3MissingKey);
             }
@@ -311,11 +300,7 @@ impl Config {
         }
 
         if let Some(bare) = self.local.bare.as_ref() {
-            let has_bare_listener = bare
-                .listen
-                .as_ref()
-                .map(|listen| !listen.trim().is_empty())
-                .unwrap_or(false);
+            let has_bare_listener = !bare.listen.trim().is_empty();
             if !has_bare_listener {
                 errors.push(ValidationError::LocalBareMissingListen);
             }
@@ -374,7 +359,7 @@ impl Config {
                 }
                 (Some(_), None) => {}
                 (None, Some(bare)) => {
-                    if bare.endpoint.as_ref().map(String::is_empty).unwrap_or(true) {
+                    if bare.endpoint.trim().is_empty() {
                         errors.push(ValidationError::PeerBareMissingEndpoint {
                             peer_id: peer.id.clone(),
                         });
@@ -507,9 +492,9 @@ mod tests {
                     bindif: None,
                 },
                 h3: Some(LocalH3 {
-                    listen: Some("https://[::]:443/path".to_string()),
-                    cert: Some("./cert.pem".to_string()),
-                    key: Some("./key.pem".to_string()),
+                    listen: "https://[::]:443/path".to_string(),
+                    cert: "./cert.pem".to_string(),
+                    key: "./key.pem".to_string(),
                     admin: Some(LocalAdmin {
                         name: "admin-username".to_string(),
                         pass: "admin-password".to_string(),
@@ -563,7 +548,7 @@ mod tests {
     fn rejects_missing_admin_listener() {
         let mut config = sample_h3_config();
         if let Some(h3) = config.local.h3.as_mut() {
-            h3.listen = None;
+            h3.listen.clear();
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
@@ -576,9 +561,9 @@ mod tests {
     fn rejects_missing_required_local_h3_fields() {
         let mut config = sample_h3_config();
         config.local.h3 = Some(LocalH3 {
-            listen: None,
-            cert: None,
-            key: None,
+            listen: String::new(),
+            cert: String::new(),
+            key: String::new(),
             admin: None,
         });
         let err = config.validate().unwrap_err();
@@ -611,7 +596,9 @@ mod tests {
     fn rejects_missing_local_bare_listener() {
         let mut config = sample_h3_config();
         config.local.h3 = None;
-        config.local.bare = Some(LocalBare { listen: None });
+        config.local.bare = Some(LocalBare {
+            listen: String::new(),
+        });
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
@@ -623,7 +610,7 @@ mod tests {
     fn rejects_peer_transport_conflict() {
         let mut config = sample_h3_config();
         config.peers[0].bare = Some(PeerBare {
-            endpoint: Some("udp://peer.example.com:6635".to_string()),
+            endpoint: "udp://peer.example.com:6635".to_string(),
             bindif: None,
         });
         let err = config.validate().unwrap_err();
@@ -638,7 +625,7 @@ mod tests {
         let mut config = sample_h3_config();
         config.peers[0].h3 = None;
         config.peers[0].bare = Some(PeerBare {
-            endpoint: None,
+            endpoint: String::new(),
             bindif: None,
         });
         let err = config.validate().unwrap_err();

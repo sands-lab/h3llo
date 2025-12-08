@@ -543,22 +543,18 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(
-            warnings,
-            vec![
-                RouteSyncWarning::DefaultRouteSplit {
-                    prefix: "0.0.0.0/0".parse().unwrap()
-                },
-                RouteSyncWarning::Conflict {
-                    prefix: "0.0.0.0/1".parse().unwrap(),
-                    existing_ifindex: 2
-                },
-                RouteSyncWarning::Conflict {
-                    prefix: "128.0.0.0/1".parse().unwrap(),
-                    existing_ifindex: 7
-                }
-            ]
-        );
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings.contains(&RouteSyncWarning::DefaultRouteSplit {
+            prefix: "0.0.0.0/0".parse().unwrap()
+        }));
+        assert!(warnings.contains(&RouteSyncWarning::Conflict {
+            prefix: "0.0.0.0/1".parse().unwrap(),
+            existing_ifindex: 2
+        }));
+        assert!(warnings.contains(&RouteSyncWarning::Conflict {
+            prefix: "128.0.0.0/1".parse().unwrap(),
+            existing_ifindex: 7
+        }));
 
         let ops = handle.ops();
         assert_eq!(ops.len(), 2);

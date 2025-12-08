@@ -171,7 +171,7 @@ mod tests {
             enabled,
             h3: None,
             bare: Some(PeerBare {
-                endpoint: Some("udp://127.0.0.1:5353".to_string()),
+                endpoint: "udp://127.0.0.1:5353".to_string(),
                 bindif: None,
             }),
             tun: PeerTun {
