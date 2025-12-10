@@ -1,298 +1,536 @@
-use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+//! DNS resolver coroutine: consumes resolve commands, processes UDP responses, retries on timeout, and emits events.
 
 use crate::bind::{BindWarning, RouteProbe};
 use crate::config::{parse_dns_server_uri, LocalDns};
+use crate::events::{
+    DnsAnswer, DnsAnswerWarning, DnsEvent, DnsEventDetail, DnsRecordType, DnsTimeout,
+    DnsUnexpected, DnsUnexpectedKind, Event,
+};
 use crate::udp::bind_socket;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use rand::Rng;
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time;
 
-/// Performs DNS resolution over UDP sockets bound to the chosen interface.
-#[derive(Debug, Clone)]
-pub struct DnsResolver {
-    server: SocketAddr,
-    timeout: Duration,
-}
+const DNS_BUFFER_SIZE: usize = 1500;
+const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
-impl DnsResolver {
-    /// Creates a resolver targeting `server` with the provided timeout.
-    pub fn new(server: SocketAddr, timeout: Duration) -> Self {
-        Self { server, timeout }
-    }
-
-    /// Builds a resolver from `local_dns` configuration, parsing the UDP URI.
-    pub fn from_config(local_dns: &LocalDns, timeout: Duration) -> Result<Self, ResolveInitError> {
-        let server =
-            parse_dns_server_uri(&local_dns.server).map_err(ResolveInitError::InvalidServer)?;
-        Ok(Self::new(server, timeout))
-    }
-
-    /// Resolves `hosts` sequentially using a socket bound according to `bind_interface`.
-    ///
-    /// The resolver probes outbound interfaces toward the DNS server IP before socket creation;
-    /// when probing yields zero or multiple interfaces it emits warnings and chooses the first (if any).
-    pub async fn resolve_hosts<P: RouteProbe>(
-        &self,
-        hosts: &[String],
-        bind_interface: Option<&str>,
-        tun_if: Option<&str>,
-        probe: &P,
-    ) -> ResolveOutcome {
-        let (socket, warnings) = match self.prepare_socket(bind_interface, tun_if, probe).await {
-            Ok(pair) => pair,
-            Err(err) => {
-                return ResolveOutcome {
-                    records: HashMap::new(),
-                    errors: vec![err],
-                    warnings: Vec::new(),
-                };
-            }
-        };
-
-        let mut records = HashMap::new();
-        let mut errors = Vec::new();
-
-        for host in hosts {
-            match self.resolve_single(&socket, host).await {
-                Ok(ips) => {
-                    if !ips.is_empty() {
-                        records.insert(host.clone(), ips);
-                    }
-                }
-                Err(err) => errors.push(err),
-            }
-        }
-
-        ResolveOutcome {
-            records,
-            errors,
-            warnings,
-        }
-    }
-
-    /// Prepares and connects the UDP socket while capturing bind warnings.
-    async fn prepare_socket<P: RouteProbe>(
-        &self,
-        bind_interface: Option<&str>,
-        tun_if: Option<&str>,
-        probe: &P,
-    ) -> Result<(UdpSocket, Vec<DnsWarning>), ResolveError> {
-        let bind_addr: SocketAddr = match self.server {
-            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
-            SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
-        };
-
-        let (socket, bind_warnings) =
-            bind_socket(bind_addr, bind_interface, self.server.ip(), tun_if, probe)
-                .await
-                .map_err(|e| ResolveError::Resolver {
-                    error: e.to_string(),
-                })?;
-        let warnings: Vec<DnsWarning> = bind_warnings.into_iter().map(DnsWarning::Bind).collect();
-
-        socket
-            .connect(self.server)
-            .await
-            .map_err(|e| ResolveError::Resolver {
-                error: e.to_string(),
-            })?;
-
-        Ok((socket, warnings))
-    }
-
-    async fn resolve_single(
-        &self,
-        socket: &UdpSocket,
-        host: &str,
-    ) -> Result<Vec<IpAddr>, ResolveError> {
-        let name = Name::from_ascii(host).map_err(|e| ResolveError::InvalidHost {
-            host: host.to_string(),
-            error: e.to_string(),
-        })?;
-
-        let mut ips = Vec::new();
-
-        for record_type in [RecordType::A, RecordType::AAAA] {
-            let mut result = self.query(socket, host, &name, record_type).await?;
-            ips.append(&mut result);
-        }
-
-        Ok(dedup_ips(ips))
-    }
-
-    async fn query(
-        &self,
-        socket: &UdpSocket,
-        host: &str,
-        name: &Name,
-        record_type: RecordType,
-    ) -> Result<Vec<IpAddr>, ResolveError> {
-        let mut message = Message::new();
-        let id = rand::rng().random::<u16>();
-        message.set_id(id);
-        message.set_message_type(MessageType::Query);
-        message.set_op_code(OpCode::Query);
-        message.set_recursion_desired(true);
-        message.add_query(record_type_query(name.clone(), record_type));
-
-        let outbound = message.to_vec().map_err(|e| ResolveError::QueryFailed {
-            host: host.to_string(),
-            error: e.to_string(),
-        })?;
-
-        let mut inbound = vec![0u8; 1500];
-        let send_recv = async {
-            socket
-                .send(&outbound)
-                .await
-                .map_err(|e| ResolveError::QueryFailed {
-                    host: host.to_string(),
-                    error: e.to_string(),
-                })?;
-            let len = socket
-                .recv(&mut inbound)
-                .await
-                .map_err(|e| ResolveError::QueryFailed {
-                    host: host.to_string(),
-                    error: e.to_string(),
-                })?;
-            Ok(len)
-        };
-
-        let len = match time::timeout(self.timeout, send_recv).await {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(ResolveError::Timeout {
-                    host: host.to_string(),
-                })
-            }
-        };
-
-        let response =
-            Message::from_vec(&inbound[..len]).map_err(|e| ResolveError::QueryFailed {
-                host: host.to_string(),
-                error: e.to_string(),
-            })?;
-
-        if response.id() != id {
-            return Err(ResolveError::QueryFailed {
-                host: host.to_string(),
-                error: "response id mismatch".to_string(),
-            });
-        }
-
-        if response.response_code() != ResponseCode::NoError {
-            return Err(ResolveError::QueryFailed {
-                host: host.to_string(),
-                error: format!("dns error: {:?}", response.response_code()),
-            });
-        }
-
-        let mut ips = Vec::new();
-        for answer in response.answers() {
-            match answer.data() {
-                RData::A(addr) if record_type == RecordType::A => {
-                    ips.push(IpAddr::V4(ipv4_from_rdata(addr)));
-                }
-                RData::AAAA(addr) if record_type == RecordType::AAAA => {
-                    ips.push(IpAddr::V6(ipv6_from_rdata(addr)));
-                }
-                _ => {}
-            }
-        }
-
-        Ok(ips)
-    }
-}
-
-fn record_type_query(name: Name, record_type: RecordType) -> Query {
-    let mut query = Query::new();
-    query.set_name(name);
-    query.set_query_type(record_type);
-    query
-}
-
-fn dedup_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for ip in ips {
-        if seen.insert(ip) {
-            out.push(ip);
-        }
-    }
-    out
-}
-
-fn ipv4_from_rdata(data: &hickory_proto::rr::rdata::A) -> Ipv4Addr {
-    data.0
-}
-
-fn ipv6_from_rdata(data: &hickory_proto::rr::rdata::AAAA) -> Ipv6Addr {
-    data.0
-}
-
-/// Tracks the result of DNS resolution attempts.
+/// Commands accepted by the DNS resolver coroutine.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolveOutcome {
-    /// Latest answers per host (empty when a host failed).
-    pub records: HashMap<String, Vec<IpAddr>>,
-    /// Errors encountered during resolution.
-    pub errors: Vec<ResolveError>,
-    /// Warnings about binding or platform limitations.
-    pub warnings: Vec<DnsWarning>,
+pub enum DnsCommand {
+    /// Resolve the provided hostname by sending A and AAAA queries.
+    Resolve { host: String },
 }
 
-/// Describes DNS resolution errors.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum ResolveError {
-    /// DNS resolver socket could not be prepared.
-    #[error("dns resolver failed to initialize: {error}")]
-    Resolver { error: String },
-    /// Hostname was not valid.
-    #[error("invalid host {host}: {error}")]
-    InvalidHost { host: String, error: String },
-    /// DNS exchange failed.
-    #[error("failed to resolve {host}: {error}")]
-    QueryFailed { host: String, error: String },
-    /// DNS response timed out.
-    #[error("dns query for {host} timed out")]
-    Timeout { host: String },
-}
-
-/// Captures warnings raised during DNS resolution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DnsWarning {
-    /// Binding decision emitted a warning.
-    Bind(BindWarning),
-}
-
-/// Describes resolver construction errors.
+/// Describes resolver initialization failures.
 #[derive(Debug, Error)]
 pub enum ResolveInitError {
     /// DNS server URI could not be parsed.
     #[error("invalid dns server: {0}")]
     InvalidServer(String),
+    /// DNS socket could not be prepared.
+    #[error("dns resolver failed to initialize: {0}")]
+    Socket(String),
+}
+
+/// Configures and spawns the DNS resolver coroutine.
+#[derive(Debug, Clone)]
+pub struct DnsResolver {
+    server: SocketAddr,
+    bind_interface: Option<String>,
+    tun_if: Option<String>,
+    timeout: Duration,
+}
+
+impl DnsResolver {
+    /// Creates a resolver targeting `server`, binding to `bind_interface`, and using `timeout`.
+    pub fn new(
+        server: SocketAddr,
+        bind_interface: Option<String>,
+        tun_if: Option<String>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            server,
+            bind_interface,
+            tun_if,
+            timeout,
+        }
+    }
+
+    /// Builds a resolver from configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResolveInitError::InvalidServer` when `local_dns.server` is malformed.
+    pub fn from_config(
+        local_dns: &LocalDns,
+        tun_if: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self, ResolveInitError> {
+        let server =
+            parse_dns_server_uri(&local_dns.server).map_err(ResolveInitError::InvalidServer)?;
+        Ok(Self::new(server, local_dns.bindif.clone(), tun_if, timeout))
+    }
+
+    /// Spawns the DNS resolver coroutine, returning its join handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResolveInitError::Socket` when socket creation, binding, or connection fails.
+    pub async fn spawn<P: RouteProbe + Send + Sync + 'static>(
+        self,
+        probe: P,
+        commands: mpsc::Receiver<DnsCommand>,
+        events_tx: mpsc::Sender<Event>,
+    ) -> Result<JoinHandle<()>, ResolveInitError> {
+        let (socket, bind_warnings) = self.prepare_socket(&probe).await?;
+        let mut task = ResolverTask::new(self.server, self.timeout, commands, events_tx, socket);
+
+        let handle = tokio::spawn(async move {
+            task.emit_bind_warnings(bind_warnings).await;
+            task.run().await;
+        });
+
+        Ok(handle)
+    }
+
+    /// Prepares and connects a UDP socket to the DNS server.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResolveInitError::Socket` when binding or connecting fails.
+    async fn prepare_socket<P: RouteProbe>(
+        &self,
+        probe: &P,
+    ) -> Result<(UdpSocket, Vec<BindWarning>), ResolveInitError> {
+        let bind_addr: SocketAddr = match self.server {
+            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
+        };
+
+        let (socket, warnings) = bind_socket(
+            bind_addr,
+            self.bind_interface.as_deref(),
+            self.server.ip(),
+            self.tun_if.as_deref(),
+            probe,
+        )
+        .await
+        .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
+
+        socket
+            .connect(self.server)
+            .await
+            .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
+
+        Ok((socket, warnings))
+    }
+}
+
+/// Tracks outstanding DNS queries by transaction ID.
+#[derive(Debug, Clone)]
+struct PendingRequest {
+    host: String,
+    record_type: DnsRecordType,
+    last_sent: Instant,
+}
+
+/// Drives the DNS resolver coroutine.
+struct ResolverTask {
+    server: SocketAddr,
+    socket: UdpSocket,
+    timeout: Duration,
+    commands: mpsc::Receiver<DnsCommand>,
+    events_tx: mpsc::Sender<Event>,
+    pending: HashMap<u16, PendingRequest>,
+    commands_closed: bool,
+}
+
+impl ResolverTask {
+    /// Constructs a resolver task with the provided socket and channels.
+    fn new(
+        server: SocketAddr,
+        timeout: Duration,
+        commands: mpsc::Receiver<DnsCommand>,
+        events_tx: mpsc::Sender<Event>,
+        socket: UdpSocket,
+    ) -> Self {
+        Self {
+            server,
+            socket,
+            timeout,
+            commands,
+            events_tx,
+            pending: HashMap::new(),
+            commands_closed: false,
+        }
+    }
+
+    /// Emits binding warnings as DNS events.
+    async fn emit_bind_warnings(&mut self, warnings: Vec<BindWarning>) {
+        for warning in warnings {
+            let event = Event::Dns(DnsEvent {
+                server: self.server,
+                detail: DnsEventDetail::BindWarning(warning),
+            });
+            if self.events_tx.send(event).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Runs the resolver loop with select over commands, UDP socket, and timer ticks.
+    async fn run(&mut self) {
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+        let mut ticker = time::interval(TICK_INTERVAL);
+
+        loop {
+            tokio::select! {
+                maybe_cmd = self.commands.recv() => self.handle_command(maybe_cmd).await,
+                result = self.socket.recv(&mut buf) => self.handle_recv(result, &buf).await,
+                _ = ticker.tick() => self.handle_tick().await,
+            }
+
+            if self.commands_closed && self.pending.is_empty() {
+                break;
+            }
+        }
+    }
+
+    /// Handles commands from the orchestrator queue.
+    async fn handle_command(&mut self, command: Option<DnsCommand>) {
+        match command {
+            Some(DnsCommand::Resolve { host }) => {
+                self.issue_query(host.clone(), DnsRecordType::A).await;
+                self.issue_query(host, DnsRecordType::Aaaa).await;
+            }
+            None => {
+                self.commands_closed = true;
+            }
+        }
+    }
+
+    /// Issues a query for `host` and `record_type`, emitting a send-failure event on error.
+    async fn issue_query(&mut self, host: String, record_type: DnsRecordType) {
+        if let Err(err) = self.send_query(host.clone(), record_type).await {
+            self.emit_unexpected(
+                None,
+                Some(host),
+                Some(record_type),
+                DnsUnexpectedKind::SendFailed(err),
+            )
+            .await;
+        }
+    }
+
+    /// Sends a DNS query packet and records it as pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when query construction or send fails.
+    async fn send_query(&mut self, host: String, record_type: DnsRecordType) -> Result<(), String> {
+        let name = Name::from_ascii(&host).map_err(|e| e.to_string())?;
+
+        let mut message = Message::new();
+        let id = self.allocate_id();
+        message.set_id(id);
+        message.set_message_type(MessageType::Query);
+        message.set_op_code(OpCode::Query);
+        message.set_recursion_desired(true);
+        message.add_query(record_type_query(name, record_type));
+
+        let outbound = message.to_vec().map_err(|e| e.to_string())?;
+        self.socket
+            .send(&outbound)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        self.pending.insert(
+            id,
+            PendingRequest {
+                host,
+                record_type,
+                last_sent: Instant::now(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Allocates a transaction ID unique among current pending requests.
+    fn allocate_id(&self) -> u16 {
+        loop {
+            let candidate = rand::rng().random::<u16>();
+            if !self.pending.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Handles UDP socket reads and dispatches decoded packets.
+    async fn handle_recv(&mut self, result: io::Result<usize>, buf: &[u8]) {
+        let len = match result {
+            Ok(len) if len > 0 => len,
+            Ok(_) => return,
+            Err(_) => return,
+        };
+
+        let data = &buf[..len];
+        self.handle_packet(data).await;
+    }
+
+    /// Parses a DNS packet and emits the corresponding event.
+    async fn handle_packet(&mut self, data: &[u8]) {
+        let message = match Message::from_vec(data) {
+            Ok(msg) => msg,
+            Err(err) => {
+                self.emit_unexpected(
+                    None,
+                    None,
+                    None,
+                    DnsUnexpectedKind::DecodeFailed(err.to_string()),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let id = message.id();
+        if let Some(request) = self.pending.remove(&id) {
+            self.handle_decoded_packet(message, request).await;
+        } else {
+            let record_type = message
+                .queries()
+                .first()
+                .map(|q| DnsRecordType::from(q.query_type()));
+            self.emit_unexpected(
+                Some(id),
+                None,
+                record_type,
+                DnsUnexpectedKind::UnknownTransaction,
+            )
+            .await;
+        }
+    }
+
+    /// Handles a parsed DNS packet that matches a pending request.
+    async fn handle_decoded_packet(&mut self, message: Message, request: PendingRequest) {
+        let warnings = response_warnings(&message);
+        let addresses = extract_addresses(&message, request.record_type);
+
+        if message.response_code() == ResponseCode::NoError && addresses.is_empty() {
+            if let Some(unexpected_type) = first_nonmatching_answer(&message, request.record_type) {
+                self.emit_unexpected(
+                    Some(message.id()),
+                    Some(request.host),
+                    Some(request.record_type),
+                    DnsUnexpectedKind::UnexpectedRecordType(unexpected_type),
+                )
+                .await;
+                return;
+            }
+        }
+
+        let event = Event::Dns(DnsEvent {
+            server: self.server,
+            detail: DnsEventDetail::Answer(DnsAnswer {
+                host: request.host,
+                record_type: request.record_type,
+                addresses,
+                warnings,
+            }),
+        });
+
+        let _ = self.events_tx.send(event).await;
+    }
+
+    /// Handles timer ticks by retrying timed-out pending queries.
+    async fn handle_tick(&mut self) {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+
+        for (id, req) in &self.pending {
+            if now.duration_since(req.last_sent) >= self.timeout {
+                expired.push((*id, req.clone()));
+            }
+        }
+
+        for (id, request) in expired {
+            self.pending.remove(&id);
+            self.emit_timeout(&request).await;
+            if let Err(err) = self
+                .send_query(request.host.clone(), request.record_type)
+                .await
+            {
+                self.emit_unexpected(
+                    None,
+                    Some(request.host),
+                    Some(request.record_type),
+                    DnsUnexpectedKind::SendFailed(err),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Emits an unexpected event.
+    async fn emit_unexpected(
+        &mut self,
+        id: Option<u16>,
+        host: Option<String>,
+        record_type: Option<DnsRecordType>,
+        warning: DnsUnexpectedKind,
+    ) {
+        let event = Event::Dns(DnsEvent {
+            server: self.server,
+            detail: DnsEventDetail::Unexpected(DnsUnexpected {
+                id,
+                host,
+                record_type,
+                warning,
+            }),
+        });
+        let _ = self.events_tx.send(event).await;
+    }
+
+    /// Emits a timeout event.
+    async fn emit_timeout(&mut self, request: &PendingRequest) {
+        let event = Event::Dns(DnsEvent {
+            server: self.server,
+            detail: DnsEventDetail::Timeout(DnsTimeout {
+                host: request.host.clone(),
+                record_type: request.record_type,
+            }),
+        });
+        let _ = self.events_tx.send(event).await;
+    }
+}
+
+/// Builds a query for `name` and `record_type`.
+fn record_type_query(name: Name, record_type: DnsRecordType) -> Query {
+    let mut query = Query::new();
+    query.set_name(name);
+    if let Some(rt) = to_record_type(record_type) {
+        query.set_query_type(rt);
+    }
+    query
+}
+
+/// Converts a `DnsRecordType` into Hickory's `RecordType`.
+fn to_record_type(record_type: DnsRecordType) -> Option<RecordType> {
+    match record_type {
+        DnsRecordType::A => Some(RecordType::A),
+        DnsRecordType::Aaaa => Some(RecordType::AAAA),
+        DnsRecordType::Other(_) => None,
+    }
+}
+
+/// Extracts answers matching `expected` from the DNS response.
+fn extract_addresses(message: &Message, expected: DnsRecordType) -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    let mut seen = HashSet::new();
+
+    for answer in message.answers() {
+        match answer.data() {
+            RData::A(addr) if expected == DnsRecordType::A => {
+                let ip = IpAddr::V4(ipv4_from_rdata(addr));
+                if seen.insert(ip) {
+                    ips.push(ip);
+                }
+            }
+            RData::AAAA(addr) if expected == DnsRecordType::Aaaa => {
+                let ip = IpAddr::V6(ipv6_from_rdata(addr));
+                if seen.insert(ip) {
+                    ips.push(ip);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    ips
+}
+
+/// Finds the first answer whose record type does not match `expected`.
+fn first_nonmatching_answer(message: &Message, expected: DnsRecordType) -> Option<DnsRecordType> {
+    for answer in message.answers() {
+        let record_type = DnsRecordType::from(answer.record_type());
+        if record_type != expected {
+            return Some(record_type);
+        }
+    }
+    None
+}
+
+/// Collects warnings from the DNS response code and flags.
+fn response_warnings(message: &Message) -> Vec<DnsAnswerWarning> {
+    let mut warnings = Vec::new();
+    match message.response_code() {
+        ResponseCode::NoError => {}
+        ResponseCode::NXDomain => warnings.push(DnsAnswerWarning::NxDomain),
+        ResponseCode::Refused => warnings.push(DnsAnswerWarning::Refused),
+        other => warnings.push(DnsAnswerWarning::ResponseCode(format!("{other:?}"))),
+    }
+
+    if message.truncated() {
+        warnings.push(DnsAnswerWarning::Truncated);
+    }
+
+    if !message.recursion_available() {
+        warnings.push(DnsAnswerWarning::RecursionUnavailable);
+    }
+
+    warnings
+}
+
+/// Converts Hickory's IPv4 RDATA to `Ipv4Addr`.
+fn ipv4_from_rdata(data: &hickory_proto::rr::rdata::A) -> std::net::Ipv4Addr {
+    data.0
+}
+
+/// Converts Hickory's IPv6 RDATA to `Ipv6Addr`.
+fn ipv6_from_rdata(data: &hickory_proto::rr::rdata::AAAA) -> std::net::Ipv6Addr {
+    data.0
+}
+
+impl From<RecordType> for DnsRecordType {
+    /// Converts Hickory's `RecordType` into the resolver-specific representation.
+    fn from(value: RecordType) -> Self {
+        match value {
+            RecordType::A => DnsRecordType::A,
+            RecordType::AAAA => DnsRecordType::Aaaa,
+            other => DnsRecordType::Other(u16::from(other)),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bind::RouteProbeError;
-    use hickory_proto::rr::rdata::{A, AAAA};
+    use hickory_proto::rr::rdata::{A, AAAA, TXT};
     use hickory_proto::rr::Record;
-    use tokio::net::UdpSocket;
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use std::net::Ipv6Addr;
 
+    /// Route probe stub for DNS tests.
     #[derive(Clone)]
     struct FakeRouteProbe {
         result: Result<Vec<String>, RouteProbeError>,
     }
 
     impl RouteProbe for FakeRouteProbe {
+        /// Returns the configured probe result.
         async fn probe_interfaces(
             &self,
             _target: &str,
@@ -302,107 +540,309 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn resolves_a_and_aaaa_records() {
-        let (server, handle) = start_dns_stub(
-            Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
-            Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-            2,
-        )
-        .await;
-
-        let resolver = DnsResolver::new(server, Duration::from_secs(1));
+    /// Starts a resolver coroutine wired to the provided server socket.
+    async fn start_resolver(
+        server: SocketAddr,
+        bindif: Option<String>,
+    ) -> (
+        mpsc::Sender<DnsCommand>,
+        mpsc::Receiver<Event>,
+        JoinHandle<()>,
+    ) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let resolver = DnsResolver::new(server, bindif, None, Duration::from_millis(50));
         let probe = FakeRouteProbe {
             result: Ok(Vec::new()),
         };
-        let outcome = resolver
-            .resolve_hosts(&vec!["example.com".to_string()], None, None, &probe)
-            .await;
+        let handle = resolver
+            .spawn(probe, cmd_rx, event_tx)
+            .await
+            .expect("resolver spawn");
 
-        assert!(outcome.errors.is_empty());
-        let ips = outcome
-            .records
-            .get("example.com")
-            .cloned()
-            .unwrap_or_default();
-        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
-        assert!(ips.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert!(outcome
-            .warnings
-            .iter()
-            .any(|warn| matches!(warn, DnsWarning::Bind(BindWarning::Unbound { .. }))));
+        (cmd_tx, event_rx, handle)
+    }
+
+    /// Builds a DNS response message for the provided transaction ID.
+    fn build_response(
+        id: u16,
+        query: Query,
+        response_code: ResponseCode,
+        answers: Vec<Record>,
+    ) -> Vec<u8> {
+        let mut response = Message::new();
+        response.set_id(id);
+        response.set_message_type(MessageType::Response);
+        response.set_op_code(OpCode::Query);
+        response.set_response_code(response_code);
+        response.set_recursion_available(true);
+        response.add_query(query);
+        for answer in answers {
+            response.add_answer(answer);
+        }
+        response.to_vec().unwrap()
+    }
+
+    /// Receives the next DNS event detail, skipping bind warnings.
+    async fn next_relevant_detail(events_rx: &mut mpsc::Receiver<Event>) -> DnsEventDetail {
+        loop {
+            let event = events_rx.recv().await.expect("dns event");
+            if let Event::Dns(dns) = event {
+                match dns.detail {
+                    DnsEventDetail::BindWarning(_) => continue,
+                    detail => return detail,
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn emits_answers_with_warnings() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+
+        cmd_tx
+            .send(DnsCommand::Resolve {
+                host: "example.com".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+        let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+        let request = Message::from_vec(&buf[..len]).unwrap();
+        let query = request.queries().first().cloned().unwrap();
+        let response = build_response(
+            request.id(),
+            query.clone(),
+            ResponseCode::NXDomain,
+            vec![Record::from_rdata(
+                query.name().clone().into(),
+                60,
+                RData::A(A(Ipv4Addr::new(1, 1, 1, 1))),
+            )],
+        );
+        socket.send_to(&response, peer).await.unwrap();
+
+        let (len2, peer2) = socket.recv_from(&mut buf).await.unwrap();
+        let request2 = Message::from_vec(&buf[..len2]).unwrap();
+        let query2 = request2.queries().first().cloned().unwrap();
+        let response2 = build_response(
+            request2.id(),
+            query2.clone(),
+            ResponseCode::NoError,
+            vec![Record::from_rdata(
+                query2.name().clone().into(),
+                60,
+                RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
+            )],
+        );
+        socket.send_to(&response2, peer2).await.unwrap();
+
+        let detail = next_relevant_detail(&mut events_rx).await;
+        match detail {
+            DnsEventDetail::Answer(answer) => {
+                assert_eq!(answer.host, "example.com");
+                assert_eq!(answer.record_type, DnsRecordType::A);
+                assert!(answer.warnings.contains(&DnsAnswerWarning::NxDomain));
+                assert!(answer
+                    .addresses
+                    .contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+            }
+            _ => panic!("unexpected event"),
+        }
 
         handle.abort();
     }
 
     #[tokio::test]
-    async fn times_out_on_silent_server() {
+    async fn flags_unknown_transaction() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        // Drop the socket to leave an unresponsive endpoint.
-        drop(socket);
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
 
-        let resolver = DnsResolver::new(addr, Duration::from_millis(50));
-        let probe = FakeRouteProbe {
-            result: Ok(Vec::new()),
-        };
-        let outcome = resolver
-            .resolve_hosts(&vec!["example.com".to_string()], None, None, &probe)
-            .await;
-        assert_eq!(outcome.records.len(), 0);
-        assert!(!outcome.errors.is_empty());
+        cmd_tx
+            .send(DnsCommand::Resolve {
+                host: "unknown.test".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+        let (_len, peer) = socket.recv_from(&mut buf).await.unwrap();
+
+        let mut message = Message::new();
+        message.set_id(55);
+        message.set_message_type(MessageType::Response);
+        message.set_op_code(OpCode::Query);
+        message.set_response_code(ResponseCode::NoError);
+        message.add_query(record_type_query(
+            Name::from_ascii("example.com").unwrap(),
+            DnsRecordType::A,
+        ));
+
+        let outbound = message.to_vec().unwrap();
+        socket.send_to(&outbound, peer).await.unwrap();
+
+        let detail = next_relevant_detail(&mut events_rx).await;
+        match detail {
+            DnsEventDetail::Unexpected(DnsUnexpected {
+                warning: DnsUnexpectedKind::UnknownTransaction,
+                ..
+            }) => {}
+            _ => panic!("unexpected event"),
+        }
+
+        handle.abort();
     }
 
-    async fn start_dns_stub(
-        ipv4: Option<IpAddr>,
-        ipv6: Option<IpAddr>,
-        expected_queries: usize,
-    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    #[tokio::test]
+    async fn flags_decode_failures() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 1500];
-            for _ in 0..expected_queries {
-                if let Ok((len, peer)) = socket.recv_from(&mut buf).await {
-                    let request = Message::from_vec(&buf[..len]).unwrap();
-                    let mut response = Message::new();
-                    response.set_id(request.id());
-                    response.set_message_type(MessageType::Response);
-                    response.set_op_code(OpCode::Query);
-                    response.set_response_code(ResponseCode::NoError);
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
 
-                    for query in request.queries() {
-                        response.add_query(query.clone());
-                        match query.query_type() {
-                            RecordType::A => {
-                                if let Some(IpAddr::V4(ip)) = ipv4 {
-                                    response.add_answer(Record::from_rdata(
-                                        query.name().clone().into(),
-                                        60,
-                                        RData::A(A(ip)),
-                                    ));
-                                }
-                            }
-                            RecordType::AAAA => {
-                                if let Some(IpAddr::V6(ip)) = ipv6 {
-                                    response.add_answer(Record::from_rdata(
-                                        query.name().clone().into(),
-                                        60,
-                                        RData::AAAA(AAAA(ip)),
-                                    ));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+        cmd_tx
+            .send(DnsCommand::Resolve {
+                host: "decode.test".to_string(),
+            })
+            .await
+            .unwrap();
 
-                    if let Ok(out) = response.to_vec() {
-                        let _ = socket.send_to(&out, peer).await;
-                    }
-                }
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+        let (_len, peer) = socket.recv_from(&mut buf).await.unwrap();
+
+        socket.send_to(b"not-dns", peer).await.unwrap();
+
+        let detail = next_relevant_detail(&mut events_rx).await;
+        match detail {
+            DnsEventDetail::Unexpected(DnsUnexpected {
+                warning: DnsUnexpectedKind::DecodeFailed(_),
+                ..
+            }) => {}
+            _ => panic!("unexpected event"),
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn flags_unexpected_record_type() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+
+        cmd_tx
+            .send(DnsCommand::Resolve {
+                host: "txt.example".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+        let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+        let request = Message::from_vec(&buf[..len]).unwrap();
+        let query = request.queries().first().cloned().unwrap();
+        let response = build_response(
+            request.id(),
+            query,
+            ResponseCode::NoError,
+            vec![Record::from_rdata(
+                Name::from_ascii("txt.example").unwrap().into(),
+                60,
+                RData::TXT(TXT::new(vec!["hello".to_string()])),
+            )],
+        );
+        socket.send_to(&response, peer).await.unwrap();
+
+        let (len2, peer2) = socket.recv_from(&mut buf).await.unwrap();
+        let request2 = Message::from_vec(&buf[..len2]).unwrap();
+        let query2 = request2.queries().first().cloned().unwrap();
+        let response2 = build_response(
+            request2.id(),
+            query2.clone(),
+            ResponseCode::NoError,
+            vec![Record::from_rdata(
+                query2.name().clone().into(),
+                60,
+                RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
+            )],
+        );
+        socket.send_to(&response2, peer2).await.unwrap();
+
+        let detail = next_relevant_detail(&mut events_rx).await;
+        match detail {
+            DnsEventDetail::Unexpected(DnsUnexpected {
+                warning: DnsUnexpectedKind::UnexpectedRecordType(DnsRecordType::Other(16)),
+                host,
+                record_type,
+                ..
+            }) => {
+                assert_eq!(host.as_deref(), Some("txt.example"));
+                assert_eq!(record_type, Some(DnsRecordType::A));
             }
-        });
+            _ => panic!("unexpected event"),
+        }
 
-        (addr, handle)
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn retries_with_new_id_on_timeout() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+
+        cmd_tx
+            .send(DnsCommand::Resolve {
+                host: "timeout.example".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+        let mut first_ids: HashMap<DnsRecordType, u16> = HashMap::new();
+        for _ in 0..2 {
+            let (len, _peer) = socket.recv_from(&mut buf).await.unwrap();
+            let message = Message::from_vec(&buf[..len]).unwrap();
+            let query = message.queries().first().cloned().unwrap();
+            first_ids.insert(DnsRecordType::from(query.query_type()), message.id());
+        }
+
+        let detail1 = next_relevant_detail(&mut events_rx).await;
+        match detail1 {
+            DnsEventDetail::Timeout(timeout) => {
+                assert_eq!(timeout.host, "timeout.example");
+            }
+            _ => panic!("expected timeout event"),
+        }
+
+        let detail2 = next_relevant_detail(&mut events_rx).await;
+        match detail2 {
+            DnsEventDetail::Timeout(timeout) => {
+                assert_eq!(timeout.host, "timeout.example");
+            }
+            _ => panic!("expected timeout event"),
+        }
+
+        let mut retry_ids: HashMap<DnsRecordType, u16> = HashMap::new();
+        for _ in 0..2 {
+            let (len, _peer) = socket.recv_from(&mut buf).await.unwrap();
+            let message = Message::from_vec(&buf[..len]).unwrap();
+            let query = message.queries().first().cloned().unwrap();
+            retry_ids.insert(DnsRecordType::from(query.query_type()), message.id());
+        }
+
+        assert_ne!(
+            first_ids.get(&DnsRecordType::A),
+            retry_ids.get(&DnsRecordType::A)
+        );
+        assert_ne!(
+            first_ids.get(&DnsRecordType::Aaaa),
+            retry_ids.get(&DnsRecordType::Aaaa)
+        );
+
+        handle.abort();
     }
 }
