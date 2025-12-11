@@ -89,14 +89,14 @@ pub struct UdpCtx {
 /// - `context`: Bundled socket, MTU, and interface label.
 /// - `allowed_sources`: Initial allowed source IP set.
 /// - `allowed_updates`: Channel delivering full replacements for the allowed source set.
-/// - `outbound`: Channel to push accepted packets into.
+/// - `packet_tx`: Channel to push accepted packets into.
 /// - `events_tx`: Channel for emitting receive metrics.
 /// - `interval`: Metrics emission interval.
-pub fn spawn_receiver(
+pub fn spawn_udp_rx(
     context: UdpCtx,
     mut allowed_sources: HashSet<IpAddr>,
     mut allowed_updates: mpsc::Receiver<HashSet<IpAddr>>,
-    outbound: mpsc::Sender<Vec<u8>>,
+    packet_tx: mpsc::Sender<Vec<u8>>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
@@ -120,7 +120,7 @@ pub fn spawn_receiver(
                                 continue;
                             }
                             let packet = buf[..len].to_vec();
-                            if outbound.send(packet).await.is_err() {
+                            if packet_tx.send(packet).await.is_err() {
                                 break;
                             }
                             counters.record_success(len);
@@ -147,13 +147,13 @@ pub fn spawn_receiver(
 /// # Arguments
 /// - `context`: Bundled socket, MTU, and interface label.
 /// - `destination`: Remote peer socket address.
-/// - `inbound`: Channel supplying packets to send.
+/// - `packet_rx`: Channel supplying packets to send.
 /// - `events_tx`: Channel for emitting transmit metrics.
 /// - `interval`: Metrics emission interval.
-pub fn spawn_sender(
+pub fn spawn_udp_tx(
     context: UdpCtx,
     destination: SocketAddr,
-    mut inbound: mpsc::Receiver<Vec<u8>>,
+    mut packet_rx: mpsc::Receiver<Vec<u8>>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
@@ -166,7 +166,7 @@ pub fn spawn_sender(
 
         loop {
             tokio::select! {
-                maybe_packet = inbound.recv() => {
+                maybe_packet = packet_rx.recv() => {
                     let packet = match maybe_packet {
                         Some(packet) => packet,
                         None => break,
@@ -197,7 +197,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn selects_destination_and_flags_multiple_answers() {
+    fn udp_selects_destination_and_flags_multiple_answers() {
         let endpoints = vec![
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 6635)),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 6635)),
@@ -217,14 +217,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receiver_filters_disallowed_sources() {
+    async fn udp_rx_filters_disallowed_sources() {
         let (socket, addr) = {
             let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = sock.local_addr().unwrap();
             (sock, addr)
         };
 
-        let (tx, mut rx) = mpsc::channel(4);
+        let (packet_tx, mut packet_rx) = mpsc::channel(4);
         let allowed = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))]);
         let (_allow_tx, allowed_updates) = mpsc::channel(1);
         let (events_tx, mut _events_rx) = mpsc::channel(4);
@@ -233,11 +233,11 @@ mod tests {
             mtu: 64,
             iface: "bare0".to_string(),
         };
-        let handle = spawn_receiver(
+        let handle = spawn_udp_rx(
             context,
             allowed,
             allowed_updates,
-            tx,
+            packet_tx,
             events_tx,
             Duration::from_millis(200),
         );
@@ -249,21 +249,21 @@ mod tests {
             .expect("send should succeed");
 
         // Packet should be dropped because source IP is not allowed.
-        let result = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        let result = tokio::time::timeout(Duration::from_millis(50), packet_rx.recv()).await;
         assert!(result.is_err(), "no packet should be delivered");
 
         handle.abort();
     }
 
     #[tokio::test]
-    async fn receiver_updates_allowed_sources() {
+    async fn udp_rx_updates_allowed_sources() {
         let (socket, addr) = {
             let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = sock.local_addr().unwrap();
             (sock, addr)
         };
 
-        let (tx, mut rx) = mpsc::channel(4);
+        let (packet_tx, mut packet_rx) = mpsc::channel(4);
         let (update_tx, allowed_updates) = mpsc::channel(1);
         let (events_tx, mut _events_rx) = mpsc::channel(4);
         let context = UdpCtx {
@@ -271,11 +271,11 @@ mod tests {
             mtu: 64,
             iface: "bare1".to_string(),
         };
-        let handle = spawn_receiver(
+        let handle = spawn_udp_rx(
             context,
             HashSet::new(),
             allowed_updates,
-            tx,
+            packet_tx,
             events_tx,
             Duration::from_millis(200),
         );
@@ -287,7 +287,7 @@ mod tests {
             .expect("initial send should succeed");
 
         // First packet should be dropped.
-        let first = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        let first = tokio::time::timeout(Duration::from_millis(50), packet_rx.recv()).await;
         assert!(
             first.is_err(),
             "no packet should be delivered before update"
@@ -303,7 +303,7 @@ mod tests {
             .await
             .expect("second send should succeed");
 
-        let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+        let second = tokio::time::timeout(Duration::from_millis(100), packet_rx.recv())
             .await
             .expect("packet should arrive after update")
             .expect("channel should carry packet");
@@ -313,21 +313,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sender_forwards_packets_to_destination() {
+    async fn udp_tx_forwards_packets_to_destination() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (tx, rx) = mpsc::channel(4);
+        let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut _events_rx) = mpsc::channel(4);
         let context = UdpCtx {
             socket: Arc::new(sender_socket),
             mtu: 64,
             iface: "bare2".to_string(),
         };
-        let handle = spawn_sender(context, dest, rx, events_tx, Duration::from_millis(200));
+        let handle = spawn_udp_tx(
+            context,
+            dest,
+            packet_rx,
+            events_tx,
+            Duration::from_millis(200),
+        );
 
-        tx.send(vec![9, 8, 7]).await.unwrap();
+        packet_tx.send(vec![9, 8, 7]).await.unwrap();
 
         let mut buf = vec![0u8; 64];
         let (len, _) = receiver
@@ -340,14 +346,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receiver_emits_metrics() {
+    async fn udp_rx_emits_metrics() {
         let (socket, addr) = {
             let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = sock.local_addr().unwrap();
             (sock, addr)
         };
 
-        let (tx, mut rx) = mpsc::channel(4);
+        let (packet_tx, mut packet_rx) = mpsc::channel(4);
         let (_update_tx, allowed_updates) = mpsc::channel(1);
         let (events_tx, mut events_rx) = mpsc::channel(4);
         let context = UdpCtx {
@@ -355,11 +361,11 @@ mod tests {
             mtu: 128,
             iface: "bare-metrics-rx".to_string(),
         };
-        let handle = spawn_receiver(
+        let handle = spawn_udp_rx(
             context,
             HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]),
             allowed_updates,
-            tx,
+            packet_tx,
             events_tx,
             Duration::from_millis(10),
         );
@@ -371,7 +377,7 @@ mod tests {
             .expect("send should succeed");
 
         // Drain the forwarded packet to avoid channel backpressure.
-        let forwarded = rx.recv().await.expect("packet should be forwarded");
+        let forwarded = packet_rx.recv().await.expect("packet should be forwarded");
         assert_eq!(forwarded, vec![1, 2, 3, 4]);
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
@@ -396,21 +402,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sender_emits_metrics() {
+    async fn udp_tx_emits_metrics() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (tx, rx) = mpsc::channel(4);
+        let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(4);
         let context = UdpCtx {
             socket: Arc::new(sender_socket),
             mtu: 64,
             iface: "bare-metrics-tx".to_string(),
         };
-        let handle = spawn_sender(context, dest, rx, events_tx, Duration::from_millis(10));
+        let handle = spawn_udp_tx(
+            context,
+            dest,
+            packet_rx,
+            events_tx,
+            Duration::from_millis(10),
+        );
 
-        tx.send(vec![5, 4, 3, 2]).await.unwrap();
+        packet_tx.send(vec![5, 4, 3, 2]).await.unwrap();
 
         let mut buf = vec![0u8; 16];
         let _ = receiver

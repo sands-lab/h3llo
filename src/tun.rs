@@ -173,11 +173,11 @@ fn parse_addrs(raw_addrs: &[String]) -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Tun
     Ok((v4, v6))
 }
 
-/// Spawns the TUN read loop, pushing packets into `outbound` with backpressure and emitting RX metrics.
+/// Spawns the TUN read loop, pushing packets into `packet_tx` with backpressure and emitting RX metrics.
 #[allow(dead_code)]
-pub(crate) fn spawn_reader<T: TunRx>(
+pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
-    outbound: mpsc::Sender<Vec<u8>>,
+    packet_tx: mpsc::Sender<Vec<u8>>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
@@ -197,7 +197,7 @@ pub(crate) fn spawn_reader<T: TunRx>(
                                 continue;
                             }
                             let packet = buf[..len].to_vec();
-                            if outbound.send(packet).await.is_err() {
+                            if packet_tx.send(packet).await.is_err() {
                                 break;
                             }
                             counters.record_success(len);
@@ -218,9 +218,9 @@ pub(crate) fn spawn_reader<T: TunRx>(
 
 /// Spawns the TUN write loop, dropping oversize packets with counting and emitting TX metrics.
 #[allow(dead_code)]
-pub(crate) fn spawn_writer<T: TunTx>(
+pub(crate) fn spawn_tun_tx<T: TunTx>(
     mut tun: T,
-    mut inbound: mpsc::Receiver<Vec<u8>>,
+    mut packet_rx: mpsc::Receiver<Vec<u8>>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
@@ -233,7 +233,7 @@ pub(crate) fn spawn_writer<T: TunTx>(
 
         loop {
             tokio::select! {
-                maybe_packet = inbound.recv() => {
+                maybe_packet = packet_rx.recv() => {
                     let packet = match maybe_packet {
                         Some(packet) => packet,
                         None => break,
@@ -283,28 +283,28 @@ mod tests {
     struct MemoryTunRx {
         name: String,
         mtu: usize,
-        inbound: mpsc::Receiver<Vec<u8>>,
+        packet_rx: mpsc::Receiver<Vec<u8>>,
     }
 
     struct MemoryTunTx {
         name: String,
         mtu: usize,
-        outbound: mpsc::Sender<Vec<u8>>,
+        packet_tx: mpsc::Sender<Vec<u8>>,
         send_errors: VecDeque<io::ErrorKind>,
     }
 
     fn memory_tun(name: &str, mtu: usize) -> (MemoryTunRx, MemoryTunTx) {
-        let (out_tx, out_rx) = mpsc::channel(4);
+        let (packet_tx, packet_rx) = mpsc::channel(4);
         (
             MemoryTunRx {
                 name: name.to_string(),
                 mtu,
-                inbound: out_rx,
+                packet_rx,
             },
             MemoryTunTx {
                 name: name.to_string(),
                 mtu,
-                outbound: out_tx,
+                packet_tx,
                 send_errors: VecDeque::new(),
             },
         )
@@ -315,17 +315,17 @@ mod tests {
         mtu: usize,
         send_errors: Vec<io::ErrorKind>,
     ) -> (MemoryTunRx, MemoryTunTx) {
-        let (out_tx, out_rx) = mpsc::channel(4);
+        let (packet_tx, packet_rx) = mpsc::channel(4);
         (
             MemoryTunRx {
                 name: name.to_string(),
                 mtu,
-                inbound: out_rx,
+                packet_rx,
             },
             MemoryTunTx {
                 name: name.to_string(),
                 mtu,
-                outbound: out_tx,
+                packet_tx,
                 send_errors: send_errors.into(),
             },
         )
@@ -341,7 +341,7 @@ mod tests {
         }
 
         async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            match self.inbound.recv().await {
+            match self.packet_rx.recv().await {
                 Some(packet) => {
                     let len = packet.len().min(buf.len());
                     buf[..len].copy_from_slice(&packet[..len]);
@@ -368,10 +368,10 @@ mod tests {
             if let Some(kind) = self.send_errors.pop_front() {
                 return Err(io::Error::new(kind, "injected send error"));
             }
-            self.outbound
+            self.packet_tx
                 .send(buf.to_vec())
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "outbound closed"))?;
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "packet_tx closed"))?;
             Ok(buf.len())
         }
     }
@@ -389,14 +389,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_pushes_packets_and_counts() {
+    async fn tun_rx_pushes_packets_and_counts() {
         let (rx_tun, mut tx_tun) = memory_tun("mem0", 32);
-        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let (packet_tx, mut packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
-        let reader = spawn_reader(rx_tun, out_tx, events_tx, Duration::from_millis(10));
+        let tun_rx_task = spawn_tun_rx(rx_tun, packet_tx, events_tx, Duration::from_millis(10));
 
         tx_tun.send(&[1, 2, 3]).await.unwrap();
-        let packet = out_rx.recv().await.expect("packet should be forwarded");
+        let packet = packet_rx.recv().await.expect("packet should be forwarded");
         assert_eq!(packet, vec![1, 2, 3]);
 
         let mut snapshot = None;
@@ -412,7 +412,7 @@ mod tests {
         })
         .await;
 
-        reader.abort();
+        tun_rx_task.abort();
 
         let metrics = snapshot.expect("rx metrics should arrive");
         assert_eq!(metrics.iface, "mem0");
@@ -421,14 +421,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_drops_oversize_and_reports_metrics() {
+    async fn tun_tx_drops_oversize_and_reports_metrics() {
         let (mut rx_tun, tx_tun) = memory_tun("mem1", 4);
-        let (tx, rx) = mpsc::channel(4);
+        let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
-        let writer = spawn_writer(tx_tun, rx, events_tx, Duration::from_millis(10));
+        let tun_tx_task = spawn_tun_tx(tx_tun, packet_rx, events_tx, Duration::from_millis(10));
 
-        tx.send(vec![0, 1, 2, 3, 4, 5]).await.unwrap();
-        tx.send(vec![9, 9, 9]).await.unwrap();
+        packet_tx.send(vec![0, 1, 2, 3, 4, 5]).await.unwrap();
+        packet_tx.send(vec![9, 9, 9]).await.unwrap();
 
         // First packet should be dropped; second should be emitted.
         let mut buf = vec![0u8; 8];
@@ -451,7 +451,7 @@ mod tests {
         })
         .await;
 
-        writer.abort();
+        tun_tx_task.abort();
 
         let metrics = snapshot.expect("tx metrics should arrive");
         assert_eq!(metrics.iface, "mem1");
@@ -462,14 +462,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_retries_interrupted_send() {
+    async fn tun_tx_retries_interrupted_send() {
         let (mut rx_tun, tx_tun) =
             memory_tun_with_errors("mem-interrupt", 16, vec![io::ErrorKind::Interrupted]);
-        let (tx, rx) = mpsc::channel(4);
+        let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
-        let writer = spawn_writer(tx_tun, rx, events_tx, Duration::from_millis(5));
+        let tun_tx_task = spawn_tun_tx(tx_tun, packet_rx, events_tx, Duration::from_millis(5));
 
-        tx.send(vec![1, 2, 3]).await.unwrap();
+        packet_tx.send(vec![1, 2, 3]).await.unwrap();
 
         let mut buf = vec![0u8; 16];
         let len = rx_tun
@@ -492,7 +492,7 @@ mod tests {
         .expect("tx metrics should arrive")
         .expect("tx metrics should not be None");
 
-        writer.abort();
+        tun_tx_task.abort();
 
         assert_eq!(metrics.packets, 1);
         assert_eq!(metrics.dropped_packets, 0);
