@@ -1,6 +1,7 @@
 //! Shared events flowing into the orchestrator.
 
 use crate::bind::BindWarning;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 /// Carries high-level events emitted by modules to the orchestrator.
@@ -21,6 +22,15 @@ pub enum InterfaceEvent {
     Metrics(InterfaceMetrics),
 }
 
+/// Indicates which transport produced the metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportKind {
+    /// TUN interface.
+    Tun,
+    /// BareUDP socket.
+    BareUdp,
+}
+
 /// Indicates whether metrics were collected on the receive or transmit path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -30,21 +40,58 @@ pub enum Direction {
     Tx,
 }
 
+/// Enumerates reasons for packet drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DropReason {
+    /// Packet exceeded the MTU.
+    Oversize,
+    /// Packet failed allowlist checks (e.g., source IP).
+    DisallowedSource,
+    /// Sending the packet failed.
+    SendError,
+    /// Packet could not be forwarded because the channel closed.
+    ChannelClosed,
+}
+
+/// Aggregates packet counters by outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PktCounters {
+    /// Number of packets observed.
+    pub packets: u64,
+    /// Total bytes observed.
+    pub bytes: u64,
+}
+
+impl PktCounters {
+    /// Records a packet with length `len`, saturating on overflow.
+    pub fn record(&mut self, len: usize) {
+        self.packets = self.packets.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(len as u64);
+    }
+}
+
+/// Collects per-interface statistics including drop breakdowns.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InterfaceStats {
+    /// Successful packet counters.
+    pub succeeded: PktCounters,
+    /// Dropped packet counters.
+    pub dropped: PktCounters,
+    /// Drop counters keyed by reason.
+    pub drop_reasons: HashMap<DropReason, PktCounters>,
+}
+
 /// Carries cumulative counters collected from an interface loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceMetrics {
     /// Interface name that produced the metrics.
     pub iface: String,
+    /// Transport associated with the metrics.
+    pub transport: TransportKind,
     /// Direction (receive or transmit) of the collected metrics.
     pub direction: Direction,
-    /// Total packets observed on the interface.
-    pub packets: u64,
-    /// Total bytes observed on the interface.
-    pub bytes: u64,
-    /// Packets dropped in this direction.
-    pub dropped_packets: u64,
-    /// Bytes dropped in this direction.
-    pub dropped_bytes: u64,
+    /// Aggregated statistics with drop breakdown.
+    pub stats: InterfaceStats,
 }
 
 /// Captures DNS observations per packet or timer tick.

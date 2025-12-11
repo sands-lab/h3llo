@@ -15,7 +15,7 @@ Why recursive routing happens: if h3llo installs the default route into the TUN 
 Binding workflow for HTTP/3, BareUDP, and DNS:
 1. Pick the DNS interface: prefer `local.dns.bindif` when provided and present in probe results; warn and fall back to the first probed non-TUN interface when the preferred one is missing. If no interface is available or probing fails, log a warning and continue with an unbound DNS socket. Probing uses `route_manager` to list routes, performs prefix matches against the target IP, filters entries whose `ifindex` matches the TUN, and maps interface indexes back to names; `route_manager` does not expose route metrics/priority, so ties with equal prefixes rely on route enumeration order—set `local.dns.bindif` / `peers[].h3.bindifs` (non-empty) explicitly when interface preference matters.
 2. DNS resolver coroutine: bind a UDP socket by interface index (Linux/macOS via `bind_device_by_index_v4/6`, Windows via `IP_UNICAST_IF` / `IPV6_UNICAST_IF`) when available. The coroutine runs a `select` over its command queue, UDP socket, and a one-second timer tick. Each resolve command assigns random unique transaction IDs for A and AAAA, tracks the `(domain, id)` pairs, and sends two queries to the configured DNS server. Every received packet emits a DNS event: answers include parsed IPs plus warnings for NXDOMAIN/truncation/recursion refusal; decode failures, unknown transaction IDs, and non-A/AAAA answers emit “unexpected” events. Pending entries are removed after each packet. Timer ticks re-send timed-out entries with new transaction IDs and emit timeout events before retransmission.
-3. Transport binding: for each resolved IP (HTTP/3) or selected outbound IP (BareUDP), probe the WAN-facing interface excluding the TUN; bind transport sockets to that interface. HTTP/3 creates connections across the Cartesian product of DNS answers, `peers[].h3.endpoints`, and provided `peers[].h3.bindifs` (auto-detected bindif yields at most one entry when the field is omitted); BareUDP binds one socket per outbound interface plus a dedicated listener socket. If probing or binding fails, warn and continue unbound.
+3. Transport binding: for each resolved IP (HTTP/3) or selected outbound IP (BareUDP), probe the WAN-facing interface excluding the TUN; bind transport sockets to that interface. HTTP/3 creates connections across the Cartesian product of DNS answers, `peers[].h3.endpoints`, and provided `peers[].h3.bindifs` (auto-detected bindif yields at most one entry when the field is omitted); BareUDP uses a single listener socket (RX-only) and one outbound socket per BareUDP peer (TX-only). If probing or binding fails, warn and continue unbound.
 
 Platform tiers and binding behavior:
 - Linux (primary): uses `bind_device_by_index_v4` / `bind_device_by_index_v6` with `if_nametoindex` to pin sockets by interface index.
@@ -135,7 +135,7 @@ Orchestrator responsibilities and invariants:
 - Stay fully async: handle config updates, DNS refresh results, connection close notifications, and timer ticks without blocking other commands.
 - Spawn new coroutines (DNS resolver, H3 dialers) and push newly established H3 connections to the TUN-Rx coroutine for routing decisions.
 
-Spawn a coroutine for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx coroutine; each outbound interface for BareUDP owns a socket, plus one listener socket.
+Spawn a coroutine for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx coroutine; BareUDP owns one listener socket for RX and a separate TX-only socket per BareUDP peer.
 
 When configuration changes arrive (external controller POST or initialization), update the internal routing table first, then the system routing table. Dynamic reconfiguration flows through the orchestrator via command queues; transport rebuilds or filter updates happen after routing changes.
 
@@ -166,3 +166,11 @@ Route update summary: keep the TUN interface’s routes aligned with `peers[].tu
 LPM summary: reuse WireGuard’s longest-prefix-match behavior when choosing peers for IP packets.
 
 h3llo should use the same longest-prefix-match algorithm as WireGuard when matching entries in the internal routing table.
+
+### Observability
+
+Observability summary: interface loops emit cumulative metrics (packets/bytes, drops, and drop-reason breakdowns) on a timer; the orchestrator owns periodic reporting and change detection.
+
+- Metric shape: every emit includes interface name, transport (`Tun` or `BareUdp`), direction (`Rx`/`Tx`), total succeeded and dropped counters, and a drop-reason map keyed by `DropReason` (e.g., `Oversize`, `DisallowedSource`, `SendError`, `ChannelClosed`).
+- Drop accounting: TUN TX counts oversize and send failures; TUN RX counts channel-closed drops when forwarding to the writer queue fails; BareUDP RX counts disallowed sources; BareUDP TX counts send failures. All counters saturate to avoid panics.
+- Reporting: only the orchestrator prints periodic drop summaries (when counters change); transport loops stay silent, including oversized TUN drops.

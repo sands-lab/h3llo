@@ -1,49 +1,46 @@
 //! Shared counters for interface receive/transmit loops.
 
-use crate::events::{Direction, InterfaceMetrics};
+use crate::events::{Direction, DropReason, InterfaceMetrics, InterfaceStats, TransportKind};
 
-/// Tracks counters for an interface direction.
+/// Tracks counters for an interface direction and transport.
 pub(crate) struct InterfaceCounters {
+    transport: TransportKind,
     direction: Direction,
-    packets: u64,
-    bytes: u64,
-    dropped_packets: u64,
-    dropped_bytes: u64,
+    stats: InterfaceStats,
 }
 
 impl InterfaceCounters {
-    /// Builds counters for the given direction.
-    pub(crate) fn new(direction: Direction) -> Self {
+    /// Builds counters for the given transport and direction.
+    pub(crate) fn new(transport: TransportKind, direction: Direction) -> Self {
         Self {
+            transport,
             direction,
-            packets: 0,
-            bytes: 0,
-            dropped_packets: 0,
-            dropped_bytes: 0,
+            stats: InterfaceStats::default(),
         }
     }
 
     /// Records a successfully handled packet length with saturation.
     pub(crate) fn record_success(&mut self, len: usize) {
-        self.packets = self.packets.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(len as u64);
+        self.stats.succeeded.record(len);
     }
 
-    /// Records a dropped packet length with saturation.
-    pub(crate) fn record_drop(&mut self, len: usize) {
-        self.dropped_packets = self.dropped_packets.saturating_add(1);
-        self.dropped_bytes = self.dropped_bytes.saturating_add(len as u64);
+    /// Records a dropped packet length for `reason` with saturation.
+    pub(crate) fn record_drop(&mut self, reason: DropReason, len: usize) {
+        self.stats.dropped.record(len);
+        self.stats
+            .drop_reasons
+            .entry(reason)
+            .or_default()
+            .record(len);
     }
 
     /// Generates a metrics snapshot tagged with `iface`.
     pub(crate) fn snapshot(&self, iface: &str) -> InterfaceMetrics {
         InterfaceMetrics {
             iface: iface.to_string(),
+            transport: self.transport,
             direction: self.direction,
-            packets: self.packets,
-            bytes: self.bytes,
-            dropped_packets: self.dropped_packets,
-            dropped_bytes: self.dropped_bytes,
+            stats: self.stats.clone(),
         }
     }
 }

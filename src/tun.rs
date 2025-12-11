@@ -1,11 +1,10 @@
 //! TUN management: device creation, read/write loops with backpressure, and metrics reporting.
 
 use crate::config::LocalTun;
-use crate::events::{Direction, Event, InterfaceEvent};
+use crate::events::{Direction, DropReason, Event, InterfaceEvent, TransportKind};
 use crate::helpers::retry_on_interrupted;
 use crate::metrics::InterfaceCounters;
 use ipnet::{Ipv4Net, Ipv6Net};
-use log::warn;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
@@ -184,7 +183,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
     tokio::spawn(async move {
         let mtu = tun.mtu();
         let iface = tun.name().to_string();
-        let mut counters = InterfaceCounters::new(Direction::Rx);
+        let mut counters = InterfaceCounters::new(TransportKind::Tun, Direction::Rx);
         let mut ticker = time::interval(interval);
         let mut buf = vec![0u8; mtu];
 
@@ -198,6 +197,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             }
                             let packet = buf[..len].to_vec();
                             if packet_tx.send(packet).await.is_err() {
+                                counters.record_drop(DropReason::ChannelClosed, len);
                                 break;
                             }
                             counters.record_success(len);
@@ -227,8 +227,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     tokio::spawn(async move {
         let mtu = tun.mtu();
         let iface = tun.name().to_string();
-        let mut warned_oversize = false;
-        let mut counters = InterfaceCounters::new(Direction::Tx);
+        let mut counters = InterfaceCounters::new(TransportKind::Tun, Direction::Tx);
         let mut ticker = time::interval(interval);
 
         loop {
@@ -240,23 +239,14 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                     };
 
                     if packet.len() > mtu {
-                        if !warned_oversize {
-                            warned_oversize = true;
-                            warn!(
-                                "dropping TUN packet larger than MTU (len={}, mtu={}, if={})",
-                                packet.len(),
-                                mtu,
-                                iface
-                            );
-                        }
-                        counters.record_drop(packet.len());
+                        counters.record_drop(DropReason::Oversize, packet.len());
                         continue;
                     }
 
                     match retry_on_interrupted!(tun.send(&packet).await) {
                         Ok(written) => counters.record_success(written),
                         Err(_) => {
-                            counters.record_drop(packet.len());
+                            counters.record_drop(DropReason::SendError, packet.len());
                             break;
                         }
                     }
@@ -403,7 +393,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
                 if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
-                    if m.direction == Direction::Rx && m.packets >= 1 {
+                    if m.direction == Direction::Rx && m.stats.succeeded.packets >= 1 {
                         snapshot = Some(m);
                         break;
                     }
@@ -416,8 +406,9 @@ mod tests {
 
         let metrics = snapshot.expect("rx metrics should arrive");
         assert_eq!(metrics.iface, "mem0");
-        assert_eq!(metrics.packets, 1);
-        assert_eq!(metrics.bytes, 3);
+        assert_eq!(metrics.transport, TransportKind::Tun);
+        assert_eq!(metrics.stats.succeeded.packets, 1);
+        assert_eq!(metrics.stats.succeeded.bytes, 3);
     }
 
     #[tokio::test]
@@ -442,7 +433,10 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
                 if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
-                    if m.direction == Direction::Tx && m.packets >= 1 && m.dropped_packets >= 1 {
+                    if m.direction == Direction::Tx
+                        && m.stats.succeeded.packets >= 1
+                        && m.stats.dropped.packets >= 1
+                    {
                         snapshot = Some(m);
                         break;
                     }
@@ -455,10 +449,19 @@ mod tests {
 
         let metrics = snapshot.expect("tx metrics should arrive");
         assert_eq!(metrics.iface, "mem1");
-        assert_eq!(metrics.packets, 1);
-        assert_eq!(metrics.bytes, 3);
-        assert_eq!(metrics.dropped_packets, 1);
-        assert_eq!(metrics.dropped_bytes, 6);
+        assert_eq!(metrics.transport, TransportKind::Tun);
+        assert_eq!(metrics.stats.succeeded.packets, 1);
+        assert_eq!(metrics.stats.succeeded.bytes, 3);
+        assert_eq!(metrics.stats.dropped.packets, 1);
+        assert_eq!(metrics.stats.dropped.bytes, 6);
+        assert_eq!(
+            metrics
+                .stats
+                .drop_reasons
+                .get(&DropReason::Oversize)
+                .map(|c| (c.packets, c.bytes)),
+            Some((1, 6))
+        );
     }
 
     #[tokio::test]
@@ -481,7 +484,7 @@ mod tests {
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
                 if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
-                    if m.direction == Direction::Tx && m.packets >= 1 {
+                    if m.direction == Direction::Tx && m.stats.succeeded.packets >= 1 {
                         return Some(m);
                     }
                 }
@@ -494,7 +497,8 @@ mod tests {
 
         tun_tx_task.abort();
 
-        assert_eq!(metrics.packets, 1);
-        assert_eq!(metrics.dropped_packets, 0);
+        assert_eq!(metrics.transport, TransportKind::Tun);
+        assert_eq!(metrics.stats.succeeded.packets, 1);
+        assert_eq!(metrics.stats.dropped.packets, 0);
     }
 }
