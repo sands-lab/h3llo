@@ -196,11 +196,10 @@ pub(crate) fn spawn_reader<T: TunRx>(
                             if len == 0 {
                                 continue;
                             }
-                            buf.truncate(len);
-                            if outbound.send(buf).await.is_err() {
+                            let packet = buf[..len].to_vec();
+                            if outbound.send(packet).await.is_err() {
                                 break;
                             }
-                            buf = Vec::with_capacity(mtu);
                             counters.record_success(len);
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,

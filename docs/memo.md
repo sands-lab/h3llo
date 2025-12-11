@@ -25,4 +25,3 @@
 - 优先使用 RPITIT/GAT 返回 Future，非必要不要引入 `Pin<Box<dyn Future>>`。可参考 `RouteProbe` 和 `DefaultRouteProbe`。
 - 无论方法是否公开，都需要添加注释，统一使用英文 docstring。
 - 当前阶段不考虑向前兼容。可任意修改接口，增删方法和测试。
-- docs/internals.md：DNS resolver 协程描述已更新（命令队列 + 每包事件 + 超时重发使用新 transaction ID）。
