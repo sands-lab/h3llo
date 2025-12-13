@@ -1,21 +1,24 @@
-//! Shared counters for interface receive/transmit loops.
+//! Shared counters for transport receive/transmit loops.
 
-use crate::events::{Direction, DropReason, InterfaceMetrics, InterfaceStats, TransportKind};
+use crate::events::{
+    Direction, DropReason, TransportKind, TransportLabels, TransportMetrics, TransportStats,
+};
+use std::net::IpAddr;
 
-/// Tracks counters for an interface direction and transport.
-pub(crate) struct InterfaceCounters {
-    transport: TransportKind,
+/// Tracks counters for a transport direction.
+pub(crate) struct TransportCounters {
+    kind: TransportKind,
     direction: Direction,
-    stats: InterfaceStats,
+    stats: TransportStats,
 }
 
-impl InterfaceCounters {
-    /// Builds counters for the given transport and direction.
+impl TransportCounters {
+    /// Builds counters for the given transport kind and direction.
     pub(crate) fn new(transport: TransportKind, direction: Direction) -> Self {
         Self {
-            transport,
+            kind: transport,
             direction,
-            stats: InterfaceStats::default(),
+            stats: TransportStats::default(),
         }
     }
 
@@ -34,12 +37,19 @@ impl InterfaceCounters {
             .record(len);
     }
 
-    /// Generates a metrics snapshot tagged with `iface`.
-    pub(crate) fn snapshot(&self, iface: &str) -> InterfaceMetrics {
-        InterfaceMetrics {
-            iface: iface.to_string(),
-            transport: self.transport,
-            direction: self.direction,
+    /// Generates a metrics snapshot with optional peer and IP labels.
+    pub(crate) fn snapshot(
+        &self,
+        peer_id: Option<&str>,
+        ip_addr: Option<IpAddr>,
+    ) -> TransportMetrics {
+        TransportMetrics {
+            labels: TransportLabels {
+                kind: self.kind,
+                direction: self.direction,
+                peer_id: peer_id.map(str::to_string),
+                ip_addr,
+            },
             stats: self.stats.clone(),
         }
     }

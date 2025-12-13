@@ -1,9 +1,9 @@
 //! TUN management: device creation, read/write loops with backpressure, and metrics reporting.
 
 use crate::config::LocalTun;
-use crate::events::{Direction, DropReason, Event, InterfaceEvent, TransportKind};
+use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_interrupted;
-use crate::metrics::InterfaceCounters;
+use crate::metrics::TransportCounters;
 use ipnet::{Ipv4Net, Ipv6Net};
 use std::io;
 use std::net::{IpAddr, Ipv6Addr};
@@ -182,8 +182,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mtu = tun.mtu();
-        let iface = tun.name().to_string();
-        let mut counters = InterfaceCounters::new(TransportKind::Tun, Direction::Rx);
+        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
         let mut ticker = time::interval(interval);
         let mut buf = vec![0u8; mtu];
 
@@ -207,7 +206,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Interface(InterfaceEvent::Metrics(counters.snapshot(&iface)))).await.is_err() {
+                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).await.is_err() {
                         break;
                     }
                 }
@@ -226,8 +225,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mtu = tun.mtu();
-        let iface = tun.name().to_string();
-        let mut counters = InterfaceCounters::new(TransportKind::Tun, Direction::Tx);
+        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Tx);
         let mut ticker = time::interval(interval);
 
         loop {
@@ -252,7 +250,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Interface(InterfaceEvent::Metrics(counters.snapshot(&iface)))).await.is_err() {
+                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).await.is_err() {
                         break;
                     }
                 }
@@ -392,8 +390,8 @@ mod tests {
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
-                    if m.direction == Direction::Rx && m.stats.succeeded.packets >= 1 {
+                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                    if m.labels.direction == Direction::Rx && m.stats.succeeded.packets >= 1 {
                         snapshot = Some(m);
                         break;
                     }
@@ -405,8 +403,10 @@ mod tests {
         tun_rx_task.abort();
 
         let metrics = snapshot.expect("rx metrics should arrive");
-        assert_eq!(metrics.iface, "mem0");
-        assert_eq!(metrics.transport, TransportKind::Tun);
+        assert_eq!(metrics.labels.kind, TransportKind::Tun);
+        assert_eq!(metrics.labels.direction, Direction::Rx);
+        assert_eq!(metrics.labels.peer_id, None);
+        assert_eq!(metrics.labels.ip_addr, None);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 3);
     }
@@ -432,8 +432,8 @@ mod tests {
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
-                    if m.direction == Direction::Tx
+                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                    if m.labels.direction == Direction::Tx
                         && m.stats.succeeded.packets >= 1
                         && m.stats.dropped.packets >= 1
                     {
@@ -448,8 +448,10 @@ mod tests {
         tun_tx_task.abort();
 
         let metrics = snapshot.expect("tx metrics should arrive");
-        assert_eq!(metrics.iface, "mem1");
-        assert_eq!(metrics.transport, TransportKind::Tun);
+        assert_eq!(metrics.labels.kind, TransportKind::Tun);
+        assert_eq!(metrics.labels.direction, Direction::Tx);
+        assert_eq!(metrics.labels.peer_id, None);
+        assert_eq!(metrics.labels.ip_addr, None);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 3);
         assert_eq!(metrics.stats.dropped.packets, 1);
@@ -483,8 +485,8 @@ mod tests {
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
-                    if m.direction == Direction::Tx && m.stats.succeeded.packets >= 1 {
+                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                    if m.labels.direction == Direction::Tx && m.stats.succeeded.packets >= 1 {
                         return Some(m);
                     }
                 }
@@ -497,7 +499,10 @@ mod tests {
 
         tun_tx_task.abort();
 
-        assert_eq!(metrics.transport, TransportKind::Tun);
+        assert_eq!(metrics.labels.kind, TransportKind::Tun);
+        assert_eq!(metrics.labels.direction, Direction::Tx);
+        assert_eq!(metrics.labels.peer_id, None);
+        assert_eq!(metrics.labels.ip_addr, None);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.dropped.packets, 0);
     }

@@ -7,19 +7,19 @@ use std::net::{IpAddr, SocketAddr};
 /// Carries high-level events emitted by modules to the orchestrator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// Events originating from network interfaces (TUN or otherwise).
-    Interface(InterfaceEvent),
+    /// Events originating from transports (TUN, BareUDP, HTTP/3).
+    Transport(TransportEvent),
     /// Events originating from DNS resolution.
     Dns(DnsEvent),
     /// Placeholder for future modules to extend the event stream without changing the channel type.
     Other(String),
 }
 
-/// Describes interface-level events.
+/// Describes transport-level events.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InterfaceEvent {
-    /// Latest cumulative metrics for an interface.
-    Metrics(InterfaceMetrics),
+pub enum TransportEvent {
+    /// Latest cumulative metrics for a transport direction.
+    Metrics(TransportMetrics),
 }
 
 /// Indicates which transport produced the metrics.
@@ -29,6 +29,8 @@ pub enum TransportKind {
     Tun,
     /// BareUDP socket.
     BareUdp,
+    /// HTTP/3 transport.
+    Http3,
 }
 
 /// Indicates whether metrics were collected on the receive or transmit path.
@@ -70,9 +72,9 @@ impl PktCounters {
     }
 }
 
-/// Collects per-interface statistics including drop breakdowns.
+/// Collects per-transport statistics including drop breakdowns.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct InterfaceStats {
+pub struct TransportStats {
     /// Successful packet counters.
     pub succeeded: PktCounters,
     /// Dropped packet counters.
@@ -81,17 +83,26 @@ pub struct InterfaceStats {
     pub drop_reasons: HashMap<DropReason, PktCounters>,
 }
 
-/// Carries cumulative counters collected from an interface loop.
+/// Labels attached to transport metrics for grouping.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InterfaceMetrics {
-    /// Interface name that produced the metrics.
-    pub iface: String,
-    /// Transport associated with the metrics.
-    pub transport: TransportKind,
+pub struct TransportLabels {
+    /// Transport kind (TUN, BareUDP, HTTP/3).
+    pub kind: TransportKind,
     /// Direction (receive or transmit) of the collected metrics.
     pub direction: Direction,
+    /// Optional peer identifier when the transport is peer-scoped.
+    pub peer_id: Option<String>,
+    /// Optional IP address associated with the transport.
+    pub ip_addr: Option<IpAddr>,
+}
+
+/// Carries cumulative counters collected from a transport loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportMetrics {
+    /// Labels describing the metric dimensions.
+    pub labels: TransportLabels,
     /// Aggregated statistics with drop breakdown.
-    pub stats: InterfaceStats,
+    pub stats: TransportStats,
 }
 
 /// Captures DNS observations per packet or timer tick.

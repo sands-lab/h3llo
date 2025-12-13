@@ -2,9 +2,9 @@
 
 pub use crate::udp::bind_socket;
 
-use crate::events::{Direction, DropReason, Event, InterfaceEvent, TransportKind};
+use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_interrupted;
-use crate::metrics::InterfaceCounters;
+use crate::metrics::TransportCounters;
 use crate::udp::UdpError;
 use log::warn;
 use std::collections::HashSet;
@@ -72,21 +72,19 @@ impl PeerEndpoints {
     }
 }
 
-/// Collects socket, MTU, and interface label shared by BareUDP loops.
+/// Collects socket and MTU shared by BareUDP loops.
 #[derive(Debug)]
 pub struct UdpCtx {
     /// Shared UDP socket for BareUDP traffic.
     pub socket: Arc<UdpSocket>,
     /// Buffer size for inbound packets, typically the TUN MTU.
     pub mtu: usize,
-    /// Label used in metrics emission.
-    pub iface: String,
 }
 
 /// Spawns the BareUDP receive loop, filtering on source IPs, emitting metrics, and forwarding packets.
 ///
 /// # Arguments
-/// - `context`: Bundled socket, MTU, and interface label.
+/// - `context`: Bundled socket and MTU.
 /// - `allowed_sources`: Initial allowed source IP set.
 /// - `allowed_updates`: Channel delivering full replacements for the allowed source set.
 /// - `packet_tx`: Channel to push accepted packets into.
@@ -100,11 +98,11 @@ pub fn spawn_udp_rx(
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
-    let UdpCtx { socket, mtu, iface } = context;
+    let UdpCtx { socket, mtu } = context;
 
     tokio::spawn(async move {
         let mut buf = vec![0u8; mtu];
-        let mut counters = InterfaceCounters::new(TransportKind::BareUdp, Direction::Rx);
+        let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Rx);
         let mut ticker = time::interval(interval);
 
         loop {
@@ -134,7 +132,7 @@ pub fn spawn_udp_rx(
                     allowed_sources = update;
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Interface(InterfaceEvent::Metrics(counters.snapshot(&iface)))).await.is_err() {
+                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).await.is_err() {
                         break;
                     }
                 }
@@ -146,7 +144,7 @@ pub fn spawn_udp_rx(
 /// Spawns the BareUDP send loop, emitting metrics while forwarding packets to `destination`.
 ///
 /// # Arguments
-/// - `context`: Bundled socket, MTU, and interface label.
+/// - `context`: Bundled socket and MTU.
 /// - `destination`: Remote peer socket address.
 /// - `packet_rx`: Channel supplying packets to send.
 /// - `events_tx`: Channel for emitting transmit metrics.
@@ -158,11 +156,11 @@ pub fn spawn_udp_tx(
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
-    let UdpCtx { socket, iface, .. } = context;
+    let UdpCtx { socket, .. } = context;
     let socket = socket;
 
     tokio::spawn(async move {
-        let mut counters = InterfaceCounters::new(TransportKind::BareUdp, Direction::Tx);
+        let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Tx);
         let mut ticker = time::interval(interval);
 
         loop {
@@ -182,7 +180,7 @@ pub fn spawn_udp_tx(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Interface(InterfaceEvent::Metrics(counters.snapshot(&iface)))).await.is_err() {
+                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).await.is_err() {
                         break;
                     }
                 }
@@ -232,7 +230,6 @@ mod tests {
         let context = UdpCtx {
             socket: Arc::new(socket),
             mtu: 64,
-            iface: "bare0".to_string(),
         };
         let handle = spawn_udp_rx(
             context,
@@ -270,7 +267,6 @@ mod tests {
         let context = UdpCtx {
             socket: Arc::new(socket),
             mtu: 64,
-            iface: "bare1".to_string(),
         };
         let handle = spawn_udp_rx(
             context,
@@ -324,7 +320,6 @@ mod tests {
         let context = UdpCtx {
             socket: Arc::new(sender_socket),
             mtu: 64,
-            iface: "bare2".to_string(),
         };
         let handle = spawn_udp_tx(
             context,
@@ -360,7 +355,6 @@ mod tests {
         let context = UdpCtx {
             socket: Arc::new(socket),
             mtu: 128,
-            iface: "bare-metrics-rx".to_string(),
         };
         let handle = spawn_udp_rx(
             context,
@@ -383,8 +377,8 @@ mod tests {
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
-                    if m.direction == Direction::Rx && m.stats.succeeded.packets >= 1 {
+                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                    if m.labels.direction == Direction::Rx && m.stats.succeeded.packets >= 1 {
                         return Some(m);
                     }
                 }
@@ -395,8 +389,10 @@ mod tests {
         .expect("rx metrics should arrive")
         .expect("rx metrics should not be None");
 
-        assert_eq!(metrics.iface, "bare-metrics-rx");
-        assert_eq!(metrics.transport, TransportKind::BareUdp);
+        assert_eq!(metrics.labels.kind, TransportKind::BareUdp);
+        assert_eq!(metrics.labels.direction, Direction::Rx);
+        assert_eq!(metrics.labels.peer_id, None);
+        assert_eq!(metrics.labels.ip_addr, None);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 4);
 
@@ -414,7 +410,6 @@ mod tests {
         let context = UdpCtx {
             socket: Arc::new(sender_socket),
             mtu: 64,
-            iface: "bare-metrics-tx".to_string(),
         };
         let handle = spawn_udp_tx(
             context,
@@ -434,8 +429,8 @@ mod tests {
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Interface(InterfaceEvent::Metrics(m)) = event {
-                    if m.direction == Direction::Tx && m.stats.succeeded.packets >= 1 {
+                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                    if m.labels.direction == Direction::Tx && m.stats.succeeded.packets >= 1 {
                         return Some(m);
                     }
                 }
@@ -446,8 +441,10 @@ mod tests {
         .expect("tx metrics should arrive")
         .expect("tx metrics should not be None");
 
-        assert_eq!(metrics.iface, "bare-metrics-tx");
-        assert_eq!(metrics.transport, TransportKind::BareUdp);
+        assert_eq!(metrics.labels.kind, TransportKind::BareUdp);
+        assert_eq!(metrics.labels.direction, Direction::Tx);
+        assert_eq!(metrics.labels.peer_id, None);
+        assert_eq!(metrics.labels.ip_addr, None);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 4);
         assert_eq!(metrics.stats.dropped.packets, 0);
