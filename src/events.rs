@@ -134,10 +134,19 @@ pub struct DnsAnswer {
     pub host: String,
     /// Record type of the query.
     pub record_type: DnsRecordType,
-    /// Resolved IP addresses for the record type.
-    pub addresses: Vec<IpAddr>,
+    /// Resolved answer records with TTL (order not guaranteed).
+    pub records: Vec<DnsAnswerRecord>,
     /// Warnings derived from the DNS response.
     pub warnings: Vec<DnsAnswerWarning>,
+}
+
+/// Represents a DNS answer record with its TTL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsAnswerRecord {
+    /// Resolved IP address.
+    pub address: IpAddr,
+    /// Time-to-live in seconds for the record.
+    pub ttl: u32,
 }
 
 /// Warnings extracted from a DNS answer.

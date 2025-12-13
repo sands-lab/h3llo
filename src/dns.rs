@@ -3,14 +3,14 @@
 use crate::bind::{BindWarning, RouteProbe};
 use crate::config::{parse_dns_server_uri, LocalDns};
 use crate::events::{
-    DnsAnswer, DnsAnswerWarning, DnsEvent, DnsEventDetail, DnsRecordType, DnsTimeout,
-    DnsUnexpected, DnsUnexpectedKind, Event,
+    DnsAnswer, DnsAnswerRecord, DnsAnswerWarning, DnsEvent, DnsEventDetail, DnsRecordType,
+    DnsTimeout, DnsUnexpected, DnsUnexpectedKind, Event,
 };
 use crate::udp::bind_socket;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use rand::Rng;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -325,9 +325,9 @@ impl ResolverTask {
     /// Handles a parsed DNS packet that matches a pending request.
     async fn handle_decoded_packet(&mut self, message: Message, request: PendingRequest) {
         let warnings = response_warnings(&message);
-        let addresses = extract_addresses(&message, request.record_type);
+        let records = extract_records(&message, request.record_type);
 
-        if message.response_code() == ResponseCode::NoError && addresses.is_empty() {
+        if message.response_code() == ResponseCode::NoError && records.is_empty() {
             if let Some(unexpected_type) = first_nonmatching_answer(&message, request.record_type) {
                 self.emit_unexpected(
                     Some(message.id()),
@@ -345,7 +345,7 @@ impl ResolverTask {
             detail: DnsEventDetail::Answer(DnsAnswer {
                 host: request.host,
                 record_type: request.record_type,
-                addresses,
+                records,
                 warnings,
             }),
         });
@@ -434,30 +434,29 @@ fn to_record_type(record_type: DnsRecordType) -> Option<RecordType> {
     }
 }
 
-/// Extracts answers matching `expected` from the DNS response.
-fn extract_addresses(message: &Message, expected: DnsRecordType) -> Vec<IpAddr> {
-    let mut ips = Vec::new();
-    let mut seen = HashSet::new();
+/// Extracts answers matching `expected`, deduplicating by IP and keeping an arbitrary TTL (order not guaranteed).
+fn extract_records(message: &Message, expected: DnsRecordType) -> Vec<DnsAnswerRecord> {
+    let mut records: HashMap<IpAddr, DnsAnswerRecord> = HashMap::new();
 
     for answer in message.answers() {
-        match answer.data() {
+        let (ip, ttl) = match answer.data() {
             RData::A(addr) if expected == DnsRecordType::A => {
-                let ip = IpAddr::V4(ipv4_from_rdata(addr));
-                if seen.insert(ip) {
-                    ips.push(ip);
-                }
+                (Some(IpAddr::V4(ipv4_from_rdata(addr))), answer.ttl())
             }
             RData::AAAA(addr) if expected == DnsRecordType::Aaaa => {
-                let ip = IpAddr::V6(ipv6_from_rdata(addr));
-                if seen.insert(ip) {
-                    ips.push(ip);
-                }
+                (Some(IpAddr::V6(ipv6_from_rdata(addr))), answer.ttl())
             }
-            _ => {}
+            _ => (None, 0u32),
+        };
+
+        if let Some(ip) = ip {
+            records
+                .entry(ip)
+                .or_insert_with(|| DnsAnswerRecord { address: ip, ttl });
         }
     }
 
-    ips
+    records.into_values().collect()
 }
 
 /// Finds the first answer whose record type does not match `expected`.
@@ -646,9 +645,12 @@ mod tests {
                 assert_eq!(answer.host, "example.com");
                 assert_eq!(answer.record_type, DnsRecordType::A);
                 assert!(answer.warnings.contains(&DnsAnswerWarning::NxDomain));
-                assert!(answer
-                    .addresses
-                    .contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+                assert_eq!(answer.records.len(), 1);
+                assert_eq!(
+                    answer.records[0].address,
+                    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))
+                );
+                assert_eq!(answer.records[0].ttl, 60);
             }
             _ => panic!("unexpected event"),
         }
@@ -691,6 +693,72 @@ mod tests {
                 warning: DnsUnexpectedKind::UnknownTransaction,
                 ..
             }) => {}
+            _ => panic!("unexpected event"),
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn deduplicates_answers_and_keeps_some_ttl() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+
+        cmd_tx
+            .send(DnsCommand::Resolve {
+                host: "ttl.test".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+        let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+        let request = Message::from_vec(&buf[..len]).unwrap();
+        let query = request.queries().first().cloned().unwrap();
+        let response = build_response(
+            request.id(),
+            query,
+            ResponseCode::NoError,
+            vec![
+                Record::from_rdata(
+                    Name::from_ascii("ttl.test").unwrap().into(),
+                    120,
+                    RData::A(A(Ipv4Addr::new(10, 0, 0, 1))),
+                ),
+                Record::from_rdata(
+                    Name::from_ascii("ttl.test").unwrap().into(),
+                    30,
+                    RData::A(A(Ipv4Addr::new(10, 0, 0, 2))),
+                ),
+                Record::from_rdata(
+                    Name::from_ascii("ttl.test").unwrap().into(),
+                    90,
+                    RData::A(A(Ipv4Addr::new(10, 0, 0, 1))),
+                ),
+            ],
+        );
+        socket.send_to(&response, peer).await.unwrap();
+
+        let detail = next_relevant_detail(&mut events_rx).await;
+        match detail {
+            DnsEventDetail::Answer(answer) => {
+                assert_eq!(answer.host, "ttl.test");
+                assert_eq!(answer.record_type, DnsRecordType::A);
+                let mut map = HashMap::new();
+                for rec in answer.records {
+                    map.insert(rec.address, rec.ttl);
+                }
+                assert_eq!(map.len(), 2);
+                assert!(
+                    matches!(
+                        map.get(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+                        Some(120) | Some(90)
+                    ),
+                    "ttl should be taken from one of the duplicated records"
+                );
+                assert_eq!(map.get(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))), Some(&30));
+            }
             _ => panic!("unexpected event"),
         }
 
