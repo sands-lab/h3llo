@@ -1,42 +1,60 @@
 # Development Plan
 
-Iterative delivery of h3llo by building one module at a time, gating each step with tests, then composing modules into components and finally the full system.
+Iterative delivery of h3llo by building one module at a time, gating each step with tests, then composing modules into components and the full system.
 
 ## Principles and Gates
-- Sequence: implement one module, add/update its tests, run them, and proceed only when green.
-- Tests first: favor fast unit and mocked component tests; align with docs/test.md’s layered approach.
-- Interfaces: each module exposes clear interfaces to keep later composition minimal.
-- Progress logging: as you move through the plan, promptly record the current completion status here to keep progress visible.
+
+Guiding rules for the plan execution and progress updates.
+
+- [x] Step 1: Implement one module at a time and gate progress with passing tests.
+- [x] Step 2: Prefer unit and mocked component tests aligned with `docs/test.md`.
+- [x] Step 3: Keep module interfaces minimal and explicit to simplify composition.
+- [x] Step 4: Keep progress visible by updating this plan when status changes.
 
 ## Module Order and Expected Tests
-- Config and validation: YAML load/validate, defaults, peer exclusivity; unit tests for success/failure cases and merge rules.
-- DNS and socket binding: default-route probing, per-socket binding, single-resolver policy; mocked tests for single/multiple IP answers, errors, and re-resolution.
-- TUN management: creation, address/MTU setup, read/write loops with backpressure; loopback/mocked tests for enqueue/dequeue correctness.
-- Internal routing (LPM): add/remove, longest-prefix match, atomic swaps; unit tests for overlapping prefixes and disabled peers.
-- BareUDP transport: single resolution, source-IP filter, raw packet pass-through; tests for allowed/blocked sources and multi-IP panic behavior.
-- System route sync: platform command wrapper, idempotent replace, warning-on-failure; mocked tests for command sequencing and error handling.
-- Runtime orchestration (BareUDP-first): task lifecycle, structured errors, start/stop order for a BareUDP-only stack; integration tests for clean startup/shutdown and restartability.
-- Identity and auth: Basic Auth generation/validation (CONNECT vs GET/POST pairs); unit tests for valid/invalid combinations and edge cases.
-- HTTP/3 transport: listen/dial with DATAGRAM, Context ID 0, reconnection and smooth handover; loopback/component tests for send/receive and reconnect.
-- Control plane (GET/POST): snapshot export, partial peer merge, trigger routing/transport refresh; handler tests for auth, payload validation, and `null` clearing.
-- Runtime orchestration (Hybrid): extend orchestration to mix H3 and BareUDP; integration tests for clean startup/shutdown and restartability with both transports.
+
+Primary build order with the minimum test coverage for each module.
+
+- [x] Step 1: Implement config and validation: YAML load/validate, defaults, peer exclusivity; add unit tests for success/failure cases and merge rules.
+- [x] Step 2: Implement DNS and socket binding: default-route probing, per-socket binding, single-resolver policy; add mocked tests for single/multiple answers, errors, and re-resolution.
+- [x] Step 3: Implement TUN management: creation, address/MTU setup, read/write loops with backpressure; add loopback or mocked tests for enqueue/dequeue correctness.
+- [x] Step 4: Implement internal routing (LPM): add/remove, longest-prefix match, atomic swaps; add unit tests for overlapping prefixes and disabled peers.
+- [x] Step 5: Implement BareUDP transport: single resolution, source-IP filter, raw packet pass-through; add tests for allowed/blocked sources and multi-IP warning behavior.
+- [x] Step 6: Implement system route sync: route_manager-based sync, idempotent replace, warning-on-failure; add mocked tests for command sequencing and error handling.
+- [ ] Step 7: Implement runtime orchestration (BareUDP-first): task lifecycle, structured errors, start/stop order for a BareUDP-only stack; add integration tests for clean startup/shutdown and restartability.
+- [ ] Step 8: Implement identity and auth: Basic Auth generation/validation (CONNECT vs GET/POST pairs); add unit tests for valid/invalid combinations and edge cases.
+- [ ] Step 9: Implement HTTP/3 transport: listen/dial with DATAGRAM, Context ID 0, reconnection and smooth handover; add loopback/component tests for send/receive and reconnect.
+- [ ] Step 10: Implement control plane (GET/POST): snapshot export, partial peer merge, trigger routing/transport refresh; add handler tests for auth, payload validation, and `null` clearing.
+- [ ] Step 11: Implement runtime orchestration (Hybrid): mix H3 and BareUDP; add integration tests for clean startup/shutdown and restartability with both transports.
+
+## BareUDP VPN Delivery
+
+Concrete implementation steps to ship a BareUDP-only VPN on top of the existing modules.
+
+- [ ] Step 1: Add a CLI entrypoint that loads config, initializes logging, and selects the BareUDP-only runtime.
+- [ ] Step 2: Validate `local.bare.listen` and `peers[].bare.endpoint` as `udp://host:port`, and parse into `SocketAddr`.
+- [ ] Step 3: Build a BareUDP orchestrator wiring TUN Rx/Tx, routing table, and per-peer UDP Tx queues.
+- [ ] Step 4: Refactor BareUDP Tx to allow destination updates or socket rebuilds when endpoints change.
+- [ ] Step 5: Wire `local.table` to system route sync using TUN addresses and `allowedIPs`.
+- [ ] Step 6: Add a metrics aggregation loop that periodically logs transport counters.
+- [ ] Step 7: Add a two-node BareUDP integration test (static IP) plus MTU boundary checks.
+- [ ] Step 8: Document a BareUDP-only quick start in `docs/configuration.md` and `README.md`.
 
 ## Component Integration and Tests
-- BareUDP data plane: TUN + LPM + BareUDP with source-IP filtering and single-resolution constraint.
-- Route sync: internal vs system route alignment with mocked platform commands.
-- H3 data plane: TUN + LPM + HTTP/3 end-to-end (loopback/two-node local), reconnection under load.
-- Config + Routing + Control-plane: repeated POSTs (idempotent/merge), rollback-on-failure behavior.
-- Hybrid routing: mixed H3/BareUDP peers, overlapping allowedIPs with longest-prefix selection and dynamic switches.
+
+Compose modules into higher-level components with focused integration tests.
+
+- [ ] Step 1: Assemble BareUDP data plane: TUN + LPM + BareUDP with source-IP filtering and single-resolution constraint.
+- [ ] Step 2: Align route sync: internal vs system route alignment with mocked platform commands.
+- [ ] Step 3: Exercise H3 data plane: TUN + LPM + HTTP/3 end-to-end (loopback/two-node local), reconnection under load.
+- [ ] Step 4: Validate config + routing + control plane: repeated POSTs (idempotent/merge) and rollback-on-failure behavior.
+- [ ] Step 5: Extend hybrid routing: mixed H3/BareUDP peers, overlapping allowedIPs with longest-prefix selection and dynamic switches.
 
 ## System Integration Tests
-- Two-node BareUDP: static IP reachability, invalid source drop, MTU boundary checks.
-- Two-node HTTP/3 end-to-end: ping/iperf, cert rotation, auth failures, path errors, reconnection.
-- Mixed mode: POST-driven transport/peer changes with zero-downtime goal and route drift checks.
-- Observability: structured logs and metrics hooks emit expected events under the above scenarios.
 
-## Progress Log
-- Config and validation: crate scaffolded with YAML parsing, defaults, and validation checks; unit and integration tests added; Linux CI workflow configured.
-- Plan reordered to deliver a BareUDP-only VPN first, then add HTTP/3 features.
-- TUN management: implemented tun-rs based creation, address/MTU setup, read/write loops with backpressure, oversize drop counting, periodic metrics events, and unit tests with in-memory doubles.
-- BareUDP transport: added socket binding helper reuse, outbound/receive loops with source-IP filtering, multi-answer warning, and unit tests covering allowed/blocked sources and forwarding.
-- System route sync: route_manager-based TUN route reconciliation (add missing `allowedIPs`, delete stale TUN routes, warn on conflicts/failures).
+Full end-to-end scenarios across multiple nodes.
+
+- [ ] Step 1: Run two-node BareUDP: static IP reachability, invalid source drop, MTU boundary checks.
+- [ ] Step 2: Exercise two-node HTTP/3 end-to-end: ping/iperf, cert rotation, auth failures, path errors, reconnection.
+- [ ] Step 3: Validate mixed mode: POST-driven transport/peer changes with zero-downtime goal and route drift checks.
+- [ ] Step 4: Verify observability: structured logs and metrics hooks emit expected events under the above scenarios.

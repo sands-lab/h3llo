@@ -47,6 +47,7 @@
 
 - [coding.md](/docs/rules/coding.md)：代码与实现/重构要求、并发/性能/注释规范。
 - [document.md](/docs/rules/document.md)：文档结构、长度、一致性与 mermaid 使用规范。
+- [plan.md](/docs/rules/plan.md)：Plan 任务的步骤格式与状态维护规范。
 - [commit.md](/docs/rules/commit.md)：Review 问题清单、提交规范与 Commit 任务要求。
 - [debug.md](/docs/rules/debug.md)：Debug 任务的定位、复现、修复与复盘要求。
 - [propose.md](/docs/rules/propose.md)：Propose 任务的问题清单与设计取舍原则。
