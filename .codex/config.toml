@@ -1,0 +1,5 @@
+[sandbox_workspace_write]
+network_access = true
+
+[features]
+web_search_request = true
