@@ -7,6 +7,7 @@ pub mod dns;
 pub mod events;
 mod helpers;
 mod metrics;
+pub mod orch;
 pub mod route;
 pub mod routing;
 pub mod tun;

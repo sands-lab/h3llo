@@ -31,11 +31,11 @@ Primary build order with the minimum test coverage for each module.
 
 Concrete implementation steps to ship a BareUDP-only VPN on top of the existing modules.
 
-- [ ] Step 1: Add a CLI entrypoint that loads config, initializes logging, and selects the BareUDP-only runtime.
-- [ ] Step 2: Validate `local.bare.listen` and `peers[].bare.endpoint` as `udp://host:port`, and parse into `SocketAddr`.
-- [ ] Step 3: Build a BareUDP orchestrator wiring TUN Rx/Tx, routing table, and per-peer UDP Tx queues.
+- [x] Step 1: Add a CLI entrypoint that loads config, initializes logging, and selects the BareUDP-only runtime.
+- [x] Step 2: Validate `local.bare.listen` and `peers[].bare.endpoint` as `udp://host:port`, and parse into `SocketAddr`.
+- [x] Step 3: Build a BareUDP orchestrator wiring TUN Rx/Tx, routing table, and per-peer UDP Tx queues.
 - [ ] Step 4: Refactor BareUDP Tx to allow destination updates or socket rebuilds when endpoints change.
-- [ ] Step 5: Wire `local.table` to system route sync using TUN addresses and `allowedIPs`.
+- [x] Step 5: Wire `local.table` to system route sync using TUN addresses and `allowedIPs`.
 - [ ] Step 6: Add a metrics aggregation loop that periodically logs transport counters.
 - [ ] Step 7: Add a two-node BareUDP integration test (static IP) plus MTU boundary checks.
 - [ ] Step 8: Document a BareUDP-only quick start in `docs/configuration.md` and `README.md`.

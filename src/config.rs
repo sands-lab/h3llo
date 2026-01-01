@@ -218,6 +218,9 @@ pub enum ValidationError {
     /// `local.bare.listen` is missing when BareUDP is configured.
     #[error("local.bare.listen must be set when local.bare is configured")]
     LocalBareMissingListen,
+    /// `local.bare.listen` is not a valid UDP URI.
+    #[error("local.bare.listen must be a udp:// URI with host and port: {reason}")]
+    LocalBareListenInvalid { reason: String },
     /// Peer identifier is missing or too short.
     #[error("peer id '{peer_id}' must be at least 6 characters")]
     PeerIdTooShort { peer_id: String },
@@ -233,6 +236,9 @@ pub enum ValidationError {
     /// BareUDP endpoint missing when BareUDP is configured.
     #[error("peer '{peer_id}' requires bare.endpoint when bare is configured")]
     PeerBareMissingEndpoint { peer_id: String },
+    /// BareUDP endpoint is not a valid UDP URI.
+    #[error("peer '{peer_id}' bare.endpoint must be a udp:// URI with host and port: {reason}")]
+    PeerBareEndpointInvalid { peer_id: String, reason: String },
     /// Allowed IP list missing.
     #[error("peer '{peer_id}' must include at least one allowedIPs entry")]
     PeerMissingAllowedIps { peer_id: String },
@@ -303,6 +309,8 @@ impl Config {
             let has_bare_listener = !bare.listen.trim().is_empty();
             if !has_bare_listener {
                 errors.push(ValidationError::LocalBareMissingListen);
+            } else if let Err(reason) = parse_udp_uri(&bare.listen) {
+                errors.push(ValidationError::LocalBareListenInvalid { reason });
             }
         }
 
@@ -362,6 +370,11 @@ impl Config {
                     if bare.endpoint.trim().is_empty() {
                         errors.push(ValidationError::PeerBareMissingEndpoint {
                             peer_id: peer.id.clone(),
+                        });
+                    } else if let Err(reason) = parse_udp_uri(&bare.endpoint) {
+                        errors.push(ValidationError::PeerBareEndpointInvalid {
+                            peer_id: peer.id.clone(),
+                            reason,
                         });
                     }
                 }
@@ -433,6 +446,15 @@ fn default_peer_h3_retry_secs() -> u64 {
     10
 }
 
+/// Represents a UDP endpoint parsed from a `udp://` URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpEndpoint {
+    /// Host portion of the URI (domain or IP literal).
+    pub host: String,
+    /// Port number of the endpoint.
+    pub port: u16,
+}
+
 /// Parses a UDP DNS server URI (e.g., `udp://1.1.1.1:53`) into a socket address, enforcing IP literals.
 pub fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
     let url = Url::parse(raw).map_err(|e| e.to_string())?;
@@ -460,6 +482,39 @@ pub fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
     }
 
     Ok(SocketAddr::new(ip, port))
+}
+
+/// Parses a UDP URI (e.g., `udp://host:6635`) into host and port components.
+pub fn parse_udp_uri(raw: &str) -> Result<UdpEndpoint, String> {
+    let url = Url::parse(raw).map_err(|e| e.to_string())?;
+
+    if url.scheme() != "udp" {
+        return Err("scheme must be udp".to_string());
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("userinfo is not supported".to_string());
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| "host is required".to_string())?;
+
+    let port = url
+        .port()
+        .ok_or_else(|| "port is required (e.g., udp://host:6635)".to_string())?;
+
+    if url.path() != "/" && !url.path().is_empty() {
+        return Err("path must be empty".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("query and fragment are not supported".to_string());
+    }
+
+    Ok(UdpEndpoint {
+        host: host.to_string(),
+        port,
+    })
 }
 
 fn deserialize_endpoints<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -607,6 +662,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_local_bare_listen_uri() {
+        let mut config = sample_h3_config();
+        config.local.h3 = None;
+        config.local.bare = Some(LocalBare {
+            listen: "udp://example.com:6635/path".to_string(),
+        });
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::LocalBareListenInvalid { .. }))
+        ));
+    }
+
+    #[test]
     fn rejects_peer_transport_conflict() {
         let mut config = sample_h3_config();
         config.peers[0].bare = Some(PeerBare {
@@ -632,6 +701,21 @@ mod tests {
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerBareMissingEndpoint { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_bare_endpoint_uri() {
+        let mut config = sample_h3_config();
+        config.peers[0].h3 = None;
+        config.peers[0].bare = Some(PeerBare {
+            endpoint: "udp://peer.example.com:6635/path".to_string(),
+            bindif: None,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerBareEndpointInvalid { .. }))
         ));
     }
 
@@ -853,5 +937,12 @@ peers:
                     .iter()
                     .any(|e| matches!(e, ValidationError::PeerDuplicateAllowedIp { .. }))
         ));
+    }
+
+    #[test]
+    fn parse_udp_uri_accepts_hostname() {
+        let endpoint = parse_udp_uri("udp://example.com:6635").expect("udp uri should parse");
+        assert_eq!(endpoint.host, "example.com");
+        assert_eq!(endpoint.port, 6635);
     }
 }
