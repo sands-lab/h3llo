@@ -1,6 +1,6 @@
 //! BareUDP-only runtime orchestration.
 
-use crate::bare::{bind_socket, spawn_udp_rx, spawn_udp_tx, PeerEndpoints, UdpCtx};
+use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpTx, PeerEndpoints};
 use crate::bind::{BindWarning, DefaultRouteProbe};
 use crate::config::{parse_udp_uri, Config, Peer, UdpEndpoint};
 use crate::dns::{DnsCommand, DnsResolver};
@@ -14,7 +14,6 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Instant};
@@ -88,7 +87,7 @@ pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
         .map_err(|err| BareRuntimeError::Tun(err.to_string()))?;
     let mtu = config.local.tun.mtu as usize;
 
-    let listener = UdpSocket::bind(listen_addr)
+    let bare_rx = BareUdpRx::from_config(listen_addr, mtu)
         .await
         .map_err(|err| BareRuntimeError::Udp(err.to_string()))?;
 
@@ -99,7 +98,6 @@ pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
         parsed_peers,
         &resolved_hosts,
         &config.local.tun.ifname,
-        mtu,
         events_tx.clone(),
     )
     .await;
@@ -151,10 +149,7 @@ pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
         METRICS_INTERVAL,
     );
     let bare_rx_handle = spawn_udp_rx(
-        UdpCtx {
-            socket: std::sync::Arc::new(listener),
-            mtu,
-        },
+        bare_rx,
         allowed_sources,
         allowed_rx,
         bare_packet_tx,
@@ -389,7 +384,6 @@ async fn build_active_peers(
     peers: Vec<ParsedBarePeer>,
     resolved: &HashMap<String, Vec<IpAddr>>,
     tun_if: &str,
-    mtu: usize,
     events_tx: mpsc::Sender<Event>,
 ) -> Vec<ActivePeer> {
     let probe = DefaultRouteProbe;
@@ -426,39 +420,24 @@ async fn build_active_peers(
         };
 
         let destination = endpoints.destination();
-        let bind_addr = if destination.is_ipv4() {
-            SocketAddr::from(([0, 0, 0, 0], 0))
-        } else {
-            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0))
-        };
-
-        let (socket, warnings) = match bind_socket(
-            bind_addr,
-            peer.bindif.as_deref(),
-            destination.ip(),
-            Some(tun_if),
-            &probe,
-        )
-        .await
-        {
-            Ok((socket, warnings)) => (socket, warnings),
-            Err(err) => {
-                warn!("bare peer '{}' socket setup failed: {err}", peer.peer.id);
-                continue;
-            }
-        };
+        let (tx_socket, warnings) =
+            match BareUdpTx::from_config(destination, peer.bindif.as_deref(), Some(tun_if), &probe)
+                .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    warn!("bare peer '{}' socket setup failed: {err}", peer.peer.id);
+                    continue;
+                }
+            };
 
         for warning in warnings {
             log_bind_warning(&format!("peer {}", peer.peer.id), &warning);
         }
 
         let (packet_tx, packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
-        let ctx = UdpCtx {
-            socket: std::sync::Arc::new(socket),
-            mtu,
-        };
         let tx_handle = spawn_udp_tx(
-            ctx,
+            tx_socket,
             destination,
             packet_rx,
             events_tx.clone(),
