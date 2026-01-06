@@ -1,0 +1,1 @@
+./3rdparty/agentize/CLAUDE.md

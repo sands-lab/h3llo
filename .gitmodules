@@ -1,0 +1,3 @@
+[submodule "3rdparty/agentize"]
+	path = 3rdparty/agentize
+	url = https://github.com/Tonny-Gu/agentize.git

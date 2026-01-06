@@ -1,0 +1,1 @@
+../3rdparty/agentize/docs/git-msg-tags.md
