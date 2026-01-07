@@ -9,7 +9,7 @@ use crate::route::{sync_tun_routes, RouteManagerHandle, RouteSyncWarning};
 use crate::routing::RoutingTable;
 use crate::tun;
 use ipnet::IpNet;
-use log::{debug, warn};
+use log::warn;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -130,15 +130,20 @@ pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
         }
     }
 
-    let (tun_packet_tx, tun_packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
     let (bare_packet_tx, bare_packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
 
     let allowed_sources = collect_allowed_sources(&active_peers);
     let (_allowed_tx, allowed_rx) = mpsc::channel(1);
 
+    let peer_txs = active_peers
+        .iter()
+        .map(|peer| (peer.peer.id.clone(), peer.packet_tx.clone()))
+        .collect::<HashMap<_, _>>();
+
     let tun_rx_handle = tun::spawn_tun_rx(
         tun_reader,
-        tun_packet_tx,
+        routing.clone(),
+        peer_txs.clone(),
         events_tx.clone(),
         METRICS_INTERVAL,
     );
@@ -157,17 +162,10 @@ pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
         METRICS_INTERVAL,
     );
 
-    let peer_txs = active_peers
-        .iter()
-        .map(|peer| (peer.peer.id.clone(), peer.packet_tx.clone()))
-        .collect::<HashMap<_, _>>();
-    let dispatch_handle = spawn_tun_dispatch(tun_packet_rx, routing, peer_txs);
-
     let mut join_set = JoinSet::new();
     join_set.spawn(wrap_task("tun_rx", tun_rx_handle));
     join_set.spawn(wrap_task("tun_tx", tun_tx_handle));
     join_set.spawn(wrap_task("bare_rx", bare_rx_handle));
-    join_set.spawn(wrap_task("tun_dispatch", dispatch_handle));
 
     for peer in active_peers.drain(..) {
         let label = format!("bare_tx:{}", peer.peer.id);
@@ -495,66 +493,6 @@ fn tun_prefixes(addrs: &[String]) -> Result<Vec<IpNet>, BareRuntimeError> {
         prefixes.push(net);
     }
     Ok(prefixes)
-}
-
-fn spawn_tun_dispatch(
-    mut packet_rx: mpsc::Receiver<Vec<u8>>,
-    routing: RoutingTable,
-    peer_txs: HashMap<String, mpsc::Sender<Vec<u8>>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(packet) = packet_rx.recv().await {
-            let dest = match extract_dst_ip(&packet) {
-                Some(ip) => ip,
-                None => {
-                    debug!("dropping packet with unknown IP version");
-                    continue;
-                }
-            };
-
-            let route = match routing.lookup(dest) {
-                Some(route) => route,
-                None => {
-                    debug!("no route for destination {}", dest);
-                    continue;
-                }
-            };
-
-            match peer_txs.get(route.peer_id) {
-                Some(tx) => {
-                    if tx.send(packet).await.is_err() {
-                        warn!("peer {} channel closed", route.peer_id);
-                        break;
-                    }
-                }
-                None => {
-                    warn!("no tx channel for peer {}", route.peer_id);
-                }
-            }
-        }
-    })
-}
-
-fn extract_dst_ip(packet: &[u8]) -> Option<IpAddr> {
-    let first = *packet.first()?;
-    match first >> 4 {
-        4 => {
-            if packet.len() < 20 {
-                return None;
-            }
-            let dst = [packet[16], packet[17], packet[18], packet[19]];
-            Some(IpAddr::from(dst))
-        }
-        6 => {
-            if packet.len() < 40 {
-                return None;
-            }
-            let mut dst = [0u8; 16];
-            dst.copy_from_slice(&packet[24..40]);
-            Some(IpAddr::from(dst))
-        }
-        _ => None,
-    }
 }
 
 fn parse_ip_literal(host: &str) -> Option<IpAddr> {
