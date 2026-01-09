@@ -70,14 +70,10 @@ flowchart TB
     rsys[/System<br>Route Table\]
     cmd["Commands"]@{shape: braces}
 
-    subgraph cr-tun["Coroutine (TUN-Rx with Inline Routing)"]
+    subgraph cr-tun["Coroutine (TUN-Rx)"]
         tr[TUN Reader]
         tq[Command Queue]@{shape: h-cyl}
         rint[/Internal<br>Route Table\]
-        dispatch[Routing Dispatch<br>inline logic]
-        tr --> dispatch
-        tq -.-> rint
-        dispatch --> rint
     end
 
     subgraph cr-h3-1["Coroutine (H3-Tx)"]
@@ -92,9 +88,8 @@ flowchart TB
         bw[Bare Datagram Writer]
     end
 
-    cmd -.-> tq
-    prog --> rsys --> tun --> tr
-    dispatch --> bw & hw1
+    cmd -.-> tq -.-> rint
+    prog --> rsys --> tun --> tr --> rint --> bw & hw1
     rint -. backup path -.-> hw2
     hw1 & hw2 & bw -- bypass system route table --> wan
 ```
@@ -154,11 +149,11 @@ DNS refresh loop:
 - On timed-out pending entries, the resolver emits a timeout event, re-sends both A/AAAA queries with fresh transaction IDs, and re-registers them as pending.
 - On changes (new IPs), the orchestrator spawns H3 dialers to create new connections and updates BareUDP filters; newly established connections flow back into the pool and are pushed to TUN-Rx. BareUDP continues to keep the full DNS answer set for filtering and uses the first entry for outbound traffic.
 
-During packet forwarding, TUN-Rx performs inline routing dispatch: it extracts the destination IP from each packet, performs routing table lookup, and directly forwards packets to the appropriate peer's TX channel (H3 or BareUDP writer). This eliminates the intermediate dispatch coroutine and MPSC queue hop that previously existed between TUN-Rx and peer TX channels. For inbound traffic, received IP packets are enqueued into the TUN-Tx queue to keep TUN writes thread-safe.
+During packet forwarding, TUN-Rx chooses the active H3 connection for the peer based on the pool ordering above; it enqueues received IP packets into the TUN-Tx queue to keep TUN writes thread-safe.
 
 Key flows:
 
-- TUN Reader → inline routing dispatch (dest IP extraction + route lookup) → H3/Bare datagram writer.
+- TUN Reader → internal route table lookup → H3/Bare datagram writer.
 - H3/Bare datagram reader → queue → TUN Writer.
 - Controller updates → internal routes → system routes.
 
