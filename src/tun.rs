@@ -5,7 +5,6 @@ use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind}
 use crate::helpers::retry_on_interrupted;
 use crate::metrics::TransportCounters;
 use ipnet::{Ipv4Net, Ipv6Net};
-use log::debug;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
@@ -188,29 +187,6 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
         let mut ticker = time::interval(interval);
         let mut buf = vec![0u8; mtu];
 
-        // Helper function to extract destination IP from packet (inlined from orch.rs)
-        fn extract_dst_ip_inline(packet: &[u8]) -> Option<std::net::IpAddr> {
-            let first = *packet.first()?;
-            match first >> 4 {
-                4 => {
-                    if packet.len() < 20 {
-                        return None;
-                    }
-                    let dst = [packet[16], packet[17], packet[18], packet[19]];
-                    Some(std::net::IpAddr::from(dst))
-                }
-                6 => {
-                    if packet.len() < 40 {
-                        return None;
-                    }
-                    let mut dst = [0u8; 16];
-                    dst.copy_from_slice(&packet[24..40]);
-                    Some(std::net::IpAddr::from(dst))
-                }
-                _ => None,
-            }
-        }
-
         loop {
             tokio::select! {
                 result = tun.recv(&mut buf) => {
@@ -222,10 +198,10 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             let packet = buf[..len].to_vec();
 
                             // Inline routing dispatch (moved from spawn_tun_dispatch)
-                            let dest = match extract_dst_ip_inline(&packet) {
+                            let dest = match extract_dst_ip(&packet) {
                                 Some(ip) => ip,
                                 None => {
-                                    debug!("dropping packet with unknown IP version");
+                                    counters.record_drop(DropReason::InvalidIpVersion, len);
                                     continue;
                                 }
                             };
@@ -233,7 +209,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             let route = match routing.lookup(dest) {
                                 Some(route) => route,
                                 None => {
-                                    debug!("no route for destination {}", dest);
+                                    counters.record_drop(DropReason::NoRoute, len);
                                     continue;
                                 }
                             };
@@ -241,13 +217,13 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             match peer_txs.get(route.peer_id) {
                                 Some(tx) => {
                                     if tx.send(packet).await.is_err() {
-                                        debug!("peer {} channel closed", route.peer_id);
+                                        counters.record_drop(DropReason::ChannelClosed, len);
                                     } else {
                                         counters.record_success(len);
                                     }
                                 }
                                 None => {
-                                    debug!("no tx channel for peer {}", route.peer_id);
+                                    counters.record_drop(DropReason::NoPeerChannel, len);
                                 }
                             }
                         }
@@ -263,6 +239,29 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
             }
         }
     })
+}
+
+/// Extracts the destination IP address from an IP packet.
+fn extract_dst_ip(packet: &[u8]) -> Option<IpAddr> {
+    let first = *packet.first()?;
+    match first >> 4 {
+        4 => {
+            if packet.len() < 20 {
+                return None;
+            }
+            let dst = [packet[16], packet[17], packet[18], packet[19]];
+            Some(IpAddr::from(dst))
+        }
+        6 => {
+            if packet.len() < 40 {
+                return None;
+            }
+            let mut dst = [0u8; 16];
+            dst.copy_from_slice(&packet[24..40]);
+            Some(IpAddr::from(dst))
+        }
+        _ => None,
+    }
 }
 
 /// Spawns the TUN write loop, dropping oversize packets with counting and emitting TX metrics.
