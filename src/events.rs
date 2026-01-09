@@ -53,6 +53,12 @@ pub enum DropReason {
     SendError,
     /// Packet could not be forwarded because the channel closed.
     ChannelClosed,
+    /// Packet has unknown or invalid IP version.
+    InvalidIpVersion,
+    /// No route found for destination IP.
+    NoRoute,
+    /// No peer channel available for the route.
+    NoPeerChannel,
 }
 
 /// Aggregates packet counters by outcome.

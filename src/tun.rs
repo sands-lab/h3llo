@@ -176,7 +176,8 @@ fn parse_addrs(raw_addrs: &[String]) -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Tun
 #[allow(dead_code)]
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
-    packet_tx: mpsc::Sender<Vec<u8>>,
+    routing: crate::routing::RoutingTable,
+    peer_txs: std::collections::HashMap<String, mpsc::Sender<Vec<u8>>>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
@@ -195,11 +196,36 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                                 continue;
                             }
                             let packet = buf[..len].to_vec();
-                            if packet_tx.send(packet).await.is_err() {
-                                counters.record_drop(DropReason::ChannelClosed, len);
-                                break;
+
+                            // Inline routing dispatch (moved from spawn_tun_dispatch)
+                            let dest = match extract_dst_ip(&packet) {
+                                Some(ip) => ip,
+                                None => {
+                                    counters.record_drop(DropReason::InvalidIpVersion, len);
+                                    continue;
+                                }
+                            };
+
+                            let route = match routing.lookup(dest) {
+                                Some(route) => route,
+                                None => {
+                                    counters.record_drop(DropReason::NoRoute, len);
+                                    continue;
+                                }
+                            };
+
+                            match peer_txs.get(route.peer_id) {
+                                Some(tx) => {
+                                    if tx.send(packet).await.is_err() {
+                                        counters.record_drop(DropReason::ChannelClosed, len);
+                                    } else {
+                                        counters.record_success(len);
+                                    }
+                                }
+                                None => {
+                                    counters.record_drop(DropReason::NoPeerChannel, len);
+                                }
                             }
-                            counters.record_success(len);
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -213,6 +239,29 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
             }
         }
     })
+}
+
+/// Extracts the destination IP address from an IP packet.
+fn extract_dst_ip(packet: &[u8]) -> Option<IpAddr> {
+    let first = *packet.first()?;
+    match first >> 4 {
+        4 => {
+            if packet.len() < 20 {
+                return None;
+            }
+            let dst = [packet[16], packet[17], packet[18], packet[19]];
+            Some(IpAddr::from(dst))
+        }
+        6 => {
+            if packet.len() < 40 {
+                return None;
+            }
+            let mut dst = [0u8; 16];
+            dst.copy_from_slice(&packet[24..40]);
+            Some(IpAddr::from(dst))
+        }
+        _ => None,
+    }
 }
 
 /// Spawns the TUN write loop, dropping oversize packets with counting and emitting TX metrics.
@@ -378,14 +427,52 @@ mod tests {
 
     #[tokio::test]
     async fn tun_rx_pushes_packets_and_counts() {
-        let (rx_tun, mut tx_tun) = memory_tun("mem0", 32);
-        let (packet_tx, mut packet_rx) = mpsc::channel(4);
+        let (rx_tun, mut tx_tun) = memory_tun("mem0", 64);
+        let (peer_tx, mut peer_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
-        let tun_rx_task = spawn_tun_rx(rx_tun, packet_tx, events_tx, Duration::from_millis(10));
 
-        tx_tun.send(&[1, 2, 3]).await.unwrap();
-        let packet = packet_rx.recv().await.expect("packet should be forwarded");
-        assert_eq!(packet, vec![1, 2, 3]);
+        // Create mock routing table and peer channels for test
+        use crate::routing::RoutingTable;
+        use std::collections::HashMap;
+
+        // Create a simple IPv4 packet (version 4, dst 192.0.2.1)
+        let mut ipv4_packet = vec![0u8; 20];
+        ipv4_packet[0] = 0x45; // Version 4, header length 5
+        ipv4_packet[16] = 192; // Destination IP: 192.0.2.1
+        ipv4_packet[17] = 0;
+        ipv4_packet[18] = 2;
+        ipv4_packet[19] = 1;
+
+        // Setup routing: 192.0.2.0/24 -> peer1
+        use crate::config::{Peer, PeerTun};
+        let peer_config = Peer {
+            id: "peer1".to_string(),
+            enabled: true,
+            h3: None,
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
+            },
+        };
+        let routing = RoutingTable::from_peers(&[peer_config]).unwrap();
+
+        let mut peer_txs = HashMap::new();
+        peer_txs.insert("peer1".to_string(), peer_tx);
+
+        let tun_rx_task = spawn_tun_rx(
+            rx_tun,
+            routing,
+            peer_txs,
+            events_tx,
+            Duration::from_millis(10),
+        );
+
+        tx_tun.send(&ipv4_packet).await.unwrap();
+        let packet = peer_rx
+            .recv()
+            .await
+            .expect("packet should be routed to peer");
+        assert_eq!(packet, ipv4_packet);
 
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
@@ -408,7 +495,7 @@ mod tests {
         assert_eq!(metrics.labels.peer_id, None);
         assert_eq!(metrics.labels.ip_addr, None);
         assert_eq!(metrics.stats.succeeded.packets, 1);
-        assert_eq!(metrics.stats.succeeded.bytes, 3);
+        assert_eq!(metrics.stats.succeeded.bytes, 20);
     }
 
     #[tokio::test]
