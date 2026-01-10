@@ -237,6 +237,10 @@ impl RoutingTable {
 
         for peer in peers.iter().filter(|peer| peer.enabled) {
             let Some(tx) = peer_txs.get(&peer.id) else {
+                warn!(
+                    "enabled peer '{}' has no TX channel; skipping route registration",
+                    peer.id
+                );
                 continue;
             };
 
