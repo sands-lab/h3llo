@@ -273,6 +273,18 @@ impl RoutingTable {
     }
 }
 
+/// Commands accepted by the TUN receive loop.
+#[derive(Debug, Clone)]
+pub enum TunRxCommand {
+    /// Replace the routing table and peer TX channels atomically.
+    UpdateRouting {
+        /// New routing table.
+        routing: RoutingTable,
+        /// New peer TX channels.
+        peer_txs: std::collections::HashMap<String, mpsc::Sender<Vec<u8>>>,
+    },
+}
+
 /// Routing table construction or lookup error.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RoutingError {
@@ -330,11 +342,21 @@ fn parse_addrs(raw_addrs: &[String]) -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Tun
 }
 
 /// Spawns the TUN read loop, pushing packets into `packet_tx` with backpressure and emitting RX metrics.
+///
+/// # Arguments
+///
+/// * `tun` - TUN device reader.
+/// * `routing` - Initial routing table for destination lookups.
+/// * `peer_txs` - Initial peer TX channels keyed by peer ID.
+/// * `command_rx` - Channel for receiving runtime commands (e.g., routing updates).
+/// * `events_tx` - Channel for emitting receive metrics.
+/// * `interval` - Metrics emission interval.
 #[allow(dead_code)]
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
-    routing: RoutingTable,
-    peer_txs: std::collections::HashMap<String, mpsc::Sender<Vec<u8>>>,
+    mut routing: RoutingTable,
+    mut peer_txs: std::collections::HashMap<String, mpsc::Sender<Vec<u8>>>,
+    mut command_rx: mpsc::Receiver<TunRxCommand>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
@@ -386,6 +408,14 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
+                    }
+                }
+                Some(command) = command_rx.recv() => {
+                    match command {
+                        TunRxCommand::UpdateRouting { routing: new_routing, peer_txs: new_peer_txs } => {
+                            routing = new_routing;
+                            peer_txs = new_peer_txs;
+                        }
                     }
                 }
                 _ = ticker.tick() => {
@@ -614,10 +644,13 @@ mod tests {
         let mut peer_txs = HashMap::new();
         peer_txs.insert("peer1".to_string(), peer_tx);
 
+        let (_cmd_tx, command_rx) = mpsc::channel::<TunRxCommand>(1);
+
         let tun_rx_task = spawn_tun_rx(
             rx_tun,
             routing,
             peer_txs,
+            command_rx,
             events_tx,
             Duration::from_millis(10),
         );
@@ -824,5 +857,90 @@ mod tests {
             .lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
             .expect("lookup should succeed");
         assert_eq!(result.peer_id, "peer-a");
+    }
+
+    #[tokio::test]
+    async fn tun_rx_updates_routing_via_command() {
+        let (rx_tun, mut tx_tun) = memory_tun("mem-cmd", 64);
+        let (peer1_tx, mut peer1_rx) = mpsc::channel(4);
+        let (peer2_tx, mut peer2_rx) = mpsc::channel(4);
+        let (events_tx, _events_rx) = mpsc::channel(8);
+
+        use std::collections::HashMap;
+
+        // Create IPv4 packet destined to 192.0.2.1
+        let mut ipv4_packet = vec![0u8; 20];
+        ipv4_packet[0] = 0x45;
+        ipv4_packet[16] = 192;
+        ipv4_packet[17] = 0;
+        ipv4_packet[18] = 2;
+        ipv4_packet[19] = 1;
+
+        // Initial routing: 192.0.2.0/24 -> peer1
+        let peer1_config = Peer {
+            id: "peer1".to_string(),
+            enabled: true,
+            h3: None,
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["192.0.2.0/24".to_string()],
+            },
+        };
+        let routing = RoutingTable::from_peers(&[peer1_config]).unwrap();
+
+        let mut peer_txs = HashMap::new();
+        peer_txs.insert("peer1".to_string(), peer1_tx);
+
+        let (cmd_tx, command_rx) = mpsc::channel::<TunRxCommand>(1);
+
+        let tun_rx_task = spawn_tun_rx(
+            rx_tun,
+            routing,
+            peer_txs,
+            command_rx,
+            events_tx,
+            Duration::from_secs(60),
+        );
+
+        // Send packet - should go to peer1
+        tx_tun.send(&ipv4_packet).await.unwrap();
+        let packet = peer1_rx.recv().await.expect("packet should route to peer1");
+        assert_eq!(packet, ipv4_packet);
+
+        // Update routing: 192.0.2.0/24 -> peer2
+        let peer2_config = Peer {
+            id: "peer2".to_string(),
+            enabled: true,
+            h3: None,
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["192.0.2.0/24".to_string()],
+            },
+        };
+        let new_routing = RoutingTable::from_peers(&[peer2_config]).unwrap();
+
+        let mut new_peer_txs = HashMap::new();
+        new_peer_txs.insert("peer2".to_string(), peer2_tx);
+
+        cmd_tx
+            .send(TunRxCommand::UpdateRouting {
+                routing: new_routing,
+                peer_txs: new_peer_txs,
+            })
+            .await
+            .unwrap();
+
+        // Allow command to be processed
+        tokio::task::yield_now().await;
+
+        // Send another packet - should now go to peer2
+        tx_tun.send(&ipv4_packet).await.unwrap();
+        let packet = peer2_rx.recv().await.expect("packet should route to peer2");
+        assert_eq!(packet, ipv4_packet);
+
+        // Verify peer1 did not receive the second packet
+        assert!(peer1_rx.try_recv().is_err());
+
+        tun_rx_task.abort();
     }
 }
