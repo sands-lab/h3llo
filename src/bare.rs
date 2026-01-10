@@ -72,6 +72,13 @@ impl PeerEndpoints {
     }
 }
 
+/// Commands accepted by the BareUDP receive loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BareUdpRxCommand {
+    /// Replace the allowed source IP filter set.
+    UpdateAllowedSources(HashSet<IpAddr>),
+}
+
 /// Provides receive-only access to a BareUDP socket.
 #[derive(Debug)]
 pub struct BareUdpRx {
@@ -127,14 +134,14 @@ impl BareUdpTx {
 /// # Arguments
 /// - `rx`: Receive-only socket and MTU.
 /// - `allowed_sources`: Initial allowed source IP set.
-/// - `allowed_updates`: Channel delivering full replacements for the allowed source set.
+/// - `command_rx`: Channel delivering commands to the receive loop.
 /// - `packet_tx`: Channel to push accepted packets into.
 /// - `events_tx`: Channel for emitting receive metrics.
 /// - `interval`: Metrics emission interval.
 pub fn spawn_udp_rx(
     rx: BareUdpRx,
     mut allowed_sources: HashSet<IpAddr>,
-    mut allowed_updates: mpsc::Receiver<HashSet<IpAddr>>,
+    mut command_rx: mpsc::Receiver<BareUdpRxCommand>,
     packet_tx: mpsc::Sender<Vec<u8>>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
@@ -169,8 +176,12 @@ pub fn spawn_udp_rx(
                         Err(_) => break,
                     }
                 }
-                Some(update) = allowed_updates.recv() => {
-                    allowed_sources = update;
+                Some(command) = command_rx.recv() => {
+                    match command {
+                        BareUdpRxCommand::UpdateAllowedSources(update) => {
+                            allowed_sources = update;
+                        }
+                    }
                 }
                 _ = ticker.tick() => {
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).await.is_err() {
@@ -265,13 +276,13 @@ mod tests {
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
         let allowed = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))]);
-        let (_allow_tx, allowed_updates) = mpsc::channel(1);
+        let (_cmd_tx, command_rx) = mpsc::channel(1);
         let (events_tx, mut _events_rx) = mpsc::channel(4);
         let context = BareUdpRx { socket, mtu: 64 };
         let handle = spawn_udp_rx(
             context,
             allowed,
-            allowed_updates,
+            command_rx,
             packet_tx,
             events_tx,
             Duration::from_millis(200),
@@ -299,13 +310,13 @@ mod tests {
         };
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
-        let (update_tx, allowed_updates) = mpsc::channel(1);
+        let (cmd_tx, command_rx) = mpsc::channel(1);
         let (events_tx, mut _events_rx) = mpsc::channel(4);
         let context = BareUdpRx { socket, mtu: 64 };
         let handle = spawn_udp_rx(
             context,
             HashSet::new(),
-            allowed_updates,
+            command_rx,
             packet_tx,
             events_tx,
             Duration::from_millis(200),
@@ -324,8 +335,10 @@ mod tests {
             "no packet should be delivered before update"
         );
 
-        update_tx
-            .send(HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]))
+        cmd_tx
+            .send(BareUdpRxCommand::UpdateAllowedSources(HashSet::from([
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            ])))
             .await
             .unwrap();
 
@@ -383,13 +396,13 @@ mod tests {
         };
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
-        let (_update_tx, allowed_updates) = mpsc::channel(1);
+        let (_cmd_tx, command_rx) = mpsc::channel(1);
         let (events_tx, mut events_rx) = mpsc::channel(4);
         let context = BareUdpRx { socket, mtu: 128 };
         let handle = spawn_udp_rx(
             context,
             HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]),
-            allowed_updates,
+            command_rx,
             packet_tx,
             events_tx,
             Duration::from_millis(10),

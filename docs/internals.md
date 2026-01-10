@@ -1,6 +1,6 @@
 ## Internals
 
-Internals overview: runtime dependencies, guards against recursive routing and DNS resolution loops, coroutine layout for packet flow, route update strategy, and longest-prefix matching. Protocol/auth specifics live in `docs/protocol.md`.
+Internals overview: runtime dependencies, guards against recursive routing and DNS resolution loops, actor-based concurrency model, route update strategy, and longest-prefix matching. Protocol/auth specifics live in `docs/protocol.md`.
 
 ### Dependencies
 
@@ -14,7 +14,7 @@ Why recursive routing happens: if h3llo installs the default route into the TUN 
 
 Binding workflow for HTTP/3, BareUDP, and DNS:
 1. Pick the DNS interface: prefer `local.dns.bindif` when provided and present in probe results; warn and fall back to the first probed non-TUN interface when the preferred one is missing. If no interface is available or probing fails, log a warning and continue with an unbound DNS socket. Probing uses `route_manager` to list routes, performs prefix matches against the target IP, filters entries whose `ifindex` matches the TUN, and maps interface indexes back to names; `route_manager` does not expose route metrics/priority, so ties with equal prefixes rely on route enumeration order—set `local.dns.bindif` / `peers[].h3.bindifs` (non-empty) explicitly when interface preference matters.
-2. DNS resolver coroutine: bind a UDP socket by interface index (Linux/macOS via `bind_device_by_index_v4/6`, Windows via `IP_UNICAST_IF` / `IPV6_UNICAST_IF`) when available. The coroutine runs a `select` over its command queue, UDP socket, and a one-second timer tick. Each resolve command assigns random unique transaction IDs for A and AAAA, tracks the `(domain, id)` pairs, and sends two queries to the configured DNS server. Every received packet emits a DNS event: answers include parsed IPs plus warnings for NXDOMAIN/truncation/recursion refusal; decode failures, unknown transaction IDs, and non-A/AAAA answers emit “unexpected” events. Pending entries are removed after each packet. Timer ticks re-send timed-out entries with new transaction IDs and emit timeout events before retransmission.
+2. DNS resolver actor: bind a UDP socket by interface index (Linux/macOS via `bind_device_by_index_v4/6`, Windows via `IP_UNICAST_IF` / `IPV6_UNICAST_IF`) when available. The actor runs a `select` over its command queue, UDP socket, and a one-second timer tick. Each resolve command assigns random unique transaction IDs for A and AAAA, tracks the `(domain, id)` pairs, and sends two queries to the configured DNS server. Every received packet emits a DNS event: answers include parsed IPs plus warnings for NXDOMAIN/truncation/recursion refusal; decode failures, unknown transaction IDs, and non-A/AAAA answers emit "unexpected" events. Pending entries are removed after each packet. Timer ticks re-send timed-out entries with new transaction IDs and emit timeout events before retransmission.
 3. Transport binding: for each resolved IP (HTTP/3) or selected outbound IP (BareUDP), probe the WAN-facing interface excluding the TUN; bind transport sockets to that interface. HTTP/3 creates connections across the Cartesian product of DNS answers, `peers[].h3.endpoints`, and provided `peers[].h3.bindifs` (auto-detected bindif yields at most one entry when the field is omitted); BareUDP uses a single listener socket (RX-only) and one outbound socket per BareUDP peer (TX-only). If probing or binding fails, warn and continue unbound.
 
 Platform tiers and binding behavior:
@@ -23,9 +23,15 @@ Platform tiers and binding behavior:
 - Windows (second tier): binds via `IP_UNICAST_IF` / `IPV6_UNICAST_IF` using interface index; failures degrade to unbound sockets with warnings.
 - BSD (third tier): route probing and interface binding are not supported; h3llo will warn, avoid interface pinning, and cannot install or adjust routes automatically. Users must update the system route table manually to prevent recursive routing.
 
-### Thread Model
+### Concurrency Model (Actor)
 
-Thread model overview: h3llo schedules a coroutine per I/O source (TUN, each HTTP/3 connection, BareUDP endpoint) and uses MPSC queues to serialize cross-component communication; configuration updates flow from the controller into routing tables before affecting system routes.
+Concurrency model overview: h3llo adopts the actor model—each coroutine (actor) owns private state, communicates exclusively via MPSC message queues, and never shares mutable data with other actors. This eliminates lock contention and simplifies reasoning about concurrent correctness.
+
+Actor design principles:
+- **Isolated state**: each actor (TUN-Rx, TUN-Tx, DNS Resolver, BareUDP-Rx/Tx, Orchestrator, H3 connections) maintains its own state; no `Arc<Mutex<_>>` across actors.
+- **Message passing**: actors communicate through typed `mpsc::channel` queues; the `Event` enum and command types define the message protocol.
+- **Async select loop**: each actor runs a `tokio::select!` loop over its input channels, I/O sources, and timers.
+- **Supervision**: the Orchestrator spawns and monitors child actors (DNS resolver, H3 dialers); task exits propagate upward via `JoinSet`.
 
 **Inbound Datapath**
 
@@ -36,21 +42,21 @@ flowchart TB
     prog[Programs]@{shape: processes}
     cmd["Commands"]@{shape: braces}
 
-    subgraph cr-h3-1["Coroutine (H3-Rx)"]
+    subgraph cr-h3-1["Actor (H3-Rx)"]
         hr1[H3 Datagram Reader]
     end
 
-    subgraph cr-h3-2["Coroutine (H3-Rx)"]
+    subgraph cr-h3-2["Actor (H3-Rx)"]
         hr2[H3 Datagram Reader]
     end
 
-    subgraph cr-bare["Coroutine (Bare-Rx)"]
+    subgraph cr-bare["Actor (Bare-Rx)"]
         bq[Command Queue]@{shape: h-cyl}
         bsf[Source IP Filter]
         br[Bare Datagram Reader]
     end
 
-    subgraph cr-tun["Coroutine (TUN-Tx)"]
+    subgraph cr-tun["Actor (TUN-Tx)"]
         tq[MPSC Queue]@{shape: h-cyl}
         tw[TUN Writer]
     end
@@ -70,21 +76,21 @@ flowchart TB
     rsys[/System<br>Route Table\]
     cmd["Commands"]@{shape: braces}
 
-    subgraph cr-tun["Coroutine (TUN-Rx)"]
+    subgraph cr-tun["Actor (TUN-Rx)"]
         tr[TUN Reader]
         tq[Command Queue]@{shape: h-cyl}
         rint[/Internal<br>Route Table\]
     end
 
-    subgraph cr-h3-1["Coroutine (H3-Tx)"]
+    subgraph cr-h3-1["Actor (H3-Tx)"]
         hw1[H3 Datagram Writer]
     end
 
-    subgraph cr-h3-2["Coroutine (H3-Tx)"]
+    subgraph cr-h3-2["Actor (H3-Tx)"]
         hw2[H3 Datagram Writer]
     end
 
-    subgraph cr-bare["Coroutine (Bare-Tx)"]
+    subgraph cr-bare["Actor (Bare-Tx)"]
         bw[Bare Datagram Writer]
     end
 
@@ -98,7 +104,7 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    subgraph cr-orch["Coroutine (Orchestrator)"]
+    subgraph cr-orch["Actor (Orchestrator)"]
         oq[Command Queue]@{shape: h-cyl}
         hcp[H3 Conn Pool]
         dr[DNS Answers]
@@ -107,15 +113,15 @@ flowchart TB
     end
 
     ctrl["External Controller"]
-    cr-h3h["Coroutine<br>(H3-Handler)"]
-    cr-h3r["Coroutine (H3-Rx)"]
-    cr-timer["Coroutine (Timer)"]
+    cr-h3h["Actor<br>(H3-Handler)"]
+    cr-h3r["Actor (H3-Rx)"]
+    cr-timer["Actor (Timer)"]
 
     rsys[/System<br>Route Table\]
-    cr-tun["Coroutine<br>(TUN-Rx)"]
-    cr-bare["Coroutine<br>(Bare-Rx)"]
-    cr-dns["Coroutine<br>(DNS-Resolver)"]
-    cr-h3d["Coroutine<br>(H3-Dialer)"]
+    cr-tun["Actor<br>(TUN-Rx)"]
+    cr-bare["Actor<br>(Bare-Rx)"]
+    cr-dns["Actor<br>(DNS-Resolver)"]
+    cr-h3d["Actor<br>(H3-Dialer)"]
 
     ctrl -- HTTP GET/POST --> cr-h3h -- emit(conf-update) --> cr-orch
     cr-h3r -- emit(conn-close) --> cr-orch
@@ -128,14 +134,14 @@ flowchart TB
     cr-orch -- emit(filter-update) --> cr-bare
 ```
 
-h3llo uses the tokio runtime to schedule coroutines and should rely on MPSC queues instead of locks to reduce async complexity, since MPSC queues explicitly linearize async operations.
+h3llo uses the tokio runtime to schedule actors and relies on MPSC queues instead of locks, since message passing explicitly linearizes async operations and avoids shared mutable state.
 
 Orchestrator responsibilities and invariants:
-- Maintain the latest configuration snapshot and H3 connection pool; receive commands from other coroutines through its MPSC queue.
+- Maintain the latest configuration snapshot and H3 connection pool; receive commands from other actors through its MPSC queue.
 - Stay fully async: handle config updates, DNS refresh results, connection close notifications, and timer ticks without blocking other commands.
-- Spawn new coroutines (DNS resolver, H3 dialers) and push newly established H3 connections to the TUN-Rx coroutine for routing decisions.
+- Spawn child actors (DNS resolver, H3 dialers) and push newly established H3 connections to the TUN-Rx actor for routing decisions.
 
-Spawn a coroutine for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx coroutine; BareUDP owns one listener socket for RX and a separate TX-only socket per BareUDP peer.
+Spawn an actor for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx actor; BareUDP owns one listener socket for RX and a separate TX-only socket per BareUDP peer.
 
 When configuration changes arrive (external controller POST or initialization), update the internal routing table first, then the system routing table. Dynamic reconfiguration flows through the orchestrator via command queues; transport rebuilds or filter updates happen after routing changes.
 
@@ -145,11 +151,11 @@ H3 connection pooling and selection:
 - Prefer the earliest established connection until it disconnects or becomes invalid because its IP left the latest DNS result set or its interface is no longer within `bindifs`. Fall back to the next-most-recent connection; newly rebuilt connections sit at the end of the ordering.
 
 DNS refresh loop:
-- Every `local.dns.refresh` seconds (when nonzero), the orchestrator enqueues resolve commands for all hostnames; the resolver coroutine streams one DNS event per packet (answers plus warnings, or unexpected packets) and removes the matching pending entry.
+- Every `local.dns.refresh` seconds (when nonzero), the orchestrator enqueues resolve commands for all hostnames; the resolver actor streams one DNS event per packet (answers plus warnings, or unexpected packets) and removes the matching pending entry.
 - On timed-out pending entries, the resolver emits a timeout event, re-sends both A/AAAA queries with fresh transaction IDs, and re-registers them as pending.
 - On changes (new IPs), the orchestrator spawns H3 dialers to create new connections and updates BareUDP filters; newly established connections flow back into the pool and are pushed to TUN-Rx. BareUDP continues to keep the full DNS answer set for filtering and uses the first entry for outbound traffic.
 
-During packet forwarding, TUN-Rx performs inline routing dispatch: it extracts the destination IP from each packet, performs routing table lookup, and directly forwards packets to the appropriate peer's TX channel (H3 or BareUDP writer). This eliminates the intermediate dispatch coroutine and MPSC queue hop that previously existed between TUN-Rx and peer TX channels. For inbound traffic, received IP packets are enqueued into the TUN-Tx queue to keep TUN writes thread-safe.
+During packet forwarding, TUN-Rx performs inline routing dispatch: it extracts the destination IP from each packet, performs routing table lookup, and directly forwards packets to the appropriate peer's TX channel (H3 or BareUDP writer). This eliminates an intermediate dispatch actor and MPSC queue hop that would otherwise exist between TUN-Rx and peer TX channels. For inbound traffic, received IP packets are enqueued into the TUN-Tx queue to keep TUN writes thread-safe.
 
 Key flows:
 

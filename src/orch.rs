@@ -1,6 +1,8 @@
 //! BareUDP-only runtime orchestration.
 
-use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpTx, PeerEndpoints};
+use crate::bare::{
+    spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareUdpTx, PeerEndpoints,
+};
 use crate::bind::{BindWarning, DefaultRouteProbe};
 use crate::config::{parse_udp_uri, Config, Peer, UdpEndpoint};
 use crate::dns::{DnsCommand, DnsResolver};
@@ -132,7 +134,7 @@ pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
     let (bare_packet_tx, bare_packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
 
     let allowed_sources = collect_allowed_sources(&active_peers);
-    let (_allowed_tx, allowed_rx) = mpsc::channel(1);
+    let (_cmd_tx, command_rx) = mpsc::channel::<BareUdpRxCommand>(1);
 
     let peer_txs = active_peers
         .iter()
@@ -155,7 +157,7 @@ pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
     let bare_rx_handle = spawn_udp_rx(
         bare_rx,
         allowed_sources,
-        allowed_rx,
+        command_rx,
         bare_packet_tx,
         events_tx.clone(),
         METRICS_INTERVAL,
