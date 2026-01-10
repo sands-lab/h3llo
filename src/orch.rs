@@ -8,7 +8,7 @@ use crate::config::{parse_udp_uri, Config, Peer, UdpEndpoint};
 use crate::dns::{DnsCommand, DnsResolver};
 use crate::events::{DnsEventDetail, DnsRecordType, Event};
 use crate::route::{sync_tun_routes, RouteManagerHandle, RouteSyncWarning};
-use crate::tun::{self, RoutingTable};
+use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
 use log::warn;
 use std::collections::{HashMap, HashSet};
@@ -135,6 +135,8 @@ pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
 
     let allowed_sources = collect_allowed_sources(&active_peers);
     let (_cmd_tx, command_rx) = mpsc::channel::<BareUdpRxCommand>(1);
+    // Command sender for future dynamic routing updates; currently unused.
+    let (_tun_cmd_tx, tun_command_rx) = mpsc::channel::<TunRxCommand>(1);
 
     let peer_txs = active_peers
         .iter()
@@ -145,6 +147,7 @@ pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
         tun_reader,
         routing.clone(),
         peer_txs.clone(),
+        tun_command_rx,
         events_tx.clone(),
         METRICS_INTERVAL,
     );
