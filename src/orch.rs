@@ -108,7 +108,11 @@ pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
     }
 
     let routing_peers: Vec<Peer> = active_peers.iter().map(|peer| peer.peer.clone()).collect();
-    let routing = RoutingTable::from_peers(&routing_peers)
+    let peer_txs: HashMap<_, _> = active_peers
+        .iter()
+        .map(|peer| (peer.peer.id.clone(), peer.packet_tx.clone()))
+        .collect();
+    let routing = RoutingTable::from_peers(&routing_peers, &peer_txs)
         .map_err(|err| BareRuntimeError::Routing(err.to_string()))?;
 
     if config.local.table {
@@ -138,15 +142,9 @@ pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
     // Command sender for future dynamic routing updates; currently unused.
     let (_tun_cmd_tx, tun_command_rx) = mpsc::channel::<TunRxCommand>(1);
 
-    let peer_txs = active_peers
-        .iter()
-        .map(|peer| (peer.peer.id.clone(), peer.packet_tx.clone()))
-        .collect::<HashMap<_, _>>();
-
     let tun_rx_handle = tun::spawn_tun_rx(
         tun_reader,
         routing.clone(),
-        peer_txs.clone(),
         tun_command_rx,
         events_tx.clone(),
         METRICS_INTERVAL,

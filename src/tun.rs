@@ -7,6 +7,7 @@ use crate::metrics::TransportCounters;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use ipnet_trie::IpnetTrie;
 use log::warn;
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
@@ -154,20 +155,40 @@ fn log_duplicate_allowed(peer_id: &str, cidr: &str) {
     );
 }
 
-/// Stores routing metadata for a prefix.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Stores routing metadata for a prefix, including the channel to forward packets.
+#[derive(Clone)]
 pub struct RouteEntry {
     /// Identifier of the peer owning the prefix.
     pub peer_id: String,
+    /// Channel to send packets to this peer.
+    pub tx: mpsc::Sender<Vec<u8>>,
 }
 
+impl std::fmt::Debug for RouteEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouteEntry")
+            .field("peer_id", &self.peer_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for RouteEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.peer_id == other.peer_id
+    }
+}
+
+impl Eq for RouteEntry {}
+
 /// Represents the result of a longest-prefix lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RouteMatch<'a> {
     /// Matched prefix.
     pub prefix: IpNet,
     /// Identifier of the peer selected by the lookup.
     pub peer_id: &'a str,
+    /// Channel to send packets to this peer.
+    pub tx: &'a mpsc::Sender<Vec<u8>>,
 }
 
 /// In-memory routing table supporting IPv4 and IPv6 longest-prefix matches.
@@ -198,15 +219,27 @@ impl RoutingTable {
         }
     }
 
-    /// Builds a routing table from enabled peers, validating prefixes and skipping duplicates within a peer.
+    /// Builds a routing table from enabled peers with their TX channels.
+    ///
+    /// # Arguments
+    ///
+    /// * `peers` - Peer configurations.
+    /// * `peer_txs` - Map of peer ID to TX channel. Peers without a channel are skipped.
     ///
     /// # Errors
     ///
     /// Returns `RoutingError` when a prefix is invalid or conflicts with an existing peer.
-    pub fn from_peers(peers: &[Peer]) -> Result<Self, RoutingError> {
+    pub fn from_peers(
+        peers: &[Peer],
+        peer_txs: &HashMap<String, mpsc::Sender<Vec<u8>>>,
+    ) -> Result<Self, RoutingError> {
         let mut table = RoutingTable::new();
 
         for peer in peers.iter().filter(|peer| peer.enabled) {
+            let Some(tx) = peer_txs.get(&peer.id) else {
+                continue;
+            };
+
             for cidr in &peer.tun.allowed_ips {
                 let net: IpNet =
                     cidr.parse::<IpNet>()
@@ -220,6 +253,7 @@ impl RoutingTable {
                     net,
                     RouteEntry {
                         peer_id: peer.id.clone(),
+                        tx: tx.clone(),
                     },
                 )?;
             }
@@ -259,6 +293,7 @@ impl RoutingTable {
             .map(|(prefix, entry)| RouteMatch {
                 prefix,
                 peer_id: entry.peer_id.as_str(),
+                tx: &entry.tx,
             })
     }
 
@@ -276,12 +311,10 @@ impl RoutingTable {
 /// Commands accepted by the TUN receive loop.
 #[derive(Debug, Clone)]
 pub enum TunRxCommand {
-    /// Replace the routing table and peer TX channels atomically.
+    /// Replace the routing table atomically.
     UpdateRouting {
-        /// New routing table.
+        /// New routing table (includes embedded TX channels).
         routing: RoutingTable,
-        /// New peer TX channels.
-        peer_txs: std::collections::HashMap<String, mpsc::Sender<Vec<u8>>>,
     },
 }
 
@@ -341,13 +374,12 @@ fn parse_addrs(raw_addrs: &[String]) -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Tun
     Ok((v4, v6))
 }
 
-/// Spawns the TUN read loop, pushing packets into `packet_tx` with backpressure and emitting RX metrics.
+/// Spawns the TUN read loop, pushing packets into peer TX channels with backpressure and emitting RX metrics.
 ///
 /// # Arguments
 ///
 /// * `tun` - TUN device reader.
-/// * `routing` - Initial routing table for destination lookups.
-/// * `peer_txs` - Initial peer TX channels keyed by peer ID.
+/// * `routing` - Initial routing table for destination lookups (includes embedded TX channels).
 /// * `command_rx` - Channel for receiving runtime commands (e.g., routing updates).
 /// * `events_tx` - Channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
@@ -355,7 +387,6 @@ fn parse_addrs(raw_addrs: &[String]) -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Tun
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
     mut routing: RoutingTable,
-    mut peer_txs: std::collections::HashMap<String, mpsc::Sender<Vec<u8>>>,
     mut command_rx: mpsc::Receiver<TunRxCommand>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
@@ -376,7 +407,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             }
                             let packet = buf[..len].to_vec();
 
-                            // Inline routing dispatch (moved from spawn_tun_dispatch)
+                            // Inline routing dispatch
                             let dest = match extract_dst_ip(&packet) {
                                 Some(ip) => ip,
                                 None => {
@@ -393,17 +424,11 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                                 }
                             };
 
-                            match peer_txs.get(route.peer_id) {
-                                Some(tx) => {
-                                    if tx.send(packet).await.is_err() {
-                                        counters.record_drop(DropReason::ChannelClosed, len);
-                                    } else {
-                                        counters.record_success(len);
-                                    }
-                                }
-                                None => {
-                                    counters.record_drop(DropReason::NoPeerChannel, len);
-                                }
+                            // Send directly via embedded TX channel
+                            if route.tx.send(packet).await.is_err() {
+                                counters.record_drop(DropReason::ChannelClosed, len);
+                            } else {
+                                counters.record_success(len);
                             }
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -412,9 +437,8 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                 }
                 Some(command) = command_rx.recv() => {
                     match command {
-                        TunRxCommand::UpdateRouting { routing: new_routing, peer_txs: new_peer_txs } => {
+                        TunRxCommand::UpdateRouting { routing: new_routing } => {
                             routing = new_routing;
-                            peer_txs = new_peer_txs;
                         }
                     }
                 }
@@ -618,9 +642,6 @@ mod tests {
         let (peer_tx, mut peer_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
 
-        // Create mock routing table and peer channels for test
-        use std::collections::HashMap;
-
         // Create a simple IPv4 packet (version 4, dst 192.0.2.1)
         let mut ipv4_packet = vec![0u8; 20];
         ipv4_packet[0] = 0x45; // Version 4, header length 5
@@ -639,17 +660,15 @@ mod tests {
                 allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
             },
         };
-        let routing = RoutingTable::from_peers(&[peer_config]).unwrap();
-
         let mut peer_txs = HashMap::new();
         peer_txs.insert("peer1".to_string(), peer_tx);
+        let routing = RoutingTable::from_peers(&[peer_config], &peer_txs).unwrap();
 
         let (_cmd_tx, command_rx) = mpsc::channel::<TunRxCommand>(1);
 
         let tun_rx_task = spawn_tun_rx(
             rx_tun,
             routing,
-            peer_txs,
             command_rx,
             events_tx,
             Duration::from_millis(10),
@@ -803,13 +822,25 @@ mod tests {
         }
     }
 
+    /// Creates dummy peer TX channels for routing table tests.
+    fn dummy_peer_txs(peer_ids: &[&str]) -> HashMap<String, mpsc::Sender<Vec<u8>>> {
+        peer_ids
+            .iter()
+            .map(|id| {
+                let (tx, _rx) = mpsc::channel(1);
+                (id.to_string(), tx)
+            })
+            .collect()
+    }
+
     #[test]
     fn chooses_longest_prefix() {
         let peers = vec![
             bare_peer("peer-a", true, &["10.0.0.0/16"]),
             bare_peer("peer-b", true, &["10.0.0.0/24"]),
         ];
-        let table = RoutingTable::from_peers(&peers).expect("table should build");
+        let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
+        let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
         let result = table
             .lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42)))
             .expect("lookup should succeed");
@@ -823,7 +854,8 @@ mod tests {
             bare_peer("peer-disabled", false, &["10.1.0.0/16"]),
             bare_peer("peer-active", true, &["10.0.0.0/8"]),
         ];
-        let table = RoutingTable::from_peers(&peers).expect("table should build");
+        let peer_txs = dummy_peer_txs(&["peer-disabled", "peer-active"]);
+        let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
         assert_eq!(table.len(), (1, 0));
         let result = table
             .lookup(IpAddr::V4(Ipv4Addr::new(10, 2, 3, 4)))
@@ -837,7 +869,8 @@ mod tests {
             bare_peer("peer-a", true, &["10.0.0.0/24"]),
             bare_peer("peer-b", true, &["10.0.0.0/24"]),
         ];
-        let err = RoutingTable::from_peers(&peers).unwrap_err();
+        let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
+        let err = RoutingTable::from_peers(&peers, &peer_txs).unwrap_err();
         assert!(matches!(
             err,
             RoutingError::ConflictingPrefix {
@@ -851,7 +884,8 @@ mod tests {
     #[test]
     fn skips_duplicate_prefixes_within_peer() {
         let peers = vec![bare_peer("peer-a", true, &["10.0.0.0/24", "10.0.0.0/24"])];
-        let table = RoutingTable::from_peers(&peers).expect("table should build");
+        let peer_txs = dummy_peer_txs(&["peer-a"]);
+        let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
         assert_eq!(table.len(), (1, 0));
         let result = table
             .lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
@@ -865,8 +899,6 @@ mod tests {
         let (peer1_tx, mut peer1_rx) = mpsc::channel(4);
         let (peer2_tx, mut peer2_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::channel(8);
-
-        use std::collections::HashMap;
 
         // Create IPv4 packet destined to 192.0.2.1
         let mut ipv4_packet = vec![0u8; 20];
@@ -886,17 +918,15 @@ mod tests {
                 allowed_ips: vec!["192.0.2.0/24".to_string()],
             },
         };
-        let routing = RoutingTable::from_peers(&[peer1_config]).unwrap();
-
         let mut peer_txs = HashMap::new();
         peer_txs.insert("peer1".to_string(), peer1_tx);
+        let routing = RoutingTable::from_peers(&[peer1_config], &peer_txs).unwrap();
 
         let (cmd_tx, command_rx) = mpsc::channel::<TunRxCommand>(1);
 
         let tun_rx_task = spawn_tun_rx(
             rx_tun,
             routing,
-            peer_txs,
             command_rx,
             events_tx,
             Duration::from_secs(60),
@@ -917,15 +947,13 @@ mod tests {
                 allowed_ips: vec!["192.0.2.0/24".to_string()],
             },
         };
-        let new_routing = RoutingTable::from_peers(&[peer2_config]).unwrap();
-
         let mut new_peer_txs = HashMap::new();
         new_peer_txs.insert("peer2".to_string(), peer2_tx);
+        let new_routing = RoutingTable::from_peers(&[peer2_config], &new_peer_txs).unwrap();
 
         cmd_tx
             .send(TunRxCommand::UpdateRouting {
                 routing: new_routing,
-                peer_txs: new_peer_txs,
             })
             .await
             .unwrap();
