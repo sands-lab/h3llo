@@ -180,3 +180,12 @@ Observability summary: interface loops emit cumulative metrics (packets/bytes, d
 - Metric shape: every emit carries labels `{kind: Tun|BareUdp|Http3, direction: Rx|Tx, peer_id?: string, ip_addr?: IP}` plus total succeeded and dropped counters and a drop-reason map keyed by `DropReason` (e.g., `Oversize`, `DisallowedSource`, `SendError`, `ChannelClosed`).
 - Drop accounting: TUN TX counts oversize and send failures; TUN RX counts channel-closed drops when forwarding to the writer queue fails; BareUDP RX counts disallowed sources; BareUDP TX counts send failures. All counters saturate to avoid panics.
 - Reporting: only the orchestrator prints periodic drop summaries (when counters change); transport loops stay silent, including oversized TUN drops.
+
+#### Warning Patterns
+
+h3llo uses return-value warnings for operation outcomes that may need logging or action:
+
+- **Return-value warnings** (`BindWarning`, `RouteSyncWarning`, `PeerEndpointsWarning`): Returned from functions and processed by the orchestrator. This pattern enables unit testing of warning conditions.
+- **Event-field warnings** (`DnsAnswerWarning`, `DnsUnexpectedKind`): Metadata attached to events flowing through the event system.
+
+**Guideline**: Prefer return-value warnings over direct `warn!()` calls when the condition is testable. Direct logging is acceptable only for transient runtime status that cannot be meaningfully tested.
