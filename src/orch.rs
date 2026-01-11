@@ -538,3 +538,94 @@ async fn wrap_task(label: impl Into<String>, handle: JoinHandle<()>) -> String {
     let _ = handle.await;
     name
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{
+        Direction, DropReason, Event, PktCounters, TransportEvent, TransportKind, TransportLabels,
+        TransportMetrics, TransportStats,
+    };
+    use std::collections::HashMap;
+
+    fn make_metrics_event(kind: TransportKind, direction: Direction) -> Event {
+        let mut drop_reasons = HashMap::new();
+        drop_reasons.insert(
+            DropReason::Oversize,
+            PktCounters {
+                packets: 1,
+                bytes: 1500,
+            },
+        );
+        Event::Transport(TransportEvent::Metrics(TransportMetrics {
+            labels: TransportLabels {
+                kind,
+                direction,
+                peer_id: Some("test-peer".to_string()),
+                ip_addr: None,
+            },
+            stats: TransportStats {
+                succeeded: PktCounters {
+                    packets: 100,
+                    bytes: 64000,
+                },
+                dropped: PktCounters {
+                    packets: 1,
+                    bytes: 1500,
+                },
+                drop_reasons,
+            },
+        }))
+    }
+
+    #[test]
+    fn handle_event_processes_metrics() {
+        // Test that handle_event correctly processes metrics events without panicking.
+        // The actual logging behavior is verified by the function not panicking
+        // and returning normally.
+        let event = make_metrics_event(TransportKind::Tun, Direction::Rx);
+        handle_event(&event);
+
+        let event = make_metrics_event(TransportKind::BareUdp, Direction::Tx);
+        handle_event(&event);
+    }
+
+    #[test]
+    fn handle_event_processes_dns_events() {
+        use crate::events::{
+            DnsAnswer, DnsAnswerRecord, DnsEvent, DnsEventDetail, DnsRecordType,
+        };
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let dns_event = Event::Dns(DnsEvent {
+            server: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
+            detail: DnsEventDetail::Answer(DnsAnswer {
+                host: "example.com".to_string(),
+                record_type: DnsRecordType::A,
+                records: vec![DnsAnswerRecord {
+                    address: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                    ttl: 300,
+                }],
+                warnings: vec![],
+            }),
+        });
+        handle_event(&dns_event);
+    }
+
+    #[test]
+    fn handle_event_processes_other_events() {
+        let event = Event::Other("test event".to_string());
+        handle_event(&event);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_error_includes_task_label() {
+        // Verify that OrchestratorError::TaskExited includes the task label
+        let error = OrchestratorError::TaskExited("tun_rx".to_string());
+        let error_msg = error.to_string();
+        assert!(
+            error_msg.contains("tun_rx"),
+            "error message should contain task label"
+        );
+    }
+}

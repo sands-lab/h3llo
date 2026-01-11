@@ -140,6 +140,8 @@ Orchestrator responsibilities and invariants:
 - Maintain the latest configuration snapshot and H3 connection pool; receive commands from other actors through its MPSC queue.
 - Stay fully async: handle config updates, DNS refresh results, connection close notifications, and timer ticks without blocking other commands.
 - Spawn child actors (DNS resolver, H3 dialers) and push newly established H3 connections to the TUN-Rx actor for routing decisions.
+- Process events from child actors (metrics, DNS) and log them appropriately; child actors control their own metric emission timing.
+- Handle graceful shutdown on `ctrl_c` signal; task exit errors include task labels for debugging.
 
 Spawn an actor for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx actor; BareUDP owns one listener socket for RX and a separate TX-only socket per BareUDP peer.
 
