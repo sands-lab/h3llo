@@ -7,7 +7,6 @@ use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind}
 use crate::helpers::retry_on_interrupted;
 use crate::metrics::TransportCounters;
 use crate::udp::UdpError;
-use log::warn;
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -17,21 +16,34 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
 
+/// Warning from PeerEndpoints construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerEndpointsWarning {
+    /// DNS resolved multiple addresses; using first for outbound.
+    MultipleAddresses {
+        /// The selected outbound destination address.
+        destination: SocketAddr,
+        /// All resolved source IPs (used for filtering).
+        all_sources: Vec<IpAddr>,
+    },
+}
+
 /// Collects resolved peer addresses, preserving the first entry as outbound destination and all IPs for source filtering.
 #[derive(Debug, Clone)]
 pub struct PeerEndpoints {
     destination: SocketAddr,
     allowed_sources: HashSet<IpAddr>,
-    multiple_answers: bool,
 }
 
 impl PeerEndpoints {
-    /// Builds endpoint selection from resolved addresses, warning when multiple unique IPs exist.
+    /// Builds endpoint selection from resolved addresses, returning a warning when multiple unique IPs exist.
     ///
     /// # Errors
     ///
     /// Returns `UdpError::NoResolvedAddresses` when `endpoints` is empty.
-    pub fn new(endpoints: Vec<SocketAddr>) -> Result<Self, UdpError> {
+    pub fn new(
+        endpoints: Vec<SocketAddr>,
+    ) -> Result<(Self, Option<PeerEndpointsWarning>), UdpError> {
         if endpoints.is_empty() {
             return Err(UdpError::NoResolvedAddresses);
         }
@@ -41,19 +53,23 @@ impl PeerEndpoints {
         for addr in endpoints {
             allowed_sources.insert(addr.ip());
         }
-        let multiple_answers = allowed_sources.len() > 1;
-        if multiple_answers {
-            warn!(
-                "bareudp resolved multiple addresses; using {} for outbound and filtering on {:?}",
-                destination, allowed_sources
-            );
-        }
 
-        Ok(Self {
-            destination,
-            allowed_sources,
-            multiple_answers,
-        })
+        let warning = if allowed_sources.len() > 1 {
+            Some(PeerEndpointsWarning::MultipleAddresses {
+                destination,
+                all_sources: allowed_sources.iter().copied().collect(),
+            })
+        } else {
+            None
+        };
+
+        Ok((
+            Self {
+                destination,
+                allowed_sources,
+            },
+            warning,
+        ))
     }
 
     /// Returns the outbound destination socket address (first resolved entry).
@@ -64,11 +80,6 @@ impl PeerEndpoints {
     /// Returns the set of source IPs allowed for inbound packets.
     pub fn allowed_sources(&self) -> &HashSet<IpAddr> {
         &self.allowed_sources
-    }
-
-    /// Indicates whether multiple unique IPs were provided.
-    pub fn had_multiple_answers(&self) -> bool {
-        self.multiple_answers
     }
 }
 
@@ -247,12 +258,12 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn udp_selects_destination_and_flags_multiple_answers() {
+    fn udp_selects_destination_and_returns_warning_for_multiple_answers() {
         let endpoints = vec![
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 6635)),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 6635)),
         ];
-        let set = PeerEndpoints::new(endpoints).expect("peer endpoints should build");
+        let (set, warning) = PeerEndpoints::new(endpoints).expect("peer endpoints should build");
         assert_eq!(
             set.destination(),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 6635))
@@ -263,7 +274,46 @@ mod tests {
         assert!(set
             .allowed_sources()
             .contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
-        assert!(set.had_multiple_answers());
+
+        // Verify warning is returned for multiple addresses
+        let warning = warning.expect("should return warning for multiple addresses");
+        match warning {
+            PeerEndpointsWarning::MultipleAddresses {
+                destination,
+                all_sources,
+            } => {
+                assert_eq!(
+                    destination,
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 6635))
+                );
+                assert_eq!(all_sources.len(), 2);
+                assert!(all_sources.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+                assert!(all_sources.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+            }
+        }
+    }
+
+    #[test]
+    fn udp_single_address_returns_no_warning() {
+        let endpoints = vec![SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(10, 0, 0, 1),
+            6635,
+        ))];
+        let (set, warning) = PeerEndpoints::new(endpoints).expect("peer endpoints should build");
+        assert_eq!(
+            set.destination(),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 6635))
+        );
+        assert!(
+            warning.is_none(),
+            "single address should not produce warning"
+        );
+    }
+
+    #[test]
+    fn udp_empty_endpoints_returns_error() {
+        let result = PeerEndpoints::new(vec![]);
+        assert!(matches!(result, Err(UdpError::NoResolvedAddresses)));
     }
 
     #[tokio::test]

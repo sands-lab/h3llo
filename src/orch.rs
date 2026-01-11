@@ -2,6 +2,7 @@
 
 use crate::bare::{
     spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareUdpTx, PeerEndpoints,
+    PeerEndpointsWarning,
 };
 use crate::bind::{BindWarning, DefaultRouteProbe};
 use crate::config::{parse_udp_uri, Config, Peer, UdpEndpoint};
@@ -411,13 +412,17 @@ async fn build_active_peers(
             .into_iter()
             .map(|ip| SocketAddr::new(ip, peer.endpoint.port))
             .collect::<Vec<_>>();
-        let endpoints = match PeerEndpoints::new(socket_addrs) {
-            Ok(endpoints) => endpoints,
+        let (endpoints, endpoints_warning) = match PeerEndpoints::new(socket_addrs) {
+            Ok(result) => result,
             Err(err) => {
                 warn!("bare peer '{}' endpoints invalid: {err}", peer.peer.id);
                 continue;
             }
         };
+
+        if let Some(warning) = endpoints_warning {
+            log_peer_endpoints_warning(&peer.peer.id, &warning);
+        }
 
         let destination = endpoints.destination();
         let (tx_socket, warnings) =
@@ -503,6 +508,20 @@ fn parse_ip_literal(host: &str) -> Option<IpAddr> {
 
 fn log_bind_warning(context: &str, warning: &BindWarning) {
     warn!("bind warning ({}): {:?}", context, warning);
+}
+
+fn log_peer_endpoints_warning(peer_id: &str, warning: &PeerEndpointsWarning) {
+    match warning {
+        PeerEndpointsWarning::MultipleAddresses {
+            destination,
+            all_sources,
+        } => {
+            warn!(
+                "peer '{}' resolved multiple addresses; using {} for outbound, filtering on {:?}",
+                peer_id, destination, all_sources
+            );
+        }
+    }
 }
 
 fn log_route_warning(warning: &RouteSyncWarning) {
