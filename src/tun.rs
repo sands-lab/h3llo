@@ -2,7 +2,7 @@
 
 use crate::config::{LocalTun, Peer};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
-use crate::helpers::retry_on_interrupted;
+use crate::helpers::{extract_dst_ip, retry_on_interrupted};
 use crate::metrics::TransportCounters;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use ipnet_trie::IpnetTrie;
@@ -456,29 +456,6 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
     })
 }
 
-/// Extracts the destination IP address from an IP packet.
-fn extract_dst_ip(packet: &[u8]) -> Option<IpAddr> {
-    let first = *packet.first()?;
-    match first >> 4 {
-        4 => {
-            if packet.len() < 20 {
-                return None;
-            }
-            let dst = [packet[16], packet[17], packet[18], packet[19]];
-            Some(IpAddr::from(dst))
-        }
-        6 => {
-            if packet.len() < 40 {
-                return None;
-            }
-            let mut dst = [0u8; 16];
-            dst.copy_from_slice(&packet[24..40]);
-            Some(IpAddr::from(dst))
-        }
-        _ => None,
-    }
-}
-
 /// Spawns the TUN write loop, dropping oversize packets with counting and emitting TX metrics.
 #[allow(dead_code)]
 pub(crate) fn spawn_tun_tx<T: TunTx>(
@@ -526,6 +503,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpers::test_packets::make_ipv4_packet;
     use std::collections::VecDeque;
     use std::io;
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -646,13 +624,7 @@ mod tests {
         let (peer_tx, mut peer_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
 
-        // Create a simple IPv4 packet (version 4, dst 192.0.2.1)
-        let mut ipv4_packet = vec![0u8; 20];
-        ipv4_packet[0] = 0x45; // Version 4, header length 5
-        ipv4_packet[16] = 192; // Destination IP: 192.0.2.1
-        ipv4_packet[17] = 0;
-        ipv4_packet[18] = 2;
-        ipv4_packet[19] = 1;
+        let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
         // Setup routing: 192.0.2.0/24 -> peer1
         let peer_config = Peer {
@@ -904,13 +876,7 @@ mod tests {
         let (peer2_tx, mut peer2_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::channel(8);
 
-        // Create IPv4 packet destined to 192.0.2.1
-        let mut ipv4_packet = vec![0u8; 20];
-        ipv4_packet[0] = 0x45;
-        ipv4_packet[16] = 192;
-        ipv4_packet[17] = 0;
-        ipv4_packet[18] = 2;
-        ipv4_packet[19] = 1;
+        let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
         // Initial routing: 192.0.2.0/24 -> peer1
         let peer1_config = Peer {
