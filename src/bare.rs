@@ -7,7 +7,6 @@ use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind}
 use crate::helpers::retry_on_interrupted;
 use crate::metrics::TransportCounters;
 use crate::udp::UdpError;
-use log::warn;
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -16,61 +15,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
-
-/// Collects resolved peer addresses, preserving the first entry as outbound destination and all IPs for source filtering.
-#[derive(Debug, Clone)]
-pub struct PeerEndpoints {
-    destination: SocketAddr,
-    allowed_sources: HashSet<IpAddr>,
-    multiple_answers: bool,
-}
-
-impl PeerEndpoints {
-    /// Builds endpoint selection from resolved addresses, warning when multiple unique IPs exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns `UdpError::NoResolvedAddresses` when `endpoints` is empty.
-    pub fn new(endpoints: Vec<SocketAddr>) -> Result<Self, UdpError> {
-        if endpoints.is_empty() {
-            return Err(UdpError::NoResolvedAddresses);
-        }
-
-        let destination = endpoints[0];
-        let mut allowed_sources = HashSet::new();
-        for addr in endpoints {
-            allowed_sources.insert(addr.ip());
-        }
-        let multiple_answers = allowed_sources.len() > 1;
-        if multiple_answers {
-            warn!(
-                "bareudp resolved multiple addresses; using {} for outbound and filtering on {:?}",
-                destination, allowed_sources
-            );
-        }
-
-        Ok(Self {
-            destination,
-            allowed_sources,
-            multiple_answers,
-        })
-    }
-
-    /// Returns the outbound destination socket address (first resolved entry).
-    pub fn destination(&self) -> SocketAddr {
-        self.destination
-    }
-
-    /// Returns the set of source IPs allowed for inbound packets.
-    pub fn allowed_sources(&self) -> &HashSet<IpAddr> {
-        &self.allowed_sources
-    }
-
-    /// Indicates whether multiple unique IPs were provided.
-    pub fn had_multiple_answers(&self) -> bool {
-        self.multiple_answers
-    }
-}
 
 /// Commands accepted by the BareUDP receive loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,28 +187,8 @@ pub fn spawn_udp_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::Ipv4Addr;
     use std::time::Duration;
-
-    #[test]
-    fn udp_selects_destination_and_flags_multiple_answers() {
-        let endpoints = vec![
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 6635)),
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 6635)),
-        ];
-        let set = PeerEndpoints::new(endpoints).expect("peer endpoints should build");
-        assert_eq!(
-            set.destination(),
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 6635))
-        );
-        assert!(set
-            .allowed_sources()
-            .contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        assert!(set
-            .allowed_sources()
-            .contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
-        assert!(set.had_multiple_answers());
-    }
 
     #[tokio::test]
     async fn udp_rx_filters_disallowed_sources() {
