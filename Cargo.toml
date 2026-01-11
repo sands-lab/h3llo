@@ -8,7 +8,7 @@ license = "MIT"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "signal"] }
 socket2 = "0.6"
 hickory-proto = { version = "0.25", default-features = false }
 rand = "0.9"
