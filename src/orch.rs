@@ -221,9 +221,16 @@ impl Orchestrator {
                         None => return Ok(()),
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    log::info!("shutdown signal received, stopping...");
-                    break;
+                result = tokio::signal::ctrl_c() => {
+                    match result {
+                        Ok(()) => {
+                            log::info!("shutdown signal received, stopping...");
+                            break;
+                        }
+                        Err(e) => {
+                            log::warn!("signal handler error: {e}");
+                        }
+                    }
                 }
             }
         }
