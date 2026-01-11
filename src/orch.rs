@@ -4,7 +4,7 @@ use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareU
 use crate::bind::{BindWarning, DefaultRouteProbe};
 use crate::config::{parse_udp_uri, Config, Peer, UdpEndpoint};
 use crate::dns::{DnsCommand, DnsResolver};
-use crate::events::{DnsEventDetail, DnsRecordType, Event};
+use crate::events::{DnsEventDetail, DnsRecordType, Event, TransportEvent};
 use crate::route::{sync_tun_routes, RouteManagerHandle, RouteSyncWarning};
 use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
@@ -23,9 +23,9 @@ const METRICS_INTERVAL: Duration = Duration::from_secs(30);
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_OVERALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Errors returned by the BareUDP runtime.
+/// Errors returned by the orchestrator.
 #[derive(Debug, Error)]
-pub enum BareRuntimeError {
+pub enum OrchestratorError {
     /// BareUDP configuration is missing.
     #[error("bare runtime requires local.bare.listen to be set")]
     MissingBareListen,
@@ -61,122 +61,185 @@ pub enum BareRuntimeError {
     TaskJoin(String),
 }
 
-/// Runs the BareUDP-only runtime until a task exits.
+/// BareUDP runtime orchestrator.
+///
+/// Manages child actors (TUN-Rx/Tx, BareUDP-Rx/Tx) and processes runtime events.
+pub struct Orchestrator {
+    events_rx: mpsc::Receiver<Event>,
+    join_set: JoinSet<String>,
+}
+
+impl Orchestrator {
+    /// Creates a new orchestrator from configuration.
+    ///
+    /// Initializes TUN interface, BareUDP sockets, routing table, and spawns
+    /// child actors. Does not start the event loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OrchestratorError` when initialization fails.
+    pub async fn new(config: Config) -> Result<Self, OrchestratorError> {
+        let local_bare = config
+            .local
+            .bare
+            .as_ref()
+            .ok_or(OrchestratorError::MissingBareListen)?;
+        let listen_endpoint =
+            parse_udp_uri(&local_bare.listen).map_err(OrchestratorError::InvalidBareListen)?;
+
+        let parsed_peers = collect_bare_peers(&config)?;
+        let hosts = collect_hosts(&listen_endpoint, &parsed_peers);
+        let resolved_hosts =
+            resolve_hosts_once(&config.local.dns, &config.local.tun.ifname, &hosts).await?;
+
+        let listen_addr = select_listen_addr(&listen_endpoint, &resolved_hosts)?;
+        let (tun_reader, tun_writer) = tun::from_config(&config.local.tun)
+            .await
+            .map_err(|err| OrchestratorError::Tun(err.to_string()))?;
+        let mtu = config.local.tun.mtu as usize;
+
+        let bare_rx = BareUdpRx::from_config(listen_addr, mtu)
+            .await
+            .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
+
+        let (events_tx, events_rx) = mpsc::channel(EVENTS_QUEUE_DEPTH);
+
+        let mut active_peers = build_active_peers(
+            parsed_peers,
+            &resolved_hosts,
+            &config.local.tun.ifname,
+            events_tx.clone(),
+        )
+        .await;
+
+        if active_peers.is_empty() {
+            warn!("no active BareUDP peers resolved; traffic will be dropped");
+        }
+
+        let routing_peers: Vec<Peer> = active_peers.iter().map(|peer| peer.peer.clone()).collect();
+        let peer_txs: HashMap<_, _> = active_peers
+            .iter()
+            .map(|peer| (peer.peer.id.clone(), peer.packet_tx.clone()))
+            .collect();
+        let routing = RoutingTable::from_peers(&routing_peers, &peer_txs)
+            .map_err(|err| OrchestratorError::Routing(err.to_string()))?;
+
+        if config.local.table {
+            let allowed = collect_allowed_ips(&routing_peers)?;
+            let tun_addrs = tun_prefixes(&config.local.tun.addrs)?;
+            match RouteManagerHandle::new() {
+                Ok(mut handle) => {
+                    match sync_tun_routes(
+                        &config.local.tun.ifname,
+                        &tun_addrs,
+                        &allowed,
+                        &mut handle,
+                    )
+                    .await
+                    {
+                        Ok(warnings) => {
+                            for warning in warnings {
+                                log_route_warning(&warning);
+                            }
+                        }
+                        Err(err) => warn!("route sync failed: {err}"),
+                    }
+                }
+                Err(err) => warn!("route manager unavailable: {err}"),
+            }
+        }
+
+        let (bare_packet_tx, bare_packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
+
+        let allowed_sources = collect_allowed_sources(&active_peers);
+        let (_cmd_tx, command_rx) = mpsc::channel::<BareUdpRxCommand>(1);
+        // Command sender for future dynamic routing updates; currently unused.
+        let (_tun_cmd_tx, tun_command_rx) = mpsc::channel::<TunRxCommand>(1);
+
+        let tun_rx_handle = tun::spawn_tun_rx(
+            tun_reader,
+            routing.clone(),
+            tun_command_rx,
+            events_tx.clone(),
+            METRICS_INTERVAL,
+        );
+        let tun_tx_handle = tun::spawn_tun_tx(
+            tun_writer,
+            bare_packet_rx,
+            events_tx.clone(),
+            METRICS_INTERVAL,
+        );
+        let bare_rx_handle = spawn_udp_rx(
+            bare_rx,
+            allowed_sources,
+            command_rx,
+            bare_packet_tx,
+            events_tx.clone(),
+            METRICS_INTERVAL,
+        );
+
+        let mut join_set = JoinSet::new();
+        join_set.spawn(wrap_task("tun_rx", tun_rx_handle));
+        join_set.spawn(wrap_task("tun_tx", tun_tx_handle));
+        join_set.spawn(wrap_task("bare_rx", bare_rx_handle));
+
+        for peer in active_peers.drain(..) {
+            let label = format!("bare_tx:{}", peer.peer.id);
+            join_set.spawn(wrap_task(label, peer.tx_handle));
+        }
+
+        Ok(Self {
+            events_rx,
+            join_set,
+        })
+    }
+
+    /// Runs the orchestrator event loop until shutdown or task failure.
+    ///
+    /// Processes events from child actors, monitors child tasks, and handles
+    /// graceful shutdown on `ctrl_c`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OrchestratorError` when a child task exits unexpectedly.
+    pub async fn run(mut self) -> Result<(), OrchestratorError> {
+        loop {
+            tokio::select! {
+                Some(event) = self.events_rx.recv() => {
+                    handle_event(&event);
+                }
+                result = self.join_set.join_next() => {
+                    match result {
+                        Some(Ok(label)) => {
+                            log::error!("task '{}' exited unexpectedly", label);
+                            return Err(OrchestratorError::TaskExited(label));
+                        }
+                        Some(Err(err)) => {
+                            log::error!("task join failed: {}", err);
+                            return Err(OrchestratorError::TaskJoin(err.to_string()));
+                        }
+                        None => return Ok(()),
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    log::info!("shutdown signal received, stopping...");
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Runs the BareUDP-only runtime until a task exits or shutdown signal.
+///
+/// This is a convenience function that creates an `Orchestrator` and runs it.
 ///
 /// # Errors
 ///
-/// Returns `BareRuntimeError` when initialization fails or a runtime task exits unexpectedly.
-pub async fn run_bare(config: Config) -> Result<(), BareRuntimeError> {
-    let local_bare = config
-        .local
-        .bare
-        .as_ref()
-        .ok_or(BareRuntimeError::MissingBareListen)?;
-    let listen_endpoint =
-        parse_udp_uri(&local_bare.listen).map_err(BareRuntimeError::InvalidBareListen)?;
-
-    let parsed_peers = collect_bare_peers(&config)?;
-    let hosts = collect_hosts(&listen_endpoint, &parsed_peers);
-    let resolved_hosts =
-        resolve_hosts_once(&config.local.dns, &config.local.tun.ifname, &hosts).await?;
-
-    let listen_addr = select_listen_addr(&listen_endpoint, &resolved_hosts)?;
-    let (tun_reader, tun_writer) = tun::from_config(&config.local.tun)
-        .await
-        .map_err(|err| BareRuntimeError::Tun(err.to_string()))?;
-    let mtu = config.local.tun.mtu as usize;
-
-    let bare_rx = BareUdpRx::from_config(listen_addr, mtu)
-        .await
-        .map_err(|err| BareRuntimeError::Udp(err.to_string()))?;
-
-    let (events_tx, mut events_rx) = mpsc::channel(EVENTS_QUEUE_DEPTH);
-    tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
-
-    let mut active_peers = build_active_peers(
-        parsed_peers,
-        &resolved_hosts,
-        &config.local.tun.ifname,
-        events_tx.clone(),
-    )
-    .await;
-
-    if active_peers.is_empty() {
-        warn!("no active BareUDP peers resolved; traffic will be dropped");
-    }
-
-    let routing_peers: Vec<Peer> = active_peers.iter().map(|peer| peer.peer.clone()).collect();
-    let peer_txs: HashMap<_, _> = active_peers
-        .iter()
-        .map(|peer| (peer.peer.id.clone(), peer.packet_tx.clone()))
-        .collect();
-    let routing = RoutingTable::from_peers(&routing_peers, &peer_txs)
-        .map_err(|err| BareRuntimeError::Routing(err.to_string()))?;
-
-    if config.local.table {
-        let allowed = collect_allowed_ips(&routing_peers)?;
-        let tun_addrs = tun_prefixes(&config.local.tun.addrs)?;
-        match RouteManagerHandle::new() {
-            Ok(mut handle) => {
-                match sync_tun_routes(&config.local.tun.ifname, &tun_addrs, &allowed, &mut handle)
-                    .await
-                {
-                    Ok(warnings) => {
-                        for warning in warnings {
-                            log_route_warning(&warning);
-                        }
-                    }
-                    Err(err) => warn!("route sync failed: {err}"),
-                }
-            }
-            Err(err) => warn!("route manager unavailable: {err}"),
-        }
-    }
-
-    let (bare_packet_tx, bare_packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
-
-    let allowed_sources = collect_allowed_sources(&active_peers);
-    let (_cmd_tx, command_rx) = mpsc::channel::<BareUdpRxCommand>(1);
-    // Command sender for future dynamic routing updates; currently unused.
-    let (_tun_cmd_tx, tun_command_rx) = mpsc::channel::<TunRxCommand>(1);
-
-    let tun_rx_handle = tun::spawn_tun_rx(
-        tun_reader,
-        routing.clone(),
-        tun_command_rx,
-        events_tx.clone(),
-        METRICS_INTERVAL,
-    );
-    let tun_tx_handle = tun::spawn_tun_tx(
-        tun_writer,
-        bare_packet_rx,
-        events_tx.clone(),
-        METRICS_INTERVAL,
-    );
-    let bare_rx_handle = spawn_udp_rx(
-        bare_rx,
-        allowed_sources,
-        command_rx,
-        bare_packet_tx,
-        events_tx.clone(),
-        METRICS_INTERVAL,
-    );
-
-    let mut join_set = JoinSet::new();
-    join_set.spawn(wrap_task("tun_rx", tun_rx_handle));
-    join_set.spawn(wrap_task("tun_tx", tun_tx_handle));
-    join_set.spawn(wrap_task("bare_rx", bare_rx_handle));
-
-    for peer in active_peers.drain(..) {
-        let label = format!("bare_tx:{}", peer.peer.id);
-        join_set.spawn(wrap_task(label, peer.tx_handle));
-    }
-
-    match join_set.join_next().await {
-        Some(Ok(label)) => Err(BareRuntimeError::TaskExited(label)),
-        Some(Err(err)) => Err(BareRuntimeError::TaskJoin(err.to_string())),
-        None => Ok(()),
-    }
+/// Returns `OrchestratorError` when initialization fails or a runtime task exits unexpectedly.
+pub async fn run_bare(config: Config) -> Result<(), OrchestratorError> {
+    Orchestrator::new(config).await?.run().await
 }
 
 struct ParsedBarePeer {
@@ -192,7 +255,7 @@ struct ActivePeer {
     allowed_sources: HashSet<IpAddr>,
 }
 
-fn collect_bare_peers(config: &Config) -> Result<Vec<ParsedBarePeer>, BareRuntimeError> {
+fn collect_bare_peers(config: &Config) -> Result<Vec<ParsedBarePeer>, OrchestratorError> {
     let mut peers = Vec::new();
 
     for peer in &config.peers {
@@ -209,11 +272,12 @@ fn collect_bare_peers(config: &Config) -> Result<Vec<ParsedBarePeer>, BareRuntim
                 continue;
             }
         };
-        let endpoint =
-            parse_udp_uri(&bare.endpoint).map_err(|err| BareRuntimeError::InvalidPeerEndpoint {
+        let endpoint = parse_udp_uri(&bare.endpoint).map_err(|err| {
+            OrchestratorError::InvalidPeerEndpoint {
                 peer_id: peer.id.clone(),
                 reason: err,
-            })?;
+            }
+        })?;
         peers.push(ParsedBarePeer {
             peer: peer.clone(),
             endpoint,
@@ -241,13 +305,13 @@ async fn resolve_hosts_once(
     dns: &crate::config::LocalDns,
     tun_if: &str,
     hosts: &HashSet<String>,
-) -> Result<HashMap<String, Vec<IpAddr>>, BareRuntimeError> {
+) -> Result<HashMap<String, Vec<IpAddr>>, OrchestratorError> {
     if hosts.is_empty() {
         return Ok(HashMap::new());
     }
 
     let resolver = DnsResolver::from_config(dns, Some(tun_if.to_string()), DNS_QUERY_TIMEOUT)
-        .map_err(|err| BareRuntimeError::DnsInit(err.to_string()))?;
+        .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
     let (events_tx, mut events_rx) = mpsc::channel(32);
@@ -255,13 +319,13 @@ async fn resolve_hosts_once(
     let handle = resolver
         .spawn(probe, cmd_rx, events_tx)
         .await
-        .map_err(|err| BareRuntimeError::DnsInit(err.to_string()))?;
+        .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
     for host in hosts {
         cmd_tx
             .send(DnsCommand::Resolve { host: host.clone() })
             .await
-            .map_err(|err| BareRuntimeError::DnsInit(err.to_string()))?;
+            .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
     }
     drop(cmd_tx);
 
@@ -357,14 +421,14 @@ impl HostResolution {
 fn select_listen_addr(
     listen: &UdpEndpoint,
     resolved: &HashMap<String, Vec<IpAddr>>,
-) -> Result<SocketAddr, BareRuntimeError> {
+) -> Result<SocketAddr, OrchestratorError> {
     if let Some(ip) = parse_ip_literal(&listen.host) {
         return Ok(SocketAddr::new(ip, listen.port));
     }
 
     let addrs = resolved.get(&listen.host).cloned().unwrap_or_default();
     if addrs.is_empty() {
-        return Err(BareRuntimeError::ListenResolveFailed {
+        return Err(OrchestratorError::ListenResolveFailed {
             host: listen.host.clone(),
             reason: "no resolved addresses".to_string(),
         });
@@ -464,31 +528,31 @@ fn collect_allowed_sources(peers: &[ActivePeer]) -> HashSet<IpAddr> {
     allowed
 }
 
-fn collect_allowed_ips(peers: &[Peer]) -> Result<Vec<IpNet>, BareRuntimeError> {
+fn collect_allowed_ips(peers: &[Peer]) -> Result<Vec<IpNet>, OrchestratorError> {
     let mut allowed = Vec::new();
     for peer in peers {
         for cidr in &peer.tun.allowed_ips {
             let net = cidr
                 .parse::<IpNet>()
-                .map_err(|err| BareRuntimeError::Routing(err.to_string()))?;
+                .map_err(|err| OrchestratorError::Routing(err.to_string()))?;
             allowed.push(net);
         }
     }
     Ok(allowed)
 }
 
-fn tun_prefixes(addrs: &[String]) -> Result<Vec<IpNet>, BareRuntimeError> {
+fn tun_prefixes(addrs: &[String]) -> Result<Vec<IpNet>, OrchestratorError> {
     let mut prefixes = Vec::new();
     for addr in addrs {
         let ip = addr
             .parse::<IpAddr>()
-            .map_err(|err| BareRuntimeError::Routing(err.to_string()))?;
+            .map_err(|err| OrchestratorError::Routing(err.to_string()))?;
         let net = match ip {
             IpAddr::V4(ip) => IpNet::new(ip.into(), 32).map_err(|e| {
-                BareRuntimeError::Routing(format!("invalid IPv4 TUN addr {addr}: {e}"))
+                OrchestratorError::Routing(format!("invalid IPv4 TUN addr {addr}: {e}"))
             })?,
             IpAddr::V6(ip) => IpNet::new(ip.into(), 128).map_err(|e| {
-                BareRuntimeError::Routing(format!("invalid IPv6 TUN addr {addr}: {e}"))
+                OrchestratorError::Routing(format!("invalid IPv6 TUN addr {addr}: {e}"))
             })?,
         };
         prefixes.push(net);
@@ -537,6 +601,52 @@ async fn wrap_task(label: impl Into<String>, handle: JoinHandle<()>) -> String {
     let name = label.into();
     let _ = handle.await;
     name
+}
+
+/// Processes an event from a child actor.
+///
+/// Logs metrics and DNS events at appropriate levels. Child actors control
+/// their own metric emission timing; this function simply logs events as
+/// they arrive.
+fn handle_event(event: &Event) {
+    match event {
+        Event::Transport(TransportEvent::Metrics(metrics)) => {
+            let labels = &metrics.labels;
+            let stats = &metrics.stats;
+            log::debug!(
+                "{:?} {:?} {}: {} pkts/{} bytes ok, {} pkts/{} bytes dropped",
+                labels.kind,
+                labels.direction,
+                labels.peer_id.as_deref().unwrap_or("local"),
+                stats.succeeded.packets,
+                stats.succeeded.bytes,
+                stats.dropped.packets,
+                stats.dropped.bytes,
+            );
+            if stats.dropped.packets > 0 {
+                for (reason, counters) in &stats.drop_reasons {
+                    if counters.packets > 0 {
+                        log::debug!(
+                            "  drop reason {:?}: {} pkts/{} bytes",
+                            reason,
+                            counters.packets,
+                            counters.bytes
+                        );
+                    }
+                }
+            }
+        }
+        Event::Dns(dns_event) => {
+            log::debug!(
+                "dns event from {}: {:?}",
+                dns_event.server,
+                dns_event.detail
+            );
+        }
+        Event::Other(msg) => {
+            log::debug!("other event: {}", msg);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -592,9 +702,7 @@ mod tests {
 
     #[test]
     fn handle_event_processes_dns_events() {
-        use crate::events::{
-            DnsAnswer, DnsAnswerRecord, DnsEvent, DnsEventDetail, DnsRecordType,
-        };
+        use crate::events::{DnsAnswer, DnsAnswerRecord, DnsEvent, DnsEventDetail, DnsRecordType};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         let dns_event = Event::Dns(DnsEvent {
