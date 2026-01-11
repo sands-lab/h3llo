@@ -798,4 +798,32 @@ mod tests {
             "error message should contain task label"
         );
     }
+
+    // Tests for new types (to be implemented in refactoring)
+
+    #[test]
+    fn parse_ip_literal_parses_ipv4() {
+        let ip = parse_ip_literal("192.168.1.1");
+        assert!(ip.is_some());
+        assert_eq!(ip.unwrap().to_string(), "192.168.1.1");
+    }
+
+    #[test]
+    fn parse_ip_literal_parses_ipv6() {
+        let ip = parse_ip_literal("::1");
+        assert!(ip.is_some());
+        assert!(ip.unwrap().is_ipv6());
+    }
+
+    #[test]
+    fn parse_ip_literal_returns_none_for_hostname() {
+        let ip = parse_ip_literal("example.com");
+        assert!(ip.is_none());
+    }
+
+    #[test]
+    fn parse_ip_literal_returns_none_for_empty() {
+        let ip = parse_ip_literal("");
+        assert!(ip.is_none());
+    }
 }
