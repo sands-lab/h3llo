@@ -147,7 +147,7 @@ Orchestrator DNS handling:
 - **Single event loop**: The orchestrator runs one unified event loop that handles all events including DNS answers. There is no separate initialization event loop.
 - **Listen hostname**: If the listen address is a hostname (not IP literal), perform synchronous DNS lookup before starting the event loop. This ensures BareUDP RX and TUN TX are created immediately.
 - **Peer hostnames**: Peer endpoint hostnames are resolved asynchronously. The orchestrator tracks pending DNS resolutions via `PendingDns` enum and creates BareUDP TX actors when answers arrive.
-- **Minimal DNS state**: Instead of tracking A/AAAA completion separately, use a simple `PendingDns` enum that maps hostname to pending operation type (BareListen, BarePeer, H3Listen, H3Peer).
+- **Minimal DNS state**: Instead of tracking A/AAAA completion separately, use a simple `PendingDns` enum that maps hostname to pending operation type. Currently only `BarePeers` variant is implemented; H3 variants will be added when HTTP/3 support is integrated.
 - **First IP wins**: For peer endpoints, use the first resolved IP for outbound traffic. All resolved IPs are added to the allowed source filter.
 
 Spawn an actor for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx actor; BareUDP owns one listener socket for RX and a separate TX-only socket per BareUDP peer.
