@@ -63,17 +63,21 @@ pub enum OrchestratorError {
 
 /// BareUDP runtime orchestrator.
 ///
-/// Manages child actors (TUN-Rx/Tx, BareUDP-Rx/Tx) and processes runtime events.
+/// Manages child actors (TUN-Rx/Tx, BareUDP-Rx/Tx, DNS resolver) and processes runtime events.
 pub struct Orchestrator {
     events_rx: mpsc::Receiver<Event>,
     join_set: JoinSet<String>,
+    /// DNS resolver command sender for future refresh commands.
+    #[allow(dead_code)]
+    dns_cmd_tx: Option<mpsc::Sender<DnsCommand>>,
 }
 
 impl Orchestrator {
     /// Creates a new orchestrator from configuration.
     ///
     /// Initializes TUN interface, BareUDP sockets, routing table, and spawns
-    /// child actors. Does not start the event loop.
+    /// child actors. DNS resolution is performed via an event loop that can
+    /// respond to `ctrl_c` for graceful shutdown during initialization.
     ///
     /// # Errors
     ///
@@ -89,8 +93,10 @@ impl Orchestrator {
 
         let parsed_peers = collect_bare_peers(&config)?;
         let hosts = collect_hosts(&listen_endpoint, &parsed_peers);
-        let resolved_hosts =
-            resolve_hosts_once(&config.local.dns, &config.local.tun.ifname, &hosts).await?;
+
+        // Resolve hosts via event loop (can respond to ctrl_c during initialization)
+        let (resolved_hosts, dns_cmd_tx, dns_handle) =
+            resolve_hosts_init(&config.local.dns, &config.local.tun.ifname, &hosts).await?;
 
         let listen_addr = select_listen_addr(&listen_endpoint, &resolved_hosts)?;
         let (tun_reader, tun_writer) = tun::from_config(&config.local.tun)
@@ -183,6 +189,11 @@ impl Orchestrator {
         join_set.spawn(wrap_task("tun_tx", tun_tx_handle));
         join_set.spawn(wrap_task("bare_rx", bare_rx_handle));
 
+        // Add DNS resolver as a long-lived child actor
+        if let Some(handle) = dns_handle {
+            join_set.spawn(wrap_task("dns_resolver", handle));
+        }
+
         for peer in active_peers.drain(..) {
             let label = format!("bare_tx:{}", peer.peer.id);
             join_set.spawn(wrap_task(label, peer.tx_handle));
@@ -191,6 +202,7 @@ impl Orchestrator {
         Ok(Self {
             events_rx,
             join_set,
+            dns_cmd_tx,
         })
     }
 
@@ -308,13 +320,24 @@ fn collect_hosts(listen: &UdpEndpoint, peers: &[ParsedBarePeer]) -> HashSet<Stri
     hosts
 }
 
-async fn resolve_hosts_once(
+/// Resolves hosts during initialization via event loop.
+///
+/// Returns resolved hosts, DNS command sender for future refresh, and DNS resolver handle.
+/// The event loop can respond to `ctrl_c` for graceful shutdown during initialization.
+async fn resolve_hosts_init(
     dns: &crate::config::LocalDns,
     tun_if: &str,
     hosts: &HashSet<String>,
-) -> Result<HashMap<String, Vec<IpAddr>>, OrchestratorError> {
+) -> Result<
+    (
+        HashMap<String, Vec<IpAddr>>,
+        Option<mpsc::Sender<DnsCommand>>,
+        Option<JoinHandle<()>>,
+    ),
+    OrchestratorError,
+> {
     if hosts.is_empty() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), None, None));
     }
 
     let resolver = DnsResolver::from_config(dns, Some(tun_if.to_string()), DNS_QUERY_TIMEOUT)
@@ -334,7 +357,6 @@ async fn resolve_hosts_once(
             .await
             .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
     }
-    drop(cmd_tx);
 
     let mut states: HashMap<String, HostResolution> = hosts
         .iter()
@@ -342,6 +364,8 @@ async fn resolve_hosts_once(
         .collect();
 
     let deadline = Instant::now() + DNS_OVERALL_TIMEOUT;
+
+    // Event loop that handles DNS events and ctrl_c during initialization
     loop {
         if states.values().all(|state| state.done()) {
             break;
@@ -354,47 +378,78 @@ async fn resolve_hosts_once(
         }
 
         let remaining = deadline - now;
-        match time::timeout(remaining, events_rx.recv()).await {
-            Ok(Some(Event::Dns(dns_event))) => match dns_event.detail {
-                DnsEventDetail::Answer(answer) => {
-                    if let Some(state) = states.get_mut(&answer.host) {
-                        for record in &answer.records {
-                            state.insert(record.address);
-                        }
-                        match answer.record_type {
-                            DnsRecordType::A => state.a_done = true,
-                            DnsRecordType::Aaaa => state.aaaa_done = true,
-                            DnsRecordType::Other(_) => {}
-                        }
-                        for warning in answer.warnings {
-                            warn!("dns warning for {}: {:?}", answer.host, warning);
-                        }
+        tokio::select! {
+            result = time::timeout(remaining, events_rx.recv()) => {
+                match result {
+                    Ok(Some(Event::Dns(dns_event))) => {
+                        process_dns_event(&dns_event, &mut states);
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {
+                        warn!("dns resolution timed out waiting for answers");
+                        break;
                     }
                 }
-                DnsEventDetail::Timeout(timeout) => {
-                    warn!(
-                        "dns timeout resolving {} ({:?})",
-                        timeout.host, timeout.record_type
-                    );
+            }
+            result = tokio::signal::ctrl_c() => {
+                match result {
+                    Ok(()) => {
+                        log::info!("shutdown signal received during DNS initialization");
+                        // Return empty results on graceful shutdown
+                        let resolved = collect_resolved_hosts(states);
+                        return Ok((resolved, Some(cmd_tx), Some(handle)));
+                    }
+                    Err(e) => {
+                        log::warn!("signal handler error during DNS init: {e}");
+                    }
                 }
-                DnsEventDetail::Unexpected(unexpected) => {
-                    warn!("dns unexpected packet: {:?}", unexpected);
-                }
-                DnsEventDetail::BindWarning(warning) => {
-                    log_bind_warning("dns", &warning);
-                }
-            },
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(_) => {
-                warn!("dns resolution timed out waiting for answers");
-                break;
             }
         }
     }
 
-    handle.abort();
+    let resolved = collect_resolved_hosts(states);
+    Ok((resolved, Some(cmd_tx), Some(handle)))
+}
 
+/// Processes a DNS event and updates host resolution states.
+fn process_dns_event(
+    dns_event: &crate::events::DnsEvent,
+    states: &mut HashMap<String, HostResolution>,
+) {
+    match &dns_event.detail {
+        DnsEventDetail::Answer(answer) => {
+            if let Some(state) = states.get_mut(&answer.host) {
+                for record in &answer.records {
+                    state.insert(record.address);
+                }
+                match answer.record_type {
+                    DnsRecordType::A => state.a_done = true,
+                    DnsRecordType::Aaaa => state.aaaa_done = true,
+                    DnsRecordType::Other(_) => {}
+                }
+                for warning in &answer.warnings {
+                    warn!("dns warning for {}: {:?}", answer.host, warning);
+                }
+            }
+        }
+        DnsEventDetail::Timeout(timeout) => {
+            warn!(
+                "dns timeout resolving {} ({:?})",
+                timeout.host, timeout.record_type
+            );
+        }
+        DnsEventDetail::Unexpected(unexpected) => {
+            warn!("dns unexpected packet: {:?}", unexpected);
+        }
+        DnsEventDetail::BindWarning(warning) => {
+            log_bind_warning("dns", warning);
+        }
+    }
+}
+
+/// Collects resolved hosts from resolution states.
+fn collect_resolved_hosts(states: HashMap<String, HostResolution>) -> HashMap<String, Vec<IpAddr>> {
     let mut resolved = HashMap::new();
     for (host, state) in states {
         if state.addrs.is_empty() {
@@ -402,7 +457,7 @@ async fn resolve_hosts_once(
         }
         resolved.insert(host, state.addrs);
     }
-    Ok(resolved)
+    resolved
 }
 
 #[derive(Default)]

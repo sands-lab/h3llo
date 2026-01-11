@@ -139,7 +139,7 @@ h3llo uses the tokio runtime to schedule actors and relies on MPSC queues instea
 Orchestrator responsibilities and invariants:
 - Maintain the latest configuration snapshot and H3 connection pool; receive commands from other actors through its MPSC queue.
 - Stay fully async: handle config updates, DNS refresh results, connection close notifications, and timer ticks without blocking other commands.
-- Spawn child actors (DNS resolver, H3 dialers) and push newly established H3 connections to the TUN-Rx actor for routing decisions.
+- Spawn child actors (DNS resolver, H3 dialers) and push newly established H3 connections to the TUN-Rx actor for routing decisions. The DNS resolver is a long-lived child actor that joins the orchestrator's JoinSet; during initialization, the orchestrator waits for DNS results via a temporary event loop that also handles `ctrl_c` for graceful shutdown.
 - Process events from child actors (metrics, DNS) and log them appropriately; child actors control their own metric emission timing.
 - Handle graceful shutdown on `ctrl_c` signal; task exit errors include task labels for debugging.
 
