@@ -1,8 +1,6 @@
 //! BareUDP-only runtime orchestration.
 
-use crate::bare::{
-    spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareUdpTx, PeerEndpoints,
-};
+use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareUdpTx};
 use crate::bind::{BindWarning, DefaultRouteProbe};
 use crate::config::{parse_udp_uri, Config, Peer, UdpEndpoint};
 use crate::dns::{DnsCommand, DnsResolver};
@@ -191,7 +189,7 @@ struct ActivePeer {
     peer: Peer,
     packet_tx: mpsc::Sender<Vec<u8>>,
     tx_handle: JoinHandle<()>,
-    endpoints: PeerEndpoints,
+    allowed_sources: HashSet<IpAddr>,
 }
 
 fn collect_bare_peers(config: &Config) -> Result<Vec<ParsedBarePeer>, BareRuntimeError> {
@@ -411,15 +409,16 @@ async fn build_active_peers(
             .into_iter()
             .map(|ip| SocketAddr::new(ip, peer.endpoint.port))
             .collect::<Vec<_>>();
-        let endpoints = match PeerEndpoints::new(socket_addrs) {
-            Ok(endpoints) => endpoints,
-            Err(err) => {
-                warn!("bare peer '{}' endpoints invalid: {err}", peer.peer.id);
-                continue;
-            }
-        };
 
-        let destination = endpoints.destination();
+        // Select first address as destination, collect all IPs for source filtering
+        let destination = socket_addrs[0];
+        let allowed_sources: HashSet<IpAddr> = socket_addrs.iter().map(|a| a.ip()).collect();
+        if allowed_sources.len() > 1 {
+            warn!(
+                "peer '{}' resolved multiple addresses; using {} for outbound, filtering on {:?}",
+                peer.peer.id, destination, allowed_sources
+            );
+        }
         let (tx_socket, warnings) =
             match BareUdpTx::from_config(destination, peer.bindif.as_deref(), Some(tun_if), &probe)
                 .await
@@ -448,7 +447,7 @@ async fn build_active_peers(
             peer: peer.peer,
             packet_tx,
             tx_handle,
-            endpoints,
+            allowed_sources,
         });
     }
 
@@ -458,7 +457,7 @@ async fn build_active_peers(
 fn collect_allowed_sources(peers: &[ActivePeer]) -> HashSet<IpAddr> {
     let mut allowed = HashSet::new();
     for peer in peers {
-        for ip in peer.endpoints.allowed_sources() {
+        for ip in &peer.allowed_sources {
             allowed.insert(*ip);
         }
     }
