@@ -1,7 +1,7 @@
 ---
 name: mega-planner
 description: Multi-agent debate-based planning with dual proposers (bold + paranoia) and partial consensus
-argument-hint: [feature-description] or --force-full [feature-description] or --refine [issue-no] [refine-comments] or --from-issue [issue-no]
+argument-hint: [feature-description] or --refine [issue-no] [refine-comments] or --from-issue [issue-no]
 ---
 
 # Mega Planner Command
@@ -85,8 +85,6 @@ This command orchestrates a multi-agent debate system with dual proposers:
 ### Step 1: Parse Arguments and Extract Feature Description
 
 Accept the $ARGUMENTS.
-
-**Force-full mode:** If we have `--force-full` at the beginning, skip complexity-based routing and always use the full multi-agent debate path.
 
 **Refinement mode:** If we have `--refine` at the beginning, the next number is the issue number to be refined.
 ```bash
