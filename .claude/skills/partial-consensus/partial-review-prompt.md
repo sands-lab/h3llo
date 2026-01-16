@@ -26,9 +26,11 @@ Review all five perspectives and determine if consensus is possible:
 - Apply simplifications from both reducers
 
 **If consensus is NOT possible:**
-- Generate TWO separate plan options (Option A and Option B)
-- Option A: Based primarily on Bold proposal
-- Option B: Based primarily on Paranoia proposal
+- Generate THREE separate plan options (Option A, B, and C)
+- Option A: Conservative - Lower risk, incremental changes, minimal disruption
+- Option B: Aggressive - Higher risk, significant refactoring, maximum improvement
+- Option C: Balanced - Synthesizes best elements from both proposers with moderate trade-offs
+- Each option should be derived from whichever proposer(s) best support that approach
 - Include comparison table and recommendation
 
 ## Input: Combined Report
@@ -98,10 +100,10 @@ Use this format when proposals are fundamentally incompatible:
 
 [Explain the fundamental disagreement between Bold and Paranoia]
 
-## Option A: Conservative Approach (Bold-based)
+## Option A: Conservative Approach
 
 ### Summary
-[Brief description]
+[Lower risk, incremental changes, minimal disruption. Derived from whichever proposer(s) support this approach.]
 
 ### File Changes
 | File | Level | Purpose |
@@ -110,13 +112,13 @@ Use this format when proposals are fundamentally incompatible:
 
 ### Key Code Changes
 ```diff
-[Code diff from Bold proposal]
+[Code diff - minimal, safe changes]
 ```
 
-## Option B: Aggressive Approach (Paranoia-based)
+## Option B: Aggressive Approach
 
 ### Summary
-[Brief description]
+[Higher risk, significant refactoring, maximum improvement. Derived from whichever proposer(s) support this approach.]
 
 ### File Changes
 | File | Level | Purpose |
@@ -125,26 +127,45 @@ Use this format when proposals are fundamentally incompatible:
 
 ### Key Code Changes
 ```diff
-[Code diff from Paranoia proposal]
+[Code diff - aggressive refactoring]
+```
+
+## Option C: Balanced Approach
+
+### Summary
+[Moderate risk, synthesizes best elements from both proposers. Balances improvement against disruption.]
+
+### File Changes
+| File | Level | Purpose |
+|------|-------|---------|
+| ... | ... | ... |
+
+### Key Code Changes
+```diff
+[Code diff - balanced approach]
 ```
 
 ## Comparison
 
-| Aspect | Option A | Option B |
-|--------|----------|----------|
-| Risk level | Lower | Higher |
-| Code reduction | Moderate | Aggressive |
-| Breaking changes | Few | Many |
-| Implementation effort | Lower | Higher |
-| Long-term maintainability | Good | Better |
+| Aspect | Option A (Conservative) | Option B (Aggressive) | Option C (Balanced) |
+|--------|-------------------------|----------------------|---------------------|
+| Risk level | Low | High | Medium |
+| Code reduction | Minimal | Maximum | Moderate |
+| Breaking changes | Few/None | Many | Some |
+| Implementation effort | Low | High | Medium |
+| Long-term maintainability | Good | Best | Better |
+| Innovation | Low | High | Medium |
 
 ## Recommendation
 
-**Recommended option**: [A or B]
+**Recommended option**: [A, B, or C]
 
-**Rationale**: [Why this option is recommended]
+**Rationale**: [Why this option is recommended for this specific case]
 
-**When to choose the other option**: [Conditions where the other option is better]
+**When to choose other options**:
+- Choose A if: [Conditions favoring conservative approach]
+- Choose B if: [Conditions favoring aggressive approach]
+- Choose C if: [Conditions favoring balanced approach]
 ```
 
 ## Decision Criteria
