@@ -26,8 +26,8 @@ Perform rigorous validation of BOTH proposals by:
 
 You receive:
 - Original feature description
-- **Bold proposer's proposal** (innovative, builds on existing code)
-- **Paranoia proposer's proposal** (destructive, rewrites aggressively)
+- **Bold proposer's proposal**
+- **Paranoia proposer's proposal**
 
 Your job: Analyze BOTH and compare their feasibility.
 
