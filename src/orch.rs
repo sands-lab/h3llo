@@ -287,9 +287,13 @@ impl Orchestrator {
 
             // Send resolve commands for all pending hostnames
             for host in pending_dns.keys() {
-                let _ = cmd_tx
+                if cmd_tx
                     .send(DnsCommand::Resolve { host: host.clone() })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    warn!("failed to send DNS resolve command for host");
+                }
             }
 
             join_set.spawn(wrap_task("dns_resolver", handle));
@@ -458,19 +462,27 @@ impl Orchestrator {
 
         // Update routing table
         if let Ok(routing) = RoutingTable::from_peers(&self.peers, &self.peer_txs) {
-            let _ = self
+            if self
                 .tun_cmd_tx
                 .send(TunRxCommand::UpdateRouting { routing })
-                .await;
+                .await
+                .is_err()
+            {
+                warn!("failed to send routing update command");
+            }
         }
 
         // Update allowed sources
         if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
-            let _ = cmd_tx
+            if cmd_tx
                 .send(BareUdpRxCommand::UpdateAllowedSources(
                     self.active_ips.clone(),
                 ))
-                .await;
+                .await
+                .is_err()
+            {
+                warn!("failed to send allowed sources update command");
+            }
         }
     }
 }
