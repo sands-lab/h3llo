@@ -144,7 +144,7 @@ Save output to `.tmp/issue-${ISSUE_NUMBER}-context.md`.
 **Task tool call #1 - Bold Proposer:**
 ```
 Task tool parameters:
-  subagent_type: "agentize:bold-proposer"
+  subagent_type: "mega-planner:bold-proposer"
   prompt: "Research and propose an innovative solution for: {FEATURE_DESC}
 
 CODEBASE CONTEXT:
@@ -184,7 +184,7 @@ Save outputs:
 **Task tool call #1 - Critique Agent:**
 ```
 Task tool parameters:
-  subagent_type: "agentize:proposal-critique"
+  subagent_type: "mega-planner:proposal-critique"
   prompt: "Analyze BOTH proposals for feasibility and risks:
 
 Feature: {FEATURE_DESC}

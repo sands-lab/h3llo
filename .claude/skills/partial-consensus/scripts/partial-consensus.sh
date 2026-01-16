@@ -41,13 +41,20 @@ done
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 
 # Extract issue number from first report filename
+# Expected format: "issue-{N}-bold.md" where N is the issue number
 BOLD_BASENAME=$(basename "$BOLD_PATH")
 ISSUE_NUMBER=""
+# Pattern: starts with "issue-", followed by digits, then "-"
+# BASH_REMATCH[1] captures the issue number (Bash-specific feature)
 if [[ "$BOLD_BASENAME" =~ ^issue-([0-9]+)- ]]; then
     ISSUE_NUMBER="${BASH_REMATCH[1]}"
 fi
 
-# Extract feature name
+# Extract feature name from report file
+# Searches for lines matching markdown headers like:
+#   "# Feature: X", "## Title: Y", "**Feature**: Z", "Feature - W"
+# The grep pattern matches: optional "#" prefix, optional "**" bold markers,
+# "Feature" or "Title" keyword, followed by ":" or "-" separator
 extract_feature_name() {
     local report_path="$1"
     grep -iE "^(#+[[:space:]]*)?(\\*\\*)?(Feature|Title)(\\*\\*)?[[:space:]]*[:\-]" "$report_path" 2>/dev/null \
