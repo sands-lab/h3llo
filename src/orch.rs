@@ -4,7 +4,7 @@ use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareU
 use crate::bind::{BindWarning, DefaultRouteProbe};
 use crate::config::{parse_udp_uri, Config, Peer, UdpEndpoint};
 use crate::dns::{DnsCommand, DnsResolver};
-use crate::events::{DnsEventDetail, DnsRecordType, Event, TransportEvent};
+use crate::events::{DnsEventDetail, Event, TransportEvent};
 use crate::route::{sync_tun_routes, RouteManagerHandle, RouteSyncWarning};
 use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
@@ -15,13 +15,38 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{self, Instant};
 
 const PACKET_QUEUE_DEPTH: usize = 256;
 const EVENTS_QUEUE_DEPTH: usize = 64;
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
-const DNS_OVERALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Configuration for a BareUDP peer pending DNS resolution.
+struct BarePeerConfig {
+    peer_id: String,
+    port: u16,
+    bindif: Option<String>,
+    #[allow(dead_code)]
+    peer: Peer,
+}
+
+/// Pending DNS resolution context.
+///
+/// Tracks what operations are waiting for a hostname to be resolved.
+/// Multiple peers may share the same hostname.
+enum PendingDns {
+    /// Waiting for BareUDP peer addresses.
+    BarePeers { configs: Vec<BarePeerConfig> },
+}
+
+impl PendingDns {
+    /// Adds a peer config to the pending DNS entry.
+    fn push_config(&mut self, config: BarePeerConfig) {
+        match self {
+            PendingDns::BarePeers { configs } => configs.push(config),
+        }
+    }
+}
 
 /// Errors returned by the orchestrator.
 #[derive(Debug, Error)]
@@ -64,9 +89,25 @@ pub enum OrchestratorError {
 /// BareUDP runtime orchestrator.
 ///
 /// Manages child actors (TUN-Rx/Tx, BareUDP-Rx/Tx, DNS resolver) and processes runtime events.
+/// Uses a single unified event loop for both initialization and runtime.
 pub struct Orchestrator {
     events_rx: mpsc::Receiver<Event>,
+    events_tx: mpsc::Sender<Event>,
     join_set: JoinSet<String>,
+
+    // DNS state (minimal)
+    pending_dns: HashMap<String, PendingDns>,
+
+    // Runtime state
+    tun_if: String,
+    #[allow(dead_code)]
+    mtu: usize,
+    peers: Vec<Peer>,
+    active_ips: HashSet<IpAddr>,
+    peer_txs: HashMap<String, mpsc::Sender<Vec<u8>>>,
+    tun_cmd_tx: mpsc::Sender<TunRxCommand>,
+    bare_rx_cmd_tx: Option<mpsc::Sender<BareUdpRxCommand>>,
+
     /// DNS resolver command sender for future refresh commands.
     #[allow(dead_code)]
     dns_cmd_tx: Option<mpsc::Sender<DnsCommand>>,
@@ -76,8 +117,8 @@ impl Orchestrator {
     /// Creates a new orchestrator from configuration.
     ///
     /// Initializes TUN interface, BareUDP sockets, routing table, and spawns
-    /// child actors. DNS resolution is performed via an event loop that can
-    /// respond to `ctrl_c` for graceful shutdown during initialization.
+    /// child actors. Listen hostname is resolved synchronously; peer hostnames
+    /// are resolved asynchronously via the event loop.
     ///
     /// # Errors
     ///
@@ -91,58 +132,102 @@ impl Orchestrator {
         let listen_endpoint =
             parse_udp_uri(&local_bare.listen).map_err(OrchestratorError::InvalidBareListen)?;
 
-        let parsed_peers = collect_bare_peers(&config)?;
-        let hosts = collect_hosts(&listen_endpoint, &parsed_peers);
+        let tun_if = config.local.tun.ifname.clone();
+        let mtu = config.local.tun.mtu as usize;
 
-        // Resolve hosts via event loop (can respond to ctrl_c during initialization)
-        let (resolved_hosts, dns_cmd_tx, dns_handle) =
-            resolve_hosts_init(&config.local.dns, &config.local.tun.ifname, &hosts).await?;
+        // Resolve listen address synchronously (blocking for hostname)
+        let listen_addr = resolve_listen_addr(&listen_endpoint)?;
 
-        let listen_addr = select_listen_addr(&listen_endpoint, &resolved_hosts)?;
+        // Setup TUN
         let (tun_reader, tun_writer) = tun::from_config(&config.local.tun)
             .await
             .map_err(|err| OrchestratorError::Tun(err.to_string()))?;
-        let mtu = config.local.tun.mtu as usize;
 
+        // Setup BareUDP RX
         let bare_rx = BareUdpRx::from_config(listen_addr, mtu)
             .await
             .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
 
         let (events_tx, events_rx) = mpsc::channel(EVENTS_QUEUE_DEPTH);
+        let (bare_packet_tx, bare_packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
+        let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::channel::<BareUdpRxCommand>(1);
+        let (tun_cmd_tx, tun_cmd_rx) = mpsc::channel::<TunRxCommand>(1);
 
-        let mut active_peers = build_active_peers(
-            parsed_peers,
-            &resolved_hosts,
-            &config.local.tun.ifname,
-            events_tx.clone(),
-        )
-        .await;
+        // Collect peers and build pending DNS / immediate TX
+        let mut peers = Vec::new();
+        let mut pending_dns = HashMap::new();
+        let mut peer_txs = HashMap::new();
+        let mut active_ips = HashSet::new();
+        let mut join_set = JoinSet::new();
 
-        if active_peers.is_empty() {
-            warn!("no active BareUDP peers resolved; traffic will be dropped");
+        for peer in &config.peers {
+            if !peer.enabled {
+                continue;
+            }
+            let bare = match peer.bare.as_ref() {
+                Some(bare) => bare,
+                None => {
+                    warn!(
+                        "peer '{}' uses non-BareUDP transport; ignoring in bare runtime",
+                        peer.id
+                    );
+                    continue;
+                }
+            };
+            let endpoint = parse_udp_uri(&bare.endpoint).map_err(|err| {
+                OrchestratorError::InvalidPeerEndpoint {
+                    peer_id: peer.id.clone(),
+                    reason: err,
+                }
+            })?;
+
+            peers.push(peer.clone());
+
+            if let Some(ip) = parse_ip_literal(&endpoint.host) {
+                // IP literal: create TX immediately
+                let destination = SocketAddr::new(ip, endpoint.port);
+                if let Some((packet_tx, tx_handle)) = spawn_bare_tx_for_peer(
+                    &peer.id,
+                    destination,
+                    bare.bindif.as_deref(),
+                    &tun_if,
+                    events_tx.clone(),
+                    &mut active_ips,
+                )
+                .await
+                {
+                    peer_txs.insert(peer.id.clone(), packet_tx);
+                    let label = format!("bare_tx:{}", peer.id);
+                    join_set.spawn(wrap_task(label, tx_handle));
+                }
+            } else {
+                // Hostname: add to pending DNS (accumulate if same hostname)
+                let config = BarePeerConfig {
+                    peer_id: peer.id.clone(),
+                    port: endpoint.port,
+                    bindif: bare.bindif.clone(),
+                    peer: peer.clone(),
+                };
+                pending_dns
+                    .entry(endpoint.host.clone())
+                    .or_insert_with(|| PendingDns::BarePeers {
+                        configs: Vec::new(),
+                    })
+                    .push_config(config);
+            }
         }
 
-        let routing_peers: Vec<Peer> = active_peers.iter().map(|peer| peer.peer.clone()).collect();
-        let peer_txs: HashMap<_, _> = active_peers
-            .iter()
-            .map(|peer| (peer.peer.id.clone(), peer.packet_tx.clone()))
-            .collect();
-        let routing = RoutingTable::from_peers(&routing_peers, &peer_txs)
+        // Build initial routing table from IP literals
+        let routing = RoutingTable::from_peers(&peers, &peer_txs)
             .map_err(|err| OrchestratorError::Routing(err.to_string()))?;
 
+        // Sync system routes if enabled
         if config.local.table {
-            let allowed = collect_allowed_ips(&routing_peers)?;
+            let allowed = collect_allowed_ips(&peers)?;
             let tun_addrs = tun_prefixes(&config.local.tun.addrs)?;
             match RouteManagerHandle::new() {
                 Ok(mut handle) => {
-                    match sync_tun_routes(
-                        &config.local.tun.ifname,
-                        &tun_addrs,
-                        &allowed,
-                        &mut handle,
-                    )
-                    .await
-                    {
+                    match sync_tun_routes(&tun_if, &tun_addrs, &allowed, &mut handle).await {
                         Ok(warnings) => {
                             for warning in warnings {
                                 log_route_warning(&warning);
@@ -155,17 +240,11 @@ impl Orchestrator {
             }
         }
 
-        let (bare_packet_tx, bare_packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
-
-        let allowed_sources = collect_allowed_sources(&active_peers);
-        let (_cmd_tx, command_rx) = mpsc::channel::<BareUdpRxCommand>(1);
-        // Command sender for future dynamic routing updates; currently unused.
-        let (_tun_cmd_tx, tun_command_rx) = mpsc::channel::<TunRxCommand>(1);
-
+        // Spawn TUN actors
         let tun_rx_handle = tun::spawn_tun_rx(
             tun_reader,
-            routing.clone(),
-            tun_command_rx,
+            routing,
+            tun_cmd_rx,
             events_tx.clone(),
             METRICS_INTERVAL,
         );
@@ -175,41 +254,78 @@ impl Orchestrator {
             events_tx.clone(),
             METRICS_INTERVAL,
         );
+
+        // Spawn BareUDP RX
         let bare_rx_handle = spawn_udp_rx(
             bare_rx,
-            allowed_sources,
-            command_rx,
+            active_ips.clone(),
+            bare_rx_cmd_rx,
             bare_packet_tx,
             events_tx.clone(),
             METRICS_INTERVAL,
         );
 
-        let mut join_set = JoinSet::new();
         join_set.spawn(wrap_task("tun_rx", tun_rx_handle));
         join_set.spawn(wrap_task("tun_tx", tun_tx_handle));
         join_set.spawn(wrap_task("bare_rx", bare_rx_handle));
 
-        // Add DNS resolver as a long-lived child actor
-        if let Some(handle) = dns_handle {
-            join_set.spawn(wrap_task("dns_resolver", handle));
-        }
+        // Spawn DNS resolver if there are pending hostnames
+        let dns_cmd_tx = if !pending_dns.is_empty() {
+            let resolver = DnsResolver::from_config(
+                &config.local.dns,
+                Some(tun_if.clone()),
+                DNS_QUERY_TIMEOUT,
+            )
+            .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
-        for peer in active_peers.drain(..) {
-            let label = format!("bare_tx:{}", peer.peer.id);
-            join_set.spawn(wrap_task(label, peer.tx_handle));
+            let (cmd_tx, cmd_rx) = mpsc::channel(16);
+            let probe = DefaultRouteProbe;
+            let handle = resolver
+                .spawn(probe, cmd_rx, events_tx.clone())
+                .await
+                .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
+
+            // Send resolve commands for all pending hostnames
+            for host in pending_dns.keys() {
+                if cmd_tx
+                    .send(DnsCommand::Resolve { host: host.clone() })
+                    .await
+                    .is_err()
+                {
+                    warn!("failed to send DNS resolve command for host");
+                }
+            }
+
+            join_set.spawn(wrap_task("dns_resolver", handle));
+            Some(cmd_tx)
+        } else {
+            None
+        };
+
+        if peer_txs.is_empty() && pending_dns.is_empty() {
+            warn!("no active BareUDP peers; traffic will be dropped");
         }
 
         Ok(Self {
             events_rx,
+            events_tx,
             join_set,
+            pending_dns,
+            tun_if,
+            mtu,
+            peers,
+            active_ips,
+            peer_txs,
+            tun_cmd_tx,
+            bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
             dns_cmd_tx,
         })
     }
 
     /// Runs the orchestrator event loop until shutdown or task failure.
     ///
-    /// Processes events from child actors, monitors child tasks, and handles
-    /// graceful shutdown on `ctrl_c`.
+    /// Processes events from child actors (including DNS answers), monitors
+    /// child tasks, and handles graceful shutdown on `ctrl_c`.
     ///
     /// # Errors
     ///
@@ -218,7 +334,7 @@ impl Orchestrator {
         loop {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {
-                    handle_event(&event);
+                    self.handle_event(event).await;
                 }
                 result = self.join_set.join_next() => {
                     match result {
@@ -248,6 +364,127 @@ impl Orchestrator {
         }
         Ok(())
     }
+
+    /// Handles an event from a child actor.
+    async fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::Dns(dns_event) => {
+                if let DnsEventDetail::Answer(answer) = dns_event.detail {
+                    // Log DNS warnings
+                    for warning in &answer.warnings {
+                        warn!("dns warning for {}: {:?}", answer.host, warning);
+                    }
+
+                    if let Some(pending) = self.pending_dns.remove(&answer.host) {
+                        match pending {
+                            PendingDns::BarePeers { configs } => {
+                                for config in configs {
+                                    self.handle_bare_peer_resolved(&answer, config).await;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    log::debug!(
+                        "dns event from {}: {:?}",
+                        dns_event.server,
+                        dns_event.detail
+                    );
+                }
+            }
+            Event::Transport(TransportEvent::Metrics(metrics)) => {
+                let labels = &metrics.labels;
+                let stats = &metrics.stats;
+                log::debug!(
+                    "{:?} {:?} {}: {} pkts/{} bytes ok, {} pkts/{} bytes dropped",
+                    labels.kind,
+                    labels.direction,
+                    labels.peer_id.as_deref().unwrap_or("local"),
+                    stats.succeeded.packets,
+                    stats.succeeded.bytes,
+                    stats.dropped.packets,
+                    stats.dropped.bytes,
+                );
+                if stats.dropped.packets > 0 {
+                    for (reason, counters) in &stats.drop_reasons {
+                        if counters.packets > 0 {
+                            log::debug!(
+                                "  drop reason {:?}: {} pkts/{} bytes",
+                                reason,
+                                counters.packets,
+                                counters.bytes
+                            );
+                        }
+                    }
+                }
+            }
+            Event::Other(msg) => {
+                log::debug!("other event: {}", msg);
+            }
+        }
+    }
+
+    /// Handles a resolved BareUDP peer hostname.
+    async fn handle_bare_peer_resolved(
+        &mut self,
+        answer: &crate::events::DnsAnswer,
+        config: BarePeerConfig,
+    ) {
+        if answer.records.is_empty() {
+            warn!(
+                "dns resolved no addresses for peer '{}' hostname",
+                config.peer_id
+            );
+            return;
+        }
+
+        for record in &answer.records {
+            let destination = SocketAddr::new(record.address, config.port);
+            if let Some((packet_tx, tx_handle)) = spawn_bare_tx_for_peer(
+                &config.peer_id,
+                destination,
+                config.bindif.as_deref(),
+                &self.tun_if,
+                self.events_tx.clone(),
+                &mut self.active_ips,
+            )
+            .await
+            {
+                // First IP wins for routing
+                self.peer_txs
+                    .entry(config.peer_id.clone())
+                    .or_insert(packet_tx);
+
+                let label = format!("bare_tx:{}", config.peer_id);
+                self.join_set.spawn(wrap_task(label, tx_handle));
+            }
+        }
+
+        // Update routing table
+        if let Ok(routing) = RoutingTable::from_peers(&self.peers, &self.peer_txs) {
+            if self
+                .tun_cmd_tx
+                .send(TunRxCommand::UpdateRouting { routing })
+                .await
+                .is_err()
+            {
+                warn!("failed to send routing update command");
+            }
+        }
+
+        // Update allowed sources
+        if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
+            if cmd_tx
+                .send(BareUdpRxCommand::UpdateAllowedSources(
+                    self.active_ips.clone(),
+                ))
+                .await
+                .is_err()
+            {
+                warn!("failed to send allowed sources update command");
+            }
+        }
+    }
 }
 
 /// Runs the BareUDP-only runtime until a task exits or shutdown signal.
@@ -261,234 +498,23 @@ pub async fn run_bare(config: Config) -> Result<(), OrchestratorError> {
     Orchestrator::new(config).await?.run().await
 }
 
-struct ParsedBarePeer {
-    peer: Peer,
-    endpoint: UdpEndpoint,
-    bindif: Option<String>,
-}
-
-struct ActivePeer {
-    peer: Peer,
-    packet_tx: mpsc::Sender<Vec<u8>>,
-    tx_handle: JoinHandle<()>,
-    allowed_sources: HashSet<IpAddr>,
-}
-
-fn collect_bare_peers(config: &Config) -> Result<Vec<ParsedBarePeer>, OrchestratorError> {
-    let mut peers = Vec::new();
-
-    for peer in &config.peers {
-        if !peer.enabled {
-            continue;
-        }
-        let bare = match peer.bare.as_ref() {
-            Some(bare) => bare,
-            None => {
-                warn!(
-                    "peer '{}' uses non-BareUDP transport; ignoring in bare runtime",
-                    peer.id
-                );
-                continue;
-            }
-        };
-        let endpoint = parse_udp_uri(&bare.endpoint).map_err(|err| {
-            OrchestratorError::InvalidPeerEndpoint {
-                peer_id: peer.id.clone(),
-                reason: err,
-            }
-        })?;
-        peers.push(ParsedBarePeer {
-            peer: peer.clone(),
-            endpoint,
-            bindif: bare.bindif.clone(),
-        });
-    }
-
-    Ok(peers)
-}
-
-fn collect_hosts(listen: &UdpEndpoint, peers: &[ParsedBarePeer]) -> HashSet<String> {
-    let mut hosts = HashSet::new();
-    if parse_ip_literal(&listen.host).is_none() {
-        hosts.insert(listen.host.clone());
-    }
-    for peer in peers {
-        if parse_ip_literal(&peer.endpoint.host).is_none() {
-            hosts.insert(peer.endpoint.host.clone());
-        }
-    }
-    hosts
-}
-
-/// Resolves hosts during initialization via event loop.
-///
-/// Returns resolved hosts, DNS command sender for future refresh, and DNS resolver handle.
-/// The event loop can respond to `ctrl_c` for graceful shutdown during initialization.
-async fn resolve_hosts_init(
-    dns: &crate::config::LocalDns,
-    tun_if: &str,
-    hosts: &HashSet<String>,
-) -> Result<
-    (
-        HashMap<String, Vec<IpAddr>>,
-        Option<mpsc::Sender<DnsCommand>>,
-        Option<JoinHandle<()>>,
-    ),
-    OrchestratorError,
-> {
-    if hosts.is_empty() {
-        return Ok((HashMap::new(), None, None));
-    }
-
-    let resolver = DnsResolver::from_config(dns, Some(tun_if.to_string()), DNS_QUERY_TIMEOUT)
-        .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
-
-    let (cmd_tx, cmd_rx) = mpsc::channel(16);
-    let (events_tx, mut events_rx) = mpsc::channel(32);
-    let probe = DefaultRouteProbe;
-    let handle = resolver
-        .spawn(probe, cmd_rx, events_tx)
-        .await
-        .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
-
-    for host in hosts {
-        cmd_tx
-            .send(DnsCommand::Resolve { host: host.clone() })
-            .await
-            .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
-    }
-
-    let mut states: HashMap<String, HostResolution> = hosts
-        .iter()
-        .map(|host| (host.clone(), HostResolution::default()))
-        .collect();
-
-    let deadline = Instant::now() + DNS_OVERALL_TIMEOUT;
-
-    // Event loop that handles DNS events and ctrl_c during initialization
-    loop {
-        if states.values().all(|state| state.done()) {
-            break;
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            warn!("dns resolution timed out after {:?}", DNS_OVERALL_TIMEOUT);
-            break;
-        }
-
-        let remaining = deadline - now;
-        tokio::select! {
-            result = time::timeout(remaining, events_rx.recv()) => {
-                match result {
-                    Ok(Some(Event::Dns(dns_event))) => {
-                        process_dns_event(&dns_event, &mut states);
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(_) => {
-                        warn!("dns resolution timed out waiting for answers");
-                        break;
-                    }
-                }
-            }
-            result = tokio::signal::ctrl_c() => {
-                match result {
-                    Ok(()) => {
-                        log::info!("shutdown signal received during DNS initialization");
-                        // Return empty results on graceful shutdown
-                        let resolved = collect_resolved_hosts(states);
-                        return Ok((resolved, Some(cmd_tx), Some(handle)));
-                    }
-                    Err(e) => {
-                        log::warn!("signal handler error during DNS init: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    let resolved = collect_resolved_hosts(states);
-    Ok((resolved, Some(cmd_tx), Some(handle)))
-}
-
-/// Processes a DNS event and updates host resolution states.
-fn process_dns_event(
-    dns_event: &crate::events::DnsEvent,
-    states: &mut HashMap<String, HostResolution>,
-) {
-    match &dns_event.detail {
-        DnsEventDetail::Answer(answer) => {
-            if let Some(state) = states.get_mut(&answer.host) {
-                for record in &answer.records {
-                    state.insert(record.address);
-                }
-                match answer.record_type {
-                    DnsRecordType::A => state.a_done = true,
-                    DnsRecordType::Aaaa => state.aaaa_done = true,
-                    DnsRecordType::Other(_) => {}
-                }
-                for warning in &answer.warnings {
-                    warn!("dns warning for {}: {:?}", answer.host, warning);
-                }
-            }
-        }
-        DnsEventDetail::Timeout(timeout) => {
-            warn!(
-                "dns timeout resolving {} ({:?})",
-                timeout.host, timeout.record_type
-            );
-        }
-        DnsEventDetail::Unexpected(unexpected) => {
-            warn!("dns unexpected packet: {:?}", unexpected);
-        }
-        DnsEventDetail::BindWarning(warning) => {
-            log_bind_warning("dns", warning);
-        }
-    }
-}
-
-/// Collects resolved hosts from resolution states.
-fn collect_resolved_hosts(states: HashMap<String, HostResolution>) -> HashMap<String, Vec<IpAddr>> {
-    let mut resolved = HashMap::new();
-    for (host, state) in states {
-        if state.addrs.is_empty() {
-            warn!("dns resolved no addresses for {host}");
-        }
-        resolved.insert(host, state.addrs);
-    }
-    resolved
-}
-
-#[derive(Default)]
-struct HostResolution {
-    a_done: bool,
-    aaaa_done: bool,
-    addrs: Vec<IpAddr>,
-    seen: HashSet<IpAddr>,
-}
-
-impl HostResolution {
-    fn done(&self) -> bool {
-        self.a_done && self.aaaa_done
-    }
-
-    fn insert(&mut self, addr: IpAddr) {
-        if self.seen.insert(addr) {
-            self.addrs.push(addr);
-        }
-    }
-}
-
-fn select_listen_addr(
-    listen: &UdpEndpoint,
-    resolved: &HashMap<String, Vec<IpAddr>>,
-) -> Result<SocketAddr, OrchestratorError> {
+/// Resolves listen address, using synchronous DNS lookup for hostnames.
+fn resolve_listen_addr(listen: &UdpEndpoint) -> Result<SocketAddr, OrchestratorError> {
     if let Some(ip) = parse_ip_literal(&listen.host) {
         return Ok(SocketAddr::new(ip, listen.port));
     }
 
-    let addrs = resolved.get(&listen.host).cloned().unwrap_or_default();
+    // Synchronous DNS lookup for listen hostname
+    use std::net::ToSocketAddrs;
+    let addr_str = format!("{}:{}", listen.host, listen.port);
+    let addrs: Vec<_> = addr_str
+        .to_socket_addrs()
+        .map_err(|err| OrchestratorError::ListenResolveFailed {
+            host: listen.host.clone(),
+            reason: err.to_string(),
+        })?
+        .collect();
+
     if addrs.is_empty() {
         return Err(OrchestratorError::ListenResolveFailed {
             host: listen.host.clone(),
@@ -501,93 +527,51 @@ fn select_listen_addr(
             listen.host, addrs[0]
         );
     }
-    Ok(SocketAddr::new(addrs[0], listen.port))
+    Ok(addrs[0])
 }
 
-async fn build_active_peers(
-    peers: Vec<ParsedBarePeer>,
-    resolved: &HashMap<String, Vec<IpAddr>>,
+/// Spawns a BareUDP TX actor for a peer.
+///
+/// Returns the packet sender and task handle, or None if socket setup fails.
+/// Updates `active_ips` with the destination IP for deduplication.
+async fn spawn_bare_tx_for_peer(
+    peer_id: &str,
+    destination: SocketAddr,
+    bindif: Option<&str>,
     tun_if: &str,
     events_tx: mpsc::Sender<Event>,
-) -> Vec<ActivePeer> {
-    let probe = DefaultRouteProbe;
-    let mut active = Vec::new();
+    active_ips: &mut HashSet<IpAddr>,
+) -> Option<(mpsc::Sender<Vec<u8>>, JoinHandle<()>)> {
+    // Dedup by IP
+    if !active_ips.insert(destination.ip()) {
+        return None;
+    }
 
-    for peer in peers {
-        let ip_list = if let Some(ip) = parse_ip_literal(&peer.endpoint.host) {
-            vec![ip]
-        } else {
-            resolved
-                .get(&peer.endpoint.host)
-                .cloned()
-                .unwrap_or_default()
+    let probe = DefaultRouteProbe;
+    let (tx_socket, warnings) =
+        match BareUdpTx::from_config(destination, bindif, Some(tun_if), &probe).await {
+            Ok(result) => result,
+            Err(err) => {
+                warn!("bare peer '{}' socket setup failed: {err}", peer_id);
+                active_ips.remove(&destination.ip());
+                return None;
+            }
         };
 
-        if ip_list.is_empty() {
-            warn!(
-                "bare peer '{}' resolved no addresses for {}",
-                peer.peer.id, peer.endpoint.host
-            );
-            continue;
-        }
-
-        let socket_addrs = ip_list
-            .into_iter()
-            .map(|ip| SocketAddr::new(ip, peer.endpoint.port))
-            .collect::<Vec<_>>();
-
-        // Select first address as destination, collect all IPs for source filtering
-        let destination = socket_addrs[0];
-        let allowed_sources: HashSet<IpAddr> = socket_addrs.iter().map(|a| a.ip()).collect();
-        if allowed_sources.len() > 1 {
-            warn!(
-                "peer '{}' resolved multiple addresses; using {} for outbound, filtering on {:?}",
-                peer.peer.id, destination, allowed_sources
-            );
-        }
-        let (tx_socket, warnings) =
-            match BareUdpTx::from_config(destination, peer.bindif.as_deref(), Some(tun_if), &probe)
-                .await
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    warn!("bare peer '{}' socket setup failed: {err}", peer.peer.id);
-                    continue;
-                }
-            };
-
-        for warning in warnings {
-            log_bind_warning(&format!("peer {}", peer.peer.id), &warning);
-        }
-
-        let (packet_tx, packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
-        let tx_handle = spawn_udp_tx(
-            tx_socket,
-            destination,
-            packet_rx,
-            events_tx.clone(),
-            METRICS_INTERVAL,
-        );
-
-        active.push(ActivePeer {
-            peer: peer.peer,
-            packet_tx,
-            tx_handle,
-            allowed_sources,
-        });
+    for warning in warnings {
+        log_bind_warning(&format!("peer {}", peer_id), &warning);
     }
 
-    active
-}
+    let (packet_tx, packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
+    let tx_handle = spawn_udp_tx(
+        tx_socket,
+        destination,
+        packet_rx,
+        events_tx,
+        METRICS_INTERVAL,
+    );
 
-fn collect_allowed_sources(peers: &[ActivePeer]) -> HashSet<IpAddr> {
-    let mut allowed = HashSet::new();
-    for peer in peers {
-        for ip in &peer.allowed_sources {
-            allowed.insert(*ip);
-        }
-    }
-    allowed
+    Some((packet_tx, tx_handle))
 }
 
 fn collect_allowed_ips(peers: &[Peer]) -> Result<Vec<IpNet>, OrchestratorError> {
@@ -665,128 +649,9 @@ async fn wrap_task(label: impl Into<String>, handle: JoinHandle<()>) -> String {
     name
 }
 
-/// Processes an event from a child actor.
-///
-/// Logs metrics and DNS events at appropriate levels. Child actors control
-/// their own metric emission timing; this function simply logs events as
-/// they arrive.
-fn handle_event(event: &Event) {
-    match event {
-        Event::Transport(TransportEvent::Metrics(metrics)) => {
-            let labels = &metrics.labels;
-            let stats = &metrics.stats;
-            log::debug!(
-                "{:?} {:?} {}: {} pkts/{} bytes ok, {} pkts/{} bytes dropped",
-                labels.kind,
-                labels.direction,
-                labels.peer_id.as_deref().unwrap_or("local"),
-                stats.succeeded.packets,
-                stats.succeeded.bytes,
-                stats.dropped.packets,
-                stats.dropped.bytes,
-            );
-            if stats.dropped.packets > 0 {
-                for (reason, counters) in &stats.drop_reasons {
-                    if counters.packets > 0 {
-                        log::debug!(
-                            "  drop reason {:?}: {} pkts/{} bytes",
-                            reason,
-                            counters.packets,
-                            counters.bytes
-                        );
-                    }
-                }
-            }
-        }
-        Event::Dns(dns_event) => {
-            log::debug!(
-                "dns event from {}: {:?}",
-                dns_event.server,
-                dns_event.detail
-            );
-        }
-        Event::Other(msg) => {
-            log::debug!("other event: {}", msg);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{
-        Direction, DropReason, Event, PktCounters, TransportEvent, TransportKind, TransportLabels,
-        TransportMetrics, TransportStats,
-    };
-    use std::collections::HashMap;
-
-    fn make_metrics_event(kind: TransportKind, direction: Direction) -> Event {
-        let mut drop_reasons = HashMap::new();
-        drop_reasons.insert(
-            DropReason::Oversize,
-            PktCounters {
-                packets: 1,
-                bytes: 1500,
-            },
-        );
-        Event::Transport(TransportEvent::Metrics(TransportMetrics {
-            labels: TransportLabels {
-                kind,
-                direction,
-                peer_id: Some("test-peer".to_string()),
-                ip_addr: None,
-            },
-            stats: TransportStats {
-                succeeded: PktCounters {
-                    packets: 100,
-                    bytes: 64000,
-                },
-                dropped: PktCounters {
-                    packets: 1,
-                    bytes: 1500,
-                },
-                drop_reasons,
-            },
-        }))
-    }
-
-    #[test]
-    fn handle_event_processes_metrics() {
-        // Test that handle_event correctly processes metrics events without panicking.
-        // The actual logging behavior is verified by the function not panicking
-        // and returning normally.
-        let event = make_metrics_event(TransportKind::Tun, Direction::Rx);
-        handle_event(&event);
-
-        let event = make_metrics_event(TransportKind::BareUdp, Direction::Tx);
-        handle_event(&event);
-    }
-
-    #[test]
-    fn handle_event_processes_dns_events() {
-        use crate::events::{DnsAnswer, DnsAnswerRecord, DnsEvent, DnsEventDetail, DnsRecordType};
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-        let dns_event = Event::Dns(DnsEvent {
-            server: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-            detail: DnsEventDetail::Answer(DnsAnswer {
-                host: "example.com".to_string(),
-                record_type: DnsRecordType::A,
-                records: vec![DnsAnswerRecord {
-                    address: IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
-                    ttl: 300,
-                }],
-                warnings: vec![],
-            }),
-        });
-        handle_event(&dns_event);
-    }
-
-    #[test]
-    fn handle_event_processes_other_events() {
-        let event = Event::Other("test event".to_string());
-        handle_event(&event);
-    }
 
     #[tokio::test]
     async fn orchestrator_error_includes_task_label() {
@@ -797,5 +662,31 @@ mod tests {
             error_msg.contains("tun_rx"),
             "error message should contain task label"
         );
+    }
+
+    #[test]
+    fn parse_ip_literal_parses_ipv4() {
+        let ip = parse_ip_literal("192.168.1.1");
+        assert!(ip.is_some());
+        assert_eq!(ip.unwrap().to_string(), "192.168.1.1");
+    }
+
+    #[test]
+    fn parse_ip_literal_parses_ipv6() {
+        let ip = parse_ip_literal("::1");
+        assert!(ip.is_some());
+        assert!(ip.unwrap().is_ipv6());
+    }
+
+    #[test]
+    fn parse_ip_literal_returns_none_for_hostname() {
+        let ip = parse_ip_literal("example.com");
+        assert!(ip.is_none());
+    }
+
+    #[test]
+    fn parse_ip_literal_returns_none_for_empty() {
+        let ip = parse_ip_literal("");
+        assert!(ip.is_none());
     }
 }

@@ -139,9 +139,16 @@ h3llo uses the tokio runtime to schedule actors and relies on MPSC queues instea
 Orchestrator responsibilities and invariants:
 - Maintain the latest configuration snapshot and H3 connection pool; receive commands from other actors through its MPSC queue.
 - Stay fully async: handle config updates, DNS refresh results, connection close notifications, and timer ticks without blocking other commands.
-- Spawn child actors (DNS resolver, H3 dialers) and push newly established H3 connections to the TUN-Rx actor for routing decisions. The DNS resolver is a long-lived child actor that joins the orchestrator's JoinSet; during initialization, the orchestrator waits for DNS results via a temporary event loop that also handles `ctrl_c` for graceful shutdown.
+- Spawn child actors (DNS resolver, H3 dialers) and push newly established H3 connections to the TUN-Rx actor for routing decisions. The DNS resolver is a long-lived child actor that joins the orchestrator's JoinSet.
 - Process events from child actors (metrics, DNS) and log them appropriately; child actors control their own metric emission timing.
 - Handle graceful shutdown on `ctrl_c` signal; task exit errors include task labels for debugging.
+
+Orchestrator DNS handling:
+- **Single event loop**: The orchestrator runs one unified event loop that handles all events including DNS answers. There is no separate initialization event loop.
+- **Listen hostname**: If the listen address is a hostname (not IP literal), perform synchronous DNS lookup before starting the event loop. This ensures BareUDP RX and TUN TX are created immediately.
+- **Peer hostnames**: Peer endpoint hostnames are resolved asynchronously. The orchestrator tracks pending DNS resolutions via `PendingDns` enum and creates BareUDP TX actors when answers arrive.
+- **Minimal DNS state**: Instead of tracking A/AAAA completion separately, use a simple `PendingDns` enum that maps hostname to pending operation type. Currently only `BarePeers` variant is implemented; H3 variants will be added when HTTP/3 support is integrated.
+- **First IP wins**: For peer endpoints, use the first resolved IP for outbound traffic. All resolved IPs are added to the allowed source filter.
 
 Spawn an actor for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx actor; BareUDP owns one listener socket for RX and a separate TX-only socket per BareUDP peer.
 
