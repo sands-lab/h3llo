@@ -203,7 +203,7 @@ Compare both approaches and provide critical analysis."
 **Task tool call #2 - Proposal Reducer:**
 ```
 Task tool parameters:
-  subagent_type: "agentize:proposal-reducer"
+  subagent_type: "mega-planner:proposal-reducer"
   prompt: "Simplify BOTH proposals using 'less is more' philosophy:
 
 Feature: {FEATURE_DESC}
