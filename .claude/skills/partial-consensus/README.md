@@ -33,8 +33,8 @@ Requires 5 agent report file paths:
 
 ## Outputs
 
-- `.tmp/issue-{N}-debate.md` - Combined debate report
-- `.tmp/issue-{N}-consensus.md` - Final plan(s)
+- `.tmp/issue-[refine-]{N}-debate.md` - Combined debate report
+- `.tmp/issue-[refine-]{N}-consensus.md` - Final plan(s)
 
 ## See Also
 

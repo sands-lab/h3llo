@@ -41,13 +41,20 @@ done
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 
 # Extract issue number from first report filename
-# Expected format: "issue-{N}-bold.md" where N is the issue number
+# Expected format: "issue-{N}-bold.md" or "issue-refine-{N}-bold.md" where N is the issue number
 BOLD_BASENAME=$(basename "$BOLD_PATH")
 ISSUE_NUMBER=""
-# Pattern: starts with "issue-", followed by digits, then "-"
-# BASH_REMATCH[1] captures the issue number (Bash-specific feature)
-if [[ "$BOLD_BASENAME" =~ ^issue-([0-9]+)- ]]; then
-    ISSUE_NUMBER="${BASH_REMATCH[1]}"
+ISSUE_PREFIX=""
+# Pattern: starts with "issue-", optionally "refine-", then digits, then "-"
+# BASH_REMATCH[1] captures the optional "refine-" prefix (Bash-specific feature)
+# BASH_REMATCH[2] captures the issue number
+if [[ "$BOLD_BASENAME" =~ ^issue-(refine-)?([0-9]+)- ]]; then
+    ISSUE_NUMBER="${BASH_REMATCH[2]}"
+    if [ -n "${BASH_REMATCH[1]}" ]; then
+        ISSUE_PREFIX="issue-refine-${ISSUE_NUMBER}"
+    else
+        ISSUE_PREFIX="issue-${ISSUE_NUMBER}"
+    fi
 fi
 
 # Extract feature name from report file
@@ -74,11 +81,11 @@ fi
 FEATURE_DESCRIPTION="$FEATURE_NAME"
 
 # Set file paths based on issue number
-if [ -n "$ISSUE_NUMBER" ]; then
-    INPUT_FILE=".tmp/issue-${ISSUE_NUMBER}-partial-review-input.md"
-    OUTPUT_FILE=".tmp/issue-${ISSUE_NUMBER}-partial-review-output.txt"
-    CONSENSUS_FILE=".tmp/issue-${ISSUE_NUMBER}-consensus.md"
-    DEBATE_FILE=".tmp/issue-${ISSUE_NUMBER}-debate.md"
+if [ -n "$ISSUE_PREFIX" ]; then
+    INPUT_FILE=".tmp/${ISSUE_PREFIX}-partial-review-input.md"
+    OUTPUT_FILE=".tmp/${ISSUE_PREFIX}-partial-review-output.txt"
+    CONSENSUS_FILE=".tmp/${ISSUE_PREFIX}-consensus.md"
+    DEBATE_FILE=".tmp/${ISSUE_PREFIX}-debate.md"
 else
     INPUT_FILE=".tmp/partial-review-input-${TIMESTAMP}.md"
     OUTPUT_FILE=".tmp/partial-review-output-${TIMESTAMP}.txt"

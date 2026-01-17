@@ -31,17 +31,17 @@ The skill produces multiple plans when:
 ## Inputs
 
 This skill requires exactly 5 agent report file paths:
-- **Report 1**: Bold proposer report (`.tmp/issue-N-bold.md`)
-- **Report 2**: Paranoia proposer report (`.tmp/issue-N-paranoia.md`)
-- **Report 3**: Critique report (`.tmp/issue-N-critique.md`)
-- **Report 4**: Proposal reducer report (`.tmp/issue-N-proposal-reducer.md`)
-- **Report 5**: Code reducer report (`.tmp/issue-N-code-reducer.md`)
+- **Report 1**: Bold proposer report (`.tmp/issue-[refine-]{N}-bold.md`)
+- **Report 2**: Paranoia proposer report (`.tmp/issue-[refine-]{N}-paranoia.md`)
+- **Report 3**: Critique report (`.tmp/issue-[refine-]{N}-critique.md`)
+- **Report 4**: Proposal reducer report (`.tmp/issue-[refine-]{N}-proposal-reducer.md`)
+- **Report 5**: Code reducer report (`.tmp/issue-[refine-]{N}-code-reducer.md`)
 
 ## Outputs
 
 **Files created:**
-- `.tmp/issue-{N}-debate.md` - Combined 5-agent debate report
-- `.tmp/issue-{N}-consensus.md` - Final plan(s)
+- `.tmp/issue-[refine-]{N}-debate.md` - Combined 5-agent debate report
+- `.tmp/issue-[refine-]{N}-consensus.md` - Final plan(s)
 
 **Output format when consensus reached:**
 ```markdown
@@ -125,4 +125,22 @@ Error: External review failed with exit code {code}
 **Output on stdout (last line):**
 ```
 .tmp/issue-15-consensus.md
+```
+
+## Refine Mode Naming
+
+In refine mode, report files typically use the `issue-refine-{N}-...` prefix, and outputs will match:
+
+```bash
+.claude/skills/partial-consensus/scripts/partial-consensus.sh \
+    .tmp/issue-refine-15-bold.md \
+    .tmp/issue-refine-15-paranoia.md \
+    .tmp/issue-refine-15-critique.md \
+    .tmp/issue-refine-15-proposal-reducer.md \
+    .tmp/issue-refine-15-code-reducer.md
+```
+
+Expected output:
+```
+.tmp/issue-refine-15-consensus.md
 ```

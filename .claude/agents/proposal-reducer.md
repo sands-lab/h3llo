@@ -78,9 +78,23 @@ Categorize complexity in Paranoia's proposal:
 ### Step 4: Research Minimal Patterns
 
 Check how similar problems are solved simply:
-- Find existing simple implementations
-- Check project conventions
-- Look for patterns to reuse
+
+```bash
+# Find existing simple implementations
+grep -r "similar_feature" --include="*.md" --include="*.sh"
+
+# Check docs/ for current command interfaces
+grep -r "relevant_command" docs/
+
+# Check project conventions
+cat CLAUDE.md README.md
+```
+
+Look for:
+- Existing patterns to reuse
+- Simple successful implementations
+- Project conventions to follow
+- Search `docs/` for current commands and interfaces; cite specific files checked
 
 ### Step 5: Generate Simplified Recommendations
 
@@ -220,6 +234,11 @@ Watch for and remove these over-engineering patterns in BOTH proposals:
 - Design patterns where simple code suffices
 - Frameworks for one-off tasks
 - Complex state machines for simple workflows
+
+### 5. Needless Dependencies
+- External libraries for trivial functionality
+- Tools that duplicate existing capabilities
+- Dependencies "just in case"
 
 ## When NOT to Simplify
 
