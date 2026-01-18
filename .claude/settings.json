@@ -1,4 +1,9 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(.claude/skills/partial-consensus/scripts/partial-consensus.sh:*)"
+    ]
+  },
   "hooks": {
     "Stop": [
       {
