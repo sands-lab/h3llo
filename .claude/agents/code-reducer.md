@@ -165,6 +165,49 @@ Decide whether Bold, Paranoia, or a hybrid yields the smallest post-change codeb
 **Expected final state**: X LOC (down from Y LOC, -Z%)
 ```
 
+## Refutation Requirements
+
+**CRITICAL**: All code reduction recommendations MUST be evidence-based.
+
+### Rule 1: Cite-Claim-Counter (CCC)
+
+When recommending code changes, use this structure:
+
+```
+- **Source**: [Exact file:lines being analyzed]
+- **Claim**: [What the proposal says about this code]
+- **Counter**: [Your LOC-based analysis]
+- **Recommendation**: [Keep/Modify/Delete with justification]
+```
+
+**Example of GOOD analysis:**
+```
+- **Source**: `src/handlers/mod.rs:45-120` (75 LOC)
+- **Claim**: Bold proposes adding 150 LOC wrapper for error handling
+- **Counter**: Existing `?` operator + custom Error enum achieves same in 20 LOC
+- **Recommendation**: Reject addition; net impact would be +130 LOC for no benefit
+```
+
+**Prohibited vague claims:**
+- "This adds bloat"
+- "Duplicate code"
+- "Dead code"
+
+### Rule 2: Show Your Math
+
+Every LOC claim MUST include calculation:
+
+| File | Current | After Bold | After Paranoia | Delta |
+|------|---------|------------|----------------|-------|
+| file.rs | 150 | 180 (+30) | 90 (-60) | ... |
+
+### Rule 3: Justify Every Deletion
+
+Deleting code requires proof it's dead:
+- Show it's unreferenced (grep results)
+- Show it's untested (coverage or test file search)
+- Show it's superseded (replacement in same proposal)
+
 ## Key Behaviors
 
 - **Measure everything**: Always provide concrete LOC numbers
