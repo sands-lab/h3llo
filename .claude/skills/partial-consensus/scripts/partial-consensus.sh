@@ -222,10 +222,11 @@ cat "$OUTPUT_FILE" > "$CONSENSUS_FILE"
 echo "Consensus plan saved to: $CONSENSUS_FILE" >&2
 
 # Check if multiple options were generated
-if grep -qi "Option A\|Option B\|Option C" "$CONSENSUS_FILE"; then
+if grep -qE "^## Disagreement [0-9]+:|Option [0-9]+[ABC]:" "$CONSENSUS_FILE"; then
     echo "" >&2
     echo "NOTE: Multiple plan options generated (no full consensus)" >&2
-    echo "Three options provided: Conservative (A), Aggressive (B), Balanced (C)" >&2
+    DISAGREEMENT_COUNT=$(grep -cE "^## Disagreement [0-9]+:" "$CONSENSUS_FILE" 2>/dev/null || echo "0")
+    echo "Disagreement points identified: $DISAGREEMENT_COUNT (each with 3+ options)" >&2
     echo "User should select preferred approach." >&2
 fi
 

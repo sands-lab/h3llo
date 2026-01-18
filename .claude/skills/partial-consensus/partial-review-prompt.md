@@ -149,72 +149,111 @@ Use this format when proposals are fundamentally incompatible:
 
 [Explain the fundamental disagreement between Bold and Paranoia]
 
-## Option A: Conservative Approach
+---
 
-### Summary
-[Lower risk, incremental changes, minimal disruption. Derived from whichever proposer(s) support this approach.]
+## Disagreement 1: [Topic Name]
 
-### File Changes
+### Context
+
+**Bold claims**: [Quote or summary from bold proposal]
+**Paranoia claims**: [Quote or summary from paranoia proposal]
+**Critique assessment**: [What critique agent found about this disagreement]
+
+### Option 1A: [Name] (Conservative)
+
+**Summary**: [1-2 sentence description - lower risk approach]
+
+**Source**: [Bold/Paranoia/Hybrid]
+
+**File Changes:**
 | File | Level | Purpose |
 |------|-------|---------|
-| ... | ... | ... |
+| `path/to/file` | major/medium/minor | Description |
 
-### Key Code Changes
+**Implementation Steps:**
+
+**Step 1: [Description]**
+- File: `path/to/file`
+- Changes: [description]
+
 ```diff
-[Code diff - minimal, safe changes]
+[Code changes for this step]
 ```
 
-## Option B: Aggressive Approach
+**Risks and Mitigations:**
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+| [Risk] | H/M/L | H/M/L | [Strategy] |
 
-### Summary
-[Higher risk, significant refactoring, maximum improvement. Derived from whichever proposer(s) support this approach.]
+### Option 1B: [Name] (Aggressive)
 
-### File Changes
+**Summary**: [1-2 sentence description - higher risk approach]
+
+**Source**: [Bold/Paranoia/Hybrid]
+
+**File Changes:**
 | File | Level | Purpose |
 |------|-------|---------|
-| ... | ... | ... |
+| `path/to/file` | major/medium/minor | Description |
 
-### Key Code Changes
+**Implementation Steps:**
+
+**Step 1: [Description]**
+- File: `path/to/file`
+- Changes: [description]
+
 ```diff
-[Code diff - aggressive refactoring]
+[Code changes]
 ```
 
-## Option C: Balanced Approach
+**Risks and Mitigations:**
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+| [Risk] | H/M/L | H/M/L | [Strategy] |
 
-### Summary
-[Moderate risk, synthesizes best elements from both proposers. Balances improvement against disruption.]
+### Option 1C: [Name] (Balanced)
 
-### File Changes
+**Summary**: [1-2 sentence description - moderate trade-offs]
+
+**Source**: [Bold/Paranoia/Hybrid]
+
+**File Changes:**
 | File | Level | Purpose |
 |------|-------|---------|
-| ... | ... | ... |
+| `path/to/file` | major/medium/minor | Description |
 
-### Key Code Changes
+**Implementation Steps:**
+
+**Step 1: [Description]**
+- File: `path/to/file`
+- Changes: [description]
+
 ```diff
-[Code diff - balanced approach]
+[Code changes]
 ```
 
-## Comparison
+**Risks and Mitigations:**
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+| [Risk] | H/M/L | H/M/L | [Strategy] |
 
-| Aspect | Option A (Conservative) | Option B (Aggressive) | Option C (Balanced) |
-|--------|-------------------------|----------------------|---------------------|
-| Risk level | Low | High | Medium |
-| Code reduction | Minimal | Maximum | Moderate |
-| Breaking changes | Few/None | Many | Some |
-| Implementation effort | Low | High | Medium |
-| Long-term maintainability | Good | Best | Better |
-| Innovation | Low | High | Medium |
+**Recommendation for Disagreement 1**: Option 1[A/B/C] because [one-line rationale]
 
-## Recommendation
+---
 
-**Recommended option**: [A, B, or C]
+## Disagreement 2: [Topic Name]
 
-**Rationale**: [Why this option is recommended for this specific case]
+[Same structure as Disagreement 1]
 
-**When to choose other options**:
-- Choose A if: [Conditions favoring conservative approach]
-- Choose B if: [Conditions favoring aggressive approach]
-- Choose C if: [Conditions favoring balanced approach]
+---
+
+## Overall Recommendation
+
+**Suggested path**: [e.g., "1B + 2A"] because [brief rationale]
+
+**Alternative paths**:
+- Conservative (all A options): Choose if [conditions]
+- Aggressive (all B options): Choose if [conditions]
 ```
 
 ## Decision Criteria
@@ -228,6 +267,30 @@ Choose **Format B (Multiple Options)** when:
 - Proposals have fundamentally different architectures
 - One proposes incremental change, other proposes rewrite
 - Trade-offs are significant and user preference matters
+
+### Format B Guidelines
+
+When generating Format B output:
+
+**Identifying disagreements**: A disagreement point exists when:
+1. Bold and Paranoia propose different approaches to the same sub-problem
+2. Critique identifies valid arguments for both positions
+3. The choice materially affects implementation (not just style preference)
+
+**Minimum 3 options per disagreement**: Each disagreement MUST have:
+- Option [N]A (Conservative): Lower risk, smaller change scope
+- Option [N]B (Aggressive): Higher risk, larger change scope
+- Option [N]C (Balanced): Synthesized approach with moderate trade-offs
+
+**Detail parity with Format A**: Each option MUST include ALL of:
+1. Summary with Source attribution
+2. File Changes table
+3. Implementation Steps (numbered, with diffs)
+4. Risks and Mitigations table
+
+Options lacking any of these sections are INVALID.
+
+**Maximum disagreements**: If more than 4-5 disagreement points exist, the feature request should be split into sub-features.
 
 ## Privacy Note
 

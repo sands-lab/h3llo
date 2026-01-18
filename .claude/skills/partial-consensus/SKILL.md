@@ -53,21 +53,24 @@ This skill requires exactly 5 agent report file paths:
 ```markdown
 # Implementation Options: {Feature Name}
 
-## Option A: Conservative Approach (Bold-based)
-[Plan based on Bold proposal...]
+## Why No Consensus
+[Explanation of fundamental disagreements]
 
-## Option B: Aggressive Approach (Paranoia-based)
-[Plan based on Paranoia proposal...]
+## Disagreement 1: {Topic}
 
-## Comparison
-| Aspect | Option A | Option B |
-|--------|----------|----------|
-| Risk | Lower | Higher |
-| Code reduction | Moderate | Aggressive |
-| Breaking changes | Few | Many |
+### Option 1A: (Conservative)
+- Summary, Source, File Changes, Implementation Steps, Risks/Mitigations
 
-## Recommendation
-[Which option is recommended and why]
+### Option 1B: (Aggressive)
+- Summary, Source, File Changes, Implementation Steps, Risks/Mitigations
+
+### Option 1C: (Balanced)
+- Summary, Source, File Changes, Implementation Steps, Risks/Mitigations
+
+**Recommendation for Disagreement 1**: Option [X] because [rationale]
+
+## Overall Recommendation
+**Suggested path**: [Combination like "1B + 2A"] because [rationale]
 ```
 
 ## Implementation Workflow
