@@ -94,21 +94,26 @@ Below is the combined report containing all five perspectives:
 
 ## Output Requirements
 
-### Format A: Single Consensus Plan
+### Unified Output Format
 
-Use this format when the proposals can be reconciled:
+Use this format for ALL outputs (consensus or partial consensus):
 
 ```markdown
 # Implementation Plan: {{FEATURE_NAME}}
 
-## Consensus Summary
-[How the proposals were reconciled]
+## Agent Perspectives Summary
+
+| Agent | Core Position | Key Insight |
+|-------|---------------|-------------|
+| **Bold** | [1-2 sentence summary] | [Most valuable contribution] |
+| **Paranoia** | [1-2 sentence summary] | [Most valuable contribution] |
+| **Critique** | [Key finding] | [Critical risk or validation] |
+| **Proposal Reducer** | [Simplification direction] | [What complexity was removed] |
+| **Code Reducer** | [Code impact assessment] | [LOC delta summary] |
 
 ## Goal
-[Problem statement]
 
-**Success criteria:**
-- [Criterion 1]
+[Problem statement synthesized from proposals]
 
 **Out of scope:**
 - [What we're not doing]
@@ -119,50 +124,37 @@ Use this format when the proposals can be reconciled:
 
 | File | Level | Purpose |
 |------|-------|---------|
-| `path/to/file` | major/medium/minor/remove | Description |
+| `path/to/file` | major/medium/minor | Description |
 
 ## Implementation Steps
 
 **Step 1: [Description]**
-- File changes
-- Code diff (if applicable)
+- File: `path/to/file`
+- Changes: [description]
 
-## Success Criteria
-
-- [ ] Criterion 1
-
-## Risks and Mitigations
-
-| Risk | Likelihood | Impact | Mitigation |
-|------|------------|--------|------------|
-| Risk 1 | H/M/L | H/M/L | Mitigation |
+```diff
+[Code changes if agreed upon]
 ```
-
-### Format B: Multiple Options (No Consensus)
-
-Use this format when proposals are fundamentally incompatible:
-
-```markdown
-# Implementation Options: {{FEATURE_NAME}}
-
-## Why No Consensus
-
-[Explain the fundamental disagreement between Bold and Paranoia]
 
 ---
 
 ## Disagreement 1: [Topic Name]
 
-### Context
+### Agent Perspectives
 
-**Bold claims**: [Quote or summary from bold proposal]
-**Paranoia claims**: [Quote or summary from paranoia proposal]
-**Critique assessment**: [What critique agent found about this disagreement]
+| Agent | Position | Rationale |
+|-------|----------|-----------|
+| **Bold** | [Position summary] | [Why Bold advocates this] |
+| **Paranoia** | [Position summary] | [Why Paranoia advocates this] |
+| **Critique** | [Assessment] | [Validity of each position] |
+| **Proposal Reducer** | [Recommendation] | [Simplification opportunity] |
+| **Code Reducer** | [Impact] | [LOC difference between approaches] |
 
-### Option 1A: [Name] (Conservative)
+### Resolution Options
 
-**Summary**: [1-2 sentence description - lower risk approach]
+#### Option 1A: [Name] (Conservative)
 
+**Summary**: [1-2 sentence description]
 **Source**: [Bold/Paranoia/Hybrid]
 
 **File Changes:**
@@ -176,19 +168,23 @@ Use this format when proposals are fundamentally incompatible:
 - File: `path/to/file`
 - Changes: [description]
 
+<details>
+<summary><b>Code Draft</b></summary>
+
 ```diff
-[Code changes for this step]
+[Code changes for Option 1A]
 ```
+
+</details>
 
 **Risks and Mitigations:**
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
 | [Risk] | H/M/L | H/M/L | [Strategy] |
 
-### Option 1B: [Name] (Aggressive)
+#### Option 1B: [Name] (Aggressive)
 
-**Summary**: [1-2 sentence description - higher risk approach]
-
+**Summary**: [1-2 sentence description]
 **Source**: [Bold/Paranoia/Hybrid]
 
 **File Changes:**
@@ -202,19 +198,23 @@ Use this format when proposals are fundamentally incompatible:
 - File: `path/to/file`
 - Changes: [description]
 
+<details>
+<summary><b>Code Draft</b></summary>
+
 ```diff
-[Code changes]
+[Code changes for Option 1B]
 ```
+
+</details>
 
 **Risks and Mitigations:**
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
 | [Risk] | H/M/L | H/M/L | [Strategy] |
 
-### Option 1C: [Name] (Balanced)
+#### Option 1C: [Name] (Balanced)
 
-**Summary**: [1-2 sentence description - moderate trade-offs]
-
+**Summary**: [1-2 sentence description]
 **Source**: [Bold/Paranoia/Hybrid]
 
 **File Changes:**
@@ -228,16 +228,23 @@ Use this format when proposals are fundamentally incompatible:
 - File: `path/to/file`
 - Changes: [description]
 
+<details>
+<summary><b>Code Draft</b></summary>
+
 ```diff
-[Code changes]
+[Code changes for Option 1C]
 ```
+
+</details>
 
 **Risks and Mitigations:**
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
 | [Risk] | H/M/L | H/M/L | [Strategy] |
 
-**Recommendation for Disagreement 1**: Option 1[A/B/C] because [one-line rationale]
+**AI Recommendation**: Option 1[A/B/C] because [one-line rationale]
+
+> Note: Developer must make final decision.
 
 ---
 
@@ -249,46 +256,56 @@ Use this format when proposals are fundamentally incompatible:
 
 ## Overall Recommendation
 
-**Suggested path**: [e.g., "1B + 2A"] because [brief rationale]
+**Suggested combination**: [e.g., "1B + 2A"] because [brief rationale]
 
-**Alternative paths**:
-- Conservative (all A options): Choose if [conditions]
-- Aggressive (all B options): Choose if [conditions]
+**Alternative combinations**:
+- **All Conservative** (all A options): Choose if stability is paramount
+- **All Aggressive** (all B options): Choose if major refactoring acceptable
+
+## Success Criteria
+
+- [ ] [Criterion 1]
+
+## Risks and Mitigations
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+| [Risk] | H/M/L | H/M/L | [Strategy] |
 ```
 
-## Decision Criteria
+## Output Guidelines
 
-Choose **Format A (Single Consensus)** when:
-- Both proposals agree on core architecture
-- Differences are in implementation details only
-- Critique validates both approaches as feasible
+### When to Include Disagreement Sections
 
-Choose **Format B (Multiple Options)** when:
-- Proposals have fundamentally different architectures
-- One proposes incremental change, other proposes rewrite
-- Trade-offs are significant and user preference matters
-
-### Format B Guidelines
-
-When generating Format B output:
-
-**Identifying disagreements**: A disagreement point exists when:
+Include a Disagreement section when:
 1. Bold and Paranoia propose different approaches to the same sub-problem
 2. Critique identifies valid arguments for both positions
 3. The choice materially affects implementation (not just style preference)
 
-**Minimum 3 options per disagreement**: Each disagreement MUST have:
+**If no disagreements exist**: Omit Disagreement sections entirely. The unified format's Goal, Codebase Analysis, and Implementation Steps contain the complete agreed plan.
+
+**If disagreements exist**: Each disagreement gets its own section with Agent Perspectives table and A/B/C Resolution Options.
+
+### Option Requirements
+
+Each disagreement MUST have 3 options:
 - Option [N]A (Conservative): Lower risk, smaller change scope
 - Option [N]B (Aggressive): Higher risk, larger change scope
 - Option [N]C (Balanced): Synthesized approach with moderate trade-offs
 
-**Detail parity with Format A**: Each option MUST include ALL of:
+Each option MUST include:
 1. Summary with Source attribution
 2. File Changes table
-3. Implementation Steps (numbered, with diffs)
-4. Risks and Mitigations table
+3. Implementation Steps
+4. Code Draft in collapsible `<details>` block
+5. Risks and Mitigations table
 
 Options lacking any of these sections are INVALID.
+
+### Collapsible Syntax
+
+Use `<details><summary><b>Code Draft</b></summary>` for code diffs.
+Blank line required after `</summary>` and before `</details>` for proper GitHub rendering.
 
 **Maximum disagreements**: If more than 4-5 disagreement points exist, the feature request should be split into sub-features.
 
