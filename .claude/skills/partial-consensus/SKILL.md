@@ -50,11 +50,11 @@ This skill requires exactly 5 agent report file paths:
 
 | Agent | Core Position | Key Insight |
 |-------|---------------|-------------|
-| Bold | ... | ... |
-| Paranoia | ... | ... |
-| Critique | ... | ... |
-| Proposal Reducer | ... | ... |
-| Code Reducer | ... | ... |
+| **Bold** | ... | ... |
+| **Paranoia** | ... | ... |
+| **Critique** | ... | ... |
+| **Proposal Reducer** | ... | ... |
+| **Code Reducer** | ... | ... |
 
 ## Goal / Codebase Analysis / Implementation Steps
 [Standard sections for agreed elements]

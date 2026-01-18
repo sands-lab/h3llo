@@ -115,9 +115,6 @@ Use this format for ALL outputs (consensus or partial consensus):
 
 [Problem statement synthesized from proposals]
 
-**Success criteria:**
-- [Criterion 1]
-
 **Out of scope:**
 - [What we're not doing]
 
