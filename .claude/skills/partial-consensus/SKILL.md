@@ -11,22 +11,21 @@ allowed-tools:
 
 # Partial Consensus Skill
 
-This skill synthesizes implementation plan(s) from a multi-agent debate with dual proposers. Unlike external-consensus which always produces a single plan, this skill can produce **multiple plan options** when the proposers fundamentally disagree.
+This skill synthesizes implementation plans from a multi-agent debate with dual proposers, **preserving agent perspectives** and **exposing disagreements as developer decisions** rather than auto-resolving them.
 
-## Key Difference from External Consensus
+## Key Features
 
-| Aspect | External Consensus | Partial Consensus |
-|--------|-------------------|-------------------|
-| Input | 3 reports (bold, critique, reducer) | 5 reports (bold, paranoia, critique, proposal-reducer, code-reducer) |
-| Output | Always single consensus | Single OR multiple options |
-| Philosophy | Force agreement | Allow disagreement |
+- **Agent Perspectives Preserved**: Overall summary table + per-disagreement tables
+- **No Silent Resolution**: Disagreements are never auto-resolved
+- **Developer Decision Points**: Each disagreement presents A/B/C options
+- **Collapsible Code Drafts**: `<details>` tags for implementation details
 
-## When Multiple Options Are Generated
+## When Disagreement Sections Are Generated
 
-The skill produces multiple plans when:
-1. Bold and Paranoia propose fundamentally different architectures
-2. Critique identifies valid points for BOTH approaches
-3. Code-reducer recommends different approaches for different goals
+The skill includes disagreement sections when:
+1. Bold and Paranoia propose different approaches to the same sub-problem
+2. Critique identifies valid arguments for both positions
+3. The choice materially affects implementation
 
 ## Inputs
 
@@ -43,34 +42,40 @@ This skill requires exactly 5 agent report file paths:
 - `.tmp/issue-[refine-]{N}-debate.md` - Combined 5-agent debate report
 - `.tmp/issue-[refine-]{N}-consensus.md` - Final plan(s)
 
-**Output format when consensus reached:**
+**Output format (unified):**
 ```markdown
 # Implementation Plan: {Feature Name}
-[Single balanced plan...]
-```
 
-**Output format when NO consensus (multiple options):**
-```markdown
-# Implementation Options: {Feature Name}
+## Agent Perspectives Summary
 
-## Why No Consensus
-[Explanation of fundamental disagreements]
+| Agent | Core Position | Key Insight |
+|-------|---------------|-------------|
+| Bold | ... | ... |
+| Paranoia | ... | ... |
+| Critique | ... | ... |
+| Proposal Reducer | ... | ... |
+| Code Reducer | ... | ... |
+
+## Goal / Codebase Analysis / Implementation Steps
+[Standard sections for agreed elements]
 
 ## Disagreement 1: {Topic}
 
-### Option 1A: (Conservative)
-- Summary, Source, File Changes, Implementation Steps, Risks/Mitigations
+### Agent Perspectives
+[Per-disagreement table showing each agent's position]
 
-### Option 1B: (Aggressive)
-- Summary, Source, File Changes, Implementation Steps, Risks/Mitigations
+### Resolution Options
 
-### Option 1C: (Balanced)
-- Summary, Source, File Changes, Implementation Steps, Risks/Mitigations
+#### Option 1A/1B/1C
+- Summary, Source, File Changes, Implementation Steps
+- Code Draft in `<details>` block
+- Risks/Mitigations
 
-**Recommendation for Disagreement 1**: Option [X] because [rationale]
+**AI Recommendation**: Option [X] because [rationale]
+> Note: Developer must make final decision.
 
 ## Overall Recommendation
-**Suggested path**: [Combination like "1B + 2A"] because [rationale]
+**Suggested combination**: [e.g., "1B + 2A"] because [rationale]
 ```
 
 ## Implementation Workflow
