@@ -84,7 +84,7 @@ This command orchestrates a multi-agent debate system to generate high-quality i
 - `.tmp/issue-[refine-]{N}-debate.md` - Combined multi-agent report
 - `.tmp/issue-[refine-]{N}-consensus.md` - Final plan (or plan options)
 
-`[refine-]` is optional for refine mode.
+`[refine-]` prefix is added in refine mode to distinguish artifacts from initial planning runs.
 
 **GitHub issue:**
 - Created via open-issue skill if user approves
@@ -100,10 +100,29 @@ This command orchestrates a multi-agent debate system to generate high-quality i
 
 Accept the $ARGUMENTS.
 
-**Refinement mode:** If we have `--refine` at the beginning, the next number is the issue number to be refined,
-and the rest are issue refine comments. You should fetch the issue to incorporate the users comments.
+**Refinement mode:** If `--refine` is at the beginning:
+1. Parse `ISSUE_NUMBER` (next argument) and `REFINE_COMMENTS` (remaining arguments)
+2. Fetch the issue: `gh issue view ${ISSUE_NUMBER} --json title,body`
+3. Construct FEATURE_DESC by appending refine-comments to the original issue:
+
+```
+## Original Issue
+
+{issue title}
+
+{issue body}
+
+---
+
+## Refinement Request
+
+{REFINE_COMMENTS}
+```
+
+This preserves the original context so downstream agents can verify alignment with initial requirements.
+
 ```bash
-gh issue view <issue-no>
+gh issue view ${ISSUE_NUMBER} --json title,body
 ```
 
 **From-issue mode:** If we have `--from-issue` at the beginning, the next number is the issue number to plan.
