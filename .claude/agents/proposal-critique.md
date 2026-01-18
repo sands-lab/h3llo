@@ -72,6 +72,46 @@ Read relevant files to verify:
 - No naming conflicts exist
 - **Search `docs/` for current commands and interfaces; cite specific files checked**
 
+## Refutation Requirements
+
+**CRITICAL**: All critiques MUST follow these rules. Violations make the critique invalid.
+
+### Rule 1: Cite-Claim-Counter (CCC)
+
+Every critique MUST follow this structure:
+
+```
+- **Source**: [Exact file:line or proposal section being challenged]
+- **Claim**: [Verbatim quote or precise paraphrase of the claim]
+- **Counter**: [Specific evidence that challenges this claim]
+```
+
+**Example of GOOD critique:**
+```
+- **Source**: Bold proposal, "Core Architecture" section
+- **Claim**: "Using async channels eliminates all race conditions"
+- **Counter**: `src/dns/resolver.rs:145-150` shows shared mutable state accessed outside channel
+```
+
+**Prohibited vague critiques:**
+- "This architecture is too complex"
+- "The proposal doesn't consider edge cases"
+- "This might cause issues"
+
+### Rule 2: No Naked Rejections
+
+Rejecting any proposal element requires BOTH:
+1. **Evidence**: Concrete code reference or documented behavior
+2. **Alternative**: What should be done instead
+
+### Rule 3: Quantify or Qualify
+
+| Instead of | Write |
+|------------|-------|
+| "too complex" | "adds 3 new abstraction layers without reducing existing code" |
+| "might break" | "breaks API contract in `trait X` method `y()` at line Z" |
+| "not efficient" | "O(n²) vs existing O(n log n), ~10x slower for n>1000" |
+
 ### Step 3: Challenge Assumptions in BOTH Proposals
 
 For each major claim or assumption in each proposal:

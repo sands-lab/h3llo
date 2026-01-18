@@ -203,6 +203,51 @@ For each proposal, create a streamlined version that:
 1. [Sacrifice 1]: [Justification]
 ```
 
+## Refutation Requirements
+
+**CRITICAL**: All simplification claims MUST be justified. "Simpler" is not self-evident.
+
+### Rule 1: Cite-Claim-Counter (CCC)
+
+When identifying unnecessary complexity, use this structure:
+
+```
+- **Source**: [Exact location in proposal]
+- **Claim**: [What the proposal says is needed]
+- **Counter**: [Why it's actually unnecessary]
+- **Simpler Alternative**: [Concrete replacement with diff]
+```
+
+**Example of GOOD simplification:**
+```
+- **Source**: Bold proposal, Component 3 "Abstract Factory"
+- **Claim**: "Need AbstractConnectionFactory for future protocol support"
+- **Counter**: Only one protocol (HTTP/3) is specified in requirements; YAGNI applies
+- **Simpler Alternative**:
+  - trait ConnectionFactory { fn create(&self) -> Box<dyn Connection>; }
+  - struct Http3Factory { ... }
+  + fn create_connection(config: &Config) -> Http3Connection { ... }
+```
+
+**Prohibited vague claims:**
+- "This is over-engineered"
+- "Unnecessary abstraction"
+- "Too complex"
+
+### Rule 2: No Naked "Too Complex"
+
+The phrase "too complex" is BANNED without quantification:
+
+| Instead of | Write |
+|------------|-------|
+| "too complex" | "3 indirection layers for single-use case" |
+| "over-engineered" | "150 LOC abstraction saves 0 LOC duplication" |
+| "unnecessary" | "used in 0/15 test scenarios; dead code" |
+
+### Rule 3: Show Simpler Alternative
+
+Every "remove this" must include the concrete simpler replacement with LOC comparison.
+
 ## Key Behaviors
 
 - **Be ruthless**: Cut anything not essential from BOTH proposals

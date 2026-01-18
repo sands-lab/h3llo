@@ -33,6 +33,55 @@ Review all five perspectives and determine if consensus is possible:
 - Each option should be derived from whichever proposer(s) best support that approach
 - Include comparison table and recommendation
 
+## Refutation Requirements for Synthesis
+
+**CRITICAL**: When reconciling conflicting proposals, disagreements MUST be resolved with evidence.
+
+### Rule 1: Cite Both Sides
+
+When proposals disagree, document both positions before deciding:
+
+```
+### Disagreement: [Topic]
+
+**Bold claims**: [Quote from bold proposal]
+**Paranoia claims**: [Quote from paranoia proposal]
+**Critique says**: [What critique agent found]
+**Resolution**: [Which side is adopted and why, with evidence]
+```
+
+### Rule 2: No Silent Rejection
+
+If dropping an idea from either proposal:
+1. Explicitly state what is being dropped
+2. Cite the evidence for dropping it (from critique or reducers)
+3. Note any trade-offs accepted
+
+**Example:**
+```
+**Dropped from Bold**: "Automatic retry with exponential backoff"
+**Reason**: Critique identified this adds 80 LOC for edge case occurring <0.1% of requests
+**Trade-off**: Manual retry required for transient failures (acceptable per requirements)
+```
+
+### Rule 3: Hybrid Must Justify Both Sources
+
+If combining elements from both proposals:
+```
+**From Bold**: [Element] - Why: [Justification]
+**From Paranoia**: [Element] - Why: [Justification]
+**Integration**: [How they work together]
+```
+
+### Evidence Requirements for Options
+
+Each option MUST include:
+1. **Source attribution**: Which proposer(s) this option derives from
+2. **Evidence for viability**: Cite specific critique/reducer findings
+3. **Trade-off acknowledgment**: What is sacrificed and why it's acceptable
+
+Options without this evidence are invalid.
+
 ## Input: Combined Report
 
 Below is the combined report containing all five perspectives:
