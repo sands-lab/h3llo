@@ -200,6 +200,7 @@ Use this format when proposals are fundamentally incompatible:
 
 **Step 1: [Description]**
 - File: `path/to/file`
+- Changes: [description]
 
 ```diff
 [Code changes]
@@ -225,6 +226,7 @@ Use this format when proposals are fundamentally incompatible:
 
 **Step 1: [Description]**
 - File: `path/to/file`
+- Changes: [description]
 
 ```diff
 [Code changes]
