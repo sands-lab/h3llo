@@ -1,6 +1,6 @@
 ---
 name: partial-consensus
-description: Synthesize consensus plan(s) from multi-agent debate - provides multiple options when no agreement
+description: Determine consensus/disagreement from 5-agent debate - exposes disagreements as developer decisions
 allowed-tools:
   - Bash(.claude/skills/partial-consensus/scripts/partial-consensus.sh:*)
   - Bash(cat:*)
@@ -11,19 +11,33 @@ allowed-tools:
 
 # Partial Consensus Skill
 
-This skill synthesizes implementation plans from a multi-agent debate with dual proposers. It operates in two modes:
+This skill determines consensus and exposes disagreements from a multi-agent debate with dual proposers.
 
-1. **Standard mode**: Takes 5 agent reports, exposes disagreements as developer decisions
+## Consensus Definition
+
+**CONSENSUS** requires ALL of the following:
+1. Bold and Paranoia propose the same general approach
+2. Critique finds no critical blockers
+3. Both Reducers recommend the same base proposal without fundamental changes
+
+**DISAGREEMENT** is triggered by ANY of the following:
+1. Bold and Paranoia propose different architectural approaches
+2. Critique favors one proposal over another
+3. Either Reducer recommends fundamental changes
+
+**Note:** The reviewer uses judgment for ambiguous cases, with optional reference to ~30% LOC delta as "fundamental change" guidance.
+
+## Modes
+
+1. **Standard mode**: Determines consensus/disagreement, generates options for disagreements
 2. **Resolve mode**: Same 5 reports but with "User Resolution" section appended, produces unified plan
-
-In resolve mode, the skill checks for compatibility between selected options and either produces
-a unified plan or reports conflicts.
 
 ## Key Features
 
-- **Agent Perspectives Preserved**: Overall summary table + per-disagreement tables
-- **No Silent Resolution**: Disagreements are never auto-resolved
-- **Developer Decision Points**: Each disagreement presents A/B/C options
+- **No Silent Resolution**: Disagreements are exposed, not auto-resolved
+- **Flexible Options**: Minimum 2, recommended 3, no upper limit per disagreement
+- **Source Attribution**: Each option must cite its source (Bold, Paranoia, Hybrid, etc.)
+- **AI Recommendations**: Included without disclaimer
 - **Collapsible Code Drafts**: `<details>` tags for implementation details
 
 ## When Disagreement Sections Are Generated
@@ -82,7 +96,6 @@ automatically.
 - Risks/Mitigations
 
 **AI Recommendation**: Option [X] because [rationale]
-> Note: Developer must make final decision.
 
 ## Overall Recommendation
 **Suggested combination**: [e.g., "1B + 2A"] because [rationale]
