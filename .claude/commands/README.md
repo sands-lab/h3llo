@@ -16,6 +16,7 @@ Invoke commands with arguments:
 /mega-planner Add user authentication with JWT tokens
 /mega-planner --refine 42 Add rate limiting
 /mega-planner --from-issue 42
+/mega-planner --resolve 42 1B,2A
 ```
 
 ## See Also

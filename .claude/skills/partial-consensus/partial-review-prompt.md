@@ -19,6 +19,21 @@ Each agent provided a different perspective:
 
 Review all five perspectives and determine if consensus is possible:
 
+**IMPORTANT: Check for "User Resolution" section first!**
+
+If ANY of the input reports contains a `## User Resolution` section:
+- The user has already made their option selections
+- **Step 1**: Check if selected options are compatible
+  - Look for architectural conflicts (e.g., selecting both "create new file" and "modify existing file" for same component)
+  - If incompatible: Report the conflict clearly and suggest which selection to change
+- **Step 2**: If compatible, apply the user's selections directly
+  - Produce a single unified plan (no Disagreement sections, no Options)
+  - Merge the selected approaches coherently into Implementation Steps
+  - Use standard format: Goal, Codebase Analysis, Implementation Steps
+  - Include code drafts from the selected options
+  - Add at end: `**Resolution Applied**: [user's selections]`
+- Skip the "if consensus IS possible / IS NOT possible" logic below
+
 **If consensus IS possible:**
 - Synthesize a single balanced implementation plan
 - Incorporate the best ideas from both proposers
@@ -85,6 +100,9 @@ Options without this evidence are invalid.
 ## Input: Combined Report
 
 Below is the combined report containing all five perspectives:
+
+**Note:** If any report contains a `## User Resolution` section, the user has pre-selected
+options and you should produce a single unified plan (not options). Check for conflicts first.
 
 ---
 
