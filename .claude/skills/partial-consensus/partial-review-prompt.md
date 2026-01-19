@@ -17,7 +17,24 @@ Each agent provided a different perspective:
 
 ## Your Task
 
-Review all five perspectives and determine if consensus is possible:
+Review all five perspectives and determine consensus using these criteria:
+
+### Consensus Definition
+
+**CONSENSUS** is reached when ALL of the following are true:
+1. Bold and Paranoia propose the same general approach (may differ in implementation details)
+2. Critique finds no critical blockers for that approach
+3. Both Reducers recommend the same base proposal (Bold-based or Paranoia-based) without fundamentally changing its architecture
+
+**DISAGREEMENT** exists when ANY of the following are true:
+1. Bold and Paranoia propose different architectural approaches
+2. Critique identifies critical issues that favor one proposal over the other
+3. Either Reducer recommends fundamental changes that alter the core approach
+
+**Guidance (optional reference):**
+- "Fundamental change" typically means >30% LOC delta or architectural restructuring
+- "Same general approach" means targeting the same files with similar modification patterns
+- Use your judgment when criteria are ambiguous; err toward DISAGREEMENT to surface options
 
 **IMPORTANT: Check for "User Resolution" section first!**
 
@@ -40,13 +57,23 @@ If ANY of the input reports contains a `## User Resolution` section:
 - Address risks from critique
 - Apply simplifications from both reducers
 
-**If consensus is NOT possible:**
-- Generate THREE separate plan options (Option A, B, and C)
-- Option A: Conservative - Lower risk, incremental changes, minimal disruption
-- Option B: Aggressive - Higher risk, significant refactoring, maximum improvement
-- Option C: Balanced - Synthesizes best elements from both proposers with moderate trade-offs
-- Each option should be derived from whichever proposer(s) best support that approach
-- Include comparison table and recommendation
+**If DISAGREEMENT exists:**
+
+Generate resolution options for each disagreement point:
+
+**Option Requirements:**
+- **Minimum 2 options required**: Conservative (lower risk) and Aggressive (higher risk)
+- **Recommended 3 options**: Conservative, Balanced, and Aggressive
+- **No upper limit**: Generate as many distinct options as the agent positions support
+
+**Source Attribution (MANDATORY):**
+Each option MUST specify its source (which agent(s) it derives from).
+
+**Option Generation Guidelines:**
+- Derive options from ACTUAL agent positions, not abstract categories
+- Only include options that are materially different from each other
+- If an option would be identical to another, omit it
+- Each option must include complete code diffs, not summaries
 
 ## Refutation Requirements for Synthesis
 
@@ -265,9 +292,7 @@ Use this format for ALL outputs (consensus or partial consensus):
 |------|------------|--------|------------|
 | [Risk] | H/M/L | H/M/L | [Strategy] |
 
-**AI Recommendation**: Option 1[A/B/C] because [one-line rationale]
-
-> Note: Developer must make final decision.
+**AI Recommendation**: Option [N][A/B/C/...] because [one-line rationale]
 
 ---
 
@@ -311,13 +336,14 @@ Include a Disagreement section when:
 
 ### Option Requirements
 
-Each disagreement MUST have 3 options:
+Each disagreement MUST have at least 2 options:
 - Option [N]A (Conservative): Lower risk, smaller change scope
 - Option [N]B (Aggressive): Higher risk, larger change scope
-- Option [N]C (Balanced): Synthesized approach with moderate trade-offs
+- Option [N]C (Balanced): Synthesized approach (recommended but optional)
+- Additional options as supported by agent positions
 
 Each option MUST include:
-1. Summary with Source attribution
+1. Summary with **Source attribution** (e.g., "From Bold", "From Paranoia + Code Reducer")
 2. File Changes table
 3. Implementation Steps
 4. Code Draft in collapsible `<details>` block
