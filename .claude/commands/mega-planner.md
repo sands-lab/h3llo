@@ -357,31 +357,33 @@ Give it 30 minutes timeout to complete.
 
 ### Step 8: Update Issue with Consensus Plan
 
-**REQUIRED SKILL CALL:**
+**Direct shell command (preserves `<details>` blocks verbatim):**
 
-```
-Skill tool parameters:
-  skill: "open-issue"
-  args: "--update ${ISSUE_NUMBER} --auto {CONSENSUS_PLAN_FILE}"
-```
+**Why direct command instead of `open-issue` skill:**
+- The `open-issue` skill requires AI to write content between heredoc markers (`<<'EOF'` ... `EOF`)
+- AI interpretation may escape, reformat, or strip special markdown like `<details>` blocks
+- Direct `--body-file` with pipe bypasses AI content interpretation entirely
 
-**What this skill does:**
-1. Reads consensus plan from file
-2. Determines appropriate tag from `docs/git-msg-tags.md`
-3. Formats issue with `[plan]` prefix and Problem Statement/Proposed Solution sections
-4. Updates existing issue #${ISSUE_NUMBER} using `gh issue edit`
-5. Returns issue number and URL
+```bash
+# Extract title from first line (removes "# " markdown heading prefix)
+ISSUE_TITLE=$(head -1 "${CONSENSUS_PLAN_FILE}" | sed 's/^# //')
+
+# Pipe file content (skipping title line) directly to gh issue edit
+tail -n +2 "${CONSENSUS_PLAN_FILE}" | gh issue edit ${ISSUE_NUMBER} \
+    --title "${ISSUE_TITLE}" \
+    --body-file -
+```
 
 **If multiple plans were generated (no consensus):**
-- Present all options to user
+- Present all options to user in terminal
 - Let user select preferred approach
-- Update issue with selected plan
+- After selection, update issue with selected plan file using same pattern above
 
 **Expected output:**
 ```
 Plan issue #${ISSUE_NUMBER} updated with consensus plan.
 
-Title: [plan][tag] {feature name}
+Title: ${ISSUE_TITLE}
 URL: {issue_url}
 
 To refine: /mega-planner --refine ${ISSUE_NUMBER}
