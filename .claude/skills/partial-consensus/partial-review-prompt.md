@@ -132,9 +132,14 @@ Use this format for ALL outputs (consensus or partial consensus):
 - File: `path/to/file`
 - Changes: [description]
 
+<details>
+<summary><b>Code Draft</b></summary>
+
 ```diff
 [Code changes if agreed upon]
 ```
+
+</details>
 
 ---
 
