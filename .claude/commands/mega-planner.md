@@ -1,7 +1,7 @@
 ---
 name: mega-planner
 description: Multi-agent debate-based planning with dual proposers (bold + paranoia) and partial consensus
-argument-hint: [feature-description] or --refine [issue-no] [refine-comments] or --from-issue [issue-no]
+argument-hint: [feature-description] or --refine [issue-no] [refine-comments] or --from-issue [issue-no] or --resolve [issue-no] [selections]
 ---
 
 # Mega Planner Command
@@ -66,6 +66,17 @@ This command orchestrates a multi-agent debate system to generate high-quality i
 - Updates the existing issue with the consensus plan (no new issue created)
 - Used by the server for automatic feature request planning
 
+**Resolve mode (fast-path):**
+```
+/mega-planner --resolve <issue-no> <selections>
+```
+- Resolves disagreements in an existing plan without re-running the 5-agent debate
+- `<selections>`: Option codes like `1B` or `1C,2A` (can also use natural language: "Option 1B for architecture")
+- Reads existing 5 agent report files from `.tmp/`
+- Invokes `partial-consensus` skill with appended user selections
+- Skips Steps 2-6 (5-agent debate phase)
+- Updates the existing issue with the resolved plan
+
 **From conversation context:**
 - If arguments is empty, extract feature description from recent messages
 - Look for: "implement...", "add...", "create...", "build..." statements
@@ -75,16 +86,16 @@ This command orchestrates a multi-agent debate system to generate high-quality i
 **This command produces planning documents only. No code changes are made.**
 
 **Files created:**
-- `.tmp/issue-[refine-]{N}-context.md` - Understander context summary
-- `.tmp/issue-[refine-]{N}-bold.md` - Bold proposer agent report (with code diff drafts)
-- `.tmp/issue-[refine-]{N}-paranoia.md` - Paranoia proposer agent report (with code diff drafts)
-- `.tmp/issue-[refine-]{N}-critique.md` - Critique agent report (analyzes both proposals)
-- `.tmp/issue-[refine-]{N}-proposal-reducer.md` - Proposal reducer report (simplifies both proposals)
-- `.tmp/issue-[refine-]{N}-code-reducer.md` - Code reducer report (reduces total code footprint)
-- `.tmp/issue-[refine-]{N}-debate.md` - Combined multi-agent report
-- `.tmp/issue-[refine-]{N}-consensus.md` - Final plan (or plan options)
+- `.tmp/issue-{N}-context.md` - Understander context summary
+- `.tmp/issue-{N}-bold.md` - Bold proposer agent report (with code diff drafts)
+- `.tmp/issue-{N}-paranoia.md` - Paranoia proposer agent report (with code diff drafts)
+- `.tmp/issue-{N}-critique.md` - Critique agent report (analyzes both proposals)
+- `.tmp/issue-{N}-proposal-reducer.md` - Proposal reducer report (simplifies both proposals)
+- `.tmp/issue-{N}-code-reducer.md` - Code reducer report (reduces total code footprint)
+- `.tmp/issue-{N}-debate.md` - Combined multi-agent report
+- `.tmp/issue-{N}-consensus.md` - Final plan (or plan options)
 
-`[refine-]` prefix is added in refine mode to distinguish artifacts from initial planning runs.
+All modes use the same `issue-{N}` prefix for artifact files.
 
 **GitHub issue:**
 - Created via open-issue skill if user approves
@@ -99,6 +110,41 @@ This command orchestrates a multi-agent debate system to generate high-quality i
 ### Step 1: Parse Arguments and Extract Feature Description
 
 Accept the $ARGUMENTS.
+
+**Resolve mode (fast-path):** If `--resolve` is at the beginning:
+1. Parse `ISSUE_NUMBER` (next argument) and `SELECTIONS` (remaining arguments)
+2. Set `FILE_PREFIX="issue-${ISSUE_NUMBER}"`
+3. Verify ALL 5 report files exist:
+   - `.tmp/${FILE_PREFIX}-bold.md`
+   - `.tmp/${FILE_PREFIX}-paranoia.md`
+   - `.tmp/${FILE_PREFIX}-critique.md`
+   - `.tmp/${FILE_PREFIX}-proposal-reducer.md`
+   - `.tmp/${FILE_PREFIX}-code-reducer.md`
+4. If any not found, error: "No debate reports found for issue #N. Run full planning first with `/mega-planner --from-issue N`"
+5. Verify `.tmp/${FILE_PREFIX}-consensus.md` exists. If not found, error: "Local consensus file not found. Run full planning first with `/mega-planner --from-issue N`"
+6. **Read issue and compare with local consensus file:**
+   ```bash
+   # Fetch current issue body and save to temp file
+   gh issue view ${ISSUE_NUMBER} --json body -q '.body' > ".tmp/${FILE_PREFIX}-issue-body.md"
+
+   # Check if files differ
+   if ! diff -q ".tmp/${FILE_PREFIX}-consensus.md" ".tmp/${FILE_PREFIX}-issue-body.md" > /dev/null 2>&1; then
+       # Files differ - AI will summarize and prompt user
+       DIFF_DETECTED=true
+   fi
+   ```
+
+   **If files differ**, read both files and summarize the differences:
+   - Use Read tool to read both `.tmp/${FILE_PREFIX}-consensus.md` and `.tmp/${FILE_PREFIX}-issue-body.md`
+   - Summarize key differences in natural language (e.g., "GitHub version has additional section X", "Local version modified step Y")
+   - Report which version appears more complete/recent
+
+   Then use **AskUserQuestion** with options:
+   - **Use local**: Proceed with local `.tmp/${FILE_PREFIX}-consensus.md`
+   - **Use GitHub**: Copy issue body to local consensus file, then proceed
+   - **Re-run full planning**: Abort and suggest `/mega-planner --from-issue ${ISSUE_NUMBER}`
+7. **Skip Steps 2-6 entirely** (no debate needed)
+8. Jump directly to Step 7 with resolve mode instructions
 
 **Refinement mode:** If `--refine` is at the beginning:
 1. Parse `ISSUE_NUMBER` (next argument) and `REFINE_COMMENTS` (remaining arguments)
@@ -331,6 +377,52 @@ Focus on reducing total code footprint while allowing large changes."
 - Save code reducer's response to `$CODE_REDUCER_FILE`
 
 ### Step 7: Invoke Partial Consensus Skill
+
+**For resolve mode (fast-path):**
+
+Before invoking partial-consensus, append user selections to the bold report so the AI
+sees the pre-selected options during synthesis:
+
+```bash
+BOLD_FILE=".tmp/${FILE_PREFIX}-bold.md"
+
+# Remove any existing User Resolution section (allows re-running resolve)
+# This sed command deletes from "## User Resolution" to end of file
+sed -i '/^## User Resolution/,$d' "$BOLD_FILE" 2>/dev/null || true
+
+# Append user selections section
+cat >> "$BOLD_FILE" <<EOF
+
+---
+
+## User Resolution
+
+**Selected Options**: ${SELECTIONS}
+
+The user has pre-selected the above options. When synthesizing the final plan:
+1. Check if selected options are compatible (no architectural conflicts)
+2. If incompatible, report the conflict and suggest alternatives
+3. If compatible, apply the selections to produce a single unified plan
+4. Merge the selected approaches coherently into Implementation Steps
+5. Do NOT generate new Disagreement sections - they are already resolved
+6. Produce output in standard consensus format (no options)
+
+EOF
+```
+
+Then invoke partial-consensus with the existing 5 report files (unchanged interface):
+
+```
+Skill tool parameters:
+  skill: "mega-planner:partial-consensus"
+  args: "${BOLD_FILE} .tmp/${FILE_PREFIX}-paranoia.md .tmp/${FILE_PREFIX}-critique.md .tmp/${FILE_PREFIX}-proposal-reducer.md .tmp/${FILE_PREFIX}-code-reducer.md"
+```
+
+Continue to Step 8.
+
+---
+
+**For standard mode (full debate):**
 
 **REQUIRED SKILL CALL:**
 

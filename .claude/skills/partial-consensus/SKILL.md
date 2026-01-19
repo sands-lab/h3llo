@@ -11,7 +11,13 @@ allowed-tools:
 
 # Partial Consensus Skill
 
-This skill synthesizes implementation plans from a multi-agent debate with dual proposers, **preserving agent perspectives** and **exposing disagreements as developer decisions** rather than auto-resolving them.
+This skill synthesizes implementation plans from a multi-agent debate with dual proposers. It operates in two modes:
+
+1. **Standard mode**: Takes 5 agent reports, exposes disagreements as developer decisions
+2. **Resolve mode**: Same 5 reports but with "User Resolution" section appended, produces unified plan
+
+In resolve mode, the skill checks for compatibility between selected options and either produces
+a unified plan or reports conflicts.
 
 ## Key Features
 
@@ -30,17 +36,21 @@ The skill includes disagreement sections when:
 ## Inputs
 
 This skill requires exactly 5 agent report file paths:
-- **Report 1**: Bold proposer report (`.tmp/issue-[refine-]{N}-bold.md`)
-- **Report 2**: Paranoia proposer report (`.tmp/issue-[refine-]{N}-paranoia.md`)
-- **Report 3**: Critique report (`.tmp/issue-[refine-]{N}-critique.md`)
-- **Report 4**: Proposal reducer report (`.tmp/issue-[refine-]{N}-proposal-reducer.md`)
-- **Report 5**: Code reducer report (`.tmp/issue-[refine-]{N}-code-reducer.md`)
+- **Report 1**: Bold proposer report (`.tmp/issue-{N}-bold.md`)
+- **Report 2**: Paranoia proposer report (`.tmp/issue-{N}-paranoia.md`)
+- **Report 3**: Critique report (`.tmp/issue-{N}-critique.md`)
+- **Report 4**: Proposal reducer report (`.tmp/issue-{N}-proposal-reducer.md`)
+- **Report 5**: Code reducer report (`.tmp/issue-{N}-code-reducer.md`)
+
+**For resolve mode:** The bold report should have a `## User Resolution` section appended
+containing the user's option selections. The `mega-planner --resolve` command handles this
+automatically.
 
 ## Outputs
 
 **Files created:**
-- `.tmp/issue-[refine-]{N}-debate.md` - Combined 5-agent debate report
-- `.tmp/issue-[refine-]{N}-consensus.md` - Final plan(s)
+- `.tmp/issue-{N}-debate.md` - Combined 5-agent debate report
+- `.tmp/issue-{N}-consensus.md` - Final plan(s)
 
 **Output format (unified):**
 ```markdown
