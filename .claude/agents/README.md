@@ -13,6 +13,7 @@ The mega-planner uses a dual-proposer architecture where two agents with opposin
 | `bold-proposer` | Generate innovative proposals | Build on existing code, push boundaries |
 | `paranoia-proposer` | Generate destructive refactoring proposals | Tear down and rebuild properly |
 | `proposal-critique` | Validate both proposals | Challenge assumptions, identify risks |
+| `proposal-reducer` | Simplify both proposals | Less is more, eliminate unnecessary complexity |
 | `code-reducer` | Minimize total code footprint | Allow big changes if they shrink codebase |
 
 ## Agent Relationships
@@ -35,7 +36,6 @@ The mega-planner uses a dual-proposer architecture where two agents with opposin
 ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
 │proposal-critique│ │proposal-reducer │ │  code-reducer   │
 └─────────────────┘ └─────────────────┘ └─────────────────┘
-                    (external)
 ```
 
 ## Usage
@@ -46,6 +46,7 @@ These agents are invoked by the `/mega-planner` command using the `mega-planner:
 subagent_type: "mega-planner:bold-proposer"
 subagent_type: "mega-planner:paranoia-proposer"
 subagent_type: "mega-planner:proposal-critique"
+subagent_type: "mega-planner:proposal-reducer"
 subagent_type: "mega-planner:code-reducer"
 ```
 
