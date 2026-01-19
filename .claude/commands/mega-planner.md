@@ -166,7 +166,7 @@ Set `FILE_PREFIX="issue-${ISSUE_NUMBER}"`.
 
 **For `--refine` mode:**
 Skip placeholder creation. Use the issue number from Step 1 as `ISSUE_NUMBER` for all artifact filenames.
-Set `FILE_PREFIX="issue-refine-${ISSUE_NUMBER}"`.
+Set `FILE_PREFIX="issue-${ISSUE_NUMBER}"`.
 
 **For default mode (new feature):**
 
