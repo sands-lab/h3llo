@@ -362,22 +362,21 @@ Give it 30 minutes timeout to complete.
 **Why direct command instead of `open-issue` skill:**
 - The `open-issue` skill requires AI to write content between heredoc markers (`<<'EOF'` ... `EOF`)
 - AI interpretation may escape, reformat, or strip special markdown like `<details>` blocks
-- Direct `--body-file` with pipe bypasses AI content interpretation entirely
+- Direct `--body-file` bypasses AI content interpretation entirely
+
+**Why direct file path instead of pipe:**
+- Pipe (`tail -n +2 | gh issue edit --body-file -`) is unreliable and may produce empty body
+- Direct `--body-file <file>` is robust and preserves all content
 
 ```bash
-# Extract title from first line (removes "# " markdown heading prefix)
-ISSUE_TITLE=$(head -1 "${CONSENSUS_PLAN_FILE}" | sed 's/^# //')
-
-# Pipe file content (skipping title line) directly to gh issue edit
-tail -n +2 "${CONSENSUS_PLAN_FILE}" | gh issue edit ${ISSUE_NUMBER} \
-    --title "${ISSUE_TITLE}" \
-    --body-file -
+# Update issue body directly from consensus file
+gh issue edit ${ISSUE_NUMBER} --body-file "${CONSENSUS_PLAN_FILE}"
 ```
 
 **If multiple plans were generated (no consensus):**
 - Present all options to user in terminal
 - Let user select preferred approach
-- After selection, update issue with selected plan file using same pattern above
+- After selection, update issue with selected plan file using same command above
 
 **Expected output:**
 ```
