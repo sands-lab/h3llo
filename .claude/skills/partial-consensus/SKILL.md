@@ -51,31 +51,33 @@ The skill includes disagreement sections when:
 
 ## Inputs
 
-This skill requires 5 agent report file paths, with an optional 6th selections file:
+This skill requires 5 agent report file paths, with an optional 6th history file:
 - **Report 1**: Bold proposer report (`.tmp/issue-{N}-bold.md`)
 - **Report 2**: Paranoia proposer report (`.tmp/issue-{N}-paranoia.md`)
 - **Report 3**: Critique report (`.tmp/issue-{N}-critique.md`)
 - **Report 4**: Proposal reducer report (`.tmp/issue-{N}-proposal-reducer.md`)
 - **Report 5**: Code reducer report (`.tmp/issue-{N}-code-reducer.md`)
-- **Report 6** (optional): User selections file (`.tmp/issue-{N}-selections.md`)
+- **Report 6** (optional): History file (`.tmp/issue-{N}-history.md`)
 
-**For resolve mode:** Pass a 6th argument with the selections file path. The
-`mega-planner --resolve` command creates `.tmp/${FILE_PREFIX}-selections.md`
-automatically. Original agent reports remain unmodified.
+**For resolve/refine modes:** Pass a 6th argument with the history file path.
+The `mega-planner --resolve` and `--refine` commands append to `.tmp/issue-{N}-history.md`.
+This file accumulates all selections and refinements across iterations.
 
 ## Outputs
 
 **Files created:**
 - `.tmp/issue-{N}-debate.md` - Combined 5-agent debate report (6 parts if resolve mode)
 - `.tmp/issue-{N}-consensus.md` - Final plan(s)
+- `.tmp/issue-{N}-history.md` - Accumulated selection and refine history
 
-**For resolve mode, the debate file includes a 6th section:**
-- Part 6: User Selections (from selections file)
+**For resolve/refine mode, the debate file includes a 6th section:**
+- Part 6: Selection & Refine History (from history file)
 
 **Output format changes:**
 - **Overall Recommendation** section now includes a Disagreement Summary table
 - **Validation** section (optional) appears at the end for resolve mode output:
-  - Applied Selections table
+  - Selection History table (all accumulated entries)
+  - Refine History table (if applicable)
   - Option Compatibility Check with status (VALIDATED or CONFLICT DETECTED)
 
 **Output format (unified):**
@@ -166,7 +168,7 @@ Error: External review failed with exit code {code}
     .tmp/issue-15-code-reducer.md
 ```
 
-**Resolve mode (5 reports + selections file):**
+**Resolve mode (5 reports + history file):**
 ```bash
 .claude/skills/partial-consensus/scripts/partial-consensus.sh \
     .tmp/issue-15-bold.md \
@@ -174,7 +176,7 @@ Error: External review failed with exit code {code}
     .tmp/issue-15-critique.md \
     .tmp/issue-15-proposal-reducer.md \
     .tmp/issue-15-code-reducer.md \
-    .tmp/issue-15-selections.md
+    .tmp/issue-15-history.md
 ```
 
 **Output on stdout (last line):**
