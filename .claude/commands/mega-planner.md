@@ -452,6 +452,25 @@ Continue to Step 8.
 
 ---
 
+**For refine mode (full debate with history):**
+
+Refine mode already sets `HISTORY_FILE` in Step 1 and runs the full 5-agent debate.
+At Step 7, invoke partial-consensus with the history file as 6th argument:
+
+```bash
+HISTORY_FILE=".tmp/${FILE_PREFIX}-history.md"
+```
+
+```
+Skill tool parameters:
+  skill: "mega-planner:partial-consensus"
+  args: "{BOLD_FILE} {PARANOIA_FILE} {CRITIQUE_FILE} {PROPOSAL_REDUCER_FILE} {CODE_REDUCER_FILE} {HISTORY_FILE}"
+```
+
+Continue to Step 8.
+
+---
+
 **For standard mode (full debate):**
 
 **REQUIRED SKILL CALL:**
