@@ -16,3 +16,4 @@
 - 优先使用 RPITIT/GAT 返回 Future，非必要不要引入 `Pin<Box<dyn Future>>`。可参考 `RouteProbe` 和 `DefaultRouteProbe`。
 - 当前阶段不考虑向前兼容。可任意修改接口，增删方法和测试。
 - 命名统一：凡是收包/收消息用 `*_rx`，发包/发消息用 `*_tx`；相关测试名称以协议前缀（`udp_`、`tun_`）+功能命名。
+- Channel 命名：统一使用 `cmd` 缩写（不使用 `command`）表示命令通道；下划线前缀仅用于确实未使用的变量。

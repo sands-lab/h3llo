@@ -89,11 +89,11 @@ impl DnsResolver {
     pub async fn spawn<P: RouteProbe + Send + Sync + 'static>(
         self,
         probe: P,
-        command_rx: mpsc::Receiver<DnsCommand>,
+        cmd_rx: mpsc::Receiver<DnsCommand>,
         events_tx: mpsc::Sender<Event>,
     ) -> Result<JoinHandle<()>, ResolveInitError> {
         let (socket, bind_warnings) = self.prepare_socket(&probe).await?;
-        let mut task = ResolverTask::new(self.server, self.timeout, command_rx, events_tx, socket);
+        let mut task = ResolverTask::new(self.server, self.timeout, cmd_rx, events_tx, socket);
 
         let handle = tokio::spawn(async move {
             task.emit_bind_warnings(bind_warnings).await;
@@ -149,10 +149,10 @@ struct ResolverTask {
     server: SocketAddr,
     socket: UdpSocket,
     timeout: Duration,
-    command_rx: mpsc::Receiver<DnsCommand>,
+    cmd_rx: mpsc::Receiver<DnsCommand>,
     events_tx: mpsc::Sender<Event>,
     pending: HashMap<u16, PendingRequest>,
-    command_rx_closed: bool,
+    cmd_rx_closed: bool,
 }
 
 impl ResolverTask {
@@ -160,7 +160,7 @@ impl ResolverTask {
     fn new(
         server: SocketAddr,
         timeout: Duration,
-        command_rx: mpsc::Receiver<DnsCommand>,
+        cmd_rx: mpsc::Receiver<DnsCommand>,
         events_tx: mpsc::Sender<Event>,
         socket: UdpSocket,
     ) -> Self {
@@ -168,10 +168,10 @@ impl ResolverTask {
             server,
             socket,
             timeout,
-            command_rx,
+            cmd_rx,
             events_tx,
             pending: HashMap::new(),
-            command_rx_closed: false,
+            cmd_rx_closed: false,
         }
     }
 
@@ -195,12 +195,12 @@ impl ResolverTask {
 
         loop {
             tokio::select! {
-                maybe_cmd = self.command_rx.recv() => self.handle_command(maybe_cmd).await,
+                maybe_cmd = self.cmd_rx.recv() => self.handle_command(maybe_cmd).await,
                 result = self.socket.recv(&mut buf) => self.handle_recv(result, &buf).await,
                 _ = ticker.tick() => self.handle_tick().await,
             }
 
-            if self.command_rx_closed && self.pending.is_empty() {
+            if self.cmd_rx_closed && self.pending.is_empty() {
                 break;
             }
         }
@@ -214,7 +214,7 @@ impl ResolverTask {
                 self.issue_query(host, DnsRecordType::Aaaa).await;
             }
             None => {
-                self.command_rx_closed = true;
+                self.cmd_rx_closed = true;
             }
         }
     }

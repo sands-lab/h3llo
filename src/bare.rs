@@ -78,14 +78,14 @@ impl BareUdpTx {
 /// # Arguments
 /// - `rx`: Receive-only socket and MTU.
 /// - `allowed_sources`: Initial allowed source IP set.
-/// - `command_rx`: Channel delivering commands to the receive loop.
+/// - `cmd_rx`: Channel delivering commands to the receive loop.
 /// - `packet_tx`: Channel to push accepted packets into.
 /// - `events_tx`: Channel for emitting receive metrics.
 /// - `interval`: Metrics emission interval.
 pub fn spawn_udp_rx(
     rx: BareUdpRx,
     mut allowed_sources: HashSet<IpAddr>,
-    mut command_rx: mpsc::Receiver<BareUdpRxCommand>,
+    mut cmd_rx: mpsc::Receiver<BareUdpRxCommand>,
     packet_tx: mpsc::Sender<Vec<u8>>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
@@ -120,7 +120,7 @@ pub fn spawn_udp_rx(
                         Err(_) => break,
                     }
                 }
-                Some(command) = command_rx.recv() => {
+                Some(command) = cmd_rx.recv() => {
                     match command {
                         BareUdpRxCommand::UpdateAllowedSources(update) => {
                             allowed_sources = update;
@@ -200,13 +200,13 @@ mod tests {
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
         let allowed = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))]);
-        let (_cmd_tx, command_rx) = mpsc::channel(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
         let (events_tx, mut _events_rx) = mpsc::channel(4);
         let context = BareUdpRx { socket, mtu: 64 };
         let handle = spawn_udp_rx(
             context,
             allowed,
-            command_rx,
+            cmd_rx,
             packet_tx,
             events_tx,
             Duration::from_millis(200),
@@ -234,13 +234,13 @@ mod tests {
         };
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
-        let (cmd_tx, command_rx) = mpsc::channel(1);
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
         let (events_tx, mut _events_rx) = mpsc::channel(4);
         let context = BareUdpRx { socket, mtu: 64 };
         let handle = spawn_udp_rx(
             context,
             HashSet::new(),
-            command_rx,
+            cmd_rx,
             packet_tx,
             events_tx,
             Duration::from_millis(200),
@@ -320,13 +320,13 @@ mod tests {
         };
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
-        let (_cmd_tx, command_rx) = mpsc::channel(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
         let (events_tx, mut events_rx) = mpsc::channel(4);
         let context = BareUdpRx { socket, mtu: 128 };
         let handle = spawn_udp_rx(
             context,
             HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]),
-            command_rx,
+            cmd_rx,
             packet_tx,
             events_tx,
             Duration::from_millis(10),

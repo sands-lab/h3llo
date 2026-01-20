@@ -384,14 +384,14 @@ fn parse_addrs(raw_addrs: &[String]) -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Tun
 ///
 /// * `tun` - TUN device reader.
 /// * `routing` - Initial routing table for destination lookups (includes embedded TX channels).
-/// * `command_rx` - Channel for receiving runtime commands (e.g., routing updates).
+/// * `cmd_rx` - Channel for receiving runtime commands (e.g., routing updates).
 /// * `events_tx` - Channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
 #[allow(dead_code)]
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
     mut routing: RoutingTable,
-    mut command_rx: mpsc::Receiver<TunRxCommand>,
+    mut cmd_rx: mpsc::Receiver<TunRxCommand>,
     events_tx: mpsc::Sender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
@@ -439,7 +439,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                         Err(_) => break,
                     }
                 }
-                Some(command) = command_rx.recv() => {
+                Some(command) = cmd_rx.recv() => {
                     match command {
                         TunRxCommand::UpdateRouting { routing: new_routing } => {
                             routing = new_routing;
@@ -640,12 +640,12 @@ mod tests {
         peer_txs.insert("peer1".to_string(), peer_tx);
         let routing = RoutingTable::from_peers(&[peer_config], &peer_txs).unwrap();
 
-        let (_cmd_tx, command_rx) = mpsc::channel::<TunRxCommand>(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<TunRxCommand>(1);
 
         let tun_rx_task = spawn_tun_rx(
             rx_tun,
             routing,
-            command_rx,
+            cmd_rx,
             events_tx,
             Duration::from_millis(10),
         );
@@ -892,15 +892,9 @@ mod tests {
         peer_txs.insert("peer1".to_string(), peer1_tx);
         let routing = RoutingTable::from_peers(&[peer1_config], &peer_txs).unwrap();
 
-        let (cmd_tx, command_rx) = mpsc::channel::<TunRxCommand>(1);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TunRxCommand>(1);
 
-        let tun_rx_task = spawn_tun_rx(
-            rx_tun,
-            routing,
-            command_rx,
-            events_tx,
-            Duration::from_secs(60),
-        );
+        let tun_rx_task = spawn_tun_rx(rx_tun, routing, cmd_rx, events_tx, Duration::from_secs(60));
 
         // Send packet - should go to peer1
         tx_tun.send(&ipv4_packet).await.unwrap();
