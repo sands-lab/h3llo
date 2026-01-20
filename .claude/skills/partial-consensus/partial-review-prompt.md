@@ -36,14 +36,22 @@ Review all five perspectives and determine consensus using these criteria:
 - "Same general approach" means targeting the same files with similar modification patterns
 - Use your judgment when criteria are ambiguous; err toward DISAGREEMENT to surface options
 
-**IMPORTANT: Check for "User Selections" section first!**
+**IMPORTANT: Check for "Selection & Refine History" section first!**
 
-If the combined report contains a `## Part 6: User Selections` section:
-- The user has already made their option selections
+The combined report may contain additional sections for resolve/refine modes:
+- `## Part 6: Previous Consensus Plan` - The plan being refined or resolved
+- `## Part 7: Selection & Refine History` - History table tracking all operations
+
+**If Part 7 exists, the LAST ROW of the history table is the current task.**
+This is the request you must fulfill in this iteration.
+
+If the combined report contains a `## Part 7: Selection & Refine History` section:
+- **CRITICAL**: The current task requirement is defined by the **last row** of the history table
+- The user has provided selections or refinement comments
 - **Step 1**: Check if selected options are compatible
   - Look for architectural conflicts (e.g., selecting both "create new file" and "modify existing file" for same component)
   - If incompatible: Report the conflict clearly and suggest which selection to change
-- **Step 2**: If compatible, apply the user's selections directly
+- **Step 2**: If compatible, apply the current task (last row) to the previous consensus plan (Part 6)
   - Produce a single unified plan (no Disagreement sections, no Options)
   - Merge the selected approaches coherently into Implementation Steps
   - Use standard format: Goal, Codebase Analysis, Implementation Steps
@@ -141,8 +149,11 @@ Options without this evidence are invalid.
 
 Below is the combined report containing all five perspectives:
 
-**Note:** If the report contains `## Part 6: User Selections`, the user has pre-selected
-options and you should produce a single unified plan (not options). Check for conflicts first.
+**Note:** If the report contains:
+- `## Part 6: Previous Consensus Plan` - Reference this as the baseline being modified
+- `## Part 7: Selection & Refine History` - The LAST ROW is your current task
+
+When history exists, produce a single unified plan applying the latest selection/refine request.
 
 ---
 
