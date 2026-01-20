@@ -49,22 +49,32 @@ The skill includes disagreement sections when:
 
 ## Inputs
 
-This skill requires exactly 5 agent report file paths:
+This skill requires 5 agent report file paths, with an optional 6th selections file:
 - **Report 1**: Bold proposer report (`.tmp/issue-{N}-bold.md`)
 - **Report 2**: Paranoia proposer report (`.tmp/issue-{N}-paranoia.md`)
 - **Report 3**: Critique report (`.tmp/issue-{N}-critique.md`)
 - **Report 4**: Proposal reducer report (`.tmp/issue-{N}-proposal-reducer.md`)
 - **Report 5**: Code reducer report (`.tmp/issue-{N}-code-reducer.md`)
+- **Report 6** (optional): User selections file (`.tmp/issue-{N}-selections.md`)
 
-**For resolve mode:** The bold report should have a `## User Resolution` section appended
-containing the user's option selections. The `mega-planner --resolve` command handles this
-automatically.
+**For resolve mode:** Pass a 6th argument with the selections file path. The
+`mega-planner --resolve` command creates `.tmp/${FILE_PREFIX}-selections.md`
+automatically. Original agent reports remain unmodified.
 
 ## Outputs
 
 **Files created:**
-- `.tmp/issue-{N}-debate.md` - Combined 5-agent debate report
+- `.tmp/issue-{N}-debate.md` - Combined 5-agent debate report (6 parts if resolve mode)
 - `.tmp/issue-{N}-consensus.md` - Final plan(s)
+
+**For resolve mode, the debate file includes a 6th section:**
+- Part 6: User Selections (from selections file)
+
+**Output format changes:**
+- **Overall Recommendation** section now includes a Disagreement Summary table
+- **Validation** section (optional) appears at the end for resolve mode output:
+  - Applied Selections table
+  - Option Compatibility Check with status (VALIDATED or CONFLICT DETECTED)
 
 **Output format (unified):**
 ```markdown
@@ -144,6 +154,7 @@ Error: External review failed with exit code {code}
 
 ## Usage Example
 
+**Standard mode (5 reports):**
 ```bash
 .claude/skills/partial-consensus/scripts/partial-consensus.sh \
     .tmp/issue-15-bold.md \
@@ -151,6 +162,17 @@ Error: External review failed with exit code {code}
     .tmp/issue-15-critique.md \
     .tmp/issue-15-proposal-reducer.md \
     .tmp/issue-15-code-reducer.md
+```
+
+**Resolve mode (5 reports + selections file):**
+```bash
+.claude/skills/partial-consensus/scripts/partial-consensus.sh \
+    .tmp/issue-15-bold.md \
+    .tmp/issue-15-paranoia.md \
+    .tmp/issue-15-critique.md \
+    .tmp/issue-15-proposal-reducer.md \
+    .tmp/issue-15-code-reducer.md \
+    .tmp/issue-15-selections.md
 ```
 
 **Output on stdout (last line):**

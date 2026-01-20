@@ -36,9 +36,9 @@ Review all five perspectives and determine consensus using these criteria:
 - "Same general approach" means targeting the same files with similar modification patterns
 - Use your judgment when criteria are ambiguous; err toward DISAGREEMENT to surface options
 
-**IMPORTANT: Check for "User Resolution" section first!**
+**IMPORTANT: Check for "User Selections" section first!**
 
-If ANY of the input reports contains a `## User Resolution` section:
+If the combined report contains a `## Part 6: User Selections` section:
 - The user has already made their option selections
 - **Step 1**: Check if selected options are compatible
   - Look for architectural conflicts (e.g., selecting both "create new file" and "modify existing file" for same component)
@@ -48,7 +48,8 @@ If ANY of the input reports contains a `## User Resolution` section:
   - Merge the selected approaches coherently into Implementation Steps
   - Use standard format: Goal, Codebase Analysis, Implementation Steps
   - Include code drafts from the selected options
-  - Add at end: `**Resolution Applied**: [user's selections]`
+  - **Skip Overall Recommendation section** (no Disagreement Summary, no Suggested Combination - already resolved)
+  - Include Validation section at the end (see output format below)
 - Skip the "if consensus IS possible / IS NOT possible" logic below
 
 **If consensus IS possible:**
@@ -128,7 +129,7 @@ Options without this evidence are invalid.
 
 Below is the combined report containing all five perspectives:
 
-**Note:** If any report contains a `## User Resolution` section, the user has pre-selected
+**Note:** If the report contains `## Part 6: User Selections`, the user has pre-selected
 options and you should produce a single unified plan (not options). Check for conflicts first.
 
 ---
@@ -304,6 +305,15 @@ Use this format for ALL outputs (consensus or partial consensus):
 
 ## Overall Recommendation
 
+### Disagreement Summary
+
+| # | Topic | Options | AI Recommendation |
+|---|-------|---------|-------------------|
+| 1 | [Topic Name] | A (Conservative), B (Aggressive), C (Balanced) | Option 1X |
+| 2 | [Topic Name] | A (Conservative), B (Aggressive) | Option 2X |
+
+### Suggested Combination
+
 **Suggested combination**: [e.g., "1B + 2A"] because [brief rationale]
 
 **Alternative combinations**:
@@ -319,6 +329,29 @@ Use this format for ALL outputs (consensus or partial consensus):
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
 | [Risk] | H/M/L | H/M/L | [Strategy] |
+
+## Validation (resolve mode only)
+
+*This section appears only when resolving user-selected options.*
+
+### Applied Selections
+
+| Disagreement | Selected Option | Source |
+|--------------|-----------------|--------|
+| [Topic 1] | Option [code] | [Bold/Paranoia/Hybrid] |
+| [Topic 2] | Option [code] | [Bold/Paranoia/Hybrid] |
+
+### Option Compatibility Check
+
+**Status**: VALIDATED | CONFLICT DETECTED
+
+[If VALIDATED:]
+All selected options are architecturally compatible. No conflicting file modifications or design decisions detected.
+
+[If CONFLICT DETECTED:]
+**Conflict Description**: [Detailed explanation]
+**Affected Options**: [Which options conflict]
+**Suggested Resolution**: [What to change]
 ```
 
 ## Output Guidelines
