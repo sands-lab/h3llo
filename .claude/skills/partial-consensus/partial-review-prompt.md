@@ -345,17 +345,11 @@ Use this format for ALL outputs (consensus or partial consensus):
 
 ### Selection History
 
-| Timestamp | Selections | User Comment | Source |
-|-----------|------------|--------------|--------|
+| Timestamp | Disagreement | Selected Option | User Comments | Source |
+|-----------|--------------|-----------------|---------------|--------|
 | [From history file - all rows] |
 
-*Latest selection applied: [code from last row]*
-
-### Refine History (if applicable)
-
-| Timestamp | Summary | Command |
-|-----------|---------|---------|
-| [From history file - all rows if table exists] |
+*Latest selection applied: [Selected Option from last row]*
 
 ### Option Compatibility Check
 
