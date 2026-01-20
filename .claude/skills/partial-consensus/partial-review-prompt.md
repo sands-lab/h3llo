@@ -191,10 +191,40 @@ Use this format for ALL outputs (consensus or partial consensus):
 <summary><b>Code Draft</b></summary>
 
 ~~~diff
-[Code changes if agreed upon]
+[Code changes for Step 1]
 ~~~
 
 </details>
+
+**Step 2: [Description]**
+- File: `path/to/another/file`
+- Changes: [description]
+
+<details>
+<summary><b>Code Draft</b></summary>
+
+~~~diff
+[Code changes for Step 2]
+~~~
+
+</details>
+
+## Overall Recommendation
+
+### Disagreement Summary
+
+| # | Topic | Options | AI Recommendation |
+|---|-------|---------|-------------------|
+| 1 | [Topic Name] | A (Conservative), B (Aggressive), C (Balanced) | Option 1X |
+| 2 | [Topic Name] | A (Conservative), B (Aggressive) | Option 2X |
+
+### Suggested Combination
+
+**Suggested combination**: [e.g., "1B + 2A"] because [brief rationale]
+
+**Alternative combinations**:
+- **All Conservative** (all A options): Choose if stability is paramount
+- **All Aggressive** (all B options): Choose if major refactoring acceptable
 
 ---
 
@@ -232,7 +262,20 @@ Use this format for ALL outputs (consensus or partial consensus):
 <summary><b>Code Draft</b></summary>
 
 ~~~diff
-[Code changes for Option 1A]
+[Code changes for Option 1A Step 1]
+~~~
+
+</details>
+
+**Step 2: [Description]**
+- File: `path/to/another/file`
+- Changes: [description]
+
+<details>
+<summary><b>Code Draft</b></summary>
+
+~~~diff
+[Code changes for Option 1A Step 2]
 ~~~
 
 </details>
@@ -262,7 +305,20 @@ Use this format for ALL outputs (consensus or partial consensus):
 <summary><b>Code Draft</b></summary>
 
 ~~~diff
-[Code changes for Option 1B]
+[Code changes for Option 1B Step 1]
+~~~
+
+</details>
+
+**Step 2: [Description]**
+- File: `path/to/another/file`
+- Changes: [description]
+
+<details>
+<summary><b>Code Draft</b></summary>
+
+~~~diff
+[Code changes for Option 1B Step 2]
 ~~~
 
 </details>
@@ -292,7 +348,20 @@ Use this format for ALL outputs (consensus or partial consensus):
 <summary><b>Code Draft</b></summary>
 
 ~~~diff
-[Code changes for Option 1C]
+[Code changes for Option 1C Step 1]
+~~~
+
+</details>
+
+**Step 2: [Description]**
+- File: `path/to/another/file`
+- Changes: [description]
+
+<details>
+<summary><b>Code Draft</b></summary>
+
+~~~diff
+[Code changes for Option 1C Step 2]
 ~~~
 
 </details>
@@ -312,23 +381,6 @@ Use this format for ALL outputs (consensus or partial consensus):
 
 ---
 
-## Overall Recommendation
-
-### Disagreement Summary
-
-| # | Topic | Options | AI Recommendation |
-|---|-------|---------|-------------------|
-| 1 | [Topic Name] | A (Conservative), B (Aggressive), C (Balanced) | Option 1X |
-| 2 | [Topic Name] | A (Conservative), B (Aggressive) | Option 2X |
-
-### Suggested Combination
-
-**Suggested combination**: [e.g., "1B + 2A"] because [brief rationale]
-
-**Alternative combinations**:
-- **All Conservative** (all A options): Choose if stability is paramount
-- **All Aggressive** (all B options): Choose if major refactoring acceptable
-
 ## Success Criteria
 
 - [ ] [Criterion 1]
@@ -339,19 +391,19 @@ Use this format for ALL outputs (consensus or partial consensus):
 |------|------------|--------|------------|
 | [Risk] | H/M/L | H/M/L | [Strategy] |
 
-## Validation (resolve mode only)
-
-*This section appears only when resolving user-selected options.*
-
-### Selection History
+## Selection History
 
 | Timestamp | Disagreement | Selected Option | User Comments | Source |
 |-----------|--------------|-----------------|---------------|--------|
 | [From history file - all rows] |
 
-*Latest selection applied: [Selected Option from last row]*
+## Refine History
 
-### Option Compatibility Check
+| Timestamp | Summary | Command |
+|-----------|---------|---------|
+| [From history file - all rows if table exists] |
+
+## Option Compatibility Check
 
 **Status**: VALIDATED | CONFLICT DETECTED
 
@@ -367,11 +419,6 @@ All selected options are architecturally compatible. No conflicting file modific
 ## Output Guidelines
 
 ### When to Include Disagreement Sections
-
-Include a Disagreement section when:
-1. Bold and Paranoia propose different approaches to the same sub-problem
-2. Critique favors one proposal over another
-3. The choice materially affects implementation (not just style preference)
 
 **If no disagreements exist**: Omit Disagreement sections entirely. The unified format's Goal, Codebase Analysis, and Implementation Steps contain the complete agreed plan.
 
@@ -393,13 +440,6 @@ Each option MUST include:
 5. Risks and Mitigations table
 
 Options lacking any of these sections are INVALID.
-
-### Collapsible Syntax
-
-Use `<details><summary><b>Code Draft</b></summary>` for code diffs.
-Blank line required after `</summary>` and before `</details>` for proper GitHub rendering.
-
-**Maximum disagreements**: If more than 4-5 disagreement points exist, the feature request should be split into sub-features.
 
 ## Privacy Note
 
