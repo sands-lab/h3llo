@@ -13,17 +13,6 @@ allowed-tools:
 
 This skill determines consensus and exposes disagreements from a multi-agent debate with dual proposers.
 
-## Consensus Definition
-
-**CONSENSUS** requires ALL of the following:
-1. Bold and Paranoia propose the same general approach
-2. Critique finds no critical blockers
-3. Both Reducers recommend the same base proposal without fundamental changes
-
-**DISAGREEMENT** = NOT CONSENSUS. If any condition above is not satisfied, disagreement exists.
-
-**Note:** The reviewer uses judgment for ambiguous cases, with optional reference to ~30% LOC delta as "fundamental change" guidance.
-
 ## Modes
 
 1. **Standard mode**: Determines consensus/disagreement, generates options for disagreements
@@ -38,10 +27,6 @@ This skill determines consensus and exposes disagreements from a multi-agent deb
 - **AI Recommendations**: Advisory only; developer must select
 - **Collapsible Code Drafts**: `<details>` tags for implementation details
 
-## When Disagreement Sections Are Generated
-
-The skill includes disagreement sections when DISAGREEMENT exists (any CONSENSUS condition is NOT satisfied) and the choice materially affects implementation (not just style preference).
-
 ## Inputs
 
 This skill requires 5 agent report file paths, with optional 6th and 7th arguments:
@@ -54,15 +39,13 @@ This skill requires 5 agent report file paths, with optional 6th and 7th argumen
 - **Arg 7** (optional): History file (`.tmp/issue-{N}-history.md`)
 
 **Context ordering rationale:**
-The combined report is assembled as: agent reports (1-5) → previous consensus (6) → history (7).
+The combined report is assembled as: agent reports (1-5) -> previous consensus (6) -> history (7).
 This ensures the AI sees the history table's last row (current task) as the final context,
 leveraging LLM recency bias to prioritize the current request.
 
 **For resolve/refine modes:** Pass both 6th and 7th arguments:
 1. consensus.md as arg 6 (previous plan being modified)
 2. history.md as arg 7 (operation history with current task in last row)
-
-This file accumulates all selections and refinements across iterations.
 
 ## Outputs
 
@@ -75,47 +58,18 @@ This file accumulates all selections and refinements across iterations.
 - Part 6: Previous Consensus Plan (from consensus.md)
 - Part 7: Selection & Refine History (from history file, last row = current task)
 
-**Output format changes:**
-- **Overall Recommendation** section now includes a Disagreement Summary table
-- **Validation** section (optional) appears at the end for resolve mode output:
-  - Selection History table (all accumulated entries)
-  - Refine History table (if applicable)
-  - Option Compatibility Check with status (VALIDATED or CONFLICT DETECTED)
+**Output format:**
 
-**Output format (unified):**
-```markdown
-# Implementation Plan: {Feature Name}
+| Section | Description |
+|---------|-------------|
+| Agent Perspectives Summary | 5-agent position table |
+| Goal / Codebase Analysis | Problem statement and file changes |
+| Implementation Steps | Agreed changes with code drafts |
+| Disagreement N (if any) | Per-disagreement options with A/B/C choices |
+| Overall Recommendation | Suggested combination and rationale |
+| Validation (resolve mode) | Selection history and compatibility check |
 
-## Agent Perspectives Summary
-
-| Agent | Core Position | Key Insight |
-|-------|---------------|-------------|
-| **Bold** | ... | ... |
-| **Paranoia** | ... | ... |
-| **Critique** | ... | ... |
-| **Proposal Reducer** | ... | ... |
-| **Code Reducer** | ... | ... |
-
-## Goal / Codebase Analysis / Implementation Steps
-[Standard sections for agreed elements]
-
-## Disagreement 1: {Topic}
-
-### Agent Perspectives
-[Per-disagreement table showing each agent's position]
-
-### Resolution Options
-
-#### Option 1A/1B/1C
-- Summary, Source, File Changes, Implementation Steps
-- Code Draft in `<details>` block
-- Risks/Mitigations
-
-**AI Recommendation**: Option [X] because [rationale]
-
-## Overall Recommendation
-**Suggested combination**: [e.g., "1B + 2A"] because [rationale]
-```
+*See `partial-review-prompt.md` for complete output format specification.*
 
 ## Implementation Workflow
 
@@ -142,65 +96,30 @@ This file accumulates all selections and refinements across iterations.
 
 ## Error Handling
 
-### Report Files Not Found
+| Error Message | Cause | Solution |
+|---------------|-------|----------|
+| `Report file not found: {path}` | Missing agent report | Ensure all 5 reports were generated |
+| `External review failed with exit code {N}` | API/network issue | Check credentials and retry |
 
-```
-Error: Report file not found: {file_path}
-```
+## Usage Examples
 
-**Solution**: Ensure all 5 agent reports were generated.
-
-### External Reviewer Failure
-
-```
-Error: External review failed with exit code {code}
-```
-
-**Solution**: Check API credentials, network, or retry.
-
-## Usage Example
-
-**Standard mode (5 reports):**
-```bash
-.claude/skills/partial-consensus/scripts/partial-consensus.sh \
-    .tmp/issue-15-bold.md \
-    .tmp/issue-15-paranoia.md \
-    .tmp/issue-15-critique.md \
-    .tmp/issue-15-proposal-reducer.md \
-    .tmp/issue-15-code-reducer.md
-```
-
-**Resolve mode (5 reports + consensus + history):**
-```bash
-.claude/skills/partial-consensus/scripts/partial-consensus.sh \
-    .tmp/issue-15-bold.md \
-    .tmp/issue-15-paranoia.md \
-    .tmp/issue-15-critique.md \
-    .tmp/issue-15-proposal-reducer.md \
-    .tmp/issue-15-code-reducer.md \
-    .tmp/issue-15-consensus.md \
-    .tmp/issue-15-history.md
-```
-
-**Output on stdout (last line):**
-```
-.tmp/issue-15-consensus.md
-```
-
-## Refine Mode Naming
-
-In refine mode, report files typically use the `issue-refine-{N}-...` prefix, and outputs will match:
+| Mode | Arguments | Example |
+|------|-----------|---------|
+| Standard | 5 reports | `.tmp/issue-{N}-bold.md ... .tmp/issue-{N}-code-reducer.md` |
+| Resolve | 5 reports + consensus + history | Add `.tmp/issue-{N}-consensus.md .tmp/issue-{N}-history.md` |
+| Refine | Same as resolve, with `issue-refine-{N}` prefix | Use `issue-refine-{N}-*.md` filenames |
 
 ```bash
+# Standard mode
 .claude/skills/partial-consensus/scripts/partial-consensus.sh \
-    .tmp/issue-refine-15-bold.md \
-    .tmp/issue-refine-15-paranoia.md \
-    .tmp/issue-refine-15-critique.md \
-    .tmp/issue-refine-15-proposal-reducer.md \
-    .tmp/issue-refine-15-code-reducer.md
+    .tmp/issue-42-bold.md \
+    .tmp/issue-42-paranoia.md \
+    .tmp/issue-42-critique.md \
+    .tmp/issue-42-proposal-reducer.md \
+    .tmp/issue-42-code-reducer.md
 ```
 
-Expected output:
+**Output** (stdout, last line):
 ```
-.tmp/issue-refine-15-consensus.md
+.tmp/issue-42-consensus.md
 ```
