@@ -24,6 +24,7 @@ This skill determines consensus and exposes disagreements from a multi-agent deb
 1. Bold and Paranoia propose different architectural approaches
 2. Critique favors one proposal over another
 3. Either Reducer recommends fundamental changes
+4. Any significant idea from either proposal would need to be excluded to achieve synthesis
 
 **Note:** The reviewer uses judgment for ambiguous cases, with optional reference to ~30% LOC delta as "fundamental change" guidance.
 
@@ -34,17 +35,18 @@ This skill determines consensus and exposes disagreements from a multi-agent deb
 
 ## Key Features
 
-- **No Silent Resolution**: Disagreements are exposed, not auto-resolved
+- **No Automatic Dropping**: AI cannot drop ideas from proposals; all contested ideas become Disagreement sections
+- **Mandatory Developer Arbitration**: Disagreements require explicit developer selection via `--resolve` mode
 - **Flexible Options**: Minimum 2, recommended 3, no upper limit per disagreement
 - **Source Attribution**: Each option must cite its source (Bold, Paranoia, Hybrid, etc.)
-- **AI Recommendations**: Included without disclaimer
+- **AI Recommendations**: Advisory only; developer must select
 - **Collapsible Code Drafts**: `<details>` tags for implementation details
 
 ## When Disagreement Sections Are Generated
 
 The skill includes disagreement sections when:
 1. Bold and Paranoia propose different approaches to the same sub-problem
-2. Critique identifies valid arguments for both positions
+2. Critique favors one proposal over another
 3. The choice materially affects implementation
 
 ## Inputs
