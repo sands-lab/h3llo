@@ -193,9 +193,9 @@ Use this format for ALL outputs (consensus or partial consensus):
 <details>
 <summary><b>Code Draft</b></summary>
 
-```diff
+~~~diff
 [Code changes if agreed upon]
-```
+~~~
 
 </details>
 
@@ -234,9 +234,9 @@ Use this format for ALL outputs (consensus or partial consensus):
 <details>
 <summary><b>Code Draft</b></summary>
 
-```diff
+~~~diff
 [Code changes for Option 1A]
-```
+~~~
 
 </details>
 
@@ -264,9 +264,9 @@ Use this format for ALL outputs (consensus or partial consensus):
 <details>
 <summary><b>Code Draft</b></summary>
 
-```diff
+~~~diff
 [Code changes for Option 1B]
-```
+~~~
 
 </details>
 
@@ -294,9 +294,9 @@ Use this format for ALL outputs (consensus or partial consensus):
 <details>
 <summary><b>Code Draft</b></summary>
 
-```diff
+~~~diff
 [Code changes for Option 1C]
-```
+~~~
 
 </details>
 
