@@ -48,6 +48,7 @@ If the combined report contains a `## Part 6: User Selections` section:
   - Merge the selected approaches coherently into Implementation Steps
   - Use standard format: Goal, Codebase Analysis, Implementation Steps
   - Include code drafts from the selected options
+  - **Skip Overall Recommendation section** (no Disagreement Summary, no Suggested Combination - already resolved)
   - Include Validation section at the end (see output format below)
 - Skip the "if consensus IS possible / IS NOT possible" logic below
 
