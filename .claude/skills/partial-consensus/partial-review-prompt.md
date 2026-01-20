@@ -93,19 +93,31 @@ When proposals disagree, document both positions before deciding:
 **Resolution**: [Which side is adopted and why, with evidence]
 ```
 
-### Rule 2: No Silent Rejection
+### Rule 2: No Automatic Dropping
 
-If dropping an idea from either proposal:
-1. Explicitly state what is being dropped
-2. Cite the evidence for dropping it (from critique or reducers)
-3. Note any trade-offs accepted
+**PROHIBITION**: You MUST NOT automatically drop, reject, or exclude any idea from either proposal.
 
-**Example:**
-```
-**Dropped from Bold**: "Automatic retry with exponential backoff"
-**Reason**: Critique identified this adds 80 LOC for edge case occurring <0.1% of requests
-**Trade-off**: Manual retry required for transient failures (acceptable per requirements)
-```
+**Core Principle**: If not consensus, then disagreement.
+
+When agents propose different approaches or when an idea would otherwise be "dropped":
+1. **DO NOT** autonomously decide to drop, reject, or exclude the idea
+2. **DO** create a Disagreement section exposing the tension
+3. **DO** present at least 2 options: one that includes the idea, one that excludes it
+4. **DO** include evidence from critique/reducers in option rationales
+
+**What constitutes a disagreement (must create Disagreement section):**
+- Bold and Paranoia propose different approaches to the same sub-problem
+- Critique favors one proposal over another
+- Either Reducer suggests fundamental changes that would alter one proposal's approach
+- Any significant idea from either proposal would need to be excluded to achieve synthesis
+
+**What is NOT a disagreement (can be synthesized directly):**
+- Identical approaches with minor wording differences
+- Style preferences within the same architectural approach
+- Implementation details when architecture is agreed
+
+**AI Recommendation** in each Disagreement section provides advisory guidance,
+but the developer makes the final selection via `--resolve` mode.
 
 ### Rule 3: Hybrid Must Justify Both Sources
 
@@ -360,7 +372,7 @@ All selected options are architecturally compatible. No conflicting file modific
 
 Include a Disagreement section when:
 1. Bold and Paranoia propose different approaches to the same sub-problem
-2. Critique identifies valid arguments for both positions
+2. Critique favors one proposal over another
 3. The choice materially affects implementation (not just style preference)
 
 **If no disagreements exist**: Omit Disagreement sections entirely. The unified format's Goal, Codebase Analysis, and Implementation Steps contain the complete agreed plan.

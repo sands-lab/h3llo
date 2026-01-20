@@ -8,10 +8,14 @@ argument-hint: [feature-description] or --refine [issue-no] [refine-comments] or
 
 **IMPORTANT**: Keep a correct mindset when this command is invoked.
 
-0. This workflow is intended to be as hands-off as possible, do your best
-  - NOT TO STOP until the plan is finalized
-  - NOT TO ask user for design decisions. Choose the one you think the most reasonable.
-    If it is bad plan, user will feed it later.
+0. This workflow distinguishes between **workflow autonomy** and **design arbitration**:
+  - **Workflow autonomy**: DO NOT STOP the multi-agent debate workflow. Execute all steps (1-9) automatically without asking for permission to continue.
+  - **Design arbitration**: DO NOT auto-resolve disagreements between agents. All contested design decisions MUST be exposed as Disagreement sections with options for developer selection.
+
+  In practice:
+  - NOT TO STOP workflow execution until the debate report and consensus options are generated
+  - NOT TO autonomously drop ideas or resolve design disagreements. Present all options to the developer.
+  - If agents disagree on any significant design choice, the plan MUST contain Disagreement sections requiring developer selection via `--resolve` mode
 
 1. This is a **planning workflow**. It takes a feature description as input and produces
 a consensus implementation plan as output. It does NOT make any code changes or implement features.
