@@ -182,6 +182,8 @@ Use this format for ALL outputs (consensus or partial consensus):
 
 ## Implementation Steps
 
+> **Note**: Include only consensus steps here—steps that ALL agents agree on. Disputed approaches belong in their respective `## Disagreement N` sections below.
+
 **Step 1: [Description]**
 - File: `path/to/file`
 - Changes: [description]
