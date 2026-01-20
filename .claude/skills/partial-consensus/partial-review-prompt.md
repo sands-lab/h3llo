@@ -24,14 +24,13 @@ Review all five perspectives and determine consensus using these criteria:
 **CONSENSUS** is reached when ALL of the following are true:
 1. Bold and Paranoia propose the same general approach (may differ in implementation details)
 2. Critique finds no critical blockers for that approach
-3. Both Reducers recommend the same base proposal (Bold-based or Paranoia-based) without fundamentally changing its architecture
+3. Both Reducers recommend BOTH proposals (not just one) without major modifications—i.e., changes are <30 lines AND <30% of total LOC
 
 **DISAGREEMENT** = NOT CONSENSUS. If any condition above is not satisfied, disagreement exists.
 
-**Guidance (optional reference):**
-- "Fundamental change" typically means >30% LOC delta or architectural restructuring
-- "Same general approach" means targeting the same files with similar modification patterns
-- Use your judgment when criteria are ambiguous; err toward DISAGREEMENT to surface options
+**Guidance:**
+- When criteria are ambiguous or unclear, DO NOT make a judgment—treat it as DISAGREEMENT
+- Partial consensus is still DISAGREEMENT (e.g., if Reducers only endorse one proposal, or make significant simplifications)
 
 **IMPORTANT: Check for "Selection & Refine History" section first!**
 
