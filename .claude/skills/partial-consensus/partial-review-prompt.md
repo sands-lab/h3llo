@@ -26,10 +26,7 @@ Review all five perspectives and determine consensus using these criteria:
 2. Critique finds no critical blockers for that approach
 3. Both Reducers recommend the same base proposal (Bold-based or Paranoia-based) without fundamentally changing its architecture
 
-**DISAGREEMENT** exists when ANY of the following are true:
-1. Bold and Paranoia propose different architectural approaches
-2. Critique identifies critical issues that favor one proposal over the other
-3. Either Reducer recommends fundamental changes that alter the core approach
+**DISAGREEMENT** = NOT CONSENSUS. If any condition above is not satisfied, disagreement exists.
 
 **Guidance (optional reference):**
 - "Fundamental change" typically means >30% LOC delta or architectural restructuring
@@ -112,17 +109,6 @@ When agents propose different approaches or when an idea would otherwise be "dro
 2. **DO** create a Disagreement section exposing the tension
 3. **DO** present at least 2 options: one that includes the idea, one that excludes it
 4. **DO** include evidence from critique/reducers in option rationales
-
-**What constitutes a disagreement (must create Disagreement section):**
-- Bold and Paranoia propose different approaches to the same sub-problem
-- Critique favors one proposal over another
-- Either Reducer suggests fundamental changes that would alter one proposal's approach
-- Any significant idea from either proposal would need to be excluded to achieve synthesis
-
-**What is NOT a disagreement (can be synthesized directly):**
-- Identical approaches with minor wording differences
-- Style preferences within the same architectural approach
-- Implementation details when architecture is agreed
 
 **AI Recommendation** in each Disagreement section provides advisory guidance,
 but the developer makes the final selection via `--resolve` mode.
