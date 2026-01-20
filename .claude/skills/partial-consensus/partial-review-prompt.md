@@ -346,12 +346,19 @@ Use this format for ALL outputs (consensus or partial consensus):
 
 *This section appears only when resolving user-selected options.*
 
-### Applied Selections
+### Selection History
 
-| Disagreement | Selected Option | Source |
-|--------------|-----------------|--------|
-| [Topic 1] | Option [code] | [Bold/Paranoia/Hybrid] |
-| [Topic 2] | Option [code] | [Bold/Paranoia/Hybrid] |
+| Timestamp | Selections | User Comment | Source |
+|-----------|------------|--------------|--------|
+| [From history file - all rows] |
+
+*Latest selection applied: [code from last row]*
+
+### Refine History (if applicable)
+
+| Timestamp | Summary | Command |
+|-----------|---------|---------|
+| [From history file - all rows if table exists] |
 
 ### Option Compatibility Check
 

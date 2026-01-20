@@ -6,7 +6,7 @@
 # Unlike external-consensus, it can produce multiple options when no agreement.
 #
 # Usage:
-#   ./partial-consensus.sh <bold> <paranoia> <critique> <proposal-reducer> <code-reducer> [selections]
+#   ./partial-consensus.sh <bold> <paranoia> <critique> <proposal-reducer> <code-reducer> [history]
 #
 # Output:
 #   Prints the path to the generated consensus plan file on stdout
@@ -20,7 +20,7 @@ SKILL_DIR="$(dirname "$SCRIPT_DIR")"
 # Validate input arguments
 if [ $# -lt 5 ] || [ $# -gt 6 ]; then
     echo "Error: 5 or 6 arguments required" >&2
-    echo "Usage: $0 <bold> <paranoia> <critique> <proposal-reducer> <code-reducer> [selections]" >&2
+    echo "Usage: $0 <bold> <paranoia> <critique> <proposal-reducer> <code-reducer> [history]" >&2
     exit 1
 fi
 
@@ -30,15 +30,15 @@ CRITIQUE_PATH="$3"
 PROPOSAL_REDUCER_PATH="$4"
 CODE_REDUCER_PATH="$5"
 
-# Optional selections file (6th argument)
-SELECTIONS_PATH=""
+# Optional history file (6th argument)
+HISTORY_PATH=""
 if [ $# -eq 6 ]; then
-    SELECTIONS_PATH="$6"
-    if [ ! -f "$SELECTIONS_PATH" ]; then
-        echo "Error: Selections file not found: $SELECTIONS_PATH" >&2
+    HISTORY_PATH="$6"
+    if [ ! -f "$HISTORY_PATH" ]; then
+        echo "Error: History file not found: $HISTORY_PATH" >&2
         exit 1
     fi
-    echo "Resolve mode: User selections file provided" >&2
+    echo "Resolve mode: History file provided" >&2
 fi
 
 # Validate all report files exist
@@ -159,17 +159,17 @@ $(cat "$CODE_REDUCER_PATH")
 ---
 EOF
 
-# If resolve mode, append selections as Part 6 (after all agent reports)
-if [ -n "$SELECTIONS_PATH" ]; then
+# If resolve mode, append history as Part 6 (after all agent reports)
+if [ -n "$HISTORY_PATH" ]; then
     cat >> "$DEBATE_FILE" <<EOF
 
-## Part 6: User Selections
+## Part 6: Selection & Refine History
 
-$(cat "$SELECTIONS_PATH")
+$(cat "$HISTORY_PATH")
 
 ---
 EOF
-    echo "Appended user selections to debate report" >&2
+    echo "Appended history to debate report" >&2
 fi
 
 echo "Combined debate report saved to: $DEBATE_FILE" >&2

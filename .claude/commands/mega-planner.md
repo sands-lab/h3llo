@@ -97,7 +97,7 @@ This command orchestrates a multi-agent debate system to generate high-quality i
 - `.tmp/issue-{N}-proposal-reducer.md` - Proposal reducer report (simplifies both proposals)
 - `.tmp/issue-{N}-code-reducer.md` - Code reducer report (reduces total code footprint)
 - `.tmp/issue-{N}-debate.md` - Combined multi-agent report
-- `.tmp/issue-{N}-selections.md` - User selections (resolve mode only)
+- `.tmp/issue-{N}-history.md` - Selection and refine history (accumulated across iterations)
 - `.tmp/issue-{N}-consensus.md` - Final plan (or plan options)
 
 All modes use the same `issue-{N}` prefix for artifact files.
@@ -174,6 +174,34 @@ This preserves the original context so downstream agents can verify alignment wi
 
 ```bash
 gh issue view ${ISSUE_NUMBER} --json title,body
+```
+
+**Append refine entry to history file:**
+
+```bash
+HISTORY_FILE=".tmp/issue-${ISSUE_NUMBER}-history.md"
+TIMESTAMP=$(date +"%Y-%m-%d %H:%M")
+
+# Initialize history file if not exists
+if [ ! -f "$HISTORY_FILE" ]; then
+    cat > "$HISTORY_FILE" <<EOF
+# Issue ${ISSUE_NUMBER} History
+
+## Selection History
+
+| Timestamp | Selections | User Comment | Source |
+|-----------|------------|--------------|--------|
+
+## Refine History
+
+| Timestamp | Summary | Command |
+|-----------|---------|---------|
+EOF
+fi
+
+# Append refine entry (truncate to first 80 chars for summary)
+REFINE_SUMMARY=$(echo "${REFINE_COMMENTS}" | head -c 80 | tr '\n' ' ')
+echo "| ${TIMESTAMP} | ${REFINE_SUMMARY}... | --refine ${ISSUE_NUMBER} |" >> "$HISTORY_FILE"
 ```
 
 **From-issue mode:** If we have `--from-issue` at the beginning, the next number is the issue number to plan.
@@ -385,25 +413,39 @@ Focus on reducing total code footprint while allowing large changes."
 
 **For resolve mode (fast-path):**
 
-Create a dedicated selections file (keeps original agent reports unmodified):
+Append to the history file (creates if not exists, preserves selection history):
 
 ```bash
-SELECTIONS_FILE=".tmp/${FILE_PREFIX}-selections.md"
+HISTORY_FILE=".tmp/${FILE_PREFIX}-history.md"
+TIMESTAMP=$(date +"%Y-%m-%d %H:%M")
 
-# Write selections to dedicated file (overwrites if exists, allowing re-runs)
-cat > "$SELECTIONS_FILE" <<EOF
-**Selected Options**: ${SELECTIONS}
+# Initialize history file if not exists
+if [ ! -f "$HISTORY_FILE" ]; then
+    cat > "$HISTORY_FILE" <<EOF
+# Issue ${ISSUE_NUMBER} History
 
-Apply these selections to produce a unified implementation plan.
+## Selection History
+
+| Timestamp | Selections | User Comment | Source |
+|-----------|------------|--------------|--------|
+
+## Refine History
+
+| Timestamp | Summary | Command |
+|-----------|---------|---------|
 EOF
+fi
+
+# Append new selection entry
+echo "| ${TIMESTAMP} | ${SELECTIONS} | - | (see consensus) |" >> "$HISTORY_FILE"
 ```
 
-Then invoke partial-consensus with the selections file as 6th argument:
+Then invoke partial-consensus with the history file as 6th argument:
 
 ```
 Skill tool parameters:
   skill: "mega-planner:partial-consensus"
-  args: ".tmp/${FILE_PREFIX}-bold.md .tmp/${FILE_PREFIX}-paranoia.md .tmp/${FILE_PREFIX}-critique.md .tmp/${FILE_PREFIX}-proposal-reducer.md .tmp/${FILE_PREFIX}-code-reducer.md ${SELECTIONS_FILE}"
+  args: ".tmp/${FILE_PREFIX}-bold.md .tmp/${FILE_PREFIX}-paranoia.md .tmp/${FILE_PREFIX}-critique.md .tmp/${FILE_PREFIX}-proposal-reducer.md .tmp/${FILE_PREFIX}-code-reducer.md ${HISTORY_FILE}"
 ```
 
 Continue to Step 8.
