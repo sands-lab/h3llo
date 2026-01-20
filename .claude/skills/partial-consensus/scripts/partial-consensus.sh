@@ -6,7 +6,16 @@
 # Unlike external-consensus, it can produce multiple options when no agreement.
 #
 # Usage:
-#   ./partial-consensus.sh <bold> <paranoia> <critique> <proposal-reducer> <code-reducer> [history]
+#   ./partial-consensus.sh <bold> <paranoia> <critique> <proposal-reducer> <code-reducer> [consensus] [history]
+#
+# Arguments:
+#   1-5: Required agent report files
+#   6: Optional previous consensus file (for resolve/refine modes)
+#   7: Optional history file (for resolve/refine modes)
+#
+# Context ordering rationale:
+#   The combined report is assembled as: agent reports → previous consensus → history
+#   This ensures the AI sees the history table's last row (current task) as the final context.
 #
 # Output:
 #   Prints the path to the generated consensus plan file on stdout
@@ -18,9 +27,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Validate input arguments
-if [ $# -lt 5 ] || [ $# -gt 6 ]; then
-    echo "Error: 5 or 6 arguments required" >&2
-    echo "Usage: $0 <bold> <paranoia> <critique> <proposal-reducer> <code-reducer> [history]" >&2
+if [ $# -lt 5 ] || [ $# -gt 7 ]; then
+    echo "Error: 5 to 7 arguments required" >&2
+    echo "Usage: $0 <bold> <paranoia> <critique> <proposal-reducer> <code-reducer> [consensus] [history]" >&2
     exit 1
 fi
 
@@ -30,15 +39,26 @@ CRITIQUE_PATH="$3"
 PROPOSAL_REDUCER_PATH="$4"
 CODE_REDUCER_PATH="$5"
 
-# Optional history file (6th argument)
+# Optional consensus file (6th argument) and history file (7th argument)
+CONSENSUS_PATH=""
 HISTORY_PATH=""
-if [ $# -eq 6 ]; then
-    HISTORY_PATH="$6"
+
+if [ $# -ge 6 ]; then
+    CONSENSUS_PATH="$6"
+    if [ ! -f "$CONSENSUS_PATH" ]; then
+        echo "Error: Consensus file not found: $CONSENSUS_PATH" >&2
+        exit 1
+    fi
+    echo "Resolve/refine mode: Previous consensus file provided" >&2
+fi
+
+if [ $# -eq 7 ]; then
+    HISTORY_PATH="$7"
     if [ ! -f "$HISTORY_PATH" ]; then
         echo "Error: History file not found: $HISTORY_PATH" >&2
         exit 1
     fi
-    echo "Resolve mode: History file provided" >&2
+    echo "Resolve/refine mode: History file provided" >&2
 fi
 
 # Validate all report files exist
@@ -125,6 +145,8 @@ This document combines five perspectives from the mega-planner dual-proposer deb
 3. **Critique**: Feasibility analysis of both proposals
 4. **Proposal Reducer**: Simplification of both proposals
 5. **Code Reducer**: Code footprint analysis
+6. **Previous Consensus Plan**: The plan being refined (if resolve/refine mode)
+7. **Selection & Refine History**: History table with current task in last row (if resolve/refine mode)
 
 ---
 
@@ -159,11 +181,29 @@ $(cat "$CODE_REDUCER_PATH")
 ---
 EOF
 
-# If resolve mode, append history as Part 6 (after all agent reports)
+# If resolve/refine mode, append consensus as Part 6 (after all agent reports)
+if [ -n "$CONSENSUS_PATH" ]; then
+    cat >> "$DEBATE_FILE" <<EOF
+
+## Part 6: Previous Consensus Plan
+
+The following is the previous consensus plan being refined:
+
+$(cat "$CONSENSUS_PATH")
+
+---
+EOF
+    echo "Appended previous consensus to debate report" >&2
+fi
+
+# If resolve/refine mode, append history as Part 7 (after consensus)
 if [ -n "$HISTORY_PATH" ]; then
     cat >> "$DEBATE_FILE" <<EOF
 
-## Part 6: Selection & Refine History
+## Part 7: Selection & Refine History
+
+**IMPORTANT**: The last row of the table below contains the current task requirement.
+Apply the current task to the previous consensus plan to generate the updated plan.
 
 $(cat "$HISTORY_PATH")
 

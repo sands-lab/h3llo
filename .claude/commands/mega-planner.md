@@ -176,33 +176,9 @@ This preserves the original context so downstream agents can verify alignment wi
 gh issue view ${ISSUE_NUMBER} --json title,body
 ```
 
-**Append refine entry to history file:**
-
-```bash
-HISTORY_FILE=".tmp/issue-${ISSUE_NUMBER}-history.md"
-TIMESTAMP=$(date +"%Y-%m-%d %H:%M")
-
-# Initialize history file if not exists
-if [ ! -f "$HISTORY_FILE" ]; then
-    cat > "$HISTORY_FILE" <<EOF
-# Issue ${ISSUE_NUMBER} History
-
-## Selection History
-
-| Timestamp | Selections | User Comment | Source |
-|-----------|------------|--------------|--------|
-
-## Refine History
-
-| Timestamp | Summary | Command |
-|-----------|---------|---------|
-EOF
-fi
-
-# Append refine entry (truncate to first 80 chars for summary)
-REFINE_SUMMARY=$(echo "${REFINE_COMMENTS}" | head -c 80 | tr '\n' ' ')
-echo "| ${TIMESTAMP} | ${REFINE_SUMMARY}... | --refine ${ISSUE_NUMBER} |" >> "$HISTORY_FILE"
-```
+Set refine mode variables for use in Step 7 (history recording is consolidated there):
+- `IS_REFINE_MODE=true`
+- `REFINE_COMMENTS` preserved from argument parsing
 
 **From-issue mode:** If we have `--from-issue` at the beginning, the next number is the issue number to plan.
 Fetch the issue title and body to use as the feature description:
@@ -411,60 +387,46 @@ Focus on reducing total code footprint while allowing large changes."
 
 ### Step 7: Invoke Partial Consensus Skill
 
-**For resolve mode (fast-path):**
+**History file management (for resolve and refine modes):**
 
-Append to the history file (creates if not exists, preserves selection history):
+Both `--resolve` and `--refine` modes record their operations in the history file.
+This consolidates history management into a single location.
 
 ```bash
 HISTORY_FILE=".tmp/${FILE_PREFIX}-history.md"
+CONSENSUS_FILE=".tmp/${FILE_PREFIX}-consensus.md"
 TIMESTAMP=$(date +"%Y-%m-%d %H:%M")
 
-# Initialize history file if not exists
+# Initialize history file if not exists (unified single-table format)
 if [ ! -f "$HISTORY_FILE" ]; then
     cat > "$HISTORY_FILE" <<EOF
-# Issue ${ISSUE_NUMBER} History
+# Selection & Refine History
 
-## Selection History
-
-| Timestamp | Selections | User Comment | Source |
-|-----------|------------|--------------|--------|
-
-## Refine History
-
-| Timestamp | Summary | Command |
-|-----------|---------|---------|
+| Timestamp | Type | Content |
+|-----------|------|---------|
 EOF
 fi
-
-# Append new selection entry
-echo "| ${TIMESTAMP} | ${SELECTIONS} | - | (see consensus) |" >> "$HISTORY_FILE"
 ```
 
-Then invoke partial-consensus with the history file as 6th argument:
-
-```
-Skill tool parameters:
-  skill: "mega-planner:partial-consensus"
-  args: ".tmp/${FILE_PREFIX}-bold.md .tmp/${FILE_PREFIX}-paranoia.md .tmp/${FILE_PREFIX}-critique.md .tmp/${FILE_PREFIX}-proposal-reducer.md .tmp/${FILE_PREFIX}-code-reducer.md ${HISTORY_FILE}"
-```
-
-Continue to Step 8.
-
----
-
-**For refine mode (full debate with history):**
-
-Refine mode already sets `HISTORY_FILE` in Step 1 and runs the full 5-agent debate.
-At Step 7, invoke partial-consensus with the history file as 6th argument:
-
+**For resolve mode:**
 ```bash
-HISTORY_FILE=".tmp/${FILE_PREFIX}-history.md"
+# Append to unified history table
+echo "| ${TIMESTAMP} | resolve | ${SELECTIONS} |" >> "$HISTORY_FILE"
 ```
+
+**For refine mode:**
+```bash
+# Append to unified history table
+REFINE_SUMMARY=$(echo "${REFINE_COMMENTS}" | head -c 80 | tr '\n' ' ')
+echo "| ${TIMESTAMP} | refine | ${REFINE_SUMMARY} |" >> "$HISTORY_FILE"
+```
+
+Then invoke partial-consensus with consensus.md as 6th argument and history as 7th:
 
 ```
 Skill tool parameters:
   skill: "mega-planner:partial-consensus"
-  args: "{BOLD_FILE} {PARANOIA_FILE} {CRITIQUE_FILE} {PROPOSAL_REDUCER_FILE} {CODE_REDUCER_FILE} {HISTORY_FILE}"
+  args: ".tmp/${FILE_PREFIX}-bold.md .tmp/${FILE_PREFIX}-paranoia.md .tmp/${FILE_PREFIX}-critique.md .tmp/${FILE_PREFIX}-proposal-reducer.md .tmp/${FILE_PREFIX}-code-reducer.md .tmp/${FILE_PREFIX}-consensus.md .tmp/${FILE_PREFIX}-history.md"
 ```
 
 Continue to Step 8.

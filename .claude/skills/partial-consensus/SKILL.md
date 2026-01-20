@@ -51,27 +51,36 @@ The skill includes disagreement sections when:
 
 ## Inputs
 
-This skill requires 5 agent report file paths, with an optional 6th history file:
+This skill requires 5 agent report file paths, with optional 6th and 7th arguments:
 - **Report 1**: Bold proposer report (`.tmp/issue-{N}-bold.md`)
 - **Report 2**: Paranoia proposer report (`.tmp/issue-{N}-paranoia.md`)
 - **Report 3**: Critique report (`.tmp/issue-{N}-critique.md`)
 - **Report 4**: Proposal reducer report (`.tmp/issue-{N}-proposal-reducer.md`)
 - **Report 5**: Code reducer report (`.tmp/issue-{N}-code-reducer.md`)
-- **Report 6** (optional): History file (`.tmp/issue-{N}-history.md`)
+- **Arg 6** (optional): Previous consensus file (`.tmp/issue-{N}-consensus.md`)
+- **Arg 7** (optional): History file (`.tmp/issue-{N}-history.md`)
 
-**For resolve/refine modes:** Pass a 6th argument with the history file path.
-The `mega-planner --resolve` and `--refine` commands append to `.tmp/issue-{N}-history.md`.
+**Context ordering rationale:**
+The combined report is assembled as: agent reports (1-5) → previous consensus (6) → history (7).
+This ensures the AI sees the history table's last row (current task) as the final context,
+leveraging LLM recency bias to prioritize the current request.
+
+**For resolve/refine modes:** Pass both 6th and 7th arguments:
+1. consensus.md as arg 6 (previous plan being modified)
+2. history.md as arg 7 (operation history with current task in last row)
+
 This file accumulates all selections and refinements across iterations.
 
 ## Outputs
 
 **Files created:**
-- `.tmp/issue-{N}-debate.md` - Combined 5-agent debate report (6 parts if resolve mode)
+- `.tmp/issue-{N}-debate.md` - Combined 5-agent debate report (7 parts if resolve mode)
 - `.tmp/issue-{N}-consensus.md` - Final plan(s)
 - `.tmp/issue-{N}-history.md` - Accumulated selection and refine history
 
-**For resolve/refine mode, the debate file includes a 6th section:**
-- Part 6: Selection & Refine History (from history file)
+**For resolve/refine mode, the debate file includes additional sections:**
+- Part 6: Previous Consensus Plan (from consensus.md)
+- Part 7: Selection & Refine History (from history file, last row = current task)
 
 **Output format changes:**
 - **Overall Recommendation** section now includes a Disagreement Summary table
@@ -168,7 +177,7 @@ Error: External review failed with exit code {code}
     .tmp/issue-15-code-reducer.md
 ```
 
-**Resolve mode (5 reports + history file):**
+**Resolve mode (5 reports + consensus + history):**
 ```bash
 .claude/skills/partial-consensus/scripts/partial-consensus.sh \
     .tmp/issue-15-bold.md \
@@ -176,6 +185,7 @@ Error: External review failed with exit code {code}
     .tmp/issue-15-critique.md \
     .tmp/issue-15-proposal-reducer.md \
     .tmp/issue-15-code-reducer.md \
+    .tmp/issue-15-consensus.md \
     .tmp/issue-15-history.md
 ```
 
