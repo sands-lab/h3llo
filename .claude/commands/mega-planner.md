@@ -93,6 +93,7 @@ This command orchestrates a multi-agent debate system to generate high-quality i
 - `.tmp/issue-{N}-proposal-reducer.md` - Proposal reducer report (simplifies both proposals)
 - `.tmp/issue-{N}-code-reducer.md` - Code reducer report (reduces total code footprint)
 - `.tmp/issue-{N}-debate.md` - Combined multi-agent report
+- `.tmp/issue-{N}-selections.md` - User selections (resolve mode only)
 - `.tmp/issue-{N}-consensus.md` - Final plan (or plan options)
 
 All modes use the same `issue-{N}` prefix for artifact files.
@@ -380,42 +381,25 @@ Focus on reducing total code footprint while allowing large changes."
 
 **For resolve mode (fast-path):**
 
-Before invoking partial-consensus, append user selections to the bold report so the AI
-sees the pre-selected options during synthesis:
+Create a dedicated selections file (keeps original agent reports unmodified):
 
 ```bash
-BOLD_FILE=".tmp/${FILE_PREFIX}-bold.md"
+SELECTIONS_FILE=".tmp/${FILE_PREFIX}-selections.md"
 
-# Remove any existing User Resolution section (allows re-running resolve)
-# This sed command deletes from "## User Resolution" to end of file
-sed -i '/^## User Resolution/,$d' "$BOLD_FILE" 2>/dev/null || true
-
-# Append user selections section
-cat >> "$BOLD_FILE" <<EOF
-
----
-
-## User Resolution
-
+# Write selections to dedicated file (overwrites if exists, allowing re-runs)
+cat > "$SELECTIONS_FILE" <<EOF
 **Selected Options**: ${SELECTIONS}
 
-The user has pre-selected the above options. When synthesizing the final plan:
-1. Check if selected options are compatible (no architectural conflicts)
-2. If incompatible, report the conflict and suggest alternatives
-3. If compatible, apply the selections to produce a single unified plan
-4. Merge the selected approaches coherently into Implementation Steps
-5. Do NOT generate new Disagreement sections - they are already resolved
-6. Produce output in standard consensus format (no options)
-
+Apply these selections to produce a unified implementation plan.
 EOF
 ```
 
-Then invoke partial-consensus with the existing 5 report files (unchanged interface):
+Then invoke partial-consensus with the selections file as 6th argument:
 
 ```
 Skill tool parameters:
   skill: "mega-planner:partial-consensus"
-  args: "${BOLD_FILE} .tmp/${FILE_PREFIX}-paranoia.md .tmp/${FILE_PREFIX}-critique.md .tmp/${FILE_PREFIX}-proposal-reducer.md .tmp/${FILE_PREFIX}-code-reducer.md"
+  args: ".tmp/${FILE_PREFIX}-bold.md .tmp/${FILE_PREFIX}-paranoia.md .tmp/${FILE_PREFIX}-critique.md .tmp/${FILE_PREFIX}-proposal-reducer.md .tmp/${FILE_PREFIX}-code-reducer.md ${SELECTIONS_FILE}"
 ```
 
 Continue to Step 8.

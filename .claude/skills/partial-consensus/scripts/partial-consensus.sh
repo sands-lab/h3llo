@@ -6,7 +6,7 @@
 # Unlike external-consensus, it can produce multiple options when no agreement.
 #
 # Usage:
-#   ./partial-consensus.sh <bold> <paranoia> <critique> <proposal-reducer> <code-reducer>
+#   ./partial-consensus.sh <bold> <paranoia> <critique> <proposal-reducer> <code-reducer> [selections]
 #
 # Output:
 #   Prints the path to the generated consensus plan file on stdout
@@ -18,9 +18,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Validate input arguments
-if [ $# -ne 5 ]; then
-    echo "Error: Exactly 5 report paths are required" >&2
-    echo "Usage: $0 <bold> <paranoia> <critique> <proposal-reducer> <code-reducer>" >&2
+if [ $# -lt 5 ] || [ $# -gt 6 ]; then
+    echo "Error: 5 or 6 arguments required" >&2
+    echo "Usage: $0 <bold> <paranoia> <critique> <proposal-reducer> <code-reducer> [selections]" >&2
     exit 1
 fi
 
@@ -29,6 +29,17 @@ PARANOIA_PATH="$2"
 CRITIQUE_PATH="$3"
 PROPOSAL_REDUCER_PATH="$4"
 CODE_REDUCER_PATH="$5"
+
+# Optional selections file (6th argument)
+SELECTIONS_PATH=""
+if [ $# -eq 6 ]; then
+    SELECTIONS_PATH="$6"
+    if [ ! -f "$SELECTIONS_PATH" ]; then
+        echo "Error: Selections file not found: $SELECTIONS_PATH" >&2
+        exit 1
+    fi
+    echo "Resolve mode: User selections file provided" >&2
+fi
 
 # Validate all report files exist
 for REPORT_PATH in "$BOLD_PATH" "$PARANOIA_PATH" "$CRITIQUE_PATH" "$PROPOSAL_REDUCER_PATH" "$CODE_REDUCER_PATH"; do
@@ -147,6 +158,19 @@ $(cat "$CODE_REDUCER_PATH")
 
 ---
 EOF
+
+# If resolve mode, append selections as Part 6 (after all agent reports)
+if [ -n "$SELECTIONS_PATH" ]; then
+    cat >> "$DEBATE_FILE" <<EOF
+
+## Part 6: User Selections
+
+$(cat "$SELECTIONS_PATH")
+
+---
+EOF
+    echo "Appended user selections to debate report" >&2
+fi
 
 echo "Combined debate report saved to: $DEBATE_FILE" >&2
 
