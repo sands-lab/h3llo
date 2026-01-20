@@ -20,11 +20,7 @@ This skill determines consensus and exposes disagreements from a multi-agent deb
 2. Critique finds no critical blockers
 3. Both Reducers recommend the same base proposal without fundamental changes
 
-**DISAGREEMENT** is triggered by ANY of the following:
-1. Bold and Paranoia propose different architectural approaches
-2. Critique favors one proposal over another
-3. Either Reducer recommends fundamental changes
-4. Any significant idea from either proposal would need to be excluded to achieve synthesis
+**DISAGREEMENT** = NOT CONSENSUS. If any condition above is not satisfied, disagreement exists.
 
 **Note:** The reviewer uses judgment for ambiguous cases, with optional reference to ~30% LOC delta as "fundamental change" guidance.
 
@@ -44,10 +40,7 @@ This skill determines consensus and exposes disagreements from a multi-agent deb
 
 ## When Disagreement Sections Are Generated
 
-The skill includes disagreement sections when:
-1. Bold and Paranoia propose different approaches to the same sub-problem
-2. Critique favors one proposal over another
-3. The choice materially affects implementation
+The skill includes disagreement sections when DISAGREEMENT exists (any CONSENSUS condition is NOT satisfied) and the choice materially affects implementation (not just style preference).
 
 ## Inputs
 
