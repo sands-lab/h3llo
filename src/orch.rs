@@ -650,8 +650,109 @@ async fn wrap_task(label: impl Into<String>, handle: JoinHandle<()>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod test_support {
     use super::*;
+
+    /// Test-only builder for creating an Orchestrator with injected dependencies.
+    ///
+    /// Bypasses all I/O operations (TUN creation, UDP binding, DNS spawning)
+    /// to enable isolated unit testing of event handling logic.
+    pub struct TestableOrchestratorBuilder {
+        tun_if: String,
+        mtu: usize,
+        peers: Vec<Peer>,
+        active_ips: HashSet<IpAddr>,
+        peer_txs: HashMap<String, mpsc::Sender<Vec<u8>>>,
+        pending_dns: HashMap<String, PendingDns>,
+    }
+
+    impl Default for TestableOrchestratorBuilder {
+        fn default() -> Self {
+            Self {
+                tun_if: "test0".to_string(),
+                mtu: 1400,
+                peers: Vec::new(),
+                active_ips: HashSet::new(),
+                peer_txs: HashMap::new(),
+                pending_dns: HashMap::new(),
+            }
+        }
+    }
+
+    impl TestableOrchestratorBuilder {
+        pub fn with_peers(mut self, peers: Vec<Peer>) -> Self {
+            self.peers = peers;
+            self
+        }
+
+        pub fn with_pending_dns(mut self, host: &str, pending: PendingDns) -> Self {
+            self.pending_dns.insert(host.to_string(), pending);
+            self
+        }
+
+        /// Builds a testable orchestrator with dummy channels.
+        pub fn build(self) -> (Orchestrator, mpsc::Sender<Event>) {
+            let (events_tx, events_rx) = mpsc::channel(64);
+            let (tun_cmd_tx, _tun_cmd_rx) = mpsc::channel(1);
+            let (bare_rx_cmd_tx, _bare_rx_cmd_rx) = mpsc::channel(1);
+
+            let orch = Orchestrator {
+                events_rx,
+                events_tx: events_tx.clone(),
+                join_set: JoinSet::new(),
+                pending_dns: self.pending_dns,
+                tun_if: self.tun_if,
+                mtu: self.mtu,
+                peers: self.peers,
+                active_ips: self.active_ips,
+                peer_txs: self.peer_txs,
+                tun_cmd_tx,
+                bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
+                dns_cmd_tx: None,
+            };
+
+            (orch, events_tx)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::TestableOrchestratorBuilder;
+    use super::*;
+    use crate::config::{PeerBare, PeerTun};
+    use crate::events::{
+        Direction, DnsAnswer, DnsAnswerRecord, DnsEvent, DnsEventDetail, DnsRecordType,
+        TransportEvent, TransportKind, TransportLabels, TransportMetrics, TransportStats,
+    };
+
+    /// Helper to create test peers with BareUDP configuration.
+    fn bare_peer(id: &str, allowed: &[&str]) -> Peer {
+        Peer {
+            id: id.to_string(),
+            enabled: true,
+            h3: None,
+            bare: Some(PeerBare {
+                endpoint: "udp://127.0.0.1:5353".to_string(),
+                bindif: None,
+            }),
+            tun: PeerTun {
+                allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
+            },
+        }
+    }
+
+    fn make_metrics_event() -> Event {
+        Event::Transport(TransportEvent::Metrics(TransportMetrics {
+            labels: TransportLabels {
+                kind: TransportKind::Tun,
+                direction: Direction::Rx,
+                peer_id: None,
+                ip_addr: None,
+            },
+            stats: TransportStats::default(),
+        }))
+    }
 
     #[tokio::test]
     async fn orchestrator_error_includes_task_label() {
@@ -688,5 +789,330 @@ mod tests {
     fn parse_ip_literal_returns_none_for_empty() {
         let ip = parse_ip_literal("");
         assert!(ip.is_none());
+    }
+
+    // ========== collect_allowed_ips tests ==========
+
+    #[test]
+    fn collect_allowed_ips_parses_valid_cidrs() {
+        let peers = vec![
+            bare_peer("peer1", &["10.0.0.0/24", "192.168.1.0/24"]),
+            bare_peer("peer2", &["172.16.0.0/16"]),
+        ];
+        let result = collect_allowed_ips(&peers).expect("should parse");
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&"10.0.0.0/24".parse().unwrap()));
+        assert!(result.contains(&"192.168.1.0/24".parse().unwrap()));
+        assert!(result.contains(&"172.16.0.0/16".parse().unwrap()));
+    }
+
+    #[test]
+    fn collect_allowed_ips_rejects_invalid_cidr() {
+        let peers = vec![bare_peer("peer1", &["not-a-cidr"])];
+        let result = collect_allowed_ips(&peers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn collect_allowed_ips_handles_empty_peers() {
+        let peers: Vec<Peer> = vec![];
+        let result = collect_allowed_ips(&peers).expect("should parse");
+        assert!(result.is_empty());
+    }
+
+    // ========== tun_prefixes tests ==========
+
+    #[test]
+    fn tun_prefixes_parses_ipv4_addresses() {
+        let addrs = vec!["192.168.1.1".to_string(), "10.0.0.1".to_string()];
+        let result = tun_prefixes(&addrs).expect("should parse");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].prefix_len(), 32);
+        assert_eq!(result[1].prefix_len(), 32);
+    }
+
+    #[test]
+    fn tun_prefixes_parses_ipv6_addresses() {
+        let addrs = vec!["2001:db8::1".to_string()];
+        let result = tun_prefixes(&addrs).expect("should parse");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].prefix_len(), 128);
+    }
+
+    #[test]
+    fn tun_prefixes_rejects_invalid_address() {
+        let addrs = vec!["not-an-ip".to_string()];
+        let result = tun_prefixes(&addrs);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tun_prefixes_handles_mixed_families() {
+        let addrs = vec!["192.168.1.1".to_string(), "2001:db8::1".to_string()];
+        let result = tun_prefixes(&addrs).expect("should parse");
+        assert_eq!(result.len(), 2);
+        assert!(result[0].addr().is_ipv4());
+        assert!(result[1].addr().is_ipv6());
+    }
+
+    #[test]
+    fn tun_prefixes_handles_empty_addrs() {
+        let addrs: Vec<String> = vec![];
+        let result = tun_prefixes(&addrs).expect("should parse");
+        assert!(result.is_empty());
+    }
+
+    // ========== PendingDns tests ==========
+
+    #[test]
+    fn pending_dns_accumulates_configs() {
+        let mut pending = PendingDns::BarePeers {
+            configs: Vec::new(),
+        };
+
+        pending.push_config(BarePeerConfig {
+            peer_id: "peer1".to_string(),
+            port: 5353,
+            bindif: None,
+            peer: bare_peer("peer1", &["10.0.0.0/24"]),
+        });
+
+        pending.push_config(BarePeerConfig {
+            peer_id: "peer2".to_string(),
+            port: 5354,
+            bindif: Some("eth0".to_string()),
+            peer: bare_peer("peer2", &["172.16.0.0/16"]),
+        });
+
+        match pending {
+            PendingDns::BarePeers { configs } => {
+                assert_eq!(configs.len(), 2);
+                assert_eq!(configs[0].peer_id, "peer1");
+                assert_eq!(configs[1].peer_id, "peer2");
+                assert_eq!(configs[1].bindif, Some("eth0".to_string()));
+            }
+        }
+    }
+
+    // ========== OrchestratorError tests ==========
+
+    #[test]
+    fn orchestrator_error_missing_bare_listen() {
+        let error = OrchestratorError::MissingBareListen;
+        assert!(error.to_string().contains("local.bare.listen"));
+    }
+
+    #[test]
+    fn orchestrator_error_invalid_bare_listen() {
+        let error = OrchestratorError::InvalidBareListen("bad uri".to_string());
+        let msg = error.to_string();
+        assert!(msg.contains("invalid bare listen"));
+        assert!(msg.contains("bad uri"));
+    }
+
+    #[test]
+    fn orchestrator_error_invalid_peer_endpoint() {
+        let error = OrchestratorError::InvalidPeerEndpoint {
+            peer_id: "test-peer".to_string(),
+            reason: "bad uri".to_string(),
+        };
+        let msg = error.to_string();
+        assert!(msg.contains("test-peer"));
+        assert!(msg.contains("bad uri"));
+    }
+
+    #[test]
+    fn orchestrator_error_listen_resolve_failed() {
+        let error = OrchestratorError::ListenResolveFailed {
+            host: "example.com".to_string(),
+            reason: "dns timeout".to_string(),
+        };
+        let msg = error.to_string();
+        assert!(msg.contains("example.com"));
+        assert!(msg.contains("dns timeout"));
+    }
+
+    #[test]
+    fn orchestrator_error_dns_init() {
+        let error = OrchestratorError::DnsInit("socket bind failed".to_string());
+        assert!(error.to_string().contains("socket bind failed"));
+    }
+
+    #[test]
+    fn orchestrator_error_tun() {
+        let error = OrchestratorError::Tun("device creation failed".to_string());
+        assert!(error.to_string().contains("device creation failed"));
+    }
+
+    #[test]
+    fn orchestrator_error_udp() {
+        let error = OrchestratorError::Udp("address in use".to_string());
+        assert!(error.to_string().contains("address in use"));
+    }
+
+    #[test]
+    fn orchestrator_error_routing() {
+        let error = OrchestratorError::Routing("invalid prefix".to_string());
+        assert!(error.to_string().contains("invalid prefix"));
+    }
+
+    #[test]
+    fn orchestrator_error_route_sync() {
+        let error = OrchestratorError::RouteSync("permission denied".to_string());
+        assert!(error.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn orchestrator_error_task_join() {
+        let error = OrchestratorError::TaskJoin("task panicked".to_string());
+        assert!(error.to_string().contains("task panicked"));
+    }
+
+    // ========== resolve_listen_addr tests ==========
+
+    #[test]
+    fn resolve_listen_addr_with_ipv4_literal() {
+        let endpoint = UdpEndpoint {
+            host: "127.0.0.1".to_string(),
+            port: 5353,
+        };
+        let result = resolve_listen_addr(&endpoint).expect("should resolve");
+        assert_eq!(
+            result.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        );
+        assert_eq!(result.port(), 5353);
+    }
+
+    #[test]
+    fn resolve_listen_addr_with_ipv6_literal() {
+        let endpoint = UdpEndpoint {
+            host: "::1".to_string(),
+            port: 5353,
+        };
+        let result = resolve_listen_addr(&endpoint).expect("should resolve");
+        assert!(result.ip().is_ipv6());
+        assert_eq!(result.port(), 5353);
+    }
+
+    // ========== Event handling tests ==========
+
+    #[tokio::test]
+    async fn handle_event_processes_metrics_without_state_change() {
+        let (mut orch, events_tx) = TestableOrchestratorBuilder::default().build();
+
+        let initial_peer_count = orch.peer_txs.len();
+        let initial_pending_count = orch.pending_dns.len();
+
+        orch.handle_event(make_metrics_event()).await;
+
+        assert_eq!(orch.peer_txs.len(), initial_peer_count);
+        assert_eq!(orch.pending_dns.len(), initial_pending_count);
+
+        drop(events_tx);
+    }
+
+    #[tokio::test]
+    async fn handle_event_processes_other_event() {
+        let (mut orch, events_tx) = TestableOrchestratorBuilder::default().build();
+
+        orch.handle_event(Event::Other("test message".to_string()))
+            .await;
+
+        assert!(orch.peer_txs.is_empty());
+        assert!(orch.pending_dns.is_empty());
+
+        drop(events_tx);
+    }
+
+    #[tokio::test]
+    async fn handle_event_ignores_dns_answer_for_unknown_host() {
+        let (mut orch, events_tx) = TestableOrchestratorBuilder::default().build();
+
+        let answer = Event::Dns(DnsEvent {
+            server: "127.0.0.1:53".parse().unwrap(),
+            detail: DnsEventDetail::Answer(DnsAnswer {
+                host: "unknown.example.com".to_string(),
+                record_type: DnsRecordType::A,
+                records: vec![DnsAnswerRecord {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+                    ttl: 60,
+                }],
+                warnings: vec![],
+            }),
+        });
+        orch.handle_event(answer).await;
+
+        // No new peer TX should be created for unknown host
+        assert!(orch.peer_txs.is_empty());
+
+        drop(events_tx);
+    }
+
+    #[tokio::test]
+    async fn handle_event_removes_pending_dns_on_answer() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let pending = PendingDns::BarePeers {
+            configs: vec![BarePeerConfig {
+                peer_id: "peer1".to_string(),
+                port: 5353,
+                bindif: None,
+                peer: peer.clone(),
+            }],
+        };
+
+        let (mut orch, events_tx) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_pending_dns("example.com", pending)
+            .build();
+
+        assert!(orch.pending_dns.contains_key("example.com"));
+
+        // DNS answer with empty records (will trigger warning path but still remove pending)
+        let answer = Event::Dns(DnsEvent {
+            server: "127.0.0.1:53".parse().unwrap(),
+            detail: DnsEventDetail::Answer(DnsAnswer {
+                host: "example.com".to_string(),
+                record_type: DnsRecordType::A,
+                records: vec![],
+                warnings: vec![],
+            }),
+        });
+        orch.handle_event(answer).await;
+
+        // Pending DNS entry should be removed after processing
+        assert!(!orch.pending_dns.contains_key("example.com"));
+
+        drop(events_tx);
+    }
+
+    #[tokio::test]
+    async fn handle_bare_peer_resolved_with_empty_records_logs_warning() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let (mut orch, events_tx) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer.clone()])
+            .build();
+
+        let answer = DnsAnswer {
+            host: "example.com".to_string(),
+            record_type: DnsRecordType::A,
+            records: vec![],
+            warnings: vec![],
+        };
+
+        let config = BarePeerConfig {
+            peer_id: "peer1".to_string(),
+            port: 5353,
+            bindif: None,
+            peer,
+        };
+
+        // This should return early with a warning, not create any TX
+        orch.handle_bare_peer_resolved(&answer, config).await;
+
+        // No peer TX should be created
+        assert!(!orch.peer_txs.contains_key("peer1"));
+
+        drop(events_tx);
     }
 }
