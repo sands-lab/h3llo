@@ -11,6 +11,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+const RESOLVER_TIMEOUT: Duration = Duration::from_secs(5);
+const COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 use h3llo::bind::{RouteProbe, RouteProbeError};
 use h3llo::dns::{DnsCommand, DnsResolver};
 use h3llo::events::{DnsAnswer, DnsAnswerWarning, DnsEventDetail, DnsRecordType, Event};
@@ -112,6 +115,7 @@ async fn collect_answers(
     let mut answers = Vec::new();
     let deadline = tokio::time::Instant::now() + timeout;
 
+    // DnsResolver issues both A and AAAA queries per Resolve command.
     while answers.len() < 2 {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(Event::Dns(ev))) => match ev.detail {
@@ -149,7 +153,7 @@ async fn next_dns_detail(rx: &mut mpsc::Receiver<Event>, timeout: Duration) -> D
 async fn dns_resolve_single_a_record() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, Duration::from_secs(5)).await;
+    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
         .send(DnsCommand::Resolve {
@@ -158,7 +162,7 @@ async fn dns_resolve_single_a_record() {
         .await
         .unwrap();
 
-    let answers = collect_answers(&mut event_rx, Duration::from_secs(10)).await;
+    let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
 
     // Find the A record answer
     let a_answer = answers
@@ -185,7 +189,7 @@ async fn dns_resolve_single_a_record() {
 async fn dns_resolve_multiple_records() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, Duration::from_secs(5)).await;
+    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
         .send(DnsCommand::Resolve {
@@ -194,7 +198,7 @@ async fn dns_resolve_multiple_records() {
         .await
         .unwrap();
 
-    let answers = collect_answers(&mut event_rx, Duration::from_secs(10)).await;
+    let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
 
     // Check A records contain 10.0.0.2 and 10.0.0.3
     let a_answer = answers
@@ -241,7 +245,7 @@ async fn dns_resolve_multiple_records() {
 async fn dns_resolve_aaaa_only() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, Duration::from_secs(5)).await;
+    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
         .send(DnsCommand::Resolve {
@@ -250,7 +254,7 @@ async fn dns_resolve_aaaa_only() {
         .await
         .unwrap();
 
-    let answers = collect_answers(&mut event_rx, Duration::from_secs(10)).await;
+    let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
 
     // AAAA answer should contain 2001:db8::1
     let aaaa_answer = answers
@@ -290,7 +294,7 @@ async fn dns_resolve_aaaa_only() {
 async fn dns_resolve_nxdomain() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, Duration::from_secs(5)).await;
+    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
         .send(DnsCommand::Resolve {
@@ -299,7 +303,7 @@ async fn dns_resolve_nxdomain() {
         .await
         .unwrap();
 
-    let answers = collect_answers(&mut event_rx, Duration::from_secs(10)).await;
+    let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
 
     // At least one answer should have NxDomain warning
     let has_nxdomain = answers
@@ -317,7 +321,8 @@ async fn dns_resolve_nxdomain() {
 #[tokio::test]
 #[ignore]
 async fn dns_resolve_timeout() {
-    // Point resolver at unreachable address (RFC 5737 TEST-NET)
+    // RFC 5737 TEST-NET-1: guaranteed unroutable in well-configured networks,
+    // causing the resolver to timeout rather than receive a response.
     let server: SocketAddr = "192.0.2.1:53".parse().unwrap();
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, Duration::from_secs(2)).await;
 
@@ -329,7 +334,7 @@ async fn dns_resolve_timeout() {
         .unwrap();
 
     // Should receive a Timeout event
-    let detail = next_dns_detail(&mut event_rx, Duration::from_secs(10)).await;
+    let detail = next_dns_detail(&mut event_rx, COLLECT_TIMEOUT).await;
     match detail {
         DnsEventDetail::Timeout(timeout) => {
             assert_eq!(timeout.host, "anything.example.com");
