@@ -1,9 +1,10 @@
-//! Docker-based integration tests using testcontainers-rs.
+//! BareUDP end-to-end integration tests using testcontainers-rs.
 //!
-//! These tests verify multi-node BareUDP connectivity using real TUN devices
+//! These tests verify multi-node BareUDP VPN connectivity using real TUN devices,
+//! source IP filtering, and MTU boundary behavior
 //! inside Docker containers. Requires Docker daemon and CAP_NET_ADMIN.
 //!
-//! Run with: `cargo test --test docker_integration -- --ignored --nocapture`
+//! Run with: `cargo test --test bareudp_e2e -- --ignored --nocapture`
 
 use std::process::Command;
 use std::time::Duration;
@@ -340,6 +341,89 @@ peers:
     );
 
     drop(node_c);
+    drop(node_a);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// Integration test: MTU boundary checks.
+///
+/// Verifies that packets at the configured MTU (1400) pass through while
+/// oversized packets are dropped when DF (Don't Fragment) is set.
+/// Fulfills docs/plan.md Step 7 requirement.
+#[tokio::test]
+#[ignore = "requires Docker and pre-built image"]
+async fn test_mtu_boundary_drop() {
+    if !ensure_image_exists() {
+        panic!("Missing Docker image {}:{}", TEST_IMAGE, TEST_TAG);
+    }
+
+    ensure_network_exists();
+
+    let temp_dir = create_temp_dir();
+    let node_a_config_path = temp_dir.join("node-a-mtu.yaml");
+    let node_b_config_path = temp_dir.join("node-b-mtu.yaml");
+    std::fs::write(&node_a_config_path, NODE_A_CONFIG).expect("write node-a config");
+    std::fs::write(&node_b_config_path, NODE_B_CONFIG).expect("write node-b config");
+
+    let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
+        .with_exposed_port(ContainerPort::Udp(5353))
+        .with_wait_for(WaitFor::seconds(2))
+        .with_container_name("node-a-mtu")
+        .with_network(TEST_NETWORK)
+        .with_privileged(true)
+        .with_mount(Mount::bind_mount(
+            node_a_config_path.to_str().unwrap(),
+            "/etc/h3llo/config.yaml",
+        ))
+        .start()
+        .await
+        .expect("start node-a-mtu");
+
+    let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
+        .with_exposed_port(ContainerPort::Udp(5353))
+        .with_wait_for(WaitFor::seconds(2))
+        .with_container_name("node-b-mtu")
+        .with_network(TEST_NETWORK)
+        .with_privileged(true)
+        .with_mount(Mount::bind_mount(
+            node_b_config_path.to_str().unwrap(),
+            "/etc/h3llo/config.yaml",
+        ))
+        .start()
+        .await
+        .expect("start node-b-mtu");
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Ping with payload fitting within MTU: 1400 - 20 (IP hdr) - 8 (ICMP hdr) = 1372 bytes
+    let ping_ok = node_a
+        .exec(testcontainers::core::ExecCommand::new([
+            "ping", "-c", "2", "-W", "2", "-s", "1372", "-M", "do", "10.0.0.2",
+        ]))
+        .await
+        .expect("exec ping mtu-ok");
+    let exit_ok = ping_ok.exit_code().await.unwrap();
+    assert_eq!(
+        exit_ok,
+        Some(0),
+        "ping with MTU-fitting payload should succeed"
+    );
+
+    // Ping with payload exceeding MTU (DF set, should be dropped)
+    let ping_big = node_a
+        .exec(testcontainers::core::ExecCommand::new([
+            "ping", "-c", "2", "-W", "2", "-s", "1400", "-M", "do", "10.0.0.2",
+        ]))
+        .await
+        .expect("exec ping mtu-exceed");
+    let exit_big = ping_big.exit_code().await.unwrap();
+    assert_ne!(
+        exit_big,
+        Some(0),
+        "ping exceeding MTU should fail with DF set"
+    );
+
+    drop(node_b);
     drop(node_a);
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

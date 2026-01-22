@@ -49,7 +49,7 @@ Multi-node BareUDP testing using Docker containers with real TUN devices.
 
 ```bash
 # Run Docker integration tests
-cargo test --test docker_integration -- --ignored --nocapture
+cargo test --test bareudp_e2e -- --ignored --nocapture
 ```
 
 ### Test Architecture
@@ -87,5 +87,5 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Linux CI: `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, Docker integration tests.
 - Unit: `src/config.rs` tests for defaults, admin/listener coupling, peer transport exclusivity, BareUDP endpoint requirement, and allowed IP presence.
 - Integration: `tests/config_integration.rs` loads valid/invalid YAML samples to assert validation behavior.
-- Docker: `tests/docker_integration.rs` multi-node BareUDP connectivity via testcontainers-rs.
+- Docker: `tests/bareudp_e2e.rs` multi-node BareUDP connectivity, source IP filtering, and MTU boundary checks via testcontainers-rs.
 - Other platforms: TODO for macOS/Windows when platform-specific code is introduced.
