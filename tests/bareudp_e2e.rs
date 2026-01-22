@@ -1,8 +1,8 @@
 //! BareUDP end-to-end integration tests using testcontainers-rs.
 //!
-//! These tests verify multi-node BareUDP VPN connectivity using real TUN devices,
-//! source IP filtering, and MTU boundary behavior
-//! inside Docker containers. Requires Docker daemon and CAP_NET_ADMIN.
+//! These tests verify multi-node BareUDP VPN connectivity, source IP filtering,
+//! and MTU boundary behavior using real TUN devices inside Docker containers.
+//! Requires Docker daemon and CAP_NET_ADMIN.
 //!
 //! Run with: `cargo test --test bareudp_e2e -- --ignored --nocapture`
 
@@ -359,11 +359,58 @@ async fn test_mtu_boundary_drop() {
 
     ensure_network_exists();
 
+    // Dedicated configs with container names matching the endpoints
+    let node_a_mtu_config = r#"
+local:
+  id: node-a-mtu-local
+  tun:
+    ifname: tun0
+    addrs:
+      - 10.0.0.1
+    mtu: 1400
+  dns:
+    server: udp://127.0.0.11:53
+    refresh: 30
+  bare:
+    listen: "udp://0.0.0.0:5353"
+peers:
+  - id: node-b-mtu
+    enabled: true
+    bare:
+      endpoint: "udp://node-b-mtu:5353"
+    tun:
+      allowedIPs:
+        - 10.0.0.2/32
+"#;
+
+    let node_b_mtu_config = r#"
+local:
+  id: node-b-mtu-local
+  tun:
+    ifname: tun0
+    addrs:
+      - 10.0.0.2
+    mtu: 1400
+  dns:
+    server: udp://127.0.0.11:53
+    refresh: 30
+  bare:
+    listen: "udp://0.0.0.0:5353"
+peers:
+  - id: node-a-mtu
+    enabled: true
+    bare:
+      endpoint: "udp://node-a-mtu:5353"
+    tun:
+      allowedIPs:
+        - 10.0.0.1/32
+"#;
+
     let temp_dir = create_temp_dir();
     let node_a_config_path = temp_dir.join("node-a-mtu.yaml");
     let node_b_config_path = temp_dir.join("node-b-mtu.yaml");
-    std::fs::write(&node_a_config_path, NODE_A_CONFIG).expect("write node-a config");
-    std::fs::write(&node_b_config_path, NODE_B_CONFIG).expect("write node-b config");
+    std::fs::write(&node_a_config_path, node_a_mtu_config).expect("write node-a config");
+    std::fs::write(&node_b_config_path, node_b_mtu_config).expect("write node-b config");
 
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
@@ -396,13 +443,18 @@ async fn test_mtu_boundary_drop() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Ping with payload fitting within MTU: 1400 - 20 (IP hdr) - 8 (ICMP hdr) = 1372 bytes
-    let ping_ok = node_a
+    let mut ping_ok = node_a
         .exec(testcontainers::core::ExecCommand::new([
             "ping", "-c", "2", "-W", "2", "-s", "1372", "-M", "do", "10.0.0.2",
         ]))
         .await
         .expect("exec ping mtu-ok");
+    let ping_ok_out = ping_ok.stdout_to_vec().await.unwrap();
     let exit_ok = ping_ok.exit_code().await.unwrap();
+    println!(
+        "Ping MTU-ok (1372 bytes payload):\n{}",
+        String::from_utf8_lossy(&ping_ok_out)
+    );
     assert_eq!(
         exit_ok,
         Some(0),
@@ -410,13 +462,18 @@ async fn test_mtu_boundary_drop() {
     );
 
     // Ping with payload exceeding MTU (DF set, should be dropped)
-    let ping_big = node_a
+    let mut ping_big = node_a
         .exec(testcontainers::core::ExecCommand::new([
             "ping", "-c", "2", "-W", "2", "-s", "1400", "-M", "do", "10.0.0.2",
         ]))
         .await
         .expect("exec ping mtu-exceed");
+    let ping_big_out = ping_big.stdout_to_vec().await.unwrap();
     let exit_big = ping_big.exit_code().await.unwrap();
+    println!(
+        "Ping MTU-exceed (1400 bytes payload, should fail):\n{}",
+        String::from_utf8_lossy(&ping_big_out)
+    );
     assert_ne!(
         exit_big,
         Some(0),

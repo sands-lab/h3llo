@@ -63,6 +63,7 @@ cargo test --test bareudp_e2e -- --ignored --nocapture
 
 1. **Two-node BareUDP tunnel**: Verifies bidirectional VPN connectivity between two containers
 2. **Source IP filtering**: Verifies unauthorized sources are rejected
+3. **MTU boundary checks**: Verifies MTU-fitting packets pass and oversized packets with DF are dropped
 
 ### Fault Injection
 
