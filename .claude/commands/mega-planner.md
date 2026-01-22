@@ -44,7 +44,7 @@ This command orchestrates a multi-agent debate system to generate high-quality i
 3. **Three-agent analysis**: Critique and two reducers analyze BOTH proposals
 4. **Combine reports**: Merge all perspectives into single document
 5. **Partial consensus**: Invoke partial-consensus skill to synthesize balanced plan (or options)
-6. **Draft issue creation**: Automatically create draft GitHub issue via open-issue skill
+6. **Issue update**: Update GitHub issue with consensus plan via `gh issue edit`
 
 ## Inputs
 
@@ -99,11 +99,13 @@ This command orchestrates a multi-agent debate system to generate high-quality i
 - `.tmp/issue-{N}-debate.md` - Combined multi-agent report
 - `.tmp/issue-{N}-history.md` - Selection and refine history (accumulated across iterations)
 - `.tmp/issue-{N}-consensus.md` - Final plan (or plan options)
+- `.tmp/issue-{N}-partial-review-input.md` - Input prompt sent to external AI reviewer
+- `.tmp/issue-{N}-partial-review-output.txt` - Raw output from external AI reviewer
 
 All modes use the same `issue-{N}` prefix for artifact files.
 
 **GitHub issue:**
-- Created via open-issue skill if user approves
+- Created or updated via `gh issue create/edit` commands
 
 **Terminal output:**
 - Debate summary from all agents
@@ -136,10 +138,13 @@ Accept the $ARGUMENTS.
    if ! diff -q ".tmp/${FILE_PREFIX}-consensus.md" ".tmp/${FILE_PREFIX}-issue-body.md" > /dev/null 2>&1; then
        # Files differ - AI will summarize and prompt user
        DIFF_DETECTED=true
+   else
+       # Files match - proceed with local version
+       DIFF_DETECTED=false
    fi
    ```
 
-   **If files differ**, read both files and summarize the differences:
+   **If files differ** (DIFF_DETECTED=true), read both files and summarize the differences:
    - Use Read tool to read both `.tmp/${FILE_PREFIX}-consensus.md` and `.tmp/${FILE_PREFIX}-issue-body.md`
    - Summarize key differences in natural language (e.g., "GitHub version has additional section X", "Local version modified step Y")
    - Report which version appears more complete/recent
@@ -148,6 +153,8 @@ Accept the $ARGUMENTS.
    - **Use local**: Proceed with local `.tmp/${FILE_PREFIX}-consensus.md`
    - **Use GitHub**: Copy issue body to local consensus file, then proceed
    - **Re-run full planning**: Abort and suggest `/mega-planner --from-issue ${ISSUE_NUMBER}`
+
+   **If files match** (DIFF_DETECTED=false), proceed directly with resolve mode (no user prompt needed).
 7. **Skip Steps 2-6 entirely** (no debate needed)
 8. Jump directly to Step 7 with resolve mode instructions
 
@@ -225,23 +232,15 @@ Set `FILE_PREFIX="issue-${ISSUE_NUMBER}"`.
 
 **For default mode (new feature):**
 
-**REQUIRED SKILL CALL (before agent execution):**
+**Create placeholder issue (before agent execution):**
 
-Create a placeholder issue to obtain the issue number for artifact naming:
-```
-Skill tool parameters:
-  skill: "open-issue"
-  args: "--auto"
-```
-
-**Provide context to open-issue skill:**
-- Feature description: `FEATURE_DESC`
-- Issue body: "Placeholder for multi-agent planning in progress. This will be updated with the consensus plan."
-
-**Extract issue number from response:**
+Create a placeholder issue using `gh` CLI to obtain the issue number for artifact naming:
 ```bash
-# Expected output: "GitHub issue created: #42"
-ISSUE_URL=$(echo "$OPEN_ISSUE_OUTPUT" | grep -o 'https://[^ ]*')
+# Create placeholder issue
+ISSUE_URL=$(gh issue create \
+    --title "[plan] ${FEATURE_DESC}" \
+    --body "Placeholder for multi-agent planning in progress. This will be updated with the consensus plan." \
+    --label "agentize:plan")
 ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -o '[0-9]*$')
 FILE_PREFIX="issue-${ISSUE_NUMBER}"
 ```
@@ -425,7 +424,7 @@ Then invoke partial-consensus with consensus.md as 6th argument and history as 7
 
 ```
 Skill tool parameters:
-  skill: "mega-planner:partial-consensus"
+  skill: "partial-consensus"
   args: ".tmp/${FILE_PREFIX}-bold.md .tmp/${FILE_PREFIX}-paranoia.md .tmp/${FILE_PREFIX}-critique.md .tmp/${FILE_PREFIX}-proposal-reducer.md .tmp/${FILE_PREFIX}-code-reducer.md .tmp/${FILE_PREFIX}-consensus.md .tmp/${FILE_PREFIX}-history.md"
 ```
 
@@ -439,7 +438,7 @@ Continue to Step 8.
 
 ```
 Skill tool parameters:
-  skill: "mega-planner:partial-consensus"
+  skill: "partial-consensus"
   args: "{BOLD_FILE} {PARANOIA_FILE} {CRITIQUE_FILE} {PROPOSAL_REDUCER_FILE} {CODE_REDUCER_FILE}"
 ```
 
@@ -462,11 +461,6 @@ Give it 30 minutes timeout to complete.
 
 **Direct shell command (preserves `<details>` blocks verbatim):**
 
-**Why direct command instead of `open-issue` skill:**
-- The `open-issue` skill requires AI to write content between heredoc markers (`<<'EOF'` ... `EOF`)
-- AI interpretation may escape, reformat, or strip special markdown like `<details>` blocks
-- Direct `--body-file` bypasses AI content interpretation entirely
-
 **Why direct file path instead of pipe:**
 - Pipe (`tail -n +2 | gh issue edit --body-file -`) is unreliable and may produce empty body
 - Direct `--body-file <file>` is robust and preserves all content
@@ -485,11 +479,10 @@ gh issue edit ${ISSUE_NUMBER} --body-file "${CONSENSUS_PLAN_FILE}"
 ```
 Plan issue #${ISSUE_NUMBER} updated with consensus plan.
 
-Title: ${ISSUE_TITLE}
-URL: {issue_url}
+URL: ${ISSUE_URL}
 
 To refine: /mega-planner --refine ${ISSUE_NUMBER}
-To implement: /issue-to-impl ${ISSUE_NUMBER}
+Next steps: Review the plan and begin implementation when ready.
 ```
 
 ### Step 9: Finalize Issue Labels
