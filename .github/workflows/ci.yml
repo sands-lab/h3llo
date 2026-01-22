@@ -26,16 +26,17 @@ jobs:
         uses: actions/checkout@v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Build Docker image
+      - name: Build Docker test image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: false
           tags: h3llo:test
+          target: test
           cache-from: type=gha
           cache-to: type=gha,mode=max
           load: true
-      - name: Verify image
+      - name: Verify test image
         run: docker image inspect h3llo:test
 
   docker-integration:
@@ -46,12 +47,13 @@ jobs:
         uses: actions/checkout@v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Build Docker image (from cache)
+      - name: Build Docker test image (from cache)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: false
           tags: h3llo:test
+          target: test
           cache-from: type=gha
           load: true
       - name: Set up Rust
