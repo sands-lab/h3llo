@@ -65,6 +65,26 @@ cargo test --test bareudp_e2e -- --ignored --nocapture
 2. **Source IP filtering**: Verifies unauthorized sources are rejected
 3. **MTU boundary checks**: Verifies MTU-fitting packets pass and oversized packets with DF are dropped
 
+### DNS Integration Tests
+
+DNS resolver validation against a containerized CoreDNS server with deterministic zone data.
+
+```bash
+cargo test --test dns_e2e -- --ignored --nocapture
+```
+
+- CoreDNS container with `file` plugin serves RFC-style zone with known A/AAAA records
+- DnsResolver spawned in-process via port-mapped UDP
+- No TUN, BareUDP, or CAP_NET_ADMIN required
+- Test scenarios: single A, multi-record, AAAA-only, NXDOMAIN, timeout
+
+#### Concurrency Safety
+
+Each test creates its own `tempfile::tempdir()` for CoreDNS configuration and starts
+an independent CoreDNS container with a unique port mapping. This design ensures tests
+are safe to run in parallel (`cargo test` default behavior) without temp-dir collisions
+or port conflicts.
+
 ### Fault Injection
 
 Inside containers, use `docker exec` or testcontainers' `exec()` API:
@@ -89,4 +109,5 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Unit: `src/config.rs` tests for defaults, admin/listener coupling, peer transport exclusivity, BareUDP endpoint requirement, and allowed IP presence.
 - Integration: `tests/config_integration.rs` loads valid/invalid YAML samples to assert validation behavior.
 - Docker: `tests/bareudp_e2e.rs` multi-node BareUDP connectivity, source IP filtering, and MTU boundary checks via testcontainers-rs.
+- Docker: `tests/dns_e2e.rs` DNS resolver integration tests against CoreDNS container.
 - Other platforms: TODO for macOS/Windows when platform-specific code is introduced.
