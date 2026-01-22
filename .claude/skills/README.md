@@ -20,7 +20,7 @@ Skills are invoked via the Skill tool:
 
 ```
 Skill tool parameters:
-  skill: "mega-planner:partial-consensus"
+  skill: "partial-consensus"
   args: "<bold-file> <paranoia-file> <critique-file> ..."
 ```
 
