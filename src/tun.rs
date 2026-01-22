@@ -500,6 +500,159 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     })
 }
 
+// ============================================================================
+// Test utilities (feature-gated)
+// ============================================================================
+
+/// In-memory TUN implementations for testing.
+///
+/// Available when compiled with `--features test-utils` or in test builds.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
+    use super::{TunRx, TunTx};
+    use std::collections::VecDeque;
+    use std::io;
+    use tokio::sync::mpsc;
+
+    /// In-memory TUN receiver for testing.
+    pub struct MemoryTunRx {
+        name: String,
+        mtu: usize,
+        packet_rx: mpsc::Receiver<Vec<u8>>,
+    }
+
+    /// In-memory TUN transmitter for testing.
+    pub struct MemoryTunTx {
+        name: String,
+        mtu: usize,
+        packet_tx: mpsc::Sender<Vec<u8>>,
+        send_errors: VecDeque<io::ErrorKind>,
+    }
+
+    /// Creates a connected MemoryTun pair for testing.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Interface name for the simulated TUN device.
+    /// * `mtu` - MTU value for sizing buffers.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(rx, tx, inject_tx, output_rx)` where:
+    /// - `rx`: TUN receiver implementing [`TunRx`].
+    /// - `tx`: TUN transmitter implementing [`TunTx`].
+    /// - `inject_tx`: Send packets into the TUN RX side (simulates incoming packets).
+    /// - `output_rx`: Receive packets from the TUN TX side (captures outgoing packets).
+    pub fn memory_tun(
+        name: &str,
+        mtu: usize,
+    ) -> (
+        MemoryTunRx,
+        MemoryTunTx,
+        mpsc::Sender<Vec<u8>>,
+        mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (inject_tx, packet_rx) = mpsc::channel(16);
+        let (packet_tx, output_rx) = mpsc::channel(16);
+        (
+            MemoryTunRx {
+                name: name.to_string(),
+                mtu,
+                packet_rx,
+            },
+            MemoryTunTx {
+                name: name.to_string(),
+                mtu,
+                packet_tx,
+                send_errors: VecDeque::new(),
+            },
+            inject_tx,
+            output_rx,
+        )
+    }
+
+    /// Creates a MemoryTun with pre-configured send errors for fault injection.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Interface name for the simulated TUN device.
+    /// * `mtu` - MTU value for sizing buffers.
+    /// * `send_errors` - Queue of error kinds to return on successive send calls.
+    pub fn memory_tun_with_errors(
+        name: &str,
+        mtu: usize,
+        send_errors: Vec<io::ErrorKind>,
+    ) -> (
+        MemoryTunRx,
+        MemoryTunTx,
+        mpsc::Sender<Vec<u8>>,
+        mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (inject_tx, packet_rx) = mpsc::channel(16);
+        let (packet_tx, output_rx) = mpsc::channel(16);
+        (
+            MemoryTunRx {
+                name: name.to_string(),
+                mtu,
+                packet_rx,
+            },
+            MemoryTunTx {
+                name: name.to_string(),
+                mtu,
+                packet_tx,
+                send_errors: send_errors.into(),
+            },
+            inject_tx,
+            output_rx,
+        )
+    }
+
+    impl TunRx for MemoryTunRx {
+        fn mtu(&self) -> usize {
+            self.mtu
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.packet_rx.recv().await {
+                Some(packet) => {
+                    let len = packet.len().min(buf.len());
+                    buf[..len].copy_from_slice(&packet[..len]);
+                    Ok(len)
+                }
+                None => Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "channel closed",
+                )),
+            }
+        }
+    }
+
+    impl TunTx for MemoryTunTx {
+        fn mtu(&self) -> usize {
+            self.mtu
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(kind) = self.send_errors.pop_front() {
+                return Err(io::Error::new(kind, "injected send error"));
+            }
+            self.packet_tx
+                .send(buf.to_vec())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "packet_tx closed"))?;
+            Ok(buf.len())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +663,8 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
+    // Local test-only MemoryTun with loopback semantics (TX sends to RX).
+    // This is different from test_support::memory_tun which has separate inject/capture channels.
     struct MemoryTunRx {
         name: String,
         mtu: usize,
@@ -523,7 +678,7 @@ mod tests {
         send_errors: VecDeque<io::ErrorKind>,
     }
 
-    fn memory_tun(name: &str, mtu: usize) -> (MemoryTunRx, MemoryTunTx) {
+    fn memory_tun_pair(name: &str, mtu: usize) -> (MemoryTunRx, MemoryTunTx) {
         let (packet_tx, packet_rx) = mpsc::channel(4);
         (
             MemoryTunRx {
@@ -540,7 +695,7 @@ mod tests {
         )
     }
 
-    fn memory_tun_with_errors(
+    fn memory_tun_pair_with_errors(
         name: &str,
         mtu: usize,
         send_errors: Vec<io::ErrorKind>,
@@ -620,7 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn tun_rx_pushes_packets_and_counts() {
-        let (rx_tun, mut tx_tun) = memory_tun("mem0", 64);
+        let (rx_tun, mut tx_tun) = memory_tun_pair("mem0", 64);
         let (peer_tx, mut peer_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
 
@@ -683,7 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn tun_tx_drops_oversize_and_reports_metrics() {
-        let (mut rx_tun, tx_tun) = memory_tun("mem1", 4);
+        let (mut rx_tun, tx_tun) = memory_tun_pair("mem1", 4);
         let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let tun_tx_task = spawn_tun_tx(tx_tun, packet_rx, events_tx, Duration::from_millis(10));
@@ -739,7 +894,7 @@ mod tests {
     #[tokio::test]
     async fn tun_tx_retries_interrupted_send() {
         let (mut rx_tun, tx_tun) =
-            memory_tun_with_errors("mem-interrupt", 16, vec![io::ErrorKind::Interrupted]);
+            memory_tun_pair_with_errors("mem-interrupt", 16, vec![std::io::ErrorKind::Interrupted]);
         let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let tun_tx_task = spawn_tun_tx(tx_tun, packet_rx, events_tx, Duration::from_millis(5));
@@ -871,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn tun_rx_updates_routing_via_command() {
-        let (rx_tun, mut tx_tun) = memory_tun("mem-cmd", 64);
+        let (rx_tun, mut tx_tun) = memory_tun_pair("mem-cmd", 64);
         let (peer1_tx, mut peer1_rx) = mpsc::channel(4);
         let (peer2_tx, mut peer2_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::channel(8);

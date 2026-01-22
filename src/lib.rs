@@ -11,3 +11,14 @@ pub mod orch;
 pub mod route;
 pub mod tun;
 pub mod udp;
+
+/// Test utilities module exposed via the `test-utils` feature.
+///
+/// Provides in-memory TUN implementations for integration testing without
+/// elevated privileges or real network devices.
+#[cfg(feature = "test-utils")]
+pub mod test_utils {
+    pub use crate::tun::test_support::{
+        memory_tun, memory_tun_with_errors, MemoryTunRx, MemoryTunTx,
+    };
+}
