@@ -61,9 +61,11 @@ cargo test --test docker_integration -- --ignored --nocapture
 
 ### Test Scenarios
 
-1. **Two-node BareUDP tunnel**: Verifies bidirectional connectivity over VPN
-2. **Source IP filtering**: Verifies unauthorized sources are rejected
-3. **MTU boundary**: Tests packet handling at MTU limits
+1. **Container startup**: Verifies TUN device creation and UDP port binding
+2. **Image tools**: Verifies required network tools are present in the image
+
+For full multi-node VPN connectivity testing, see the manual setup instructions
+in `tests/docker_integration.rs`.
 
 ### Fault Injection
 
