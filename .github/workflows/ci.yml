@@ -57,4 +57,4 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Run Docker integration tests
-        run: cargo test --test docker_integration -- --ignored --nocapture
+        run: cargo test --test bareudp_e2e -- --ignored --nocapture
