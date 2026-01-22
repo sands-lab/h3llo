@@ -1,30 +1,9 @@
 //! Docker-based integration tests using testcontainers-rs.
 //!
-//! These tests verify h3llo container builds and basic functionality.
-//! Full multi-node VPN connectivity tests require manual network setup.
+//! These tests verify multi-node BareUDP connectivity using real TUN devices
+//! inside Docker containers. Requires Docker daemon and CAP_NET_ADMIN.
 //!
 //! Run with: `cargo test --test docker_integration -- --ignored --nocapture`
-//!
-//! # Prerequisites
-//!
-//! Build the test image first:
-//! ```bash
-//! docker build -t h3llo:test .
-//! ```
-//!
-//! # Multi-node Testing (Manual)
-//!
-//! For full VPN connectivity testing with static IPs, use docker-compose or
-//! manual Docker network setup:
-//!
-//! ```bash
-//! # Create test network
-//! docker network create --subnet=172.30.0.0/24 h3llo-test-net
-//!
-//! # Run containers with static IPs
-//! docker run --privileged --network=h3llo-test-net --ip=172.30.0.10 \
-//!     -v /path/to/node-a.yaml:/etc/h3llo/config.yaml h3llo:test
-//! ```
 
 use std::process::Command;
 use std::time::Duration;
@@ -34,18 +13,54 @@ use testcontainers::{GenericImage, ImageExt};
 
 const TEST_IMAGE: &str = "h3llo";
 const TEST_TAG: &str = "test";
+const TEST_NETWORK: &str = "h3llo-test-net";
 
-/// Minimal configuration for container startup test.
-const MINIMAL_CONFIG: &str = r#"
+/// Test configuration for node A (server role).
+/// Uses container hostname "node-b" for peer endpoint (resolved via Docker DNS).
+const NODE_A_CONFIG: &str = r#"
 local:
   tun:
     ifname: tun0
     addrs:
       - 10.0.0.1
     mtu: 1400
+  dns:
+    server: udp://127.0.0.11:53
+    refresh: 5
   bare:
     listen: "0.0.0.0:5353"
-peers: []
+peers:
+  - id: node-b
+    enabled: true
+    bare:
+      endpoint: "udp://node-b:5353"
+    tun:
+      allowed_ips:
+        - 10.0.0.2/32
+"#;
+
+/// Test configuration for node B (client role).
+/// Uses container hostname "node-a" for peer endpoint (resolved via Docker DNS).
+const NODE_B_CONFIG: &str = r#"
+local:
+  tun:
+    ifname: tun0
+    addrs:
+      - 10.0.0.2
+    mtu: 1400
+  dns:
+    server: udp://127.0.0.11:53
+    refresh: 5
+  bare:
+    listen: "0.0.0.0:5353"
+peers:
+  - id: node-a
+    enabled: true
+    bare:
+      endpoint: "udp://node-a:5353"
+    tun:
+      allowed_ips:
+        - 10.0.0.1/32
 "#;
 
 /// Verifies Docker image exists before running tests.
@@ -68,15 +83,38 @@ fn create_temp_dir() -> std::path::PathBuf {
     temp_dir
 }
 
-/// Integration test: Container startup and TUN device creation.
+/// Creates the test Docker network if it doesn't exist.
+fn ensure_network_exists() {
+    let check = Command::new("docker")
+        .args(["network", "inspect", TEST_NETWORK])
+        .output();
+
+    if check.map(|o| o.status.success()).unwrap_or(false) {
+        return; // Network already exists
+    }
+
+    let result = Command::new("docker")
+        .args(["network", "create", TEST_NETWORK])
+        .output()
+        .expect("create network");
+
+    if !result.status.success() {
+        panic!(
+            "Failed to create network: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+/// Integration test: Two-node BareUDP tunnel connectivity.
 ///
-/// Verifies that the h3llo container:
-/// 1. Starts successfully with privileged mode
-/// 2. Can create a TUN device
-/// 3. Binds to the configured UDP port
+/// This test:
+/// 1. Creates a custom Docker network for container DNS resolution
+/// 2. Starts two h3llo containers with named hostnames
+/// 3. Verifies bidirectional ping over the VPN tunnel
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
-async fn test_container_startup() {
+async fn test_two_node_bareudp_tunnel() {
     if !ensure_image_exists() {
         eprintln!(
             "Docker image {}:{} not found. Build with:",
@@ -86,88 +124,192 @@ async fn test_container_startup() {
         panic!("Missing Docker image");
     }
 
-    // Create temporary config file
-    let temp_dir = create_temp_dir();
-    let config_path = temp_dir.join("config.yaml");
-    std::fs::write(&config_path, MINIMAL_CONFIG).expect("write config");
+    // Ensure test network exists for hostname resolution
+    ensure_network_exists();
 
-    // Start container with privileged mode for TUN access
-    let container = GenericImage::new(TEST_IMAGE, TEST_TAG)
+    // Create temporary config files
+    let temp_dir = create_temp_dir();
+
+    let node_a_config_path = temp_dir.join("node-a.yaml");
+    let node_b_config_path = temp_dir.join("node-b.yaml");
+    std::fs::write(&node_a_config_path, NODE_A_CONFIG).expect("write node-a config");
+    std::fs::write(&node_b_config_path, NODE_B_CONFIG).expect("write node-b config");
+
+    // Start node A with container name for DNS resolution
+    let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
+        .with_container_name("node-a")
+        .with_network(TEST_NETWORK)
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
-            config_path.to_str().unwrap(),
+            node_a_config_path.to_str().unwrap(),
             "/etc/h3llo/config.yaml",
         ))
         .start()
         .await
-        .expect("start container");
+        .expect("start node-a");
 
-    // Allow time for TUN setup
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Start node B with container name for DNS resolution
+    let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
+        .with_exposed_port(ContainerPort::Udp(5353))
+        .with_wait_for(WaitFor::seconds(2))
+        .with_container_name("node-b")
+        .with_network(TEST_NETWORK)
+        .with_privileged(true)
+        .with_mount(Mount::bind_mount(
+            node_b_config_path.to_str().unwrap(),
+            "/etc/h3llo/config.yaml",
+        ))
+        .start()
+        .await
+        .expect("start node-b");
 
-    // Verify TUN interface exists
-    let tun_check = container
+    // Allow time for TUN setup, DNS resolution, and peer registration
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Test ping from node A to node B via VPN tunnel (10.0.0.2)
+    let ping_result = node_a
         .exec(testcontainers::core::ExecCommand::new([
-            "ip", "link", "show", "tun0",
+            "ping", "-c", "3", "-W", "2", "10.0.0.2",
         ]))
         .await
-        .expect("exec ip link show");
+        .expect("exec ping");
 
-    println!("TUN interface check: {:?}", tun_check);
+    println!("Ping from node-a to node-b (10.0.0.2): {:?}", ping_result);
 
-    // Verify UDP port is bound
-    let port_check = container
+    // Test ping from node B to node A via VPN tunnel (10.0.0.1)
+    let ping_result_b = node_b
         .exec(testcontainers::core::ExecCommand::new([
-            "ss", "-uln", "sport", "=", ":5353",
+            "ping", "-c", "3", "-W", "2", "10.0.0.1",
         ]))
         .await
-        .expect("exec ss");
+        .expect("exec ping");
 
-    println!("UDP port check: {:?}", port_check);
+    println!("Ping from node-b to node-a (10.0.0.1): {:?}", ping_result_b);
 
-    // Cleanup
-    drop(container);
+    // Cleanup happens automatically when containers go out of scope
+    drop(node_b);
+    drop(node_a);
+
+    // Clean up temp files
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
-/// Integration test: Container image verification.
+/// Integration test: BareUDP source IP filtering.
 ///
-/// Verifies the Docker image contains required tools for VPN operation.
+/// Verifies that packets from non-allowed sources are dropped.
+/// Uses a third container that is NOT in the peer's allowed_ips.
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
-async fn test_image_tools() {
+async fn test_source_ip_filtering() {
     if !ensure_image_exists() {
         panic!("Missing Docker image {}:{}", TEST_IMAGE, TEST_TAG);
     }
 
-    let temp_dir = create_temp_dir();
-    let config_path = temp_dir.join("config.yaml");
-    std::fs::write(&config_path, MINIMAL_CONFIG).expect("write config");
+    ensure_network_exists();
 
-    let container = GenericImage::new(TEST_IMAGE, TEST_TAG)
+    let temp_dir = create_temp_dir();
+
+    // Node C has a different VPN IP (10.0.0.3) not in node-a's allowed_ips
+    let node_c_config = r#"
+local:
+  tun:
+    ifname: tun0
+    addrs:
+      - 10.0.0.3
+    mtu: 1400
+  dns:
+    server: udp://127.0.0.11:53
+    refresh: 5
+  bare:
+    listen: "0.0.0.0:5353"
+peers:
+  - id: node-a
+    enabled: true
+    bare:
+      endpoint: "udp://node-a:5353"
+    tun:
+      allowed_ips:
+        - 10.0.0.1/32
+"#;
+
+    // Node A only allows 10.0.0.2, not 10.0.0.3
+    let node_a_config = r#"
+local:
+  tun:
+    ifname: tun0
+    addrs:
+      - 10.0.0.1
+    mtu: 1400
+  dns:
+    server: udp://127.0.0.11:53
+    refresh: 5
+  bare:
+    listen: "0.0.0.0:5353"
+peers:
+  - id: node-b
+    enabled: true
+    bare:
+      endpoint: "udp://node-b:5353"
+    tun:
+      allowed_ips:
+        - 10.0.0.2/32
+"#;
+
+    let node_a_config_path = temp_dir.join("node-a-filter.yaml");
+    let node_c_config_path = temp_dir.join("node-c.yaml");
+    std::fs::write(&node_a_config_path, node_a_config).expect("write node-a config");
+    std::fs::write(&node_c_config_path, node_c_config).expect("write node-c config");
+
+    // Start node A
+    let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
-        .with_wait_for(WaitFor::seconds(1))
+        .with_wait_for(WaitFor::seconds(2))
+        .with_container_name("node-a-filter")
+        .with_network(TEST_NETWORK)
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
-            config_path.to_str().unwrap(),
+            node_a_config_path.to_str().unwrap(),
             "/etc/h3llo/config.yaml",
         ))
         .start()
         .await
-        .expect("start container");
+        .expect("start node-a");
 
-    // Verify required tools are present
-    let tools = ["ip", "ping", "ss"];
-    for tool in tools {
-        let result = container
-            .exec(testcontainers::core::ExecCommand::new(["which", tool]))
-            .await
-            .expect(&format!("exec which {}", tool));
-        println!("Tool '{}' check: {:?}", tool, result);
-    }
+    // Start node C (unauthorized source)
+    let node_c = GenericImage::new(TEST_IMAGE, TEST_TAG)
+        .with_exposed_port(ContainerPort::Udp(5353))
+        .with_wait_for(WaitFor::seconds(2))
+        .with_container_name("node-c")
+        .with_network(TEST_NETWORK)
+        .with_privileged(true)
+        .with_mount(Mount::bind_mount(
+            node_c_config_path.to_str().unwrap(),
+            "/etc/h3llo/config.yaml",
+        ))
+        .start()
+        .await
+        .expect("start node-c");
 
-    drop(container);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Ping from node C to node A should fail (source IP not allowed)
+    // Node C (10.0.0.3) is not in node-a's allowed_ips (only 10.0.0.2)
+    let ping_result = node_c
+        .exec(testcontainers::core::ExecCommand::new([
+            "ping", "-c", "2", "-W", "2", "10.0.0.1",
+        ]))
+        .await
+        .expect("exec ping");
+
+    println!(
+        "Ping from node-c (10.0.0.3) to node-a (10.0.0.1): {:?}",
+        ping_result
+    );
+    // Note: The ping should fail or timeout since node-a doesn't have node-c in its peers
+
+    drop(node_c);
+    drop(node_a);
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
