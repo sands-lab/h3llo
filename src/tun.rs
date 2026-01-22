@@ -748,10 +748,7 @@ mod tests {
         packet_tx.send(vec![9, 9, 9]).await.unwrap();
 
         // First packet should be dropped; second should be emitted.
-        let received = output_rx
-            .recv()
-            .await
-            .expect("should receive one packet");
+        let received = output_rx.recv().await.expect("should receive one packet");
         assert_eq!(received, vec![9, 9, 9]);
 
         let mut snapshot = None;
@@ -801,10 +798,7 @@ mod tests {
 
         packet_tx.send(vec![1, 2, 3]).await.unwrap();
 
-        let received = output_rx
-            .recv()
-            .await
-            .expect("should receive after retry");
+        let received = output_rx.recv().await.expect("should receive after retry");
         assert_eq!(received, vec![1, 2, 3]);
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
