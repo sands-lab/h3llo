@@ -17,7 +17,7 @@ const COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
 use h3llo::bind::{RouteProbe, RouteProbeError};
 use h3llo::dns::{DnsCommand, DnsResolver};
 use h3llo::events::{DnsAnswer, DnsAnswerWarning, DnsEventDetail, DnsRecordType, Event};
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::mpsc;
@@ -70,7 +70,7 @@ async fn start_coredns() -> (ContainerAsync<GenericImage>, tempfile::TempDir, u1
 
     let container = GenericImage::new("coredns/coredns", "1.12.0")
         .with_wait_for(WaitFor::message_on_stdout("CoreDNS-"))
-        .with_exposed_port(53_u16.udp())
+        .with_exposed_port(ContainerPort::Udp(53))
         .with_cmd(["-conf", "/etc/coredns/Corefile"])
         .with_mount(Mount::bind_mount(
             dir.path().join("Corefile").to_str().unwrap(),
@@ -84,7 +84,10 @@ async fn start_coredns() -> (ContainerAsync<GenericImage>, tempfile::TempDir, u1
         .await
         .expect("failed to start CoreDNS container");
 
-    let port = container.get_host_port_ipv4(53_u16.udp()).await.unwrap();
+    let port = container
+        .get_host_port_ipv4(ContainerPort::Udp(53))
+        .await
+        .unwrap();
     (container, dir, port)
 }
 
