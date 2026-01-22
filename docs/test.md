@@ -42,7 +42,7 @@ Multi-node BareUDP testing using Docker containers with real TUN devices.
 1. Docker daemon running
 2. Build the test image:
    ```bash
-   docker build -t h3llo:test .
+   docker build --target test -t h3llo:test .
    ```
 
 ### Running Tests
