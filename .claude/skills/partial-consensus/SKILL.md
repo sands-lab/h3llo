@@ -107,7 +107,7 @@ leveraging LLM recency bias to prioritize the current request.
 |------|-----------|---------|
 | Standard | 5 reports | `.tmp/issue-{N}-bold.md ... .tmp/issue-{N}-code-reducer.md` |
 | Resolve | 5 reports + consensus + history | Add `.tmp/issue-{N}-consensus.md .tmp/issue-{N}-history.md` |
-| Refine | Same as resolve, with `issue-refine-{N}` prefix | Use `issue-refine-{N}-*.md` filenames |
+| Refine | Same as resolve | Same `issue-{N}` prefix, history records refine operation |
 
 ```bash
 # Standard mode

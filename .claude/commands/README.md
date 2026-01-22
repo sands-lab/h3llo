@@ -7,6 +7,7 @@ This directory contains custom slash commands for Claude Code.
 | Command | Description |
 |---------|-------------|
 | `/mega-planner` | Multi-agent debate-based planning with dual proposers |
+| `/sibyl` | Alias for `/mega-planner` |
 
 ## Usage
 
