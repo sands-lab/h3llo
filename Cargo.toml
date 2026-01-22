@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+default = []
+# Exposes internal test utilities (MemoryTun) for integration tests
+test-utils = []
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
@@ -21,6 +26,8 @@ ipnet-trie = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util"] }
+testcontainers = "0.23"
+futures = "0.3"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 route_manager = { version = "0.2.9", features = ["async"] }
