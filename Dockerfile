@@ -1,9 +1,8 @@
-# syntax=docker/dockerfile:1
 # Multi-stage Dockerfile for h3llo BareUDP VPN
 # Optimized with cargo-chef for dependency caching
 
 # Stage 1: Chef - Install cargo-chef and prepare recipe
-FROM rust:1.83-bookworm AS chef
+FROM rust:bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
@@ -17,15 +16,11 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies (cached as long as recipe.json unchanged)
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 # Build application
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release --bin h3llo
+RUN cargo build --release --bin h3llo
 
 # Stage 4: Runtime - Minimal production image
 FROM debian:bookworm-slim AS runtime

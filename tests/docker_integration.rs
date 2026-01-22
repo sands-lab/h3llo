@@ -19,6 +19,7 @@ const TEST_NETWORK: &str = "h3llo-test-net";
 /// Uses container hostname "node-b" for peer endpoint (resolved via Docker DNS).
 const NODE_A_CONFIG: &str = r#"
 local:
+  id: node-a-local
   tun:
     ifname: tun0
     addrs:
@@ -26,16 +27,16 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 5
+    refresh: 30
   bare:
-    listen: "0.0.0.0:5353"
+    listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-b
     enabled: true
     bare:
       endpoint: "udp://node-b:5353"
     tun:
-      allowed_ips:
+      allowedIPs:
         - 10.0.0.2/32
 "#;
 
@@ -43,6 +44,7 @@ peers:
 /// Uses container hostname "node-a" for peer endpoint (resolved via Docker DNS).
 const NODE_B_CONFIG: &str = r#"
 local:
+  id: node-b-local
   tun:
     ifname: tun0
     addrs:
@@ -50,16 +52,16 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 5
+    refresh: 30
   bare:
-    listen: "0.0.0.0:5353"
+    listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-a
     enabled: true
     bare:
       endpoint: "udp://node-a:5353"
     tun:
-      allowed_ips:
+      allowedIPs:
         - 10.0.0.1/32
 "#;
 
@@ -214,6 +216,7 @@ async fn test_source_ip_filtering() {
     // Node C has a different VPN IP (10.0.0.3) not in node-a's allowed_ips
     let node_c_config = r#"
 local:
+  id: node-c-local
   tun:
     ifname: tun0
     addrs:
@@ -221,22 +224,23 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 5
+    refresh: 30
   bare:
-    listen: "0.0.0.0:5353"
+    listen: "udp://0.0.0.0:5353"
 peers:
-  - id: node-a
+  - id: node-a-filter
     enabled: true
     bare:
-      endpoint: "udp://node-a:5353"
+      endpoint: "udp://node-a-filter:5353"
     tun:
-      allowed_ips:
+      allowedIPs:
         - 10.0.0.1/32
 "#;
 
     // Node A only allows 10.0.0.2, not 10.0.0.3
     let node_a_config = r#"
 local:
+  id: node-a-filter-local
   tun:
     ifname: tun0
     addrs:
@@ -244,16 +248,16 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 5
+    refresh: 30
   bare:
-    listen: "0.0.0.0:5353"
+    listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-b
     enabled: true
     bare:
       endpoint: "udp://node-b:5353"
     tun:
-      allowed_ips:
+      allowedIPs:
         - 10.0.0.2/32
 "#;
 
