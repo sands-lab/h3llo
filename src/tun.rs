@@ -655,111 +655,12 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{memory_tun, memory_tun_with_errors};
     use super::*;
     use crate::helpers::test_packets::make_ipv4_packet;
-    use std::collections::VecDeque;
-    use std::io;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
     use tokio::sync::mpsc;
-
-    // Local test-only MemoryTun with loopback semantics (TX sends to RX).
-    // This is different from test_support::memory_tun which has separate inject/capture channels.
-    struct MemoryTunRx {
-        name: String,
-        mtu: usize,
-        packet_rx: mpsc::Receiver<Vec<u8>>,
-    }
-
-    struct MemoryTunTx {
-        name: String,
-        mtu: usize,
-        packet_tx: mpsc::Sender<Vec<u8>>,
-        send_errors: VecDeque<io::ErrorKind>,
-    }
-
-    fn memory_tun_pair(name: &str, mtu: usize) -> (MemoryTunRx, MemoryTunTx) {
-        let (packet_tx, packet_rx) = mpsc::channel(4);
-        (
-            MemoryTunRx {
-                name: name.to_string(),
-                mtu,
-                packet_rx,
-            },
-            MemoryTunTx {
-                name: name.to_string(),
-                mtu,
-                packet_tx,
-                send_errors: VecDeque::new(),
-            },
-        )
-    }
-
-    fn memory_tun_pair_with_errors(
-        name: &str,
-        mtu: usize,
-        send_errors: Vec<io::ErrorKind>,
-    ) -> (MemoryTunRx, MemoryTunTx) {
-        let (packet_tx, packet_rx) = mpsc::channel(4);
-        (
-            MemoryTunRx {
-                name: name.to_string(),
-                mtu,
-                packet_rx,
-            },
-            MemoryTunTx {
-                name: name.to_string(),
-                mtu,
-                packet_tx,
-                send_errors: send_errors.into(),
-            },
-        )
-    }
-
-    impl TunRx for MemoryTunRx {
-        fn mtu(&self) -> usize {
-            self.mtu
-        }
-
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            match self.packet_rx.recv().await {
-                Some(packet) => {
-                    let len = packet.len().min(buf.len());
-                    buf[..len].copy_from_slice(&packet[..len]);
-                    Ok(len)
-                }
-                None => Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "channel closed",
-                )),
-            }
-        }
-    }
-
-    impl TunTx for MemoryTunTx {
-        fn mtu(&self) -> usize {
-            self.mtu
-        }
-
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        async fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
-            if let Some(kind) = self.send_errors.pop_front() {
-                return Err(io::Error::new(kind, "injected send error"));
-            }
-            self.packet_tx
-                .send(buf.to_vec())
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "packet_tx closed"))?;
-            Ok(buf.len())
-        }
-    }
 
     #[tokio::test]
     async fn parses_addresses_and_normalizes_to_host_prefix() {
@@ -775,7 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn tun_rx_pushes_packets_and_counts() {
-        let (rx_tun, mut tx_tun) = memory_tun_pair("mem0", 64);
+        let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem0", 64);
         let (peer_tx, mut peer_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
 
@@ -805,7 +706,7 @@ mod tests {
             Duration::from_millis(10),
         );
 
-        tx_tun.send(&ipv4_packet).await.unwrap();
+        inject_tx.send(ipv4_packet.clone()).await.unwrap();
         let packet = peer_rx
             .recv()
             .await
@@ -838,7 +739,7 @@ mod tests {
 
     #[tokio::test]
     async fn tun_tx_drops_oversize_and_reports_metrics() {
-        let (mut rx_tun, tx_tun) = memory_tun_pair("mem1", 4);
+        let (_rx_tun, tx_tun, _inject_tx, mut output_rx) = memory_tun("mem1", 4);
         let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let tun_tx_task = spawn_tun_tx(tx_tun, packet_rx, events_tx, Duration::from_millis(10));
@@ -847,12 +748,8 @@ mod tests {
         packet_tx.send(vec![9, 9, 9]).await.unwrap();
 
         // First packet should be dropped; second should be emitted.
-        let mut buf = vec![0u8; 8];
-        let len = rx_tun
-            .recv(&mut buf)
-            .await
-            .expect("should receive one packet");
-        assert_eq!(buf[..len], [9, 9, 9]);
+        let received = output_rx.recv().await.expect("should receive one packet");
+        assert_eq!(received, vec![9, 9, 9]);
 
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
@@ -893,20 +790,16 @@ mod tests {
 
     #[tokio::test]
     async fn tun_tx_retries_interrupted_send() {
-        let (mut rx_tun, tx_tun) =
-            memory_tun_pair_with_errors("mem-interrupt", 16, vec![std::io::ErrorKind::Interrupted]);
+        let (_rx_tun, tx_tun, _inject_tx, mut output_rx) =
+            memory_tun_with_errors("mem-interrupt", 16, vec![std::io::ErrorKind::Interrupted]);
         let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let tun_tx_task = spawn_tun_tx(tx_tun, packet_rx, events_tx, Duration::from_millis(5));
 
         packet_tx.send(vec![1, 2, 3]).await.unwrap();
 
-        let mut buf = vec![0u8; 16];
-        let len = rx_tun
-            .recv(&mut buf)
-            .await
-            .expect("should receive after retry");
-        assert_eq!(&buf[..len], &[1, 2, 3]);
+        let received = output_rx.recv().await.expect("should receive after retry");
+        assert_eq!(received, vec![1, 2, 3]);
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
@@ -1026,7 +919,7 @@ mod tests {
 
     #[tokio::test]
     async fn tun_rx_updates_routing_via_command() {
-        let (rx_tun, mut tx_tun) = memory_tun_pair("mem-cmd", 64);
+        let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem-cmd", 64);
         let (peer1_tx, mut peer1_rx) = mpsc::channel(4);
         let (peer2_tx, mut peer2_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::channel(8);
@@ -1052,7 +945,7 @@ mod tests {
         let tun_rx_task = spawn_tun_rx(rx_tun, routing, cmd_rx, events_tx, Duration::from_secs(60));
 
         // Send packet - should go to peer1
-        tx_tun.send(&ipv4_packet).await.unwrap();
+        inject_tx.send(ipv4_packet.clone()).await.unwrap();
         let packet = peer1_rx.recv().await.expect("packet should route to peer1");
         assert_eq!(packet, ipv4_packet);
 
@@ -1081,7 +974,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Send another packet - should now go to peer2
-        tx_tun.send(&ipv4_packet).await.unwrap();
+        inject_tx.send(ipv4_packet.clone()).await.unwrap();
         let packet = peer2_rx.recv().await.expect("packet should route to peer2");
         assert_eq!(packet, ipv4_packet);
 
