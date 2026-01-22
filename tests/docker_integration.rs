@@ -171,24 +171,44 @@ async fn test_two_node_bareudp_tunnel() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Test ping from node A to node B via VPN tunnel (10.0.0.2)
-    let ping_result = node_a
+    let mut ping_ab = node_a
         .exec(testcontainers::core::ExecCommand::new([
             "ping", "-c", "3", "-W", "2", "10.0.0.2",
         ]))
         .await
-        .expect("exec ping");
+        .expect("exec ping a->b");
 
-    println!("Ping from node-a to node-b (10.0.0.2): {:?}", ping_result);
+    let ping_ab_out = ping_ab.stdout_to_vec().await.unwrap();
+    let ping_ab_exit = ping_ab.exit_code().await.unwrap();
+    println!(
+        "Ping node-a -> node-b (10.0.0.2):\n{}",
+        String::from_utf8_lossy(&ping_ab_out)
+    );
+    assert_eq!(
+        ping_ab_exit,
+        Some(0),
+        "ping a->b failed (exit={ping_ab_exit:?})"
+    );
 
     // Test ping from node B to node A via VPN tunnel (10.0.0.1)
-    let ping_result_b = node_b
+    let mut ping_ba = node_b
         .exec(testcontainers::core::ExecCommand::new([
             "ping", "-c", "3", "-W", "2", "10.0.0.1",
         ]))
         .await
-        .expect("exec ping");
+        .expect("exec ping b->a");
 
-    println!("Ping from node-b to node-a (10.0.0.1): {:?}", ping_result_b);
+    let ping_ba_out = ping_ba.stdout_to_vec().await.unwrap();
+    let ping_ba_exit = ping_ba.exit_code().await.unwrap();
+    println!(
+        "Ping node-b -> node-a (10.0.0.1):\n{}",
+        String::from_utf8_lossy(&ping_ba_out)
+    );
+    assert_eq!(
+        ping_ba_exit,
+        Some(0),
+        "ping b->a failed (exit={ping_ba_exit:?})"
+    );
 
     // Cleanup happens automatically when containers go out of scope
     drop(node_b);
@@ -300,18 +320,24 @@ peers:
 
     // Ping from node C to node A should fail (source IP not allowed)
     // Node C (10.0.0.3) is not in node-a's allowed_ips (only 10.0.0.2)
-    let ping_result = node_c
+    let mut ping_ca = node_c
         .exec(testcontainers::core::ExecCommand::new([
             "ping", "-c", "2", "-W", "2", "10.0.0.1",
         ]))
         .await
-        .expect("exec ping");
+        .expect("exec ping c->a");
 
+    let ping_ca_out = ping_ca.stdout_to_vec().await.unwrap();
+    let ping_ca_exit = ping_ca.exit_code().await.unwrap();
     println!(
-        "Ping from node-c (10.0.0.3) to node-a (10.0.0.1): {:?}",
-        ping_result
+        "Ping node-c -> node-a (10.0.0.3 -> 10.0.0.1, should fail):\n{}",
+        String::from_utf8_lossy(&ping_ca_out)
     );
-    // Note: The ping should fail or timeout since node-a doesn't have node-c in its peers
+    assert_ne!(
+        ping_ca_exit,
+        Some(0),
+        "ping c->a should have failed but exit={ping_ca_exit:?}"
+    );
 
     drop(node_c);
     drop(node_a);
