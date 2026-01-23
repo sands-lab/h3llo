@@ -1,0 +1,1 @@
+../../3rdparty/agentize/.claude-plugin/agents/mega-code-reducer.md

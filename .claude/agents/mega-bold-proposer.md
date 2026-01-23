@@ -1,0 +1,1 @@
+../../3rdparty/agentize/.claude-plugin/agents/mega-bold-proposer.md

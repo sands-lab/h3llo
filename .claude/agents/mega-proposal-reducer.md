@@ -1,0 +1,1 @@
+../../3rdparty/agentize/.claude-plugin/agents/mega-proposal-reducer.md
