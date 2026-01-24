@@ -17,9 +17,11 @@ tests/
     native/
       mod.rs
       dns.rs    # CoreDNS integration (requires Docker)
+      route.rs  # Route sync orchestrator (Container Test Pattern)
       tun.rs    # TUN device orchestrator (Container Test Pattern)
     container/
       mod.rs
+      route.rs  # Standalone route test binary (harness = false)
       tun.rs    # Standalone TUN test binary (harness = false)
   e2e/
     main.rs
@@ -74,8 +76,9 @@ cargo test --test e2e -- --ignored --nocapture
 # Run integration tests (DNS + TUN container tests, requires Docker)
 cargo test --test integration -- --ignored --nocapture
 
-# Build container test binary first (required for TUN tests)
+# Build container test binaries first (required for TUN/route tests)
 cargo test --test integration-container-tun --no-run
+cargo test --test integration-container-route --no-run
 ```
 
 ### Side-Effect Classification
@@ -144,6 +147,27 @@ cargo test --test integration-container-tun --no-run
 cargo test --test integration -- tun --ignored --nocapture
 ```
 
+#### Route Sync Tests (`integration-container-route`)
+
+Container binary: `tests/integration/container/route.rs`
+Orchestrator: `tests/integration/native/route.rs`
+
+Verifies `sync_tun_routes` with real `RouteManagerHandle` (netlink API) inside
+a privileged container. Creates dummy interfaces and performs binary-internal
+verification via `handle.list()`.
+
+Scenarios:
+- **basic**: Installs routes on dummy0, verifies via kernel listing, then cleans up
+- **default_split**: Verifies `0.0.0.0/0` is split into `0.0.0.0/1` + `128.0.0.0/1`
+
+```bash
+# Build the container binary
+cargo test --test integration-container-route --no-run
+
+# Run route integration tests
+cargo test --test integration -- route --ignored --nocapture
+```
+
 ### Fault Injection
 
 Inside containers, use `docker exec` or testcontainers' `exec()` API:
@@ -169,4 +193,5 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Docker E2E: `tests/e2e/bareudp.rs` multi-node BareUDP connectivity, source IP filtering, and MTU boundary checks via testcontainers-rs.
 - Docker Integration: `tests/integration/native/dns.rs` DNS resolver integration tests against CoreDNS container.
 - Docker Integration: `tests/integration/native/tun.rs` TUN device creation and addressing via Container Test Pattern.
+- Docker Integration: `tests/integration/native/route.rs` Route sync with real netlink API via Container Test Pattern.
 - Other platforms: TODO for macOS/Windows when platform-specific code is introduced.
