@@ -430,13 +430,13 @@ fn route_match(route: &Route, target: IpAddr) -> Option<(u8, u32)> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 /// Looks up an interface index by name using libc on Unix platforms.
-pub(crate) fn lookup_ifindex(name: &str) -> Option<u32> {
+pub fn lookup_ifindex(name: &str) -> Option<u32> {
     interface_index(name).ok().map(NonZeroU32::get)
 }
 
 #[cfg(target_os = "windows")]
 /// Looks up an interface index by name using WinSock on Windows.
-pub(crate) fn lookup_ifindex(name: &str) -> Option<u32> {
+pub fn lookup_ifindex(name: &str) -> Option<u32> {
     use windows_sys::Win32::Networking::WinSock::if_nametoindex;
 
     let mut wide: Vec<u16> = name.encode_utf16().collect();
