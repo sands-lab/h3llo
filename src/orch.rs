@@ -111,6 +111,11 @@ pub struct Orchestrator {
 
     /// DNS resolver command sender for refresh commands.
     dns_cmd_tx: Option<mpsc::Sender<DnsCommand>>,
+
+    /// Whether to manage system routes (`local.table`).
+    manage_routes: bool,
+    /// Pre-parsed TUN interface addresses as host-prefixed IpNets (for system route sync).
+    tun_addrs: Vec<IpNet>,
 }
 
 impl Orchestrator {
@@ -134,6 +139,12 @@ impl Orchestrator {
 
         let tun_if = config.local.tun.ifname.clone();
         let mtu = config.local.tun.mtu as usize;
+        let manage_routes = config.local.table;
+        let tun_addrs = if manage_routes {
+            tun_prefixes(&config.local.tun.addrs)?
+        } else {
+            Vec::new()
+        };
 
         // Resolve listen address synchronously (blocking for hostname)
         let listen_addr = resolve_listen_addr(&listen_endpoint)?;
@@ -222,22 +233,9 @@ impl Orchestrator {
             .map_err(|err| OrchestratorError::Routing(err.to_string()))?;
 
         // Sync system routes if enabled
-        if config.local.table {
+        if manage_routes {
             let allowed = collect_allowed_ips(&peers)?;
-            let tun_addrs = tun_prefixes(&config.local.tun.addrs)?;
-            match RouteManagerHandle::new() {
-                Ok(mut handle) => {
-                    match sync_tun_routes(&tun_if, &tun_addrs, &allowed, &mut handle).await {
-                        Ok(warnings) => {
-                            for warning in warnings {
-                                log_route_warning(&warning);
-                            }
-                        }
-                        Err(err) => warn!("route sync failed: {err}"),
-                    }
-                }
-                Err(err) => warn!("route manager unavailable: {err}"),
-            }
+            sync_system_routes(&tun_if, &tun_addrs, &allowed).await;
         }
 
         // Spawn TUN actors
@@ -322,6 +320,8 @@ impl Orchestrator {
             tun_cmd_tx,
             bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
             dns_cmd_tx,
+            manage_routes,
+            tun_addrs,
         })
     }
 
@@ -541,7 +541,20 @@ impl Orchestrator {
             }
         }
 
-        // Update routing table
+        // 1. Update allowed sources (fast, in-memory filter)
+        if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
+            if cmd_tx
+                .send(BareUdpRxCommand::UpdateAllowedSources(
+                    self.active_ips.clone(),
+                ))
+                .await
+                .is_err()
+            {
+                warn!("failed to send allowed sources update command");
+            }
+        }
+
+        // 2. Update internal routing table
         if let Ok(routing) = RoutingTable::from_peers(&self.peers, &self.peer_txs) {
             if self
                 .tun_cmd_tx
@@ -553,16 +566,11 @@ impl Orchestrator {
             }
         }
 
-        // Update allowed sources
-        if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
-            if cmd_tx
-                .send(BareUdpRxCommand::UpdateAllowedSources(
-                    self.active_ips.clone(),
-                ))
-                .await
-                .is_err()
-            {
-                warn!("failed to send allowed sources update command");
+        // 3. Sync system routes if enabled
+        if self.manage_routes {
+            match collect_allowed_ips(&self.peers) {
+                Ok(allowed) => sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await,
+                Err(err) => warn!("route sync skipped: {err}"),
             }
         }
     }
@@ -653,6 +661,21 @@ async fn spawn_bare_tx_for_peer(
     );
 
     Some((packet_tx, tx_handle))
+}
+
+/// Performs system route synchronization, logging warnings on failure.
+async fn sync_system_routes(tun_if: &str, tun_addrs: &[IpNet], allowed: &[IpNet]) {
+    match RouteManagerHandle::new() {
+        Ok(mut handle) => match sync_tun_routes(tun_if, tun_addrs, allowed, &mut handle).await {
+            Ok(warnings) => {
+                for warning in warnings {
+                    log_route_warning(&warning);
+                }
+            }
+            Err(err) => warn!("route sync failed: {err}"),
+        },
+        Err(err) => warn!("route manager unavailable: {err}"),
+    }
 }
 
 fn collect_allowed_ips(peers: &[Peer]) -> Result<Vec<IpNet>, OrchestratorError> {
@@ -746,6 +769,8 @@ mod test_support {
         peer_txs: HashMap<String, mpsc::Sender<Vec<u8>>>,
         pending_dns: HashMap<String, PendingDns>,
         dns_refresh: Duration,
+        manage_routes: bool,
+        tun_addrs: Vec<IpNet>,
     }
 
     impl Default for TestableOrchestratorBuilder {
@@ -758,13 +783,28 @@ mod test_support {
                 peer_txs: HashMap::new(),
                 pending_dns: HashMap::new(),
                 dns_refresh: Duration::ZERO,
+                manage_routes: false,
+                tun_addrs: Vec::new(),
             }
         }
+    }
+
+    /// Test handles for verifying commands sent by the orchestrator.
+    pub struct TestHandles {
+        #[allow(dead_code)]
+        pub events_tx: mpsc::Sender<Event>,
+        pub tun_cmd_rx: mpsc::Receiver<TunRxCommand>,
+        pub bare_rx_cmd_rx: mpsc::Receiver<BareUdpRxCommand>,
     }
 
     impl TestableOrchestratorBuilder {
         pub fn with_peers(mut self, peers: Vec<Peer>) -> Self {
             self.peers = peers;
+            self
+        }
+
+        pub fn with_peer_txs(mut self, peer_txs: HashMap<String, mpsc::Sender<Vec<u8>>>) -> Self {
+            self.peer_txs = peer_txs;
             self
         }
 
@@ -774,10 +814,13 @@ mod test_support {
         }
 
         /// Builds a testable orchestrator with dummy channels.
-        pub fn build(self) -> (Orchestrator, mpsc::Sender<Event>) {
+        ///
+        /// Returns the orchestrator and test handles that allow verifying
+        /// commands sent to child actors.
+        pub fn build(self) -> (Orchestrator, TestHandles) {
             let (events_tx, events_rx) = mpsc::channel(64);
-            let (tun_cmd_tx, _tun_cmd_rx) = mpsc::channel(1);
-            let (bare_rx_cmd_tx, _bare_rx_cmd_rx) = mpsc::channel(1);
+            let (tun_cmd_tx, tun_cmd_rx) = mpsc::channel(1);
+            let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::channel(1);
 
             let orch = Orchestrator {
                 events_rx,
@@ -793,9 +836,18 @@ mod test_support {
                 tun_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
                 dns_cmd_tx: None,
+                manage_routes: self.manage_routes,
+                tun_addrs: self.tun_addrs,
             };
 
-            (orch, events_tx)
+            (
+                orch,
+                TestHandles {
+                    events_tx,
+                    tun_cmd_rx,
+                    bare_rx_cmd_rx,
+                },
+            )
         }
     }
 }
@@ -1083,36 +1135,79 @@ mod tests {
 
     #[tokio::test]
     async fn handle_event_processes_metrics_without_state_change() {
-        let (mut orch, events_tx) = TestableOrchestratorBuilder::default().build();
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let (peer_tx, _peer_rx) = mpsc::channel(1);
+        let mut peer_txs = HashMap::new();
+        peer_txs.insert("peer1".to_string(), peer_tx);
 
-        let initial_peer_count = orch.peer_txs.len();
-        let initial_pending_count = orch.pending_dns.len();
+        let pending = PendingDns::BarePeers {
+            configs: vec![BarePeerConfig {
+                peer_id: "peer2".to_string(),
+                port: 5353,
+                bindif: None,
+                peer: bare_peer("peer2", &["172.16.0.0/16"]),
+            }],
+        };
+
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_txs(peer_txs)
+            .with_pending_dns("example.com", pending)
+            .build();
 
         orch.handle_event(make_metrics_event()).await;
 
-        assert_eq!(orch.peer_txs.len(), initial_peer_count);
-        assert_eq!(orch.pending_dns.len(), initial_pending_count);
+        // State preserved: existing entries not modified
+        assert_eq!(orch.peer_txs.len(), 1);
+        assert!(orch.peer_txs.contains_key("peer1"));
+        assert!(orch.pending_dns.contains_key("example.com"));
 
-        drop(events_tx);
+        // No commands sent to child actors
+        assert!(handles.tun_cmd_rx.try_recv().is_err());
+        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn handle_event_processes_other_event() {
-        let (mut orch, events_tx) = TestableOrchestratorBuilder::default().build();
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let (peer_tx, _peer_rx) = mpsc::channel(1);
+        let mut peer_txs = HashMap::new();
+        peer_txs.insert("peer1".to_string(), peer_tx);
+
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_txs(peer_txs)
+            .build();
 
         orch.handle_event(Event::Other("test message".to_string()))
             .await;
 
-        assert!(orch.peer_txs.is_empty());
-        assert!(orch.pending_dns.is_empty());
+        // State preserved
+        assert_eq!(orch.peer_txs.len(), 1);
 
-        drop(events_tx);
+        // No commands sent
+        assert!(handles.tun_cmd_rx.try_recv().is_err());
+        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn handle_event_ignores_dns_answer_for_unknown_host() {
-        let (mut orch, events_tx) = TestableOrchestratorBuilder::default().build();
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let pending = PendingDns::BarePeers {
+            configs: vec![BarePeerConfig {
+                peer_id: "peer1".to_string(),
+                port: 5353,
+                bindif: None,
+                peer: peer.clone(),
+            }],
+        };
 
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_pending_dns("known.example.com", pending)
+            .build();
+
+        // Answer for a host NOT in pending_dns
         let answer = Event::Dns(DnsEvent {
             server: "127.0.0.1:53".parse().unwrap(),
             detail: DnsEventDetail::Answer(DnsAnswer {
@@ -1127,10 +1222,13 @@ mod tests {
         });
         orch.handle_event(answer).await;
 
-        // No new peer TX should be created for unknown host
+        // pending_dns for the known host is NOT consumed
+        assert!(orch.pending_dns.contains_key("known.example.com"));
+        // No peer TX created
         assert!(orch.peer_txs.is_empty());
-
-        drop(events_tx);
+        // No commands sent
+        assert!(handles.tun_cmd_rx.try_recv().is_err());
+        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1145,7 +1243,7 @@ mod tests {
             }],
         };
 
-        let (mut orch, events_tx) = TestableOrchestratorBuilder::default()
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer])
             .with_pending_dns("example.com", pending)
             .build();
@@ -1166,14 +1264,12 @@ mod tests {
 
         // Pending DNS entry should be removed after processing
         assert!(!orch.pending_dns.contains_key("example.com"));
-
-        drop(events_tx);
     }
 
     #[tokio::test]
-    async fn handle_bare_peer_resolved_with_empty_records_logs_warning() {
+    async fn handle_bare_peer_resolved_with_empty_records_returns_early() {
         let peer = bare_peer("peer1", &["10.0.0.0/24"]);
-        let (mut orch, events_tx) = TestableOrchestratorBuilder::default()
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer.clone()])
             .build();
 
@@ -1191,13 +1287,108 @@ mod tests {
             peer,
         };
 
-        // This should return early with a warning, not create any TX
         orch.handle_bare_peer_resolved(&answer, config).await;
 
-        // No peer TX should be created
+        // Early return: no TX created, no commands sent
         assert!(!orch.peer_txs.contains_key("peer1"));
+        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
+        assert!(handles.tun_cmd_rx.try_recv().is_err());
+    }
 
-        drop(events_tx);
+    #[tokio::test]
+    async fn handle_bare_peer_resolved_sends_allowed_sources_and_routing_commands() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        // Pre-populate peer_txs so RoutingTable::from_peers includes this peer.
+        let (peer_packet_tx, _peer_packet_rx) = mpsc::channel(1);
+        let mut peer_txs = HashMap::new();
+        peer_txs.insert("peer1".to_string(), peer_packet_tx);
+
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer.clone()])
+            .with_peer_txs(peer_txs)
+            .build();
+
+        let answer = DnsAnswer {
+            host: "example.com".to_string(),
+            record_type: DnsRecordType::A,
+            records: vec![DnsAnswerRecord {
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+                ttl: 60,
+            }],
+            warnings: vec![],
+        };
+
+        let config = BarePeerConfig {
+            peer_id: "peer1".to_string(),
+            port: 5353,
+            bindif: None,
+            peer,
+        };
+
+        orch.handle_bare_peer_resolved(&answer, config).await;
+
+        // Verify UpdateAllowedSources was sent
+        let allowed_cmd = handles.bare_rx_cmd_rx.try_recv();
+        assert!(
+            matches!(allowed_cmd, Ok(BareUdpRxCommand::UpdateAllowedSources(_))),
+            "expected UpdateAllowedSources command"
+        );
+
+        // Verify UpdateRouting was sent
+        let routing_cmd = handles.tun_cmd_rx.try_recv();
+        assert!(
+            matches!(routing_cmd, Ok(TunRxCommand::UpdateRouting { .. })),
+            "expected UpdateRouting command"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_bare_peer_resolved_skips_route_sync_when_disabled() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let (peer_packet_tx, _peer_packet_rx) = mpsc::channel(1);
+        let mut peer_txs = HashMap::new();
+        peer_txs.insert("peer1".to_string(), peer_packet_tx);
+
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer.clone()])
+            .with_peer_txs(peer_txs)
+            .build();
+
+        // manage_routes defaults to false in TestableOrchestratorBuilder
+        assert!(!orch.manage_routes);
+
+        let answer = DnsAnswer {
+            host: "example.com".to_string(),
+            record_type: DnsRecordType::A,
+            records: vec![DnsAnswerRecord {
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+                ttl: 60,
+            }],
+            warnings: vec![],
+        };
+
+        let config = BarePeerConfig {
+            peer_id: "peer1".to_string(),
+            port: 5353,
+            bindif: None,
+            peer,
+        };
+
+        orch.handle_bare_peer_resolved(&answer, config).await;
+
+        // Verify allowed sources and routing commands were still sent
+        assert!(matches!(
+            handles.bare_rx_cmd_rx.try_recv(),
+            Ok(BareUdpRxCommand::UpdateAllowedSources(_))
+        ));
+        assert!(matches!(
+            handles.tun_cmd_rx.try_recv(),
+            Ok(TunRxCommand::UpdateRouting { .. })
+        ));
+
+        // No further commands (system route sync was skipped)
+        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
+        assert!(handles.tun_cmd_rx.try_recv().is_err());
     }
 
     // TODO: Add tests for `refresh_dns`:
