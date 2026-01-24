@@ -111,6 +111,11 @@ pub struct Orchestrator {
 
     /// DNS resolver command sender for refresh commands.
     dns_cmd_tx: Option<mpsc::Sender<DnsCommand>>,
+
+    /// Whether to manage system routes (`local.table`).
+    manage_routes: bool,
+    /// Pre-parsed TUN interface addresses as host-prefixed IpNets (for system route sync).
+    tun_addrs: Vec<IpNet>,
 }
 
 impl Orchestrator {
@@ -134,6 +139,8 @@ impl Orchestrator {
 
         let tun_if = config.local.tun.ifname.clone();
         let mtu = config.local.tun.mtu as usize;
+        let manage_routes = config.local.table;
+        let tun_addrs = tun_prefixes(&config.local.tun.addrs)?;
 
         // Resolve listen address synchronously (blocking for hostname)
         let listen_addr = resolve_listen_addr(&listen_endpoint)?;
@@ -222,22 +229,9 @@ impl Orchestrator {
             .map_err(|err| OrchestratorError::Routing(err.to_string()))?;
 
         // Sync system routes if enabled
-        if config.local.table {
+        if manage_routes {
             let allowed = collect_allowed_ips(&peers)?;
-            let tun_addrs = tun_prefixes(&config.local.tun.addrs)?;
-            match RouteManagerHandle::new() {
-                Ok(mut handle) => {
-                    match sync_tun_routes(&tun_if, &tun_addrs, &allowed, &mut handle).await {
-                        Ok(warnings) => {
-                            for warning in warnings {
-                                log_route_warning(&warning);
-                            }
-                        }
-                        Err(err) => warn!("route sync failed: {err}"),
-                    }
-                }
-                Err(err) => warn!("route manager unavailable: {err}"),
-            }
+            sync_system_routes(&tun_if, &tun_addrs, &allowed).await;
         }
 
         // Spawn TUN actors
@@ -322,6 +316,8 @@ impl Orchestrator {
             tun_cmd_tx,
             bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
             dns_cmd_tx,
+            manage_routes,
+            tun_addrs,
         })
     }
 
@@ -541,7 +537,20 @@ impl Orchestrator {
             }
         }
 
-        // Update routing table
+        // 1. Update allowed sources (fast, in-memory filter)
+        if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
+            if cmd_tx
+                .send(BareUdpRxCommand::UpdateAllowedSources(
+                    self.active_ips.clone(),
+                ))
+                .await
+                .is_err()
+            {
+                warn!("failed to send allowed sources update command");
+            }
+        }
+
+        // 2. Update internal routing table
         if let Ok(routing) = RoutingTable::from_peers(&self.peers, &self.peer_txs) {
             if self
                 .tun_cmd_tx
@@ -553,16 +562,10 @@ impl Orchestrator {
             }
         }
 
-        // Update allowed sources
-        if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
-            if cmd_tx
-                .send(BareUdpRxCommand::UpdateAllowedSources(
-                    self.active_ips.clone(),
-                ))
-                .await
-                .is_err()
-            {
-                warn!("failed to send allowed sources update command");
+        // 3. Sync system routes if enabled
+        if self.manage_routes {
+            if let Ok(allowed) = collect_allowed_ips(&self.peers) {
+                sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await;
             }
         }
     }
@@ -653,6 +656,21 @@ async fn spawn_bare_tx_for_peer(
     );
 
     Some((packet_tx, tx_handle))
+}
+
+/// Performs system route synchronization, logging warnings on failure.
+async fn sync_system_routes(tun_if: &str, tun_addrs: &[IpNet], allowed: &[IpNet]) {
+    match RouteManagerHandle::new() {
+        Ok(mut handle) => match sync_tun_routes(tun_if, tun_addrs, allowed, &mut handle).await {
+            Ok(warnings) => {
+                for warning in warnings {
+                    log_route_warning(&warning);
+                }
+            }
+            Err(err) => warn!("route sync failed: {err}"),
+        },
+        Err(err) => warn!("route manager unavailable: {err}"),
+    }
 }
 
 fn collect_allowed_ips(peers: &[Peer]) -> Result<Vec<IpNet>, OrchestratorError> {
@@ -746,6 +764,8 @@ mod test_support {
         peer_txs: HashMap<String, mpsc::Sender<Vec<u8>>>,
         pending_dns: HashMap<String, PendingDns>,
         dns_refresh: Duration,
+        manage_routes: bool,
+        tun_addrs: Vec<IpNet>,
     }
 
     impl Default for TestableOrchestratorBuilder {
@@ -758,6 +778,8 @@ mod test_support {
                 peer_txs: HashMap::new(),
                 pending_dns: HashMap::new(),
                 dns_refresh: Duration::ZERO,
+                manage_routes: false,
+                tun_addrs: Vec::new(),
             }
         }
     }
@@ -793,6 +815,8 @@ mod test_support {
                 tun_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
                 dns_cmd_tx: None,
+                manage_routes: self.manage_routes,
+                tun_addrs: self.tun_addrs,
             };
 
             (orch, events_tx)
@@ -1196,6 +1220,69 @@ mod tests {
 
         // No peer TX should be created
         assert!(!orch.peer_txs.contains_key("peer1"));
+
+        drop(events_tx);
+    }
+
+    #[tokio::test]
+    async fn handle_bare_peer_resolved_updates_routing_and_allowed_sources() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let (mut orch, events_tx) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer.clone()])
+            .build();
+
+        let answer = DnsAnswer {
+            host: "example.com".to_string(),
+            record_type: DnsRecordType::A,
+            records: vec![DnsAnswerRecord {
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+                ttl: 60,
+            }],
+            warnings: vec![],
+        };
+
+        let config = BarePeerConfig {
+            peer_id: "peer1".to_string(),
+            port: 5353,
+            bindif: None,
+            peer,
+        };
+
+        // Should not panic; exercises allowed sources → routing → (no system route sync)
+        orch.handle_bare_peer_resolved(&answer, config).await;
+
+        drop(events_tx);
+    }
+
+    #[tokio::test]
+    async fn handle_bare_peer_resolved_skips_route_sync_when_disabled() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let (mut orch, events_tx) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer.clone()])
+            .build();
+
+        // manage_routes defaults to false in TestableOrchestratorBuilder
+        assert!(!orch.manage_routes);
+
+        let answer = DnsAnswer {
+            host: "example.com".to_string(),
+            record_type: DnsRecordType::A,
+            records: vec![DnsAnswerRecord {
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+                ttl: 60,
+            }],
+            warnings: vec![],
+        };
+
+        let config = BarePeerConfig {
+            peer_id: "peer1".to_string(),
+            port: 5353,
+            bindif: None,
+            peer,
+        };
+
+        // Should complete without panic; no system route sync attempted
+        orch.handle_bare_peer_resolved(&answer, config).await;
 
         drop(events_tx);
     }

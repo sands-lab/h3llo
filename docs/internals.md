@@ -152,7 +152,7 @@ Orchestrator DNS handling:
 
 Spawn an actor for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx actor; BareUDP owns one listener socket for RX and a separate TX-only socket per BareUDP peer.
 
-When configuration changes arrive (external controller POST or initialization), update the internal routing table first, then the system routing table. Dynamic reconfiguration flows through the orchestrator via command queues; transport rebuilds or filter updates happen after routing changes.
+When configuration changes arrive (external controller POST or initialization), update the allowed-source filter first (fast, in-memory), then the internal routing table, then the system routing table. Dynamic reconfiguration flows through the orchestrator via command queues.
 
 H3 connection pooling and selection:
 - Build `a*b*c` HTTP/3 connections for each peer where `a =` DNS answers, `b = |peers[].h3.endpoints|`, and `c = |peers[].h3.bindifs|` when set (auto-detected bindif yields at most one entry when unspecified).
