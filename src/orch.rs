@@ -527,8 +527,13 @@ impl Orchestrator {
             .await
             {
                 // Latest resolution wins for routing (enables IP migration on refresh).
-                // TODO: Check if resolved IP actually changed before updating routing
-                // and allowed sources, to avoid unnecessary routing table rebuilds.
+                // TODO: IP migration is broken. When insert() replaces the old
+                // packet_tx, the old TX actor exits (bare.rs:166), triggering
+                // OrchestratorError::TaskExited (line 352-356) and shutting down.
+                // The old IP also remains in active_ips as stale state.
+                // Fix requires: (1) gracefully stop old TX actor before replacing,
+                // (2) remove old IP from active_ips, (3) distinguish expected TX
+                // exits from unexpected ones in the join_set handler.
                 self.peer_txs.insert(config.peer_id.clone(), packet_tx);
 
                 let label = format!("bare_tx:{}", config.peer_id);
