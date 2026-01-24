@@ -448,6 +448,12 @@ impl Orchestrator {
             None => return,
         };
 
+        // TODO: The `resolved_hosts` deduplication below skips config creation
+        // and `push_config` for subsequent peers sharing the same hostname.
+        // This differs from initialization (lines 203-217) which correctly
+        // accumulates all peer configs per hostname. The deduplication should
+        // only prevent sending duplicate DnsCommand::Resolve, not skip the
+        // config/push_config logic.
         let mut resolved_hosts = HashSet::new();
         for peer in &self.peers {
             let bare = match peer.bare.as_ref() {
