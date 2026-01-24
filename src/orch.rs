@@ -140,7 +140,11 @@ impl Orchestrator {
         let tun_if = config.local.tun.ifname.clone();
         let mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
-        let tun_addrs = tun_prefixes(&config.local.tun.addrs)?;
+        let tun_addrs = if manage_routes {
+            tun_prefixes(&config.local.tun.addrs)?
+        } else {
+            Vec::new()
+        };
 
         // Resolve listen address synchronously (blocking for hostname)
         let listen_addr = resolve_listen_addr(&listen_endpoint)?;
@@ -564,8 +568,9 @@ impl Orchestrator {
 
         // 3. Sync system routes if enabled
         if self.manage_routes {
-            if let Ok(allowed) = collect_allowed_ips(&self.peers) {
-                sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await;
+            match collect_allowed_ips(&self.peers) {
+                Ok(allowed) => sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await,
+                Err(err) => warn!("route sync skipped: {err}"),
             }
         }
     }
