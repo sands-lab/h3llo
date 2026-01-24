@@ -49,3 +49,8 @@ path = "tests/integration/main.rs"
 [[test]]
 name = "e2e"
 path = "tests/e2e/main.rs"
+
+[[test]]
+name = "integration-container-tun"
+path = "tests/integration/container/tun.rs"
+harness = false
