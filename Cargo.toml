@@ -25,7 +25,7 @@ tun-rs = { version = "2", features = ["async"] }
 ipnet-trie = "0.3"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "process"] }
 testcontainers = "0.23"
 tempfile = "3"
 

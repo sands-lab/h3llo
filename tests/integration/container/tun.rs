@@ -6,7 +6,8 @@
 //!
 //! Exit code 0 = all checks passed, 1 = failure.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use tokio::process::Command as AsyncCommand;
 
 fn main() {
     // Skip gracefully when not running with CAP_NET_ADMIN (e.g., during `cargo test`
@@ -50,6 +51,7 @@ async fn run_checks() -> Result<(), String> {
     check_device_creation().await?;
     check_multi_address().await?;
     check_mtu_configuration().await?;
+    check_send_recv().await?;
     Ok(())
 }
 
@@ -119,6 +121,142 @@ async fn check_multi_address() -> Result<(), String> {
 
     eprintln!("  check_multi_address: PASS");
     Ok(())
+}
+
+/// Verifies actual data transmission through a TUN device using ICMP echo (ping).
+///
+/// Creates a TUN device via `from_config()`, disables rp_filter, adds a route for
+/// a remote IP through the TUN, spawns a userspace ICMP echo responder, and runs
+/// `ping` to verify round-trip data flow through `TunRx::recv()` and `TunTx::send()`.
+async fn check_send_recv() -> Result<(), String> {
+    use h3llo::tun::{TunRx, TunTx};
+
+    let local_tun = h3llo::config::LocalTun {
+        ifname: "itun3".to_string(),
+        addrs: vec!["10.99.3.1".to_string()],
+        mtu: 1400,
+    };
+
+    let (mut reader, mut writer) = h3llo::tun::from_config(&local_tun)
+        .await
+        .map_err(|e| format!("send_recv: from_config failed: {e}"))?;
+
+    // Disable rp_filter to allow ICMP replies from non-local source.
+    // Write directly to /proc/sys since sysctl binary may not be available.
+    for path in [
+        "/proc/sys/net/ipv4/conf/all/rp_filter",
+        "/proc/sys/net/ipv4/conf/itun3/rp_filter",
+    ] {
+        std::fs::write(path, "0")
+            .map_err(|e| format!("send_recv: failed to set rp_filter ({path}): {e}"))?;
+    }
+
+    // Add route so 10.99.3.2 traffic goes through TUN
+    let route = Command::new("ip")
+        .args(["route", "add", "10.99.3.2/32", "dev", "itun3"])
+        .output()
+        .map_err(|e| format!("send_recv: ip route add failed: {e}"))?;
+    if !route.status.success() {
+        return Err(format!(
+            "send_recv: ip route add failed: {}",
+            String::from_utf8_lossy(&route.stderr)
+        ));
+    }
+
+    // Spawn ICMP echo responder
+    let responder = tokio::spawn(async move {
+        let mtu = reader.mtu();
+        let mut buf = vec![0u8; mtu];
+        loop {
+            let len = match reader.recv(&mut buf).await {
+                Ok(n) if n >= 28 => n,
+                Ok(_) => continue,
+                Err(_) => break,
+            };
+
+            let packet = &mut buf[..len];
+            // IPv4 only
+            if packet[0] >> 4 != 4 {
+                continue;
+            }
+            let ihl = ((packet[0] & 0x0F) as usize) * 4;
+            if ihl < 20 || len < ihl + 8 {
+                continue;
+            }
+            // Protocol must be ICMP
+            if packet[9] != 1 {
+                continue;
+            }
+            // Type must be Echo Request
+            if packet[ihl] != 8 {
+                continue;
+            }
+
+            // Swap src/dst IPs
+            let mut src = [0u8; 4];
+            let mut dst = [0u8; 4];
+            src.copy_from_slice(&packet[12..16]);
+            dst.copy_from_slice(&packet[16..20]);
+            packet[12..16].copy_from_slice(&dst);
+            packet[16..20].copy_from_slice(&src);
+
+            // Set type to Echo Reply
+            packet[ihl] = 0;
+
+            // Recompute ICMP checksum
+            packet[ihl + 2] = 0;
+            packet[ihl + 3] = 0;
+            let cksum = internet_checksum(&packet[ihl..len]);
+            packet[ihl + 2] = (cksum >> 8) as u8;
+            packet[ihl + 3] = (cksum & 0xFF) as u8;
+
+            // Recompute IP header checksum
+            packet[10] = 0;
+            packet[11] = 0;
+            let ip_cksum = internet_checksum(&packet[..ihl]);
+            packet[10] = (ip_cksum >> 8) as u8;
+            packet[11] = (ip_cksum & 0xFF) as u8;
+
+            let _ = writer.send(&packet[..len]).await;
+        }
+    });
+
+    // Give the responder time to start
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Use tokio::process::Command (async) to avoid blocking the single-threaded
+    // runtime, which would starve the spawned ICMP responder task.
+    let ping = AsyncCommand::new("ping")
+        .args(["-c", "3", "-W", "2", "10.99.3.2"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("send_recv: ping failed to execute: {e}"))?;
+
+    responder.abort();
+
+    if !ping.status.success() {
+        let stdout = String::from_utf8_lossy(&ping.stdout);
+        let stderr = String::from_utf8_lossy(&ping.stderr);
+        return Err(format!(
+            "send_recv: ping 10.99.3.2 failed:\n{stdout}{stderr}"
+        ));
+    }
+
+    eprintln!("  check_send_recv: PASS");
+    Ok(())
+}
+
+/// RFC 1071 internet checksum (ones-complement 16-bit sum).
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum = data.chunks(2).fold(0u32, |acc, chunk| {
+        acc + u16::from_be_bytes([chunk[0], *chunk.get(1).unwrap_or(&0)]) as u32
+    });
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// Verifies MTU is configured correctly on the TUN device.
