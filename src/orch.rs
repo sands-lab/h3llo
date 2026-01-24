@@ -1135,32 +1135,79 @@ mod tests {
 
     #[tokio::test]
     async fn handle_event_processes_metrics_without_state_change() {
-        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let (peer_tx, _peer_rx) = mpsc::channel(1);
+        let mut peer_txs = HashMap::new();
+        peer_txs.insert("peer1".to_string(), peer_tx);
 
-        let initial_peer_count = orch.peer_txs.len();
-        let initial_pending_count = orch.pending_dns.len();
+        let pending = PendingDns::BarePeers {
+            configs: vec![BarePeerConfig {
+                peer_id: "peer2".to_string(),
+                port: 5353,
+                bindif: None,
+                peer: bare_peer("peer2", &["172.16.0.0/16"]),
+            }],
+        };
+
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_txs(peer_txs)
+            .with_pending_dns("example.com", pending)
+            .build();
 
         orch.handle_event(make_metrics_event()).await;
 
-        assert_eq!(orch.peer_txs.len(), initial_peer_count);
-        assert_eq!(orch.pending_dns.len(), initial_pending_count);
+        // State preserved: existing entries not modified
+        assert_eq!(orch.peer_txs.len(), 1);
+        assert!(orch.peer_txs.contains_key("peer1"));
+        assert!(orch.pending_dns.contains_key("example.com"));
+
+        // No commands sent to child actors
+        assert!(handles.tun_cmd_rx.try_recv().is_err());
+        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn handle_event_processes_other_event() {
-        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let (peer_tx, _peer_rx) = mpsc::channel(1);
+        let mut peer_txs = HashMap::new();
+        peer_txs.insert("peer1".to_string(), peer_tx);
+
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_txs(peer_txs)
+            .build();
 
         orch.handle_event(Event::Other("test message".to_string()))
             .await;
 
-        assert!(orch.peer_txs.is_empty());
-        assert!(orch.pending_dns.is_empty());
+        // State preserved
+        assert_eq!(orch.peer_txs.len(), 1);
+
+        // No commands sent
+        assert!(handles.tun_cmd_rx.try_recv().is_err());
+        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn handle_event_ignores_dns_answer_for_unknown_host() {
-        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let pending = PendingDns::BarePeers {
+            configs: vec![BarePeerConfig {
+                peer_id: "peer1".to_string(),
+                port: 5353,
+                bindif: None,
+                peer: peer.clone(),
+            }],
+        };
 
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_pending_dns("known.example.com", pending)
+            .build();
+
+        // Answer for a host NOT in pending_dns
         let answer = Event::Dns(DnsEvent {
             server: "127.0.0.1:53".parse().unwrap(),
             detail: DnsEventDetail::Answer(DnsAnswer {
@@ -1175,8 +1222,13 @@ mod tests {
         });
         orch.handle_event(answer).await;
 
-        // No new peer TX should be created for unknown host
+        // pending_dns for the known host is NOT consumed
+        assert!(orch.pending_dns.contains_key("known.example.com"));
+        // No peer TX created
         assert!(orch.peer_txs.is_empty());
+        // No commands sent
+        assert!(handles.tun_cmd_rx.try_recv().is_err());
+        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1215,9 +1267,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_bare_peer_resolved_with_empty_records_logs_warning() {
+    async fn handle_bare_peer_resolved_with_empty_records_returns_early() {
         let peer = bare_peer("peer1", &["10.0.0.0/24"]);
-        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer.clone()])
             .build();
 
@@ -1235,11 +1287,12 @@ mod tests {
             peer,
         };
 
-        // This should return early with a warning, not create any TX
         orch.handle_bare_peer_resolved(&answer, config).await;
 
-        // No peer TX should be created
+        // Early return: no TX created, no commands sent
         assert!(!orch.peer_txs.contains_key("peer1"));
+        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
+        assert!(handles.tun_cmd_rx.try_recv().is_err());
     }
 
     #[tokio::test]
