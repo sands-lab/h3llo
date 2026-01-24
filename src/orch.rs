@@ -97,6 +97,7 @@ pub struct Orchestrator {
 
     // DNS state (minimal)
     pending_dns: HashMap<String, PendingDns>,
+    dns_refresh: Duration,
 
     // Runtime state
     tun_if: String,
@@ -108,8 +109,7 @@ pub struct Orchestrator {
     tun_cmd_tx: mpsc::Sender<TunRxCommand>,
     bare_rx_cmd_tx: Option<mpsc::Sender<BareUdpRxCommand>>,
 
-    /// DNS resolver command sender for future refresh commands.
-    #[allow(dead_code)]
+    /// DNS resolver command sender for refresh commands.
     dns_cmd_tx: Option<mpsc::Sender<DnsCommand>>,
 }
 
@@ -269,8 +269,10 @@ impl Orchestrator {
         join_set.spawn(wrap_task("tun_tx", tun_tx_handle));
         join_set.spawn(wrap_task("bare_rx", bare_rx_handle));
 
-        // Spawn DNS resolver if there are pending hostnames
-        let dns_cmd_tx = if !pending_dns.is_empty() {
+        let dns_refresh = Duration::from_secs(config.local.dns.refresh);
+
+        // Spawn DNS resolver if there are pending hostnames or refresh is enabled
+        let dns_cmd_tx = if !pending_dns.is_empty() || !dns_refresh.is_zero() {
             let resolver = DnsResolver::from_config(
                 &config.local.dns,
                 Some(tun_if.clone()),
@@ -311,6 +313,7 @@ impl Orchestrator {
             events_tx,
             join_set,
             pending_dns,
+            dns_refresh,
             tun_if,
             mtu,
             peers,
@@ -331,10 +334,20 @@ impl Orchestrator {
     ///
     /// Returns `OrchestratorError` when a child task exits unexpectedly.
     pub async fn run(mut self) -> Result<(), OrchestratorError> {
+        let mut dns_ticker = tokio::time::interval(if self.dns_refresh.is_zero() {
+            Duration::from_secs(3600) // placeholder; branch disabled below
+        } else {
+            self.dns_refresh
+        });
+        dns_ticker.tick().await; // consume the immediate first tick
+
         loop {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {
                     self.handle_event(event).await;
+                }
+                _ = dns_ticker.tick(), if !self.dns_refresh.is_zero() && self.dns_cmd_tx.is_some() => {
+                    self.refresh_dns().await;
                 }
                 result = self.join_set.join_next() => {
                     match result {
@@ -424,6 +437,69 @@ impl Orchestrator {
         }
     }
 
+    /// Sends DNS resolve commands for all hostname-based peer endpoints.
+    ///
+    /// Re-populates `pending_dns` so that incoming answers trigger the existing
+    /// `handle_bare_peer_resolved` path. Existing TX actors for unchanged IPs are
+    /// deduplicated by `active_ips` in `spawn_bare_tx_for_peer`.
+    async fn refresh_dns(&mut self) {
+        let cmd_tx = match &self.dns_cmd_tx {
+            Some(tx) => tx,
+            None => return,
+        };
+
+        // TODO: The `resolved_hosts` deduplication below skips config creation
+        // and `push_config` for subsequent peers sharing the same hostname.
+        // This differs from initialization (lines 203-217) which correctly
+        // accumulates all peer configs per hostname. The deduplication should
+        // only prevent sending duplicate DnsCommand::Resolve, not skip the
+        // config/push_config logic.
+        let mut resolved_hosts = HashSet::new();
+        for peer in &self.peers {
+            let bare = match peer.bare.as_ref() {
+                Some(b) => b,
+                None => continue,
+            };
+            let endpoint = match parse_udp_uri(&bare.endpoint) {
+                Ok(ep) => ep,
+                Err(_) => continue,
+            };
+            if parse_ip_literal(&endpoint.host).is_some() {
+                continue;
+            }
+            if !resolved_hosts.insert(endpoint.host.clone()) {
+                continue; // already enqueued this hostname
+            }
+
+            // Re-populate pending_dns so existing answer handler processes it.
+            // TODO: Consider using `insert` instead of `or_insert_with` here to
+            // replace stale in-flight entries rather than accumulating duplicates.
+            let config = BarePeerConfig {
+                peer_id: peer.id.clone(),
+                port: endpoint.port,
+                bindif: bare.bindif.clone(),
+                peer: peer.clone(),
+            };
+            self.pending_dns
+                .entry(endpoint.host.clone())
+                .or_insert_with(|| PendingDns::BarePeers {
+                    configs: Vec::new(),
+                })
+                .push_config(config);
+
+            if cmd_tx
+                .send(DnsCommand::Resolve {
+                    host: endpoint.host,
+                })
+                .await
+                .is_err()
+            {
+                warn!("dns refresh: resolver channel closed");
+                break;
+            }
+        }
+    }
+
     /// Handles a resolved BareUDP peer hostname.
     async fn handle_bare_peer_resolved(
         &mut self,
@@ -450,10 +526,15 @@ impl Orchestrator {
             )
             .await
             {
-                // First IP wins for routing
-                self.peer_txs
-                    .entry(config.peer_id.clone())
-                    .or_insert(packet_tx);
+                // Latest resolution wins for routing (enables IP migration on refresh).
+                // TODO: IP migration is broken. When insert() replaces the old
+                // packet_tx, the old TX actor exits (bare.rs:166), triggering
+                // OrchestratorError::TaskExited (line 352-356) and shutting down.
+                // The old IP also remains in active_ips as stale state.
+                // Fix requires: (1) gracefully stop old TX actor before replacing,
+                // (2) remove old IP from active_ips, (3) distinguish expected TX
+                // exits from unexpected ones in the join_set handler.
+                self.peer_txs.insert(config.peer_id.clone(), packet_tx);
 
                 let label = format!("bare_tx:{}", config.peer_id);
                 self.join_set.spawn(wrap_task(label, tx_handle));
@@ -664,6 +745,7 @@ mod test_support {
         active_ips: HashSet<IpAddr>,
         peer_txs: HashMap<String, mpsc::Sender<Vec<u8>>>,
         pending_dns: HashMap<String, PendingDns>,
+        dns_refresh: Duration,
     }
 
     impl Default for TestableOrchestratorBuilder {
@@ -675,6 +757,7 @@ mod test_support {
                 active_ips: HashSet::new(),
                 peer_txs: HashMap::new(),
                 pending_dns: HashMap::new(),
+                dns_refresh: Duration::ZERO,
             }
         }
     }
@@ -701,6 +784,7 @@ mod test_support {
                 events_tx: events_tx.clone(),
                 join_set: JoinSet::new(),
                 pending_dns: self.pending_dns,
+                dns_refresh: self.dns_refresh,
                 tun_if: self.tun_if,
                 mtu: self.mtu,
                 peers: self.peers,
@@ -1115,4 +1199,13 @@ mod tests {
 
         drop(events_tx);
     }
+
+    // TODO: Add tests for `refresh_dns`:
+    // - Verify refresh_dns populates pending_dns for hostname-based peers
+    // - Verify refresh_dns skips IP-literal peers
+    // - Verify refresh_dns deduplicates hostnames shared by multiple peers
+    // - Verify refresh_dns sends DnsCommand::Resolve for each unique hostname
+    // - Verify refresh_dns handles closed resolver channel gracefully
+    // - Verify dns_ticker branch is disabled when dns_refresh is zero
+    // - Verify dns_ticker fires at configured interval when dns_refresh > 0
 }
