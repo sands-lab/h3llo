@@ -17,8 +17,10 @@ tests/
     native/
       mod.rs
       dns.rs    # CoreDNS integration (requires Docker)
+      tun.rs    # TUN device orchestrator (Container Test Pattern)
     container/
-      mod.rs    # Future: standalone test binaries for Docker
+      mod.rs
+      tun.rs    # Standalone TUN test binary (harness = false)
   e2e/
     main.rs
     bareudp.rs  # Full system E2E (requires Docker + privileged)
@@ -69,8 +71,11 @@ Multi-node BareUDP testing using Docker containers with real TUN devices.
 # Run E2E tests (BareUDP multi-node, requires privileged containers)
 cargo test --test e2e -- --ignored --nocapture
 
-# Run integration tests (DNS resolver, requires Docker)
+# Run integration tests (DNS + TUN container tests, requires Docker)
 cargo test --test integration -- --ignored --nocapture
+
+# Build container test binary first (required for TUN tests)
+cargo test --test integration-container-tun --no-run
 ```
 
 ### Side-Effect Classification
@@ -114,13 +119,30 @@ an independent CoreDNS container with a unique port mapping. This design ensures
 are safe to run in parallel (`cargo test` default behavior) without temp-dir collisions
 or port conflicts.
 
-### Container Test Pattern (Future)
+### Container Test Pattern
 
 When tests with real side effects are needed:
 1. Write test as standalone binary in `tests/integration/container/`
 2. Add `[[test]]` entry with `harness = false` in Cargo.toml
 3. Native orchestrator in `tests/integration/native/` copies binary into Docker
 4. Uses testcontainers `with_copy_to` for binary injection
+5. Uses `WaitFor::Exit` to wait for container exit and verify exit code
+
+#### TUN Device Tests (`integration-container-tun`)
+
+Container binary: `tests/integration/container/tun.rs`
+Orchestrator: `tests/integration/native/tun.rs`
+
+Verifies TUN device creation, multi-address assignment (IPv4+IPv6), and MTU
+configuration using `h3llo::tun::from_config()` inside a privileged container.
+
+```bash
+# Build the container binary
+cargo test --test integration-container-tun --no-run
+
+# Run TUN integration tests
+cargo test --test integration -- tun --ignored --nocapture
+```
 
 ### Fault Injection
 
@@ -146,4 +168,5 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Unit: `src/config.rs` tests for defaults, admin/listener coupling, peer transport exclusivity, BareUDP endpoint requirement, and allowed IP presence.
 - Docker E2E: `tests/e2e/bareudp.rs` multi-node BareUDP connectivity, source IP filtering, and MTU boundary checks via testcontainers-rs.
 - Docker Integration: `tests/integration/native/dns.rs` DNS resolver integration tests against CoreDNS container.
+- Docker Integration: `tests/integration/native/tun.rs` TUN device creation and addressing via Container Test Pattern.
 - Other platforms: TODO for macOS/Windows when platform-specific code is introduced.
