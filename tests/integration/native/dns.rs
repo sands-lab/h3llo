@@ -1,4 +1,4 @@
-//! DNS resolver end-to-end integration tests using testcontainers-rs.
+//! DNS resolver integration tests using testcontainers-rs.
 //!
 //! Validates real DNS resolution against a CoreDNS container with
 //! deterministic zone data. No TUN or BareUDP required.
@@ -6,7 +6,7 @@
 //! Each test creates its own temporary directory and CoreDNS container,
 //! making parallel execution safe (`cargo test` default behavior).
 //!
-//! Run with: `cargo test --test dns_e2e -- --ignored --nocapture`
+//! Run with: `cargo test --test integration -- --ignored --nocapture`
 
 use std::net::SocketAddr;
 use std::time::Duration;

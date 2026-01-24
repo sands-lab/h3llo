@@ -2,13 +2,31 @@
 
 Practical testing guide for h3llo BareUDP VPN. Audience: Rust developers who need quick, repeatable checks across unit tests, mocked components, and multi-node integration tests.
 
-- Layered: unit → local component (mocked network) → Docker integration (testcontainers-rs).
+- Layered: unit → local component (mocked network) → Docker integration (testcontainers-rs) → E2E.
 - Decoupled: abstract transport via traits so business logic is mockable without quiche.
 - Repeatable: commands and snippets are ready to adapt into your test suite or CI jobs.
 
+## Directory Structure
+
+```
+src/
+  *.rs          # Inline #[cfg(test)] unit & component tests
+tests/
+  integration/
+    main.rs
+    native/
+      mod.rs
+      dns.rs    # CoreDNS integration (requires Docker)
+    container/
+      mod.rs    # Future: standalone test binaries for Docker
+  e2e/
+    main.rs
+    bareudp.rs  # Full system E2E (requires Docker + privileged)
+```
+
 ## Local Unit Tests
 
-- Run fast loops with cargo: `cargo test --lib --tests -- --nocapture` or narrow scope (`cargo test packet_handler`).
+- Run fast loops with cargo: `cargo test --lib -- --nocapture` or narrow scope (`cargo test packet_handler`).
 - Decouple transport: define a trait for H3/QUIC operations; production uses tokio-quiche, tests use in-memory mocks.
 
 ## Local Component Tests (mocked network requests)
@@ -48,9 +66,24 @@ Multi-node BareUDP testing using Docker containers with real TUN devices.
 ### Running Tests
 
 ```bash
-# Run Docker integration tests
-cargo test --test bareudp_e2e -- --ignored --nocapture
+# Run E2E tests (BareUDP multi-node, requires privileged containers)
+cargo test --test e2e -- --ignored --nocapture
+
+# Run integration tests (DNS resolver, requires Docker)
+cargo test --test integration -- --ignored --nocapture
 ```
+
+### Side-Effect Classification
+
+Side effects requiring containerization:
+- Creating TUN interfaces
+- Modifying routing tables
+- Operations requiring CAP_NET_ADMIN or elevated privileges
+
+NOT side effects (safe for inline tests):
+- Binding ephemeral localhost ports (`127.0.0.1:0`)
+- In-memory channel communication
+- Spawning async tasks
 
 ### Test Architecture
 
@@ -59,19 +92,15 @@ cargo test --test bareudp_e2e -- --ignored --nocapture
 - Each test creates isolated containers with bind-mounted configs
 - Cleanup is automatic when containers go out of scope
 
-### Test Scenarios
+### E2E Test Scenarios (`tests/e2e/bareudp.rs`)
 
 1. **Two-node BareUDP tunnel**: Verifies bidirectional VPN connectivity between two containers
 2. **Source IP filtering**: Verifies unauthorized sources are rejected
 3. **MTU boundary checks**: Verifies MTU-fitting packets pass and oversized packets with DF are dropped
 
-### DNS Integration Tests
+### Integration Test Scenarios (`tests/integration/native/dns.rs`)
 
 DNS resolver validation against a containerized CoreDNS server with deterministic zone data.
-
-```bash
-cargo test --test dns_e2e -- --ignored --nocapture
-```
 
 - CoreDNS container with `file` plugin serves RFC-style zone with known A/AAAA records
 - DnsResolver spawned in-process via port-mapped UDP
@@ -84,6 +113,14 @@ Each test creates its own `tempfile::tempdir()` for CoreDNS configuration and st
 an independent CoreDNS container with a unique port mapping. This design ensures tests
 are safe to run in parallel (`cargo test` default behavior) without temp-dir collisions
 or port conflicts.
+
+### Container Test Pattern (Future)
+
+When tests with real side effects are needed:
+1. Write test as standalone binary in `tests/integration/container/`
+2. Add `[[test]]` entry with `harness = false` in Cargo.toml
+3. Native orchestrator in `tests/integration/native/` copies binary into Docker
+4. Uses testcontainers `with_copy_to` for binary injection
 
 ### Fault Injection
 
@@ -107,7 +144,6 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 
 - Linux CI: `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, Docker integration tests.
 - Unit: `src/config.rs` tests for defaults, admin/listener coupling, peer transport exclusivity, BareUDP endpoint requirement, and allowed IP presence.
-- Integration: `tests/config_integration.rs` loads valid/invalid YAML samples to assert validation behavior.
-- Docker: `tests/bareudp_e2e.rs` multi-node BareUDP connectivity, source IP filtering, and MTU boundary checks via testcontainers-rs.
-- Docker: `tests/dns_e2e.rs` DNS resolver integration tests against CoreDNS container.
+- Docker E2E: `tests/e2e/bareudp.rs` multi-node BareUDP connectivity, source IP filtering, and MTU boundary checks via testcontainers-rs.
+- Docker Integration: `tests/integration/native/dns.rs` DNS resolver integration tests against CoreDNS container.
 - Other platforms: TODO for macOS/Windows when platform-specific code is introduced.
