@@ -41,3 +41,11 @@ windows-sys = { version = "0.60", features = [
 [[bin]]
 name = "h3llo"
 path = "src/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"

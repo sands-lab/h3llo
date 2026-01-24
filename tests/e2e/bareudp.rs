@@ -4,7 +4,7 @@
 //! and MTU boundary behavior using real TUN devices inside Docker containers.
 //! Requires Docker daemon and CAP_NET_ADMIN.
 //!
-//! Run with: `cargo test --test bareudp_e2e -- --ignored --nocapture`
+//! Run with: `cargo test --test e2e -- --ignored --nocapture`
 
 use std::process::Command;
 use std::time::Duration;
@@ -349,7 +349,6 @@ peers:
 ///
 /// Verifies that packets at the configured MTU (1400) pass through while
 /// oversized packets are dropped when DF (Don't Fragment) is set.
-/// Fulfills docs/plan.md Step 7 requirement.
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_mtu_boundary_drop() {
