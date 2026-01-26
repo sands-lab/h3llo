@@ -17,7 +17,6 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 
 const PACKET_QUEUE_DEPTH: usize = 256;
-const EVENTS_QUEUE_DEPTH: usize = 64;
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -91,8 +90,8 @@ pub enum OrchestratorError {
 /// Manages child actors (TUN-Rx/Tx, BareUDP-Rx/Tx, DNS resolver) and processes runtime events.
 /// Uses a single unified event loop for both initialization and runtime.
 pub struct Orchestrator {
-    events_rx: mpsc::Receiver<Event>,
-    events_tx: mpsc::Sender<Event>,
+    events_rx: mpsc::UnboundedReceiver<Event>,
+    events_tx: mpsc::UnboundedSender<Event>,
     join_set: JoinSet<String>,
 
     // DNS state (minimal)
@@ -106,11 +105,11 @@ pub struct Orchestrator {
     peers: Vec<Peer>,
     active_ips: HashSet<IpAddr>,
     peer_txs: HashMap<String, mpsc::Sender<Vec<u8>>>,
-    tun_cmd_tx: mpsc::Sender<TunRxCommand>,
-    bare_rx_cmd_tx: Option<mpsc::Sender<BareUdpRxCommand>>,
+    tun_cmd_tx: mpsc::UnboundedSender<TunRxCommand>,
+    bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
 
     /// DNS resolver command sender for refresh commands.
-    dns_cmd_tx: Option<mpsc::Sender<DnsCommand>>,
+    dns_cmd_tx: Option<mpsc::UnboundedSender<DnsCommand>>,
 
     /// Whether to manage system routes (`local.table`).
     manage_routes: bool,
@@ -159,10 +158,12 @@ impl Orchestrator {
             .await
             .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
 
-        let (events_tx, events_rx) = mpsc::channel(EVENTS_QUEUE_DEPTH);
+        // Control plane: unbounded to prevent deadlocks from actor cycles.
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        // Data plane: bounded for backpressure on high-throughput packet path.
         let (bare_packet_tx, bare_packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
-        let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::channel::<BareUdpRxCommand>(1);
-        let (tun_cmd_tx, tun_cmd_rx) = mpsc::channel::<TunRxCommand>(1);
+        let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel::<BareUdpRxCommand>();
+        let (tun_cmd_tx, tun_cmd_rx) = mpsc::unbounded_channel::<TunRxCommand>();
 
         // Collect peers and build pending DNS / immediate TX
         let mut peers = Vec::new();
@@ -278,7 +279,7 @@ impl Orchestrator {
             )
             .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
-            let (cmd_tx, cmd_rx) = mpsc::channel(16);
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
             let probe = DefaultRouteProbe;
             let handle = resolver
                 .spawn(probe, cmd_rx, events_tx.clone())
@@ -289,7 +290,6 @@ impl Orchestrator {
             for host in pending_dns.keys() {
                 if cmd_tx
                     .send(DnsCommand::Resolve { host: host.clone() })
-                    .await
                     .is_err()
                 {
                     warn!("failed to send DNS resolve command for host");
@@ -491,7 +491,6 @@ impl Orchestrator {
                 .send(DnsCommand::Resolve {
                     host: endpoint.host,
                 })
-                .await
                 .is_err()
             {
                 warn!("dns refresh: resolver channel closed");
@@ -547,7 +546,6 @@ impl Orchestrator {
                 .send(BareUdpRxCommand::UpdateAllowedSources(
                     self.active_ips.clone(),
                 ))
-                .await
                 .is_err()
             {
                 warn!("failed to send allowed sources update command");
@@ -559,7 +557,6 @@ impl Orchestrator {
             if self
                 .tun_cmd_tx
                 .send(TunRxCommand::UpdateRouting { routing })
-                .await
                 .is_err()
             {
                 warn!("failed to send routing update command");
@@ -628,7 +625,7 @@ async fn spawn_bare_tx_for_peer(
     destination: SocketAddr,
     bindif: Option<&str>,
     tun_if: &str,
-    events_tx: mpsc::Sender<Event>,
+    events_tx: mpsc::UnboundedSender<Event>,
     active_ips: &mut HashSet<IpAddr>,
 ) -> Option<(mpsc::Sender<Vec<u8>>, JoinHandle<()>)> {
     // Dedup by IP
@@ -792,9 +789,9 @@ mod test_support {
     /// Test handles for verifying commands sent by the orchestrator.
     pub struct TestHandles {
         #[allow(dead_code)]
-        pub events_tx: mpsc::Sender<Event>,
-        pub tun_cmd_rx: mpsc::Receiver<TunRxCommand>,
-        pub bare_rx_cmd_rx: mpsc::Receiver<BareUdpRxCommand>,
+        pub events_tx: mpsc::UnboundedSender<Event>,
+        pub tun_cmd_rx: mpsc::UnboundedReceiver<TunRxCommand>,
+        pub bare_rx_cmd_rx: mpsc::UnboundedReceiver<BareUdpRxCommand>,
     }
 
     impl TestableOrchestratorBuilder {
@@ -818,9 +815,9 @@ mod test_support {
         /// Returns the orchestrator and test handles that allow verifying
         /// commands sent to child actors.
         pub fn build(self) -> (Orchestrator, TestHandles) {
-            let (events_tx, events_rx) = mpsc::channel(64);
-            let (tun_cmd_tx, tun_cmd_rx) = mpsc::channel(1);
-            let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::channel(1);
+            let (events_tx, events_rx) = mpsc::unbounded_channel();
+            let (tun_cmd_tx, tun_cmd_rx) = mpsc::unbounded_channel();
+            let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel();
 
             let orch = Orchestrator {
                 events_rx,

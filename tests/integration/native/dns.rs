@@ -96,12 +96,12 @@ async fn spawn_resolver(
     server: SocketAddr,
     timeout: Duration,
 ) -> (
-    mpsc::Sender<DnsCommand>,
-    mpsc::Receiver<Event>,
+    mpsc::UnboundedSender<DnsCommand>,
+    mpsc::UnboundedReceiver<Event>,
     tokio::task::JoinHandle<()>,
 ) {
-    let (cmd_tx, cmd_rx) = mpsc::channel(4);
-    let (event_tx, event_rx) = mpsc::channel(16);
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
     let resolver = DnsResolver::new(server, None, None, timeout);
     let handle = resolver
         .spawn(NoopProbe, cmd_rx, event_tx)
@@ -112,7 +112,7 @@ async fn spawn_resolver(
 
 /// Collects DNS answer events until we have one for each expected record type, skipping non-answer events.
 async fn collect_answers(
-    rx: &mut mpsc::Receiver<Event>,
+    rx: &mut mpsc::UnboundedReceiver<Event>,
     timeout: Duration,
 ) -> Vec<(DnsRecordType, DnsAnswer)> {
     let mut answers = Vec::new();
@@ -136,7 +136,10 @@ async fn collect_answers(
 }
 
 /// Extracts the next DNS event detail from the receiver, skipping bind warnings.
-async fn next_dns_detail(rx: &mut mpsc::Receiver<Event>, timeout: Duration) -> DnsEventDetail {
+async fn next_dns_detail(
+    rx: &mut mpsc::UnboundedReceiver<Event>,
+    timeout: Duration,
+) -> DnsEventDetail {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -162,7 +165,6 @@ async fn dns_resolve_single_a_record() {
         .send(DnsCommand::Resolve {
             host: "single.test.h3llo".to_string(),
         })
-        .await
         .unwrap();
 
     let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
@@ -198,7 +200,6 @@ async fn dns_resolve_multiple_records() {
         .send(DnsCommand::Resolve {
             host: "multi.test.h3llo".to_string(),
         })
-        .await
         .unwrap();
 
     let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
@@ -254,7 +255,6 @@ async fn dns_resolve_aaaa_only() {
         .send(DnsCommand::Resolve {
             host: "ipv6only.test.h3llo".to_string(),
         })
-        .await
         .unwrap();
 
     let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
@@ -303,7 +303,6 @@ async fn dns_resolve_nxdomain() {
         .send(DnsCommand::Resolve {
             host: "nonexistent.test.h3llo".to_string(),
         })
-        .await
         .unwrap();
 
     let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
@@ -333,7 +332,6 @@ async fn dns_resolve_timeout() {
         .send(DnsCommand::Resolve {
             host: "anything.example.com".to_string(),
         })
-        .await
         .unwrap();
 
     // Should receive a Timeout event

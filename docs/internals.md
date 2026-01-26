@@ -33,6 +33,15 @@ Actor design principles:
 - **Async select loop**: each actor runs a `tokio::select!` loop over its input channels, I/O sources, and timers.
 - **Supervision**: the Orchestrator spawns and monitors child actors (DNS resolver, H3 dialers); task exits propagate upward via `JoinSet`.
 
+#### Channel Capacity Policy
+
+Actors use two channel categories with different capacity policies:
+
+- **Control plane (unbounded)**: Command queues (orchestrator-to-child) and event queues (child-to-orchestrator) use `mpsc::unbounded_channel()`. This prevents deadlocks from message cycles between actors—a bounded channel can deadlock when actors block on `send()` waiting for each other.
+- **Data plane (bounded)**: Packet queues for forwarding IP datagrams use `mpsc::channel(PACKET_QUEUE_DEPTH)` with `PACKET_QUEUE_DEPTH = 256`. Bounded channels provide backpressure, preventing memory exhaustion when producers outpace consumers.
+
+Reference: [Alice Ryhl - Actors with Tokio](https://ryhl.io/blog/actors-with-tokio/)
+
 **Inbound Datapath**
 
 ```mermaid
