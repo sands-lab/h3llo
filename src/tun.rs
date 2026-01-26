@@ -384,15 +384,16 @@ fn parse_addrs(raw_addrs: &[String]) -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Tun
 ///
 /// * `tun` - TUN device reader.
 /// * `routing` - Initial routing table for destination lookups (includes embedded TX channels).
-/// * `cmd_rx` - Channel for receiving runtime commands (e.g., routing updates).
-/// * `events_tx` - Channel for emitting receive metrics.
+/// * `cmd_rx` - Unbounded channel for receiving runtime commands (e.g., routing updates).
+///   Unbounded to prevent deadlocks when orchestrator sends commands during event handling.
+/// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
 #[allow(dead_code)]
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
     mut routing: RoutingTable,
-    mut cmd_rx: mpsc::Receiver<TunRxCommand>,
-    events_tx: mpsc::Sender<Event>,
+    mut cmd_rx: mpsc::UnboundedReceiver<TunRxCommand>,
+    events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -447,7 +448,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).await.is_err() {
+                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
                         break;
                     }
                 }
@@ -461,7 +462,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
 pub(crate) fn spawn_tun_tx<T: TunTx>(
     mut tun: T,
     mut packet_rx: mpsc::Receiver<Vec<u8>>,
-    events_tx: mpsc::Sender<Event>,
+    events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -491,7 +492,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).await.is_err() {
+                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
                         break;
                     }
                 }
@@ -678,7 +679,7 @@ mod tests {
     async fn tun_rx_pushes_packets_and_counts() {
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem0", 64);
         let (peer_tx, mut peer_rx) = mpsc::channel(4);
-        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
@@ -696,7 +697,7 @@ mod tests {
         peer_txs.insert("peer1".to_string(), peer_tx);
         let routing = RoutingTable::from_peers(&[peer_config], &peer_txs).unwrap();
 
-        let (_cmd_tx, cmd_rx) = mpsc::channel::<TunRxCommand>(1);
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TunRxCommand>();
 
         let tun_rx_task = spawn_tun_rx(
             rx_tun,
@@ -741,7 +742,7 @@ mod tests {
     async fn tun_tx_drops_oversize_and_reports_metrics() {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) = memory_tun("mem1", 4);
         let (packet_tx, packet_rx) = mpsc::channel(4);
-        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let tun_tx_task = spawn_tun_tx(tx_tun, packet_rx, events_tx, Duration::from_millis(10));
 
         packet_tx.send(vec![0, 1, 2, 3, 4, 5]).await.unwrap();
@@ -793,7 +794,7 @@ mod tests {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) =
             memory_tun_with_errors("mem-interrupt", 16, vec![std::io::ErrorKind::Interrupted]);
         let (packet_tx, packet_rx) = mpsc::channel(4);
-        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let tun_tx_task = spawn_tun_tx(tx_tun, packet_rx, events_tx, Duration::from_millis(5));
 
         packet_tx.send(vec![1, 2, 3]).await.unwrap();
@@ -922,7 +923,7 @@ mod tests {
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem-cmd", 64);
         let (peer1_tx, mut peer1_rx) = mpsc::channel(4);
         let (peer2_tx, mut peer2_rx) = mpsc::channel(4);
-        let (events_tx, _events_rx) = mpsc::channel(8);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
@@ -940,7 +941,7 @@ mod tests {
         peer_txs.insert("peer1".to_string(), peer1_tx);
         let routing = RoutingTable::from_peers(&[peer1_config], &peer_txs).unwrap();
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<TunRxCommand>(1);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TunRxCommand>();
 
         let tun_rx_task = spawn_tun_rx(rx_tun, routing, cmd_rx, events_tx, Duration::from_secs(60));
 
@@ -967,7 +968,6 @@ mod tests {
             .send(TunRxCommand::UpdateRouting {
                 routing: new_routing,
             })
-            .await
             .unwrap();
 
         // Allow command to be processed

@@ -83,14 +83,17 @@ impl DnsResolver {
 
     /// Spawns the DNS resolver coroutine, returning its join handle.
     ///
+    /// Uses unbounded channels to prevent deadlocks when orchestrator sends
+    /// resolve commands during event handling cycles.
+    ///
     /// # Errors
     ///
     /// Returns `ResolveInitError::Socket` when socket creation, binding, or connection fails.
     pub async fn spawn<P: RouteProbe + Send + Sync + 'static>(
         self,
         probe: P,
-        cmd_rx: mpsc::Receiver<DnsCommand>,
-        events_tx: mpsc::Sender<Event>,
+        cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
+        events_tx: mpsc::UnboundedSender<Event>,
     ) -> Result<JoinHandle<()>, ResolveInitError> {
         let (socket, bind_warnings) = self.prepare_socket(&probe).await?;
         let mut task = ResolverTask::new(self.server, self.timeout, cmd_rx, events_tx, socket);
@@ -149,8 +152,8 @@ struct ResolverTask {
     server: SocketAddr,
     socket: UdpSocket,
     timeout: Duration,
-    cmd_rx: mpsc::Receiver<DnsCommand>,
-    events_tx: mpsc::Sender<Event>,
+    cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
+    events_tx: mpsc::UnboundedSender<Event>,
     pending: HashMap<u16, PendingRequest>,
     cmd_rx_closed: bool,
 }
@@ -160,8 +163,8 @@ impl ResolverTask {
     fn new(
         server: SocketAddr,
         timeout: Duration,
-        cmd_rx: mpsc::Receiver<DnsCommand>,
-        events_tx: mpsc::Sender<Event>,
+        cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
+        events_tx: mpsc::UnboundedSender<Event>,
         socket: UdpSocket,
     ) -> Self {
         Self {
@@ -182,7 +185,7 @@ impl ResolverTask {
                 server: self.server,
                 detail: DnsEventDetail::BindWarning(warning),
             });
-            if self.events_tx.send(event).await.is_err() {
+            if self.events_tx.send(event).is_err() {
                 break;
             }
         }
@@ -350,7 +353,7 @@ impl ResolverTask {
             }),
         });
 
-        let _ = self.events_tx.send(event).await;
+        let _ = self.events_tx.send(event);
     }
 
     /// Handles timer ticks by retrying timed-out pending queries.
@@ -399,7 +402,7 @@ impl ResolverTask {
                 warning,
             }),
         });
-        let _ = self.events_tx.send(event).await;
+        let _ = self.events_tx.send(event);
     }
 
     /// Emits a timeout event.
@@ -411,7 +414,7 @@ impl ResolverTask {
                 record_type: request.record_type,
             }),
         });
-        let _ = self.events_tx.send(event).await;
+        let _ = self.events_tx.send(event);
     }
 }
 
@@ -544,12 +547,12 @@ mod tests {
         server: SocketAddr,
         bindif: Option<String>,
     ) -> (
-        mpsc::Sender<DnsCommand>,
-        mpsc::Receiver<Event>,
+        mpsc::UnboundedSender<DnsCommand>,
+        mpsc::UnboundedReceiver<Event>,
         JoinHandle<()>,
     ) {
-        let (cmd_tx, cmd_rx) = mpsc::channel(4);
-        let (event_tx, event_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let resolver = DnsResolver::new(server, bindif, None, Duration::from_millis(50));
         let probe = FakeRouteProbe {
             result: Ok(Vec::new()),
@@ -583,7 +586,9 @@ mod tests {
     }
 
     /// Receives the next DNS event detail, skipping bind warnings.
-    async fn next_relevant_detail(events_rx: &mut mpsc::Receiver<Event>) -> DnsEventDetail {
+    async fn next_relevant_detail(
+        events_rx: &mut mpsc::UnboundedReceiver<Event>,
+    ) -> DnsEventDetail {
         loop {
             let event = events_rx.recv().await.expect("dns event");
             if let Event::Dns(dns) = event {
@@ -605,7 +610,6 @@ mod tests {
             .send(DnsCommand::Resolve {
                 host: "example.com".to_string(),
             })
-            .await
             .unwrap();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
@@ -668,7 +672,6 @@ mod tests {
             .send(DnsCommand::Resolve {
                 host: "unknown.test".to_string(),
             })
-            .await
             .unwrap();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
@@ -709,7 +712,6 @@ mod tests {
             .send(DnsCommand::Resolve {
                 host: "ttl.test".to_string(),
             })
-            .await
             .unwrap();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
@@ -775,7 +777,6 @@ mod tests {
             .send(DnsCommand::Resolve {
                 host: "decode.test".to_string(),
             })
-            .await
             .unwrap();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
@@ -805,7 +806,6 @@ mod tests {
             .send(DnsCommand::Resolve {
                 host: "txt.example".to_string(),
             })
-            .await
             .unwrap();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
@@ -866,7 +866,6 @@ mod tests {
             .send(DnsCommand::Resolve {
                 host: "timeout.example".to_string(),
             })
-            .await
             .unwrap();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];

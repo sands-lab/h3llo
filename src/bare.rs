@@ -78,16 +78,17 @@ impl BareUdpTx {
 /// # Arguments
 /// - `rx`: Receive-only socket and MTU.
 /// - `allowed_sources`: Initial allowed source IP set.
-/// - `cmd_rx`: Channel delivering commands to the receive loop.
-/// - `packet_tx`: Channel to push accepted packets into.
-/// - `events_tx`: Channel for emitting receive metrics.
+/// - `cmd_rx`: Unbounded channel delivering commands to the receive loop.
+///   Unbounded to prevent deadlocks when orchestrator sends filter updates.
+/// - `packet_tx`: Bounded channel to push accepted packets into (data plane).
+/// - `events_tx`: Unbounded channel for emitting receive metrics.
 /// - `interval`: Metrics emission interval.
 pub fn spawn_udp_rx(
     rx: BareUdpRx,
     mut allowed_sources: HashSet<IpAddr>,
-    mut cmd_rx: mpsc::Receiver<BareUdpRxCommand>,
+    mut cmd_rx: mpsc::UnboundedReceiver<BareUdpRxCommand>,
     packet_tx: mpsc::Sender<Vec<u8>>,
-    events_tx: mpsc::Sender<Event>,
+    events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
     let BareUdpRx { socket, mtu } = rx;
@@ -128,7 +129,7 @@ pub fn spawn_udp_rx(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).await.is_err() {
+                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
                         break;
                     }
                 }
@@ -142,14 +143,14 @@ pub fn spawn_udp_rx(
 /// # Arguments
 /// - `tx`: Send-only socket.
 /// - `destination`: Remote peer socket address.
-/// - `packet_rx`: Channel supplying packets to send.
-/// - `events_tx`: Channel for emitting transmit metrics.
+/// - `packet_rx`: Bounded channel supplying packets to send (data plane).
+/// - `events_tx`: Unbounded channel for emitting transmit metrics.
 /// - `interval`: Metrics emission interval.
 pub fn spawn_udp_tx(
     tx: BareUdpTx,
     destination: SocketAddr,
     mut packet_rx: mpsc::Receiver<Vec<u8>>,
-    events_tx: mpsc::Sender<Event>,
+    events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<()> {
     let BareUdpTx { socket } = tx;
@@ -175,7 +176,7 @@ pub fn spawn_udp_tx(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).await.is_err() {
+                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
                         break;
                     }
                 }
@@ -200,8 +201,8 @@ mod tests {
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
         let allowed = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))]);
-        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
-        let (events_tx, mut _events_rx) = mpsc::channel(4);
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
         let context = BareUdpRx { socket, mtu: 64 };
         let handle = spawn_udp_rx(
             context,
@@ -234,8 +235,8 @@ mod tests {
         };
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
-        let (cmd_tx, cmd_rx) = mpsc::channel(1);
-        let (events_tx, mut _events_rx) = mpsc::channel(4);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
         let context = BareUdpRx { socket, mtu: 64 };
         let handle = spawn_udp_rx(
             context,
@@ -263,7 +264,6 @@ mod tests {
             .send(BareUdpRxCommand::UpdateAllowedSources(HashSet::from([
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             ])))
-            .await
             .unwrap();
 
         sender
@@ -287,7 +287,7 @@ mod tests {
 
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (packet_tx, packet_rx) = mpsc::channel(4);
-        let (events_tx, mut _events_rx) = mpsc::channel(4);
+        let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
         let context = BareUdpTx {
             socket: sender_socket,
         };
@@ -320,8 +320,8 @@ mod tests {
         };
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
-        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
-        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let context = BareUdpRx { socket, mtu: 128 };
         let handle = spawn_udp_rx(
             context,
@@ -373,7 +373,7 @@ mod tests {
 
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (packet_tx, packet_rx) = mpsc::channel(4);
-        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let context = BareUdpTx {
             socket: sender_socket,
         };
