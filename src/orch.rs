@@ -165,53 +165,24 @@ impl Orchestrator {
         let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel::<BareUdpRxCommand>();
         let (tun_cmd_tx, tun_cmd_rx) = mpsc::unbounded_channel::<TunRxCommand>();
 
-        // Collect peers and build pending DNS for all endpoints.
-        // All endpoints (IP literals and hostnames) go through DNS resolution.
+        // Build pending DNS for all BareUDP peer endpoints.
+        // Initially populate without sending commands (resolver not spawned yet).
+        // All endpoints (IP literals and hostnames) go through DNS resolution;
         // DNS resolver detects IP literals and emits DnsAnswer immediately.
-        let mut peers = Vec::new();
         let mut pending_dns = HashMap::new();
+        populate_and_resolve_dns(&config.peers, &mut pending_dns, None)?;
+
+        // Extract validated peers for storage (enabled BareUDP peers only)
+        let peers: Vec<Peer> = config
+            .peers
+            .iter()
+            .filter(|p| p.enabled && p.bare.is_some())
+            .cloned()
+            .collect();
+
         let peer_txs = HashMap::new();
         let active_ips = HashSet::new();
         let mut join_set = JoinSet::new();
-
-        for peer in &config.peers {
-            if !peer.enabled {
-                continue;
-            }
-            let bare = match peer.bare.as_ref() {
-                Some(bare) => bare,
-                None => {
-                    warn!(
-                        "peer '{}' uses non-BareUDP transport; ignoring in bare runtime",
-                        peer.id
-                    );
-                    continue;
-                }
-            };
-            let endpoint = parse_udp_uri(&bare.endpoint).map_err(|err| {
-                OrchestratorError::InvalidPeerEndpoint {
-                    peer_id: peer.id.clone(),
-                    reason: err,
-                }
-            })?;
-
-            peers.push(peer.clone());
-
-            // All endpoints (IP literals and hostnames) go through DNS resolution.
-            // DNS resolver detects IP literals and emits DnsAnswer immediately.
-            let config = BarePeerConfig {
-                peer_id: peer.id.clone(),
-                port: endpoint.port,
-                bindif: bare.bindif.clone(),
-                peer: peer.clone(),
-            };
-            pending_dns
-                .entry(endpoint.host.clone())
-                .or_insert_with(|| PendingDns::BarePeers {
-                    configs: Vec::new(),
-                })
-                .push_config(config);
-        }
 
         // Start with empty routing table; routes populated as DNS answers arrive
         let routing = RoutingTable::new();
@@ -428,52 +399,18 @@ impl Orchestrator {
             None => return,
         };
 
-        // TODO: The `resolved_hosts` deduplication below skips config creation
-        // and `push_config` for subsequent peers sharing the same hostname.
-        // This differs from initialization (lines 203-217) which correctly
-        // accumulates all peer configs per hostname. The deduplication should
-        // only prevent sending duplicate DnsCommand::Resolve, not skip the
-        // config/push_config logic.
-        let mut resolved_hosts = HashSet::new();
-        for peer in &self.peers {
-            let bare = match peer.bare.as_ref() {
-                Some(b) => b,
-                None => continue,
-            };
-            let endpoint = match parse_udp_uri(&bare.endpoint) {
-                Ok(ep) => ep,
-                Err(_) => continue,
-            };
-            // IP literals now flow through DNS resolver (emits immediate answer)
-            if !resolved_hosts.insert(endpoint.host.clone()) {
-                continue; // already enqueued this hostname/IP
-            }
+        // Clear stale entries before repopulating to prevent duplicate accumulation
+        self.pending_dns.clear();
 
-            // Re-populate pending_dns so existing answer handler processes it.
-            // TODO: Consider using `insert` instead of `or_insert_with` here to
-            // replace stale in-flight entries rather than accumulating duplicates.
-            let config = BarePeerConfig {
-                peer_id: peer.id.clone(),
-                port: endpoint.port,
-                bindif: bare.bindif.clone(),
-                peer: peer.clone(),
-            };
-            self.pending_dns
-                .entry(endpoint.host.clone())
-                .or_insert_with(|| PendingDns::BarePeers {
-                    configs: Vec::new(),
-                })
-                .push_config(config);
-
-            if cmd_tx
-                .send(DnsCommand::Resolve {
-                    host: endpoint.host,
-                })
-                .is_err()
-            {
-                warn!("dns refresh: resolver channel closed");
-                break;
-            }
+        // Re-populate pending_dns and send resolve commands using shared logic.
+        // Errors should not occur since peers were validated at startup,
+        // but log and return early if they do.
+        if let Err(err) = populate_and_resolve_dns(&self.peers, &mut self.pending_dns, Some(cmd_tx))
+        {
+            warn!(
+                "dns refresh: unexpected error parsing peer endpoint: {}",
+                err
+            );
         }
     }
 
@@ -687,6 +624,87 @@ fn tun_prefixes(addrs: &[String]) -> Result<Vec<IpNet>, OrchestratorError> {
 
 fn parse_ip_literal(host: &str) -> Option<IpAddr> {
     host.parse::<IpAddr>().ok()
+}
+
+/// Populates pending DNS entries and sends resolve commands.
+///
+/// Iterates enabled BareUDP peers, validates endpoints, populates `pending_dns`
+/// with `BarePeerConfig` entries grouped by hostname, and sends `DnsCommand::Resolve`
+/// for each unique hostname.
+///
+/// # Arguments
+///
+/// * `peers` - Slice of peer configurations to process
+/// * `pending_dns` - Map to populate (caller should clear if replacing stale entries)
+/// * `dns_cmd_tx` - Optional channel to send DNS resolve commands. If `None`, only
+///   populates `pending_dns` without sending commands (useful during initialization
+///   before DNS resolver is spawned).
+///
+/// # Returns
+///
+/// `Ok(())` on success. Logs warnings for closed channels but continues processing.
+///
+/// # Errors
+///
+/// Returns `OrchestratorError::InvalidPeerEndpoint` if any enabled peer
+/// has an invalid BareUDP endpoint URI.
+fn populate_and_resolve_dns(
+    peers: &[Peer],
+    pending_dns: &mut HashMap<String, PendingDns>,
+    dns_cmd_tx: Option<&mpsc::UnboundedSender<DnsCommand>>,
+) -> Result<(), OrchestratorError> {
+    let mut seen_hosts = HashSet::new();
+
+    for peer in peers {
+        if !peer.enabled {
+            continue;
+        }
+        let bare = match peer.bare.as_ref() {
+            Some(b) => b,
+            None => continue,
+        };
+        let endpoint = parse_udp_uri(&bare.endpoint).map_err(|err| {
+            OrchestratorError::InvalidPeerEndpoint {
+                peer_id: peer.id.clone(),
+                reason: err,
+            }
+        })?;
+
+        let config = BarePeerConfig {
+            peer_id: peer.id.clone(),
+            port: endpoint.port,
+            bindif: bare.bindif.clone(),
+            peer: peer.clone(),
+        };
+
+        // Accumulate ALL configs per hostname, not just the first peer's config.
+        // This fixes a prior bug where hostname deduplication skipped push_config
+        // for subsequent peers sharing the same hostname.
+        pending_dns
+            .entry(endpoint.host.clone())
+            .or_insert_with(|| PendingDns::BarePeers {
+                configs: Vec::new(),
+            })
+            .push_config(config);
+
+        // Send resolve command only once per hostname (deduplication)
+        if seen_hosts.insert(endpoint.host.clone()) {
+            if let Some(cmd_tx) = dns_cmd_tx {
+                if cmd_tx
+                    .send(DnsCommand::Resolve {
+                        host: endpoint.host,
+                    })
+                    .is_err()
+                {
+                    warn!("dns: resolver channel closed");
+                    // Continue processing remaining peers; channel may have
+                    // closed mid-iteration but pending_dns should still be populated
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn log_bind_warning(context: &str, warning: &BindWarning) {
@@ -1366,12 +1384,250 @@ mod tests {
         assert!(handles.tun_cmd_rx.try_recv().is_err());
     }
 
-    // TODO: Add tests for `refresh_dns`:
-    // - Verify refresh_dns populates pending_dns for hostname-based peers
-    // - Verify refresh_dns skips IP-literal peers
-    // - Verify refresh_dns deduplicates hostnames shared by multiple peers
-    // - Verify refresh_dns sends DnsCommand::Resolve for each unique hostname
-    // - Verify refresh_dns handles closed resolver channel gracefully
-    // - Verify dns_ticker branch is disabled when dns_refresh is zero
-    // - Verify dns_ticker fires at configured interval when dns_refresh > 0
+    // ========== populate_and_resolve_dns helper function tests ==========
+
+    #[test]
+    fn dns_collection_accumulates_configs_for_same_host() {
+        let peers = vec![
+            Peer {
+                id: "peer1".to_string(),
+                enabled: true,
+                h3: None,
+                bare: Some(PeerBare {
+                    endpoint: "udp://shared.example.com:5353".to_string(),
+                    bindif: None,
+                }),
+                tun: PeerTun {
+                    allowed_ips: vec!["10.0.0.0/24".to_string()],
+                },
+            },
+            Peer {
+                id: "peer2".to_string(),
+                enabled: true,
+                h3: None,
+                bare: Some(PeerBare {
+                    endpoint: "udp://shared.example.com:5354".to_string(),
+                    bindif: Some("eth0".to_string()),
+                }),
+                tun: PeerTun {
+                    allowed_ips: vec!["172.16.0.0/16".to_string()],
+                },
+            },
+        ];
+
+        let mut pending_dns = HashMap::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        let result = populate_and_resolve_dns(&peers, &mut pending_dns, Some(&cmd_tx));
+        assert!(result.is_ok());
+
+        // Both configs accumulated under the same hostname (fixes TODO bug)
+        let pending = pending_dns.get("shared.example.com").expect("should exist");
+        match pending {
+            PendingDns::BarePeers { configs } => {
+                assert_eq!(configs.len(), 2, "both peers should be accumulated");
+                assert_eq!(configs[0].peer_id, "peer1");
+                assert_eq!(configs[1].peer_id, "peer2");
+            }
+        }
+
+        // Only ONE DNS command sent (hostname deduplicated)
+        let cmd = cmd_rx.try_recv().expect("should receive command");
+        assert!(matches!(cmd, DnsCommand::Resolve { host } if host == "shared.example.com"));
+        assert!(cmd_rx.try_recv().is_err(), "should be no more commands");
+    }
+
+    #[test]
+    fn dns_collection_skips_disabled_peers() {
+        let mut peer = bare_peer("disabled", &["10.0.0.0/24"]);
+        peer.enabled = false;
+
+        let mut pending_dns = HashMap::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        let result = populate_and_resolve_dns(&[peer], &mut pending_dns, Some(&cmd_tx));
+        assert!(result.is_ok());
+
+        assert!(pending_dns.is_empty());
+        assert!(cmd_rx.try_recv().is_err(), "no commands should be sent");
+    }
+
+    #[test]
+    fn dns_collection_skips_non_bare_peers() {
+        let peer = Peer {
+            id: "h3only".to_string(),
+            enabled: true,
+            h3: None,
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec![],
+            },
+        };
+
+        let mut pending_dns = HashMap::new();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+        let result = populate_and_resolve_dns(&[peer], &mut pending_dns, Some(&cmd_tx));
+        assert!(result.is_ok());
+
+        assert!(pending_dns.is_empty());
+        assert!(cmd_rx.try_recv().is_err(), "no commands should be sent");
+    }
+
+    #[test]
+    fn dns_collection_returns_error_for_invalid_endpoint() {
+        let peer = Peer {
+            id: "badpeer".to_string(),
+            enabled: true,
+            h3: None,
+            bare: Some(PeerBare {
+                endpoint: "not-a-valid-uri".to_string(),
+                bindif: None,
+            }),
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".to_string()],
+            },
+        };
+
+        let mut pending_dns = HashMap::new();
+        let result = populate_and_resolve_dns(&[peer], &mut pending_dns, None);
+
+        assert!(matches!(
+            result,
+            Err(OrchestratorError::InvalidPeerEndpoint { peer_id, .. }) if peer_id == "badpeer"
+        ));
+    }
+
+    #[test]
+    fn dns_collection_works_without_cmd_tx() {
+        // During new() before DNS resolver is spawned, cmd_tx may be None
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let mut pending_dns = HashMap::new();
+
+        let result = populate_and_resolve_dns(&[peer], &mut pending_dns, None);
+        assert!(result.is_ok());
+
+        // pending_dns still populated even without command channel
+        assert!(pending_dns.contains_key("127.0.0.1"));
+    }
+
+    // ========== refresh_dns integration tests ==========
+
+    #[tokio::test]
+    async fn refresh_dns_accumulates_all_configs_for_shared_hostname() {
+        let peer1 = Peer {
+            id: "peer1".to_string(),
+            enabled: true,
+            h3: None,
+            bare: Some(PeerBare {
+                endpoint: "udp://example.com:5353".to_string(),
+                bindif: None,
+            }),
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".to_string()],
+            },
+        };
+        let peer2 = Peer {
+            id: "peer2".to_string(),
+            enabled: true,
+            h3: None,
+            bare: Some(PeerBare {
+                endpoint: "udp://example.com:5354".to_string(),
+                bindif: None,
+            }),
+            tun: PeerTun {
+                allowed_ips: vec!["172.16.0.0/16".to_string()],
+            },
+        };
+
+        let (dns_cmd_tx, mut dns_cmd_rx) = mpsc::unbounded_channel();
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer1, peer2])
+            .build();
+
+        orch.dns_cmd_tx = Some(dns_cmd_tx);
+        orch.refresh_dns().await;
+
+        // Verify only ONE DNS command sent (hostname deduplicated)
+        let cmd = dns_cmd_rx.try_recv().expect("should receive command");
+        assert!(matches!(cmd, DnsCommand::Resolve { host } if host == "example.com"));
+        assert!(dns_cmd_rx.try_recv().is_err(), "should be no more commands");
+
+        // Verify BOTH peer configs accumulated (fixes TODO bug)
+        let pending = orch.pending_dns.get("example.com").expect("should exist");
+        match pending {
+            PendingDns::BarePeers { configs } => {
+                assert_eq!(configs.len(), 2, "both peers should be accumulated");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_dns_replaces_stale_pending_entries() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let (dns_cmd_tx, _) = mpsc::unbounded_channel();
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer.clone()])
+            .build();
+
+        // Pre-populate with stale entry
+        orch.pending_dns.insert(
+            "127.0.0.1".to_string(),
+            PendingDns::BarePeers {
+                configs: vec![BarePeerConfig {
+                    peer_id: "stale".to_string(),
+                    port: 9999,
+                    bindif: None,
+                    peer: bare_peer("stale", &[]),
+                }],
+            },
+        );
+
+        orch.dns_cmd_tx = Some(dns_cmd_tx);
+        orch.refresh_dns().await;
+
+        // Stale entry should be replaced
+        let pending = orch.pending_dns.get("127.0.0.1").expect("should exist");
+        match pending {
+            PendingDns::BarePeers { configs } => {
+                assert_eq!(configs.len(), 1);
+                assert_eq!(configs[0].peer_id, "peer1", "should be fresh, not stale");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_dns_handles_closed_channel_gracefully() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let (dns_cmd_tx, dns_cmd_rx) = mpsc::unbounded_channel();
+        drop(dns_cmd_rx); // Close receiver
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        orch.dns_cmd_tx = Some(dns_cmd_tx);
+
+        // Should not panic, just log warning
+        orch.refresh_dns().await;
+    }
+
+    #[tokio::test]
+    async fn refresh_dns_noop_without_dns_cmd_tx() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        // dns_cmd_tx is None by default
+        assert!(orch.dns_cmd_tx.is_none());
+
+        orch.refresh_dns().await;
+
+        // pending_dns should remain empty (early return)
+        assert!(orch.pending_dns.is_empty());
+    }
 }
