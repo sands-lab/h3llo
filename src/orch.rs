@@ -677,7 +677,9 @@ fn populate_and_resolve_dns(
             peer: peer.clone(),
         };
 
-        // Accumulate ALL configs per hostname (fixes TODO bug at lines 431-436)
+        // Accumulate ALL configs per hostname, not just the first peer's config.
+        // This fixes a prior bug where hostname deduplication skipped push_config
+        // for subsequent peers sharing the same hostname.
         pending_dns
             .entry(endpoint.host.clone())
             .or_insert_with(|| PendingDns::BarePeers {
