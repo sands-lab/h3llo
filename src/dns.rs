@@ -213,13 +213,44 @@ impl ResolverTask {
     async fn handle_command(&mut self, command: Option<DnsCommand>) {
         match command {
             Some(DnsCommand::Resolve { host }) => {
-                self.issue_query(host.clone(), DnsRecordType::A).await;
-                self.issue_query(host, DnsRecordType::Aaaa).await;
+                // Fast path: IP literal detection - emit answer immediately without network I/O
+                if let Ok(ip) = host.parse::<IpAddr>() {
+                    self.emit_ip_literal_answer(host, ip).await;
+                } else {
+                    self.issue_query(host.clone(), DnsRecordType::A).await;
+                    self.issue_query(host, DnsRecordType::Aaaa).await;
+                }
             }
             None => {
                 self.cmd_rx_closed = true;
             }
         }
+    }
+
+    /// Emits a DnsAnswer for an IP literal without network I/O.
+    ///
+    /// This allows IP literals to flow through the same code path as resolved
+    /// hostnames, simplifying the orchestrator's initialization logic.
+    async fn emit_ip_literal_answer(&mut self, host: String, ip: IpAddr) {
+        let record_type = match ip {
+            IpAddr::V4(_) => DnsRecordType::A,
+            IpAddr::V6(_) => DnsRecordType::Aaaa,
+        };
+
+        let event = Event::Dns(DnsEvent {
+            server: self.server,
+            detail: DnsEventDetail::Answer(DnsAnswer {
+                host,
+                record_type,
+                records: vec![DnsAnswerRecord {
+                    address: ip,
+                    ttl: u32::MAX, // IP literal never expires
+                }],
+                warnings: vec![],
+            }),
+        });
+
+        let _ = self.events_tx.send(event);
     }
 
     /// Issues a query for `host` and `record_type`, emitting a send-failure event on error.
@@ -909,6 +940,65 @@ mod tests {
             first_ids.get(&DnsRecordType::Aaaa),
             retry_ids.get(&DnsRecordType::Aaaa)
         );
+
+        handle.abort();
+    }
+
+    // ========== IP Literal Tests ==========
+
+    #[tokio::test]
+    async fn emits_immediate_answer_for_ipv4_literal() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+
+        cmd_tx
+            .send(DnsCommand::Resolve {
+                host: "192.168.1.100".to_string(),
+            })
+            .unwrap();
+
+        let detail = next_relevant_detail(&mut events_rx).await;
+        match detail {
+            DnsEventDetail::Answer(answer) => {
+                assert_eq!(answer.host, "192.168.1.100");
+                assert_eq!(answer.record_type, DnsRecordType::A);
+                assert_eq!(answer.records.len(), 1);
+                assert_eq!(
+                    answer.records[0].address,
+                    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))
+                );
+                assert_eq!(answer.records[0].ttl, u32::MAX);
+            }
+            _ => panic!("expected Answer event for IP literal"),
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn emits_immediate_answer_for_ipv6_literal() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+
+        cmd_tx
+            .send(DnsCommand::Resolve {
+                host: "2001:db8::1".to_string(),
+            })
+            .unwrap();
+
+        let detail = next_relevant_detail(&mut events_rx).await;
+        match detail {
+            DnsEventDetail::Answer(answer) => {
+                assert_eq!(answer.host, "2001:db8::1");
+                assert_eq!(answer.record_type, DnsRecordType::Aaaa);
+                assert_eq!(answer.records.len(), 1);
+                assert!(answer.records[0].address.is_ipv6());
+                assert_eq!(answer.records[0].ttl, u32::MAX);
+            }
+            _ => panic!("expected Answer event for IPv6 literal"),
+        }
 
         handle.abort();
     }

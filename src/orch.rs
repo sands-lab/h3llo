@@ -165,11 +165,13 @@ impl Orchestrator {
         let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel::<BareUdpRxCommand>();
         let (tun_cmd_tx, tun_cmd_rx) = mpsc::unbounded_channel::<TunRxCommand>();
 
-        // Collect peers and build pending DNS / immediate TX
+        // Collect peers and build pending DNS for all endpoints.
+        // All endpoints (IP literals and hostnames) go through DNS resolution.
+        // DNS resolver detects IP literals and emits DnsAnswer immediately.
         let mut peers = Vec::new();
         let mut pending_dns = HashMap::new();
-        let mut peer_txs = HashMap::new();
-        let mut active_ips = HashSet::new();
+        let peer_txs = HashMap::new();
+        let active_ips = HashSet::new();
         let mut join_set = JoinSet::new();
 
         for peer in &config.peers {
@@ -195,49 +197,24 @@ impl Orchestrator {
 
             peers.push(peer.clone());
 
-            if let Some(ip) = parse_ip_literal(&endpoint.host) {
-                // IP literal: create TX immediately
-                let destination = SocketAddr::new(ip, endpoint.port);
-                if let Some((packet_tx, tx_handle)) = spawn_bare_tx_for_peer(
-                    &peer.id,
-                    destination,
-                    bare.bindif.as_deref(),
-                    &tun_if,
-                    events_tx.clone(),
-                    &mut active_ips,
-                )
-                .await
-                {
-                    peer_txs.insert(peer.id.clone(), packet_tx);
-                    let label = format!("bare_tx:{}", peer.id);
-                    join_set.spawn(wrap_task(label, tx_handle));
-                }
-            } else {
-                // Hostname: add to pending DNS (accumulate if same hostname)
-                let config = BarePeerConfig {
-                    peer_id: peer.id.clone(),
-                    port: endpoint.port,
-                    bindif: bare.bindif.clone(),
-                    peer: peer.clone(),
-                };
-                pending_dns
-                    .entry(endpoint.host.clone())
-                    .or_insert_with(|| PendingDns::BarePeers {
-                        configs: Vec::new(),
-                    })
-                    .push_config(config);
-            }
+            // All endpoints (IP literals and hostnames) go through DNS resolution.
+            // DNS resolver detects IP literals and emits DnsAnswer immediately.
+            let config = BarePeerConfig {
+                peer_id: peer.id.clone(),
+                port: endpoint.port,
+                bindif: bare.bindif.clone(),
+                peer: peer.clone(),
+            };
+            pending_dns
+                .entry(endpoint.host.clone())
+                .or_insert_with(|| PendingDns::BarePeers {
+                    configs: Vec::new(),
+                })
+                .push_config(config);
         }
 
-        // Build initial routing table from IP literals
-        let routing = RoutingTable::from_peers(&peers, &peer_txs)
-            .map_err(|err| OrchestratorError::Routing(err.to_string()))?;
-
-        // Sync system routes if enabled
-        if manage_routes {
-            let allowed = collect_allowed_ips(&peers)?;
-            sync_system_routes(&tun_if, &tun_addrs, &allowed).await;
-        }
+        // Start with empty routing table; routes populated as DNS answers arrive
+        let routing = RoutingTable::new();
 
         // Spawn TUN actors
         let tun_rx_handle = tun::spawn_tun_rx(
@@ -254,10 +231,10 @@ impl Orchestrator {
             METRICS_INTERVAL,
         );
 
-        // Spawn BareUDP RX
+        // Spawn BareUDP RX with empty active IPs (updated via commands as DNS answers arrive)
         let bare_rx_handle = spawn_udp_rx(
             bare_rx,
-            active_ips.clone(),
+            HashSet::new(),
             bare_rx_cmd_rx,
             bare_packet_tx,
             events_tx.clone(),
@@ -270,8 +247,10 @@ impl Orchestrator {
 
         let dns_refresh = Duration::from_secs(config.local.dns.refresh);
 
-        // Spawn DNS resolver if there are pending hostnames or refresh is enabled
-        let dns_cmd_tx = if !pending_dns.is_empty() || !dns_refresh.is_zero() {
+        // Spawn DNS resolver when there are peers or refresh is enabled.
+        // The resolver handles both hostnames and IP literals uniformly;
+        // IP literals are detected and answered immediately without network I/O.
+        let dns_cmd_tx = if !peers.is_empty() || !dns_refresh.is_zero() {
             let resolver = DnsResolver::from_config(
                 &config.local.dns,
                 Some(tun_if.clone()),
@@ -437,11 +416,12 @@ impl Orchestrator {
         }
     }
 
-    /// Sends DNS resolve commands for all hostname-based peer endpoints.
+    /// Sends DNS resolve commands for all peer endpoints.
     ///
     /// Re-populates `pending_dns` so that incoming answers trigger the existing
     /// `handle_bare_peer_resolved` path. Existing TX actors for unchanged IPs are
     /// deduplicated by `active_ips` in `spawn_bare_tx_for_peer`.
+    /// IP literals now flow through DNS resolver (emits immediate answer).
     async fn refresh_dns(&mut self) {
         let cmd_tx = match &self.dns_cmd_tx {
             Some(tx) => tx,
@@ -464,11 +444,9 @@ impl Orchestrator {
                 Ok(ep) => ep,
                 Err(_) => continue,
             };
-            if parse_ip_literal(&endpoint.host).is_some() {
-                continue;
-            }
+            // IP literals now flow through DNS resolver (emits immediate answer)
             if !resolved_hosts.insert(endpoint.host.clone()) {
-                continue; // already enqueued this hostname
+                continue; // already enqueued this hostname/IP
             }
 
             // Re-populate pending_dns so existing answer handler processes it.
