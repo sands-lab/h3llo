@@ -1,1 +1,0 @@
-../../../3rdparty/agentize/.claude-plugin/skills/partial-consensus/README.md
