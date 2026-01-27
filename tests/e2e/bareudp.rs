@@ -18,7 +18,7 @@ const TEST_NETWORK: &str = "h3llo-test-net";
 
 /// Test configuration for node A (server role).
 /// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
-/// Short DNS refresh (2s) allows h3llo to handle startup order automatically.
+/// Short DNS refresh (1s) allows h3llo to handle startup order automatically.
 const NODE_A_CONFIG: &str = r#"
 local:
   id: node-a-local
@@ -29,7 +29,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 2
+    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -44,7 +44,7 @@ peers:
 
 /// Test configuration for node B (client role).
 /// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
-/// Short DNS refresh (2s) allows h3llo to handle startup order automatically.
+/// Short DNS refresh (1s) allows h3llo to handle startup order automatically.
 const NODE_B_CONFIG: &str = r#"
 local:
   id: node-b-local
@@ -55,7 +55,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 2
+    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -173,8 +173,8 @@ async fn test_two_node_bareudp_tunnel() {
         .await
         .expect("start node-b");
 
-    // Wait for DNS refresh cycles to resolve both peers (2s interval + buffer)
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // Wait for DNS refresh cycles to resolve both peers (1s interval + buffer)
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Test ping from node A to node B via VPN tunnel (10.0.0.2)
     let mut ping_ab = node_a
@@ -250,7 +250,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 2
+    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -274,7 +274,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 2
+    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -321,8 +321,8 @@ peers:
         .await
         .expect("start node-c");
 
-    // Wait for DNS refresh cycles (2s interval + buffer)
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // Wait for DNS refresh cycles (1s interval + buffer)
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Ping from node C to node A should fail (source IP not allowed)
     // Node C (10.0.0.3) is not in node-a's allowed_ips (only 10.0.0.2)
@@ -364,7 +364,7 @@ async fn test_mtu_boundary_drop() {
     ensure_network_exists();
 
     // Dedicated configs with container names matching the endpoints.
-    // Short DNS refresh (2s) allows h3llo to handle startup order automatically.
+    // Short DNS refresh (1s) allows h3llo to handle startup order automatically.
     let node_a_mtu_config = r#"
 local:
   id: node-a-mtu-local
@@ -375,7 +375,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 2
+    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -398,7 +398,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 2
+    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -447,8 +447,8 @@ peers:
         .await
         .expect("start node-b-mtu");
 
-    // Wait for DNS refresh cycles to resolve both peers (2s interval + buffer)
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // Wait for DNS refresh cycles to resolve both peers (1s interval + buffer)
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Ping with payload fitting within MTU: 1400 - 20 (IP hdr) - 8 (ICMP hdr) = 1372 bytes
     let mut ping_ok = node_a
