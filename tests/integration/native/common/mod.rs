@@ -57,7 +57,8 @@ pub fn get_container_exit_code(container_id: &str) -> Option<i64> {
 /// Locates a compiled test binary in the target directory.
 ///
 /// `cargo test --no-run` places binaries in `target/{profile}/deps/` with
-/// underscores replacing hyphens and a hash suffix.
+/// underscores replacing hyphens and a hash suffix. For musl cross-compilation,
+/// binaries are in `target/x86_64-unknown-linux-musl/{profile}/deps/`.
 ///
 /// # Arguments
 ///
@@ -72,17 +73,25 @@ pub fn find_test_binary(binary_name: &str) -> PathBuf {
 
     let deps_prefix = binary_name.replace('-', "_");
 
-    for profile in ["debug", "release"] {
-        let deps_dir = target_dir.join(profile).join("deps");
-        if let Ok(entries) = std::fs::read_dir(&deps_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with(&deps_prefix)
-                    && !name_str.ends_with(".d")
-                    && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
-                {
-                    return entry.path();
+    // Search musl target directory first, then fall back to default
+    let search_bases = [
+        target_dir.join("x86_64-unknown-linux-musl"),
+        target_dir.clone(),
+    ];
+
+    for base in search_bases {
+        for profile in ["debug", "release"] {
+            let deps_dir = base.join(profile).join("deps");
+            if let Ok(entries) = std::fs::read_dir(&deps_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with(&deps_prefix)
+                        && !name_str.ends_with(".d")
+                        && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+                    {
+                        return entry.path();
+                    }
                 }
             }
         }
@@ -90,6 +99,6 @@ pub fn find_test_binary(binary_name: &str) -> PathBuf {
 
     panic!(
         "Cannot find test binary '{binary_name}'. Build it first with:\n  \
-         cargo test --test {binary_name} --no-run"
+         cargo test --test {binary_name} --target x86_64-unknown-linux-musl --no-run"
     );
 }
