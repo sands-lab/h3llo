@@ -87,6 +87,7 @@ fn create_temp_dir() -> std::path::PathBuf {
 }
 
 /// Creates the test Docker network if it doesn't exist.
+/// Handles race conditions when multiple tests run in parallel.
 fn ensure_network_exists() {
     let check = Command::new("docker")
         .args(["network", "inspect", TEST_NETWORK])
@@ -102,10 +103,12 @@ fn ensure_network_exists() {
         .expect("create network");
 
     if !result.status.success() {
-        panic!(
-            "Failed to create network: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        // Ignore "already exists" error from parallel test execution
+        if stderr.contains("already exists") {
+            return;
+        }
+        panic!("Failed to create network: {}", stderr);
     }
 }
 
