@@ -74,7 +74,7 @@ pub struct LocalDns {
     /// DNS server address as a UDP URI (IPv4/IPv6 literal), e.g., `udp://1.1.1.1:53`.
     #[serde(default = "default_dns_server")]
     pub server: String,
-    /// DNS refresh interval in seconds (`0` disables; minimum 30 when nonzero).
+    /// DNS refresh interval in seconds (`0` disables; minimum 1s, recommended 30s+).
     #[serde(default = "default_dns_refresh")]
     pub refresh: u64,
     /// Optional outbound interface binding for DNS resolution.
@@ -203,9 +203,7 @@ pub enum ValidationError {
     /// `local.h3.admin` requires a listener.
     #[error("local.h3.admin requires local.h3.listen to be set")]
     LocalAdminMissingListener,
-    /// `local.dns.refresh` is too small.
-    #[error("local.dns.refresh must be 0 or at least 30 seconds (got {refresh})")]
-    LocalDnsRefreshTooShort { refresh: u64 },
+    // Note: LocalDnsRefreshTooShort removed - u64 has no values between 0 and 1.
     /// `local.dns.server` is not a valid UDP URI.
     #[error("local.dns.server must be a udp:// URI with an IP literal and port: {reason}")]
     LocalDnsServerInvalid { reason: String },
@@ -326,11 +324,8 @@ impl Config {
             }
         }
 
-        if self.local.dns.refresh != 0 && self.local.dns.refresh < 30 {
-            errors.push(ValidationError::LocalDnsRefreshTooShort {
-                refresh: self.local.dns.refresh,
-            });
-        }
+        // Note: dns.refresh minimum validation is unnecessary for u64 type
+        // since 0 disables and there are no integers between 0 and 1.
 
         if let Err(reason) = parse_dns_server_uri(&self.local.dns.server) {
             errors.push(ValidationError::LocalDnsServerInvalid { reason });
@@ -746,16 +741,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rejects_dns_refresh_too_small() {
-        let mut config = sample_h3_config();
-        config.local.dns.refresh = 10;
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::LocalDnsRefreshTooShort { refresh: 10 }))
-        ));
-    }
+    // Note: dns.refresh minimum validation test removed - for u64 type, there
+    // are no invalid values between 0 (disabled) and 1 (minimum).
 
     #[test]
     fn rejects_invalid_dns_server_uri() {

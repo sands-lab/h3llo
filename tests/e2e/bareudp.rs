@@ -18,6 +18,7 @@ const TEST_NETWORK: &str = "h3llo-test-net";
 
 /// Test configuration for node A (server role).
 /// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
+/// Short DNS refresh (2s) allows h3llo to handle startup order automatically.
 const NODE_A_CONFIG: &str = r#"
 local:
   id: node-a-local
@@ -28,7 +29,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 30
+    refresh: 2
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -43,6 +44,7 @@ peers:
 
 /// Test configuration for node B (client role).
 /// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
+/// Short DNS refresh (2s) allows h3llo to handle startup order automatically.
 const NODE_B_CONFIG: &str = r#"
 local:
   id: node-b-local
@@ -53,7 +55,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 30
+    refresh: 2
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -141,25 +143,8 @@ async fn test_two_node_bareudp_tunnel() {
     std::fs::write(&node_a_config_path, NODE_A_CONFIG).expect("write node-a config");
     std::fs::write(&node_b_config_path, NODE_B_CONFIG).expect("write node-b config");
 
-    // Start node B first so node A can resolve it immediately at startup
-    let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
-        .with_exposed_port(ContainerPort::Udp(5353))
-        .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-b")
-        .with_network(TEST_NETWORK)
-        .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_b_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .start()
-        .await
-        .expect("start node-b");
-
-    // Wait for node-b to register with Docker DNS
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Start node A - it will immediately resolve node-b's hostname
+    // Start both nodes - h3llo handles DNS resolution timing via refresh interval.
+    // No need to control startup order; DNS refresh (2s) ensures eventual resolution.
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
@@ -174,9 +159,22 @@ async fn test_two_node_bareudp_tunnel() {
         .await
         .expect("start node-a");
 
-    // Wait for node-b's DNS refresh to resolve node-a (refresh interval is 30s)
-    // Add buffer for TUN setup and peer registration
-    tokio::time::sleep(Duration::from_secs(35)).await;
+    let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
+        .with_exposed_port(ContainerPort::Udp(5353))
+        .with_wait_for(WaitFor::seconds(2))
+        .with_container_name("node-b")
+        .with_network(TEST_NETWORK)
+        .with_privileged(true)
+        .with_mount(Mount::bind_mount(
+            node_b_config_path.to_str().unwrap(),
+            "/etc/h3llo/config.yaml",
+        ))
+        .start()
+        .await
+        .expect("start node-b");
+
+    // Wait for DNS refresh cycles to resolve both peers (2s interval + buffer)
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     // Test ping from node A to node B via VPN tunnel (10.0.0.2)
     let mut ping_ab = node_a
@@ -252,7 +250,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 30
+    refresh: 2
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -276,7 +274,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 30
+    refresh: 2
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -294,7 +292,7 @@ peers:
     std::fs::write(&node_a_config_path, node_a_config).expect("write node-a config");
     std::fs::write(&node_c_config_path, node_c_config).expect("write node-c config");
 
-    // Start node A first so node C can resolve it
+    // Start both nodes - h3llo handles DNS resolution timing via refresh interval.
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
@@ -309,10 +307,6 @@ peers:
         .await
         .expect("start node-a");
 
-    // Wait for node-a to register with Docker DNS
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Start node C (unauthorized source) - it will resolve node-a immediately
     let node_c = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
@@ -327,8 +321,8 @@ peers:
         .await
         .expect("start node-c");
 
-    // Allow time for TUN setup and DNS resolution
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait for DNS refresh cycles (2s interval + buffer)
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     // Ping from node C to node A should fail (source IP not allowed)
     // Node C (10.0.0.3) is not in node-a's allowed_ips (only 10.0.0.2)
@@ -369,7 +363,8 @@ async fn test_mtu_boundary_drop() {
 
     ensure_network_exists();
 
-    // Dedicated configs with container names matching the endpoints
+    // Dedicated configs with container names matching the endpoints.
+    // Short DNS refresh (2s) allows h3llo to handle startup order automatically.
     let node_a_mtu_config = r#"
 local:
   id: node-a-mtu-local
@@ -380,7 +375,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 30
+    refresh: 2
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -403,7 +398,7 @@ local:
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
-    refresh: 30
+    refresh: 2
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -422,24 +417,8 @@ peers:
     std::fs::write(&node_a_config_path, node_a_mtu_config).expect("write node-a config");
     std::fs::write(&node_b_config_path, node_b_mtu_config).expect("write node-b config");
 
-    // Start node B first so node A can resolve it immediately at startup
-    let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
-        .with_exposed_port(ContainerPort::Udp(5353))
-        .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-b-mtu")
-        .with_network(TEST_NETWORK)
-        .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_b_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .start()
-        .await
-        .expect("start node-b-mtu");
-
-    // Wait for node-b to register with Docker DNS
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
+    // Start both nodes - h3llo handles DNS resolution timing via refresh interval.
+    // No need to control startup order; DNS refresh (2s) ensures eventual resolution.
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
@@ -454,8 +433,22 @@ peers:
         .await
         .expect("start node-a-mtu");
 
-    // Wait for node-b's DNS refresh to resolve node-a (refresh interval is 30s)
-    tokio::time::sleep(Duration::from_secs(35)).await;
+    let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
+        .with_exposed_port(ContainerPort::Udp(5353))
+        .with_wait_for(WaitFor::seconds(2))
+        .with_container_name("node-b-mtu")
+        .with_network(TEST_NETWORK)
+        .with_privileged(true)
+        .with_mount(Mount::bind_mount(
+            node_b_config_path.to_str().unwrap(),
+            "/etc/h3llo/config.yaml",
+        ))
+        .start()
+        .await
+        .expect("start node-b-mtu");
+
+    // Wait for DNS refresh cycles to resolve both peers (2s interval + buffer)
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     // Ping with payload fitting within MTU: 1400 - 20 (IP hdr) - 8 (ICMP hdr) = 1372 bytes
     let mut ping_ok = node_a
