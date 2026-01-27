@@ -30,7 +30,6 @@ tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-
 testcontainers = "0.23"
 tempfile = "3"
 tracing-test = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 route_manager = { version = "0.2.9", features = ["async"] }
