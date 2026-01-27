@@ -14,7 +14,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::warn;
+use tracing::{debug, error, info, warn};
 
 const PACKET_QUEUE_DEPTH: usize = 256;
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
@@ -281,11 +281,11 @@ impl Orchestrator {
                 result = self.join_set.join_next() => {
                     match result {
                         Some(Ok(label)) => {
-                            tracing::error!("task '{}' exited unexpectedly", label);
+                            error!("task '{}' exited unexpectedly", label);
                             return Err(OrchestratorError::TaskExited(label));
                         }
                         Some(Err(err)) => {
-                            tracing::error!("task join failed: {}", err);
+                            error!("task join failed: {}", err);
                             return Err(OrchestratorError::TaskJoin(err.to_string()));
                         }
                         None => return Ok(()),
@@ -294,11 +294,11 @@ impl Orchestrator {
                 result = tokio::signal::ctrl_c() => {
                     match result {
                         Ok(()) => {
-                            tracing::info!("shutdown signal received, stopping...");
+                            info!("shutdown signal received, stopping...");
                             break;
                         }
                         Err(e) => {
-                            tracing::warn!("signal handler error: {e}");
+                            warn!("signal handler error: {e}");
                         }
                     }
                 }
@@ -339,17 +339,16 @@ impl Orchestrator {
                         }
                     }
                 } else {
-                    tracing::debug!(
+                    debug!(
                         "dns event from {}: {:?}",
-                        dns_event.server,
-                        dns_event.detail
+                        dns_event.server, dns_event.detail
                     );
                 }
             }
             Event::Transport(TransportEvent::Metrics(metrics)) => {
                 let labels = &metrics.labels;
                 let stats = &metrics.stats;
-                tracing::debug!(
+                debug!(
                     "{:?} {:?} {}: {} pkts/{} bytes ok, {} pkts/{} bytes dropped",
                     labels.kind,
                     labels.direction,
@@ -362,18 +361,16 @@ impl Orchestrator {
                 if stats.dropped.packets > 0 {
                     for (reason, counters) in &stats.drop_reasons {
                         if counters.packets > 0 {
-                            tracing::debug!(
+                            debug!(
                                 "  drop reason {:?}: {} pkts/{} bytes",
-                                reason,
-                                counters.packets,
-                                counters.bytes
+                                reason, counters.packets, counters.bytes
                             );
                         }
                     }
                 }
             }
             Event::Other(msg) => {
-                tracing::debug!("other event: {}", msg);
+                debug!("other event: {}", msg);
             }
         }
     }

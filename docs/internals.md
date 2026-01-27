@@ -198,3 +198,14 @@ Observability summary: interface loops emit cumulative metrics (packets/bytes, d
 - Metric shape: every emit carries labels `{kind: Tun|BareUdp|Http3, direction: Rx|Tx, peer_id?: string, ip_addr?: IP}` plus total succeeded and dropped counters and a drop-reason map keyed by `DropReason` (e.g., `Oversize`, `DisallowedSource`, `SendError`, `ChannelClosed`).
 - Drop accounting: TUN TX counts oversize and send failures; TUN RX counts channel-closed drops when forwarding to the writer queue fails; BareUDP RX counts disallowed sources; BareUDP TX counts send failures. All counters saturate to avoid panics.
 - Reporting: only the orchestrator prints periodic drop summaries (when counters change); transport loops stay silent, including oversized TUN drops.
+
+### Logging and Warning Handling
+
+Logging summary: h3llo uses the `tracing` crate for structured logging. Warnings are logged directly at origin points rather than propagated through return values.
+
+Warning handling design principles:
+- **Log at origin**: Modules log warnings directly via `warn!` at the point where the condition is detected, using structured fields for context (e.g., `warn!(prefix = %net, error = %err, "route add failed")`).
+- **No warning enums for logging**: Warning enums like `BindWarning` and `RouteSyncWarning` have been removed in favor of direct logging. This simplifies function signatures and eliminates boilerplate warning propagation code.
+- **Preserved semantic warnings**: `DnsAnswerWarning` is retained because it serves a control-flow purpose—the orchestrator checks for `NxDomain` to decide whether to remove a pending DNS entry. This is distinct from pure logging concerns.
+- **Structured fields**: Warning logs include structured fields (`prefix`, `interface`, `error`, etc.) to enable filtering and analysis in log aggregation systems.
+- **Test assertions**: Tests use `tracing-test` with `#[traced_test]` and `logs_contain()` to verify that expected warnings are logged.
