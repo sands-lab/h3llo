@@ -71,6 +71,19 @@ fn ensure_image_exists() -> bool {
     }
 }
 
+/// Gets the exit code of a container by ID.
+fn get_container_exit_code(container_id: &str) -> Option<i64> {
+    let output = Command::new("docker")
+        .args(["inspect", "-f", "{{.State.ExitCode}}", container_id])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    } else {
+        None
+    }
+}
+
 /// Runs the route integration test binary inside a privileged Docker container.
 ///
 /// The container binary exercises `sync_tun_routes` with real `RouteManagerHandle`
@@ -88,15 +101,23 @@ async fn route_container_integration() {
     let binary_path = find_test_binary();
     eprintln!("Using test binary: {}", binary_path.display());
 
+    // Wait for container to exit without checking exit code - allows us to get logs first
     let container = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_entrypoint(CONTAINER_BINARY_PATH)
-        .with_wait_for(WaitFor::Exit(ExitWaitStrategy::new().with_exit_code(0)))
+        .with_wait_for(WaitFor::Exit(ExitWaitStrategy::new()))
         .with_privileged(true)
         .with_copy_to(CONTAINER_BINARY_PATH, binary_path)
         .start()
         .await
-        .expect("container should start and exit successfully");
+        .expect("container should start");
 
+    // Get container output before checking exit code
     let stderr = container.stderr_to_vec().await.unwrap_or_default();
     eprintln!("Container output:\n{}", String::from_utf8_lossy(&stderr));
+
+    // Check exit code
+    let exit_code = get_container_exit_code(container.id());
+    if exit_code != Some(0) {
+        panic!("container should exit with code 0, got: {:?}", exit_code);
+    }
 }
