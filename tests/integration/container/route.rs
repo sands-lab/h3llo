@@ -7,9 +7,7 @@
 //! Exit code 0 = all checks passed, 1 = failure.
 
 use h3llo::bind::lookup_ifindex;
-use h3llo::route::{
-    ipnet_from_route, sync_tun_routes, Route, RouteHandle, RouteManagerHandle, RouteSyncWarning,
-};
+use h3llo::route::{ipnet_from_route, sync_tun_routes, Route, RouteHandle, RouteManagerHandle};
 use ipnet::IpNet;
 use std::process::Command;
 
@@ -66,12 +64,9 @@ async fn check_basic() -> Result<(), String> {
     let mut handle =
         RouteManagerHandle::new().map_err(|e| format!("basic: RouteManagerHandle::new: {e}"))?;
 
-    let warnings = sync_tun_routes("dummy0", &tun_addrs, &allowed, &mut handle)
+    sync_tun_routes("dummy0", &tun_addrs, &allowed, &mut handle)
         .await
         .map_err(|e| format!("basic: sync_tun_routes: {e}"))?;
-    for w in &warnings {
-        eprintln!("  basic sync warning: {w:?}");
-    }
 
     // Self-verify: list routes and check expected prefixes are present on dummy0
     let installed = routes_on_interface(&mut handle, "dummy0").await?;
@@ -85,12 +80,10 @@ async fn check_basic() -> Result<(), String> {
     eprintln!("  check_basic: verified {allowed:?} installed on dummy0");
 
     // Verify cleanup: sync with empty allowed, confirm routes removed
-    let warnings = sync_tun_routes("dummy0", &tun_addrs, &[], &mut handle)
+    sync_tun_routes("dummy0", &tun_addrs, &[], &mut handle)
         .await
         .map_err(|e| format!("basic cleanup: sync_tun_routes: {e}"))?;
-    for w in &warnings {
-        eprintln!("  basic cleanup warning: {w:?}");
-    }
+
     let remaining = routes_on_interface(&mut handle, "dummy0").await?;
     for prefix in &allowed {
         if remaining.contains(prefix) {
@@ -113,22 +106,11 @@ async fn check_default_split() -> Result<(), String> {
     let mut handle = RouteManagerHandle::new()
         .map_err(|e| format!("default_split: RouteManagerHandle::new: {e}"))?;
 
-    let warnings = sync_tun_routes("dummy1", &tun_addrs, &allowed, &mut handle)
+    sync_tun_routes("dummy1", &tun_addrs, &allowed, &mut handle)
         .await
         .map_err(|e| format!("default_split: sync_tun_routes: {e}"))?;
 
-    // Expect DefaultRouteSplit warning
-    let has_split_warning = warnings
-        .iter()
-        .any(|w| matches!(w, RouteSyncWarning::DefaultRouteSplit { .. }));
-    if !has_split_warning {
-        return Err(format!(
-            "default_split: expected DefaultRouteSplit warning, got: {warnings:?}"
-        ));
-    }
-    eprintln!("  check_default_split: verified DefaultRouteSplit warning emitted");
-
-    // Self-verify: both /1 halves should be installed
+    // Self-verify: both /1 halves should be installed (default route is split)
     let installed = routes_on_interface(&mut handle, "dummy1").await?;
     let lower_half: IpNet = "0.0.0.0/1".parse().unwrap();
     let upper_half: IpNet = "128.0.0.0/1".parse().unwrap();

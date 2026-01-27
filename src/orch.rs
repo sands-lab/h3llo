@@ -5,7 +5,7 @@ use crate::bind::DefaultRouteProbe;
 use crate::config::{parse_udp_uri, Config, Peer, UdpEndpoint};
 use crate::dns::{DnsCommand, DnsResolver};
 use crate::events::{DnsEventDetail, Event, TransportEvent};
-use crate::route::{sync_tun_routes, RouteManagerHandle, RouteSyncWarning};
+use crate::route::{sync_tun_routes, RouteManagerHandle};
 use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
@@ -559,14 +559,11 @@ async fn spawn_bare_tx_for_peer(
 /// Performs system route synchronization, logging warnings on failure.
 async fn sync_system_routes(tun_if: &str, tun_addrs: &[IpNet], allowed: &[IpNet]) {
     match RouteManagerHandle::new() {
-        Ok(mut handle) => match sync_tun_routes(tun_if, tun_addrs, allowed, &mut handle).await {
-            Ok(warnings) => {
-                for warning in warnings {
-                    log_route_warning(&warning);
-                }
+        Ok(mut handle) => {
+            if let Err(err) = sync_tun_routes(tun_if, tun_addrs, allowed, &mut handle).await {
+                warn!("route sync failed: {err}");
             }
-            Err(err) => warn!("route sync failed: {err}"),
-        },
+        }
         Err(err) => warn!("route manager unavailable: {err}"),
     }
 }
@@ -682,35 +679,6 @@ fn populate_and_resolve_dns(
     }
 
     Ok(())
-}
-
-fn log_route_warning(warning: &RouteSyncWarning) {
-    match warning {
-        RouteSyncWarning::AddFailed { prefix, error } => {
-            warn!("route add failed for {}: {}", prefix, error);
-        }
-        RouteSyncWarning::DeleteFailed { prefix, error } => {
-            warn!("route delete failed for {}: {}", prefix, error);
-        }
-        RouteSyncWarning::DefaultRouteSplit { prefix } => {
-            warn!("default route {} split into two /1 prefixes", prefix);
-        }
-        RouteSyncWarning::Conflict {
-            prefix,
-            existing_ifindex,
-        } => {
-            warn!(
-                "route conflict for {} (existing ifindex {})",
-                prefix, existing_ifindex
-            );
-        }
-        RouteSyncWarning::UnsupportedRoute { reason } => {
-            warn!("unsupported route skipped: {}", reason);
-        }
-        RouteSyncWarning::MissingIfIndex { prefix } => {
-            warn!("route missing ifindex skipped: {}", prefix);
-        }
-    }
 }
 
 async fn wrap_task(label: impl Into<String>, handle: JoinHandle<()>) -> String {

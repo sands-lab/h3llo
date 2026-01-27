@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
 use thiserror::Error;
+use tracing::warn;
 
 /// Resolves interface indexes from names.
 pub trait IfIndexResolver {
@@ -66,28 +67,6 @@ impl RouteHandle for RouteManagerHandle {
     }
 }
 
-/// Details about sync issues that do not halt execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RouteSyncWarning {
-    /// Adding a route failed.
-    AddFailed { prefix: IpNet, error: String },
-    /// Removing a stale route failed.
-    DeleteFailed { prefix: IpNet, error: String },
-    /// A default route was split into two /1 prefixes.
-    DefaultRouteSplit { prefix: IpNet },
-    /// A conflicting route already exists on another interface.
-    Conflict {
-        /// Conflicted prefix.
-        prefix: IpNet,
-        /// Interface index that already owns the prefix.
-        existing_ifindex: u32,
-    },
-    /// A route entry could not be interpreted and was skipped.
-    UnsupportedRoute { reason: String },
-    /// A route without interface index was encountered and skipped.
-    MissingIfIndex { prefix: IpNet },
-}
-
 /// Fatal errors returned by route sync.
 #[derive(Debug, Error)]
 pub enum RouteSyncError {
@@ -112,15 +91,15 @@ pub enum RouteSyncError {
 ///     - default routes (`0.0.0.0/0` / `::/0`) are expanded into two /1 prefixes,
 ///   * plus the exact prefixes listed in `tun_addrs` (these are preserved but never added).
 /// - Any other route currently on the TUN interface is considered stale and will be deleted.
-/// - For every prefix we add that is already present on another interface, a `Conflict`
-///   warning is emitted, but the add is still attempted.
-/// - Failures when adding or deleting are surfaced as `AddFailed` / `DeleteFailed` warnings.
+/// - For every prefix we add that is already present on another interface, a conflict
+///   warning is logged, but the add is still attempted.
+/// - Failures when adding or deleting are logged as warnings.
 pub async fn sync_tun_routes<H: RouteHandle>(
     tun_if: &str,
     tun_addrs: &[IpNet],
     allowed: &[IpNet],
     handle: &mut H,
-) -> Result<Vec<RouteSyncWarning>, RouteSyncError> {
+) -> Result<(), RouteSyncError> {
     let resolver = PlatformIfIndexResolver;
     sync_tun_routes_with_resolver(tun_if, tun_addrs, allowed, handle, &resolver).await
 }
@@ -132,18 +111,17 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
     allowed: &[IpNet],
     handle: &mut H,
     resolver: &R,
-) -> Result<Vec<RouteSyncWarning>, RouteSyncError> {
+) -> Result<(), RouteSyncError> {
     let tun_ifindex = resolver.resolve(tun_if)?;
     let routes = handle
         .list()
         .await
         .map_err(|err| RouteSyncError::ListFailed(err.to_string()))?;
 
-    let mut warnings = Vec::new();
-    // Expand allowed prefixes, splitting default routes once into two /1 prefixes and warning.
+    // Expand allowed prefixes, splitting default routes once into two /1 prefixes.
     //
     // These are the prefixes we *want to route through the TUN*.
-    let desired_routes: HashSet<IpNet> = expand_allowed_prefixes(allowed, &mut warnings);
+    let desired_routes: HashSet<IpNet> = expand_allowed_prefixes(allowed);
 
     // Prefixes that must exist on the TUN interface when we are done:
     // - desired_routes (from allowed + default split),
@@ -162,9 +140,10 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
         let net = match ipnet_from_route(route) {
             Some(net) => net,
             None => {
-                warnings.push(RouteSyncWarning::UnsupportedRoute {
-                    reason: "unsupported address family or invalid prefix".to_string(),
-                });
+                warn!(
+                    reason = "unsupported address family or invalid prefix",
+                    "route skipped: unsupported"
+                );
                 continue;
             }
         };
@@ -175,10 +154,7 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
                 if desired_routes.contains(&net) || tun_addr_set.contains(&net) {
                     existing_tun.insert(net);
                 } else if let Err(err) = handle.delete(route).await {
-                    warnings.push(RouteSyncWarning::DeleteFailed {
-                        prefix: net,
-                        error: err.to_string(),
-                    });
+                    warn!(prefix = %net, error = %err, "route delete failed");
                 }
             }
             Some(idx) => {
@@ -187,7 +163,7 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
             }
             None => {
                 // Route without ifindex: we cannot attribute it reliably; ignore.
-                warnings.push(RouteSyncWarning::MissingIfIndex { prefix: net });
+                warn!(prefix = %net, "route missing ifindex, skipped");
             }
         }
     }
@@ -203,10 +179,7 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
         }
 
         if let Some(&ifindex) = conflicts.get(&net) {
-            warnings.push(RouteSyncWarning::Conflict {
-                prefix: net,
-                existing_ifindex: ifindex,
-            });
+            warn!(prefix = %net, existing_ifindex = ifindex, "route conflict with existing interface");
         }
 
         let route = Route::new(net.addr(), net.prefix_len()).with_if_index(tun_ifindex);
@@ -214,14 +187,13 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
             Ok(_) => {
                 existing_tun.insert(net);
             }
-            Err(err) => warnings.push(RouteSyncWarning::AddFailed {
-                prefix: net,
-                error: err.to_string(),
-            }),
+            Err(err) => {
+                warn!(prefix = %net, error = %err, "route add failed");
+            }
         }
     }
 
-    Ok(warnings)
+    Ok(())
 }
 
 /// Builds the set of desired prefixes, expanding default routes into two /1 prefixes.
@@ -229,16 +201,13 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
 /// - Non-default prefixes are preserved as-is.
 /// - `0.0.0.0/0` is expanded into `0.0.0.0/1` and `128.0.0.0/1`.
 /// - `::/0` is expanded into `::/1` and `8000::/1`.
-/// - Default routes emit a `DefaultRouteSplit` warning.
-fn expand_allowed_prefixes(
-    allowed: &[IpNet],
-    warnings: &mut Vec<RouteSyncWarning>,
-) -> HashSet<IpNet> {
+/// - Default routes emit a warning when split.
+fn expand_allowed_prefixes(allowed: &[IpNet]) -> HashSet<IpNet> {
     let mut result = HashSet::new();
 
     for &net in allowed {
         if is_default_prefix(&net) {
-            warnings.push(RouteSyncWarning::DefaultRouteSplit { prefix: net });
+            warn!(prefix = %net, "default route split into two /1 prefixes");
             if let Some(children) = split_default_prefix(&net) {
                 result.insert(children[0]);
                 result.insert(children[1]);
@@ -302,6 +271,7 @@ pub fn ipnet_from_route(route: &Route) -> Option<IpNet> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tracing_test::traced_test;
 
     /// Builds a route for tests.
     fn route(prefix: &str, ifindex: Option<u32>) -> Route {
@@ -398,6 +368,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     /// Adds missing routes while skipping already present TUN prefixes.
     async fn adds_missing_routes_and_skips_existing() {
         let resolver = FakeResolver { idx: 7 };
@@ -408,15 +379,16 @@ mod tests {
         ];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        let warnings =
-            sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-                .await
-                .unwrap();
-        assert!(warnings.is_empty());
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
         assert_eq!(handle.ops(), vec!["add 10.0.1.0/24"]);
+        // No warnings expected for normal operation
+        assert!(!logs_contain("route"));
     }
 
     #[tokio::test]
+    #[traced_test]
     /// Deletes TUN routes that are not part of the desired set.
     async fn deletes_stale_tun_routes() {
         let resolver = FakeResolver { idx: 9 };
@@ -425,16 +397,17 @@ mod tests {
         let allowed: Vec<IpNet> = vec![];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        let warnings =
-            sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-                .await
-                .unwrap();
-        assert!(warnings.is_empty());
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
         assert_eq!(handle.ops(), vec!["del 10.5.0.0/16"]);
         assert!(handle.routes.lock().unwrap().is_empty());
+        // No warnings expected for normal operation
+        assert!(!logs_contain("route"));
     }
 
     #[tokio::test]
+    #[traced_test]
     /// Warns on conflicts but still installs the requested prefix.
     async fn warns_on_conflict_and_installs_route() {
         let resolver = FakeResolver { idx: 3 };
@@ -442,21 +415,17 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["192.168.0.0/24".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        let warnings =
-            sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-                .await
-                .unwrap();
-        assert_eq!(
-            warnings,
-            vec![RouteSyncWarning::Conflict {
-                prefix: "192.168.0.0/24".parse().unwrap(),
-                existing_ifindex: 2
-            }]
-        );
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
         assert_eq!(handle.ops(), vec!["add 192.168.0.0/24"]);
+        assert!(logs_contain("route conflict"));
+        assert!(logs_contain("192.168.0.0/24"));
+        assert!(logs_contain("existing_ifindex=2"));
     }
 
     #[tokio::test]
+    #[traced_test]
     /// Warns when a route lacks an interface index but still installs the prefix.
     async fn warns_on_missing_ifindex_and_installs_route() {
         let resolver = FakeResolver { idx: 10 };
@@ -464,46 +433,38 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["10.0.0.0/24".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        let warnings =
-            sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-                .await
-                .unwrap();
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
 
-        assert_eq!(
-            warnings,
-            vec![RouteSyncWarning::MissingIfIndex {
-                prefix: "10.0.0.0/24".parse().unwrap()
-            }]
-        );
         assert_eq!(handle.ops(), vec!["add 10.0.0.0/24"]);
+        assert!(logs_contain("route missing ifindex"));
+        assert!(logs_contain("10.0.0.0/24"));
     }
 
     #[tokio::test]
-    /// Splits default routes once and adds both halves when missing, without warnings.
+    #[traced_test]
+    /// Splits default routes once and adds both halves when missing.
     async fn splits_default_route_once() {
         let resolver = FakeResolver { idx: 5 };
         let mut handle = FakeHandle::new(Vec::new());
         let allowed: Vec<IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        let warnings =
-            sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-                .await
-                .unwrap();
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
 
-        assert_eq!(
-            warnings,
-            vec![RouteSyncWarning::DefaultRouteSplit {
-                prefix: "0.0.0.0/0".parse().unwrap()
-            }]
-        );
         let ops = handle.ops();
         assert_eq!(ops.len(), 2);
         assert!(ops.contains(&"add 0.0.0.0/1".to_string()));
         assert!(ops.contains(&"add 128.0.0.0/1".to_string()));
+        assert!(logs_contain("default route split"));
+        assert!(logs_contain("0.0.0.0/0"));
     }
 
     #[tokio::test]
+    #[traced_test]
     /// If both default halves already exist, they are not re-added.
     async fn skips_existing_default_halves() {
         let resolver = FakeResolver { idx: 5 };
@@ -514,21 +475,17 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        let warnings =
-            sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-                .await
-                .unwrap();
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
 
-        assert_eq!(
-            warnings,
-            vec![RouteSyncWarning::DefaultRouteSplit {
-                prefix: "0.0.0.0/0".parse().unwrap()
-            }]
-        );
         assert!(handle.ops().is_empty());
+        // Default route split warning is still emitted during expansion
+        assert!(logs_contain("default route split"));
     }
 
     #[tokio::test]
+    #[traced_test]
     /// Warns when default halves conflict with other interfaces.
     async fn warns_when_default_halves_conflict() {
         let resolver = FakeResolver { idx: 8 };
@@ -539,31 +496,23 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        let warnings =
-            sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-                .await
-                .unwrap();
-
-        assert_eq!(warnings.len(), 3);
-        assert!(warnings.contains(&RouteSyncWarning::DefaultRouteSplit {
-            prefix: "0.0.0.0/0".parse().unwrap()
-        }));
-        assert!(warnings.contains(&RouteSyncWarning::Conflict {
-            prefix: "0.0.0.0/1".parse().unwrap(),
-            existing_ifindex: 2
-        }));
-        assert!(warnings.contains(&RouteSyncWarning::Conflict {
-            prefix: "128.0.0.0/1".parse().unwrap(),
-            existing_ifindex: 7
-        }));
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
 
         let ops = handle.ops();
         assert_eq!(ops.len(), 2);
         assert!(ops.contains(&"add 0.0.0.0/1".to_string()));
         assert!(ops.contains(&"add 128.0.0.0/1".to_string()));
+        // Verify all expected warnings
+        assert!(logs_contain("default route split"));
+        assert!(logs_contain("route conflict"));
+        assert!(logs_contain("0.0.0.0/1"));
+        assert!(logs_contain("128.0.0.0/1"));
     }
 
     #[tokio::test]
+    #[traced_test]
     /// Warns when a conflicting host prefix cannot be split.
     async fn warns_when_conflict_cannot_be_split() {
         let resolver = FakeResolver { idx: 4 };
@@ -571,22 +520,17 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["10.0.0.1/32".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        let warnings =
-            sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-                .await
-                .unwrap();
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
 
-        assert_eq!(
-            warnings,
-            vec![RouteSyncWarning::Conflict {
-                prefix: "10.0.0.1/32".parse().unwrap(),
-                existing_ifindex: 2
-            }]
-        );
         assert_eq!(handle.ops(), vec!["add 10.0.0.1/32"]);
+        assert!(logs_contain("route conflict"));
+        assert!(logs_contain("10.0.0.1/32"));
     }
 
     #[tokio::test]
+    #[traced_test]
     /// Warns on IPv6 conflicts without splitting non-default prefixes.
     async fn warns_on_ipv6_conflicts() {
         let resolver = FakeResolver { idx: 12 };
@@ -594,44 +538,33 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["2001:db8::/64".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        let warnings =
-            sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-                .await
-                .unwrap();
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
 
-        assert_eq!(
-            warnings,
-            vec![RouteSyncWarning::Conflict {
-                prefix: "2001:db8::/64".parse().unwrap(),
-                existing_ifindex: 6
-            }]
-        );
         assert_eq!(handle.ops(), vec!["add 2001:db8::/64"]);
+        assert!(logs_contain("route conflict"));
+        assert!(logs_contain("2001:db8::/64"));
     }
 
     #[tokio::test]
-    /// Surfaces add/delete failures as warnings while logging attempted operations.
-    async fn surfaces_add_and_delete_failures_as_warnings() {
+    #[traced_test]
+    /// Logs add/delete failures while logging attempted operations.
+    async fn logs_add_and_delete_failures() {
         let resolver = FakeResolver { idx: 11 };
         let stale = route("10.9.0.0/16", Some(11));
         let allowed: Vec<IpNet> = vec!["10.8.0.0/16".parse().unwrap()];
         let mut handle = FakeHandle::with_failures(vec![stale.clone()], true, true);
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        let warnings =
-            sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-                .await
-                .unwrap();
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
 
-        assert_eq!(warnings.len(), 2);
-        assert!(matches!(
-            warnings[0],
-            RouteSyncWarning::DeleteFailed { prefix, .. } if prefix == "10.9.0.0/16".parse::<IpNet>().unwrap()
-        ));
-        assert!(matches!(
-            warnings[1],
-            RouteSyncWarning::AddFailed { prefix, .. } if prefix == "10.8.0.0/16".parse::<IpNet>().unwrap()
-        ));
         assert_eq!(handle.ops(), vec!["del 10.9.0.0/16", "add 10.8.0.0/16"]);
+        assert!(logs_contain("route delete failed"));
+        assert!(logs_contain("10.9.0.0/16"));
+        assert!(logs_contain("route add failed"));
+        assert!(logs_contain("10.8.0.0/16"));
     }
 }
