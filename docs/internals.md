@@ -156,7 +156,7 @@ Orchestrator DNS handling:
 - **Single event loop**: The orchestrator runs one unified event loop that handles all events including DNS answers. There is no separate initialization event loop.
 - **Listen hostname**: If the listen address is a hostname (not IP literal), perform synchronous DNS lookup before starting the event loop. This ensures BareUDP RX and TUN TX are created immediately.
 - **Unified peer resolution**: All peer endpoints (both IP literals and hostnames) flow through the DNS resolver via `DnsCommand::Resolve`. The resolver detects IP literals and emits immediate `DnsAnswer` events without network I/O. This unifies the code path and simplifies the orchestrator's initialization and refresh logic.
-- **Minimal DNS state**: Use a `PendingDns` enum that maps hostname/IP to pending operation type. The `populate_and_resolve_dns()` helper function populates `pending_dns` and sends resolve commands, used by both `new()` (with deferred command sending) and `refresh_dns()` (with immediate command sending).
+- **Minimal DNS state**: Use a `PendingDns` enum that maps hostname/IP to pending operation type. The `populate_and_resolve_dns()` helper populates `pending_dns` and sends resolve commands atomically. In `new()`, the resolver is spawned first following the actor pattern (create receiver before sending messages), then `populate_and_resolve_dns()` is called.
 - **First IP wins**: For peer endpoints, use the first resolved IP for outbound traffic. All resolved IPs are added to the allowed source filter.
 
 Spawn an actor for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx actor; BareUDP owns one listener socket for RX and a separate TX-only socket per BareUDP peer.
