@@ -33,9 +33,20 @@ pub async fn bind_socket<P: RouteProbe>(
     tun_if: Option<&str>,
     probe: &P,
 ) -> Result<(UdpSocket, Vec<BindWarning>), UdpError> {
-    // Probe using the remote server IP to avoid recursive routing; pick the first match and warn on ambiguity.
-    let (selected_interface, mut warnings) =
-        select_bind_interface(target, tun_if, bind_interface, probe).await;
+    // Skip interface binding for localhost addresses (127.x.x.x, ::1).
+    // Docker DNS (127.0.0.11) and other localhost services may not work
+    // correctly when the socket is bound to a specific interface like 'lo'.
+    let is_localhost = match target {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    };
+
+    let (selected_interface, mut warnings) = if is_localhost {
+        (None, Vec::new())
+    } else {
+        // Probe using the remote server IP to avoid recursive routing; pick the first match and warn on ambiguity.
+        select_bind_interface(target, tun_if, bind_interface, probe).await
+    };
 
     let (socket, mut bind_warnings) = bind_udp_socket(listen, selected_interface.as_deref())
         .map_err(|e| UdpError::Socket(e.to_string()))?;

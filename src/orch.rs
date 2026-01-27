@@ -317,11 +317,23 @@ impl Orchestrator {
                         warn!("dns warning for {}: {:?}", answer.host, warning);
                     }
 
-                    if let Some(pending) = self.pending_dns.remove(&answer.host) {
-                        match pending {
-                            PendingDns::BarePeers { configs } => {
-                                for config in configs {
-                                    self.handle_bare_peer_resolved(&answer, config).await;
+                    // Only process and remove pending when we have actual records.
+                    // DNS resolver sends both A and AAAA queries; if AAAA returns empty
+                    // first, we must keep pending alive to receive the A response.
+                    // NxDomain warnings indicate definitive failure, so also remove then.
+                    let has_records = !answer.records.is_empty();
+                    let has_nxdomain = answer
+                        .warnings
+                        .iter()
+                        .any(|w| matches!(w, crate::events::DnsAnswerWarning::NxDomain));
+
+                    if has_records || has_nxdomain {
+                        if let Some(pending) = self.pending_dns.remove(&answer.host) {
+                            match pending {
+                                PendingDns::BarePeers { configs } => {
+                                    for config in configs {
+                                        self.handle_bare_peer_resolved(&answer, config).await;
+                                    }
                                 }
                             }
                         }
@@ -824,8 +836,9 @@ mod tests {
     use super::*;
     use crate::config::{PeerBare, PeerTun};
     use crate::events::{
-        Direction, DnsAnswer, DnsAnswerRecord, DnsEvent, DnsEventDetail, DnsRecordType,
-        TransportEvent, TransportKind, TransportLabels, TransportMetrics, TransportStats,
+        Direction, DnsAnswer, DnsAnswerRecord, DnsAnswerWarning, DnsEvent, DnsEventDetail,
+        DnsRecordType, TransportEvent, TransportKind, TransportLabels, TransportMetrics,
+        TransportStats,
     };
 
     /// Helper to create test peers with BareUDP configuration.
@@ -1198,7 +1211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_event_removes_pending_dns_on_answer() {
+    async fn handle_event_removes_pending_dns_on_answer_with_records() {
         let peer = bare_peer("peer1", &["10.0.0.0/24"]);
         let pending = PendingDns::BarePeers {
             configs: vec![BarePeerConfig {
@@ -1216,19 +1229,93 @@ mod tests {
 
         assert!(orch.pending_dns.contains_key("example.com"));
 
-        // DNS answer with empty records (will trigger warning path but still remove pending)
+        // DNS answer with records should remove pending entry
         let answer = Event::Dns(DnsEvent {
             server: "127.0.0.1:53".parse().unwrap(),
             detail: DnsEventDetail::Answer(DnsAnswer {
                 host: "example.com".to_string(),
                 record_type: DnsRecordType::A,
-                records: vec![],
+                records: vec![DnsAnswerRecord {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+                    ttl: 60,
+                }],
                 warnings: vec![],
             }),
         });
         orch.handle_event(answer).await;
 
         // Pending DNS entry should be removed after processing
+        assert!(!orch.pending_dns.contains_key("example.com"));
+    }
+
+    #[tokio::test]
+    async fn handle_event_keeps_pending_dns_on_empty_answer() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let pending = PendingDns::BarePeers {
+            configs: vec![BarePeerConfig {
+                peer_id: "peer1".to_string(),
+                port: 5353,
+                bindif: None,
+                peer: peer.clone(),
+            }],
+        };
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_pending_dns("example.com", pending)
+            .build();
+
+        assert!(orch.pending_dns.contains_key("example.com"));
+
+        // DNS answer with empty records (e.g., AAAA when no IPv6) should keep pending
+        // to allow subsequent A record answer to succeed
+        let answer = Event::Dns(DnsEvent {
+            server: "127.0.0.1:53".parse().unwrap(),
+            detail: DnsEventDetail::Answer(DnsAnswer {
+                host: "example.com".to_string(),
+                record_type: DnsRecordType::Aaaa,
+                records: vec![],
+                warnings: vec![],
+            }),
+        });
+        orch.handle_event(answer).await;
+
+        // Pending DNS entry should still exist (waiting for A record)
+        assert!(orch.pending_dns.contains_key("example.com"));
+    }
+
+    #[tokio::test]
+    async fn handle_event_removes_pending_dns_on_nxdomain() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
+        let pending = PendingDns::BarePeers {
+            configs: vec![BarePeerConfig {
+                peer_id: "peer1".to_string(),
+                port: 5353,
+                bindif: None,
+                peer: peer.clone(),
+            }],
+        };
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_pending_dns("example.com", pending)
+            .build();
+
+        assert!(orch.pending_dns.contains_key("example.com"));
+
+        // DNS answer with NxDomain warning should remove pending (definitive failure)
+        let answer = Event::Dns(DnsEvent {
+            server: "127.0.0.1:53".parse().unwrap(),
+            detail: DnsEventDetail::Answer(DnsAnswer {
+                host: "example.com".to_string(),
+                record_type: DnsRecordType::A,
+                records: vec![],
+                warnings: vec![DnsAnswerWarning::NxDomain],
+            }),
+        });
+        orch.handle_event(answer).await;
+
+        // Pending DNS entry should be removed on NxDomain
         assert!(!orch.pending_dns.contains_key("example.com"));
     }
 

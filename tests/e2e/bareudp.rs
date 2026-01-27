@@ -17,7 +17,7 @@ const TEST_TAG: &str = "test";
 const TEST_NETWORK: &str = "h3llo-test-net";
 
 /// Test configuration for node A (server role).
-/// Uses container hostname "node-b" for peer endpoint (resolved via Docker DNS).
+/// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
 const NODE_A_CONFIG: &str = r#"
 local:
   id: node-a-local
@@ -35,14 +35,14 @@ peers:
   - id: node-b
     enabled: true
     bare:
-      endpoint: "udp://node-b:5353"
+      endpoint: "udp://node-b.h3llo-test-net:5353"
     tun:
       allowedIPs:
         - 10.0.0.2/32
 "#;
 
 /// Test configuration for node B (client role).
-/// Uses container hostname "node-a" for peer endpoint (resolved via Docker DNS).
+/// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
 const NODE_B_CONFIG: &str = r#"
 local:
   id: node-b-local
@@ -60,7 +60,7 @@ peers:
   - id: node-a
     enabled: true
     bare:
-      endpoint: "udp://node-a:5353"
+      endpoint: "udp://node-a.h3llo-test-net:5353"
     tun:
       allowedIPs:
         - 10.0.0.1/32
@@ -138,22 +138,7 @@ async fn test_two_node_bareudp_tunnel() {
     std::fs::write(&node_a_config_path, NODE_A_CONFIG).expect("write node-a config");
     std::fs::write(&node_b_config_path, NODE_B_CONFIG).expect("write node-b config");
 
-    // Start node A with container name for DNS resolution
-    let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
-        .with_exposed_port(ContainerPort::Udp(5353))
-        .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-a")
-        .with_network(TEST_NETWORK)
-        .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_a_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .start()
-        .await
-        .expect("start node-a");
-
-    // Start node B with container name for DNS resolution
+    // Start node B first so node A can resolve it immediately at startup
     let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
@@ -168,8 +153,27 @@ async fn test_two_node_bareudp_tunnel() {
         .await
         .expect("start node-b");
 
-    // Allow time for TUN setup, DNS resolution, and peer registration
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait for node-b to register with Docker DNS
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Start node A - it will immediately resolve node-b's hostname
+    let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
+        .with_exposed_port(ContainerPort::Udp(5353))
+        .with_wait_for(WaitFor::seconds(2))
+        .with_container_name("node-a")
+        .with_network(TEST_NETWORK)
+        .with_privileged(true)
+        .with_mount(Mount::bind_mount(
+            node_a_config_path.to_str().unwrap(),
+            "/etc/h3llo/config.yaml",
+        ))
+        .start()
+        .await
+        .expect("start node-a");
+
+    // Wait for node-b's DNS refresh to resolve node-a (refresh interval is 30s)
+    // Add buffer for TUN setup and peer registration
+    tokio::time::sleep(Duration::from_secs(35)).await;
 
     // Test ping from node A to node B via VPN tunnel (10.0.0.2)
     let mut ping_ab = node_a
@@ -252,7 +256,7 @@ peers:
   - id: node-a-filter
     enabled: true
     bare:
-      endpoint: "udp://node-a-filter:5353"
+      endpoint: "udp://node-a-filter.h3llo-test-net:5353"
     tun:
       allowedIPs:
         - 10.0.0.1/32
@@ -276,7 +280,7 @@ peers:
   - id: node-b
     enabled: true
     bare:
-      endpoint: "udp://node-b:5353"
+      endpoint: "udp://node-b.h3llo-test-net:5353"
     tun:
       allowedIPs:
         - 10.0.0.2/32
@@ -287,7 +291,7 @@ peers:
     std::fs::write(&node_a_config_path, node_a_config).expect("write node-a config");
     std::fs::write(&node_c_config_path, node_c_config).expect("write node-c config");
 
-    // Start node A
+    // Start node A first so node C can resolve it
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
@@ -302,7 +306,10 @@ peers:
         .await
         .expect("start node-a");
 
-    // Start node C (unauthorized source)
+    // Wait for node-a to register with Docker DNS
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Start node C (unauthorized source) - it will resolve node-a immediately
     let node_c = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
@@ -317,6 +324,7 @@ peers:
         .await
         .expect("start node-c");
 
+    // Allow time for TUN setup and DNS resolution
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Ping from node C to node A should fail (source IP not allowed)
@@ -376,7 +384,7 @@ peers:
   - id: node-b-mtu
     enabled: true
     bare:
-      endpoint: "udp://node-b-mtu:5353"
+      endpoint: "udp://node-b-mtu.h3llo-test-net:5353"
     tun:
       allowedIPs:
         - 10.0.0.2/32
@@ -399,7 +407,7 @@ peers:
   - id: node-a-mtu
     enabled: true
     bare:
-      endpoint: "udp://node-a-mtu:5353"
+      endpoint: "udp://node-a-mtu.h3llo-test-net:5353"
     tun:
       allowedIPs:
         - 10.0.0.1/32
@@ -410,6 +418,24 @@ peers:
     let node_b_config_path = temp_dir.join("node-b-mtu.yaml");
     std::fs::write(&node_a_config_path, node_a_mtu_config).expect("write node-a config");
     std::fs::write(&node_b_config_path, node_b_mtu_config).expect("write node-b config");
+
+    // Start node B first so node A can resolve it immediately at startup
+    let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
+        .with_exposed_port(ContainerPort::Udp(5353))
+        .with_wait_for(WaitFor::seconds(2))
+        .with_container_name("node-b-mtu")
+        .with_network(TEST_NETWORK)
+        .with_privileged(true)
+        .with_mount(Mount::bind_mount(
+            node_b_config_path.to_str().unwrap(),
+            "/etc/h3llo/config.yaml",
+        ))
+        .start()
+        .await
+        .expect("start node-b-mtu");
+
+    // Wait for node-b to register with Docker DNS
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
@@ -425,21 +451,8 @@ peers:
         .await
         .expect("start node-a-mtu");
 
-    let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
-        .with_exposed_port(ContainerPort::Udp(5353))
-        .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-b-mtu")
-        .with_network(TEST_NETWORK)
-        .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_b_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .start()
-        .await
-        .expect("start node-b-mtu");
-
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait for node-b's DNS refresh to resolve node-a (refresh interval is 30s)
+    tokio::time::sleep(Duration::from_secs(35)).await;
 
     // Ping with payload fitting within MTU: 1400 - 20 (IP hdr) - 8 (ICMP hdr) = 1372 bytes
     let mut ping_ok = node_a
