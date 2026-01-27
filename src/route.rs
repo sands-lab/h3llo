@@ -375,7 +375,7 @@ mod tests {
                 .unwrap()
                 .push(format!("add {}", Self::fmt_route(route)));
             if self.fail_add {
-                return Err(io::Error::new(io::ErrorKind::Other, "add failed"));
+                return Err(io::Error::other("add failed"));
             }
             self.routes.lock().unwrap().push(route.clone());
             Ok(())
@@ -387,7 +387,7 @@ mod tests {
                 .unwrap()
                 .push(format!("del {}", Self::fmt_route(route)));
             if self.fail_delete {
-                return Err(io::Error::new(io::ErrorKind::Other, "delete failed"));
+                return Err(io::Error::other("delete failed"));
             }
             let mut routes = self.routes.lock().unwrap();
             if let Some(pos) = routes.iter().position(|r| r == route) {

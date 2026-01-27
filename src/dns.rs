@@ -652,7 +652,7 @@ mod tests {
             query.clone(),
             ResponseCode::NXDomain,
             vec![Record::from_rdata(
-                query.name().clone().into(),
+                query.name().clone(),
                 60,
                 RData::A(A(Ipv4Addr::new(1, 1, 1, 1))),
             )],
@@ -667,7 +667,7 @@ mod tests {
             query2.clone(),
             ResponseCode::NoError,
             vec![Record::from_rdata(
-                query2.name().clone().into(),
+                query2.name().clone(),
                 60,
                 RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
             )],
@@ -755,17 +755,17 @@ mod tests {
             ResponseCode::NoError,
             vec![
                 Record::from_rdata(
-                    Name::from_ascii("ttl.test").unwrap().into(),
+                    Name::from_ascii("ttl.test").unwrap(),
                     120,
                     RData::A(A(Ipv4Addr::new(10, 0, 0, 1))),
                 ),
                 Record::from_rdata(
-                    Name::from_ascii("ttl.test").unwrap().into(),
+                    Name::from_ascii("ttl.test").unwrap(),
                     30,
                     RData::A(A(Ipv4Addr::new(10, 0, 0, 2))),
                 ),
                 Record::from_rdata(
-                    Name::from_ascii("ttl.test").unwrap().into(),
+                    Name::from_ascii("ttl.test").unwrap(),
                     90,
                     RData::A(A(Ipv4Addr::new(10, 0, 0, 1))),
                 ),
@@ -848,7 +848,7 @@ mod tests {
             query,
             ResponseCode::NoError,
             vec![Record::from_rdata(
-                Name::from_ascii("txt.example").unwrap().into(),
+                Name::from_ascii("txt.example").unwrap(),
                 60,
                 RData::TXT(TXT::new(vec!["hello".to_string()])),
             )],
@@ -863,7 +863,7 @@ mod tests {
             query2.clone(),
             ResponseCode::NoError,
             vec![Record::from_rdata(
-                query2.name().clone().into(),
+                query2.name().clone(),
                 60,
                 RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
             )],
