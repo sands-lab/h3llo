@@ -165,13 +165,6 @@ impl Orchestrator {
         let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel::<BareUdpRxCommand>();
         let (tun_cmd_tx, tun_cmd_rx) = mpsc::unbounded_channel::<TunRxCommand>();
 
-        // Build pending DNS for all BareUDP peer endpoints.
-        // Initially populate without sending commands (resolver not spawned yet).
-        // All endpoints (IP literals and hostnames) go through DNS resolution;
-        // DNS resolver detects IP literals and emits DnsAnswer immediately.
-        let mut pending_dns = HashMap::new();
-        populate_and_resolve_dns(&config.peers, &mut pending_dns, None)?;
-
         // Extract validated peers for storage (enabled BareUDP peers only)
         let peers: Vec<Peer> = config
             .peers
@@ -218,9 +211,12 @@ impl Orchestrator {
 
         let dns_refresh = Duration::from_secs(config.local.dns.refresh);
 
-        // Spawn DNS resolver when there are peers or refresh is enabled.
-        // The resolver handles both hostnames and IP literals uniformly;
-        // IP literals are detected and answered immediately without network I/O.
+        // Pending DNS entries: populated after resolver spawn following actor pattern.
+        let mut pending_dns = HashMap::new();
+
+        // Spawn DNS resolver first, then populate pending_dns and send commands.
+        // This follows the actor pattern: create receiver before sending messages.
+        // IP literals are detected and emit immediate DnsAnswer events.
         let dns_cmd_tx = if !peers.is_empty() || !dns_refresh.is_zero() {
             let resolver = DnsResolver::from_config(
                 &config.local.dns,
@@ -236,15 +232,10 @@ impl Orchestrator {
                 .await
                 .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
-            // Send resolve commands for all pending hostnames
-            for host in pending_dns.keys() {
-                if cmd_tx
-                    .send(DnsCommand::Resolve { host: host.clone() })
-                    .is_err()
-                {
-                    warn!("failed to send DNS resolve command for host");
-                }
-            }
+            // Populate pending_dns and send resolve commands atomically.
+            // All endpoints (IP literals and hostnames) flow through DNS resolver;
+            // IP literals are detected and emit immediate DnsAnswer events.
+            populate_and_resolve_dns(&config.peers, &mut pending_dns, &cmd_tx)?;
 
             join_set.spawn(wrap_task("dns_resolver", handle));
             Some(cmd_tx)
@@ -402,11 +393,9 @@ impl Orchestrator {
         // Clear stale entries before repopulating to prevent duplicate accumulation
         self.pending_dns.clear();
 
-        // Re-populate pending_dns and send resolve commands using shared logic.
-        // Errors should not occur since peers were validated at startup,
-        // but log and return early if they do.
-        if let Err(err) = populate_and_resolve_dns(&self.peers, &mut self.pending_dns, Some(cmd_tx))
-        {
+        // Re-populate pending_dns and send resolve commands. Errors should not
+        // occur since peers were validated at startup, but log if they do.
+        if let Err(err) = populate_and_resolve_dns(&self.peers, &mut self.pending_dns, cmd_tx) {
             warn!(
                 "dns refresh: unexpected error parsing peer endpoint: {}",
                 err
@@ -636,9 +625,8 @@ fn parse_ip_literal(host: &str) -> Option<IpAddr> {
 ///
 /// * `peers` - Slice of peer configurations to process
 /// * `pending_dns` - Map to populate (caller should clear if replacing stale entries)
-/// * `dns_cmd_tx` - Optional channel to send DNS resolve commands. If `None`, only
-///   populates `pending_dns` without sending commands (useful during initialization
-///   before DNS resolver is spawned).
+/// * `dns_cmd_tx` - Channel to send DNS resolve commands. The resolver must be
+///   spawned before calling this function.
 ///
 /// # Returns
 ///
@@ -651,7 +639,7 @@ fn parse_ip_literal(host: &str) -> Option<IpAddr> {
 fn populate_and_resolve_dns(
     peers: &[Peer],
     pending_dns: &mut HashMap<String, PendingDns>,
-    dns_cmd_tx: Option<&mpsc::UnboundedSender<DnsCommand>>,
+    dns_cmd_tx: &mpsc::UnboundedSender<DnsCommand>,
 ) -> Result<(), OrchestratorError> {
     let mut seen_hosts = HashSet::new();
 
@@ -688,19 +676,16 @@ fn populate_and_resolve_dns(
             .push_config(config);
 
         // Send resolve command only once per hostname (deduplication)
-        if seen_hosts.insert(endpoint.host.clone()) {
-            if let Some(cmd_tx) = dns_cmd_tx {
-                if cmd_tx
-                    .send(DnsCommand::Resolve {
-                        host: endpoint.host,
-                    })
-                    .is_err()
-                {
-                    warn!("dns: resolver channel closed");
-                    // Continue processing remaining peers; channel may have
-                    // closed mid-iteration but pending_dns should still be populated
-                }
-            }
+        if seen_hosts.insert(endpoint.host.clone())
+            && dns_cmd_tx
+                .send(DnsCommand::Resolve {
+                    host: endpoint.host,
+                })
+                .is_err()
+        {
+            warn!("dns: resolver channel closed");
+            // Continue processing remaining peers; channel may have
+            // closed mid-iteration but pending_dns should still be populated
         }
     }
 
@@ -1418,7 +1403,7 @@ mod tests {
         let mut pending_dns = HashMap::new();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-        let result = populate_and_resolve_dns(&peers, &mut pending_dns, Some(&cmd_tx));
+        let result = populate_and_resolve_dns(&peers, &mut pending_dns, &cmd_tx);
         assert!(result.is_ok());
 
         // Both configs accumulated under the same hostname (fixes TODO bug)
@@ -1445,7 +1430,7 @@ mod tests {
         let mut pending_dns = HashMap::new();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-        let result = populate_and_resolve_dns(&[peer], &mut pending_dns, Some(&cmd_tx));
+        let result = populate_and_resolve_dns(&[peer], &mut pending_dns, &cmd_tx);
         assert!(result.is_ok());
 
         assert!(pending_dns.is_empty());
@@ -1467,7 +1452,7 @@ mod tests {
         let mut pending_dns = HashMap::new();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-        let result = populate_and_resolve_dns(&[peer], &mut pending_dns, Some(&cmd_tx));
+        let result = populate_and_resolve_dns(&[peer], &mut pending_dns, &cmd_tx);
         assert!(result.is_ok());
 
         assert!(pending_dns.is_empty());
@@ -1490,25 +1475,13 @@ mod tests {
         };
 
         let mut pending_dns = HashMap::new();
-        let result = populate_and_resolve_dns(&[peer], &mut pending_dns, None);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let result = populate_and_resolve_dns(&[peer], &mut pending_dns, &cmd_tx);
 
         assert!(matches!(
             result,
             Err(OrchestratorError::InvalidPeerEndpoint { peer_id, .. }) if peer_id == "badpeer"
         ));
-    }
-
-    #[test]
-    fn dns_collection_works_without_cmd_tx() {
-        // During new() before DNS resolver is spawned, cmd_tx may be None
-        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
-        let mut pending_dns = HashMap::new();
-
-        let result = populate_and_resolve_dns(&[peer], &mut pending_dns, None);
-        assert!(result.is_ok());
-
-        // pending_dns still populated even without command channel
-        assert!(pending_dns.contains_key("127.0.0.1"));
     }
 
     // ========== refresh_dns integration tests ==========
