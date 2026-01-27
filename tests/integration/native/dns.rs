@@ -143,10 +143,7 @@ async fn next_dns_detail(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(Event::Dns(ev))) => match &ev.detail {
-                DnsEventDetail::BindWarning(_) => continue,
-                _ => return ev.detail,
-            },
+            Ok(Some(Event::Dns(ev))) => return ev.detail,
             Ok(Some(_)) => continue,
             Ok(None) => panic!("channel closed unexpectedly"),
             Err(_) => panic!("timed out waiting for DNS event"),

@@ -1,6 +1,6 @@
 //! DNS resolver coroutine: consumes resolve commands, processes UDP responses, retries on timeout, and emits events.
 
-use crate::bind::{BindWarning, RouteProbe};
+use crate::bind::RouteProbe;
 use crate::config::{parse_dns_server_uri, LocalDns};
 use crate::events::{
     DnsAnswer, DnsAnswerRecord, DnsAnswerWarning, DnsEvent, DnsEventDetail, DnsRecordType,
@@ -95,11 +95,10 @@ impl DnsResolver {
         cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
         events_tx: mpsc::UnboundedSender<Event>,
     ) -> Result<JoinHandle<()>, ResolveInitError> {
-        let (socket, bind_warnings) = self.prepare_socket(&probe).await?;
+        let socket = self.prepare_socket(&probe).await?;
         let mut task = ResolverTask::new(self.server, self.timeout, cmd_rx, events_tx, socket);
 
         let handle = tokio::spawn(async move {
-            task.emit_bind_warnings(bind_warnings).await;
             task.run().await;
         });
 
@@ -114,13 +113,13 @@ impl DnsResolver {
     async fn prepare_socket<P: RouteProbe>(
         &self,
         probe: &P,
-    ) -> Result<(UdpSocket, Vec<BindWarning>), ResolveInitError> {
+    ) -> Result<UdpSocket, ResolveInitError> {
         let bind_addr: SocketAddr = match self.server {
             SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
             SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
         };
 
-        let (socket, warnings) = bind_socket(
+        let socket = bind_socket(
             bind_addr,
             self.bind_interface.as_deref(),
             self.server.ip(),
@@ -135,7 +134,7 @@ impl DnsResolver {
             .await
             .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
 
-        Ok((socket, warnings))
+        Ok(socket)
     }
 }
 
@@ -175,19 +174,6 @@ impl ResolverTask {
             events_tx,
             pending: HashMap::new(),
             cmd_rx_closed: false,
-        }
-    }
-
-    /// Emits binding warnings as DNS events.
-    async fn emit_bind_warnings(&mut self, warnings: Vec<BindWarning>) {
-        for warning in warnings {
-            let event = Event::Dns(DnsEvent {
-                server: self.server,
-                detail: DnsEventDetail::BindWarning(warning),
-            });
-            if self.events_tx.send(event).is_err() {
-                break;
-            }
         }
     }
 
@@ -616,17 +602,14 @@ mod tests {
         response.to_vec().unwrap()
     }
 
-    /// Receives the next DNS event detail, skipping bind warnings.
+    /// Receives the next DNS event detail.
     async fn next_relevant_detail(
         events_rx: &mut mpsc::UnboundedReceiver<Event>,
     ) -> DnsEventDetail {
         loop {
             let event = events_rx.recv().await.expect("dns event");
             if let Event::Dns(dns) = event {
-                match dns.detail {
-                    DnsEventDetail::BindWarning(_) => continue,
-                    detail => return detail,
-                }
+                return dns.detail;
             }
         }
     }

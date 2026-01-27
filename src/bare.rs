@@ -2,7 +2,7 @@
 
 pub use crate::udp::bind_socket;
 
-use crate::bind::{BindWarning, RouteProbe};
+use crate::bind::RouteProbe;
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_interrupted;
 use crate::metrics::TransportCounters;
@@ -61,15 +61,14 @@ impl BareUdpTx {
         bindif: Option<&str>,
         tun_if: Option<&str>,
         probe: &P,
-    ) -> Result<(Self, Vec<BindWarning>), UdpError> {
+    ) -> Result<Self, UdpError> {
         let bind_addr = if destination.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
         } else {
             SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0))
         };
-        let (socket, warnings) =
-            bind_socket(bind_addr, bindif, destination.ip(), tun_if, probe).await?;
-        Ok((Self { socket }, warnings))
+        let socket = bind_socket(bind_addr, bindif, destination.ip(), tun_if, probe).await?;
+        Ok(Self { socket })
     }
 }
 

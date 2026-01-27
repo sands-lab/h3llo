@@ -6,7 +6,6 @@ use crate::helpers::{extract_dst_ip, retry_on_interrupted};
 use crate::metrics::TransportCounters;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use ipnet_trie::IpnetTrie;
-use log::warn;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr};
@@ -16,6 +15,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
+use tracing::warn;
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 
 /// Provides receive-only access to a TUN device for a single coroutine.

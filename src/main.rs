@@ -2,10 +2,11 @@
 
 use h3llo::config::Config;
 use h3llo::orch::run_bare;
-use log::{error, LevelFilter, Log, Metadata, Record};
 use std::env;
 use std::fs::File;
 use std::path::PathBuf;
+use tracing::error;
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -43,12 +44,13 @@ async fn main() {
 }
 
 fn init_logging() {
-    static LOGGER: SimpleLogger = SimpleLogger;
-    let level = env::var("RUST_LOG")
-        .ok()
-        .and_then(|value| parse_level(&value))
-        .unwrap_or(LevelFilter::Info);
-    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("h3llo=info"));
+
+    fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 fn parse_config_path() -> Result<PathBuf, String> {
@@ -76,38 +78,4 @@ fn parse_config_path() -> Result<PathBuf, String> {
     }
 
     config_path.ok_or_else(|| "missing -c/--config".to_string())
-}
-
-struct SimpleLogger;
-
-impl Log for SimpleLogger {
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() <= log::max_level()
-    }
-
-    fn log(&self, record: &Record<'_>) {
-        if self.enabled(record.metadata()) {
-            eprintln!("{} [{}] {}", record.level(), record.target(), record.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-fn parse_level(value: &str) -> Option<LevelFilter> {
-    for part in value.split(',') {
-        let level = part.split('=').next_back().unwrap_or(part).trim();
-        let parsed = match level.to_ascii_lowercase().as_str() {
-            "trace" => Some(LevelFilter::Trace),
-            "debug" => Some(LevelFilter::Debug),
-            "info" => Some(LevelFilter::Info),
-            "warn" | "warning" => Some(LevelFilter::Warn),
-            "error" => Some(LevelFilter::Error),
-            _ => None,
-        };
-        if parsed.is_some() {
-            return parsed;
-        }
-    }
-    None
 }
