@@ -80,14 +80,6 @@ fn ensure_image_exists() -> bool {
     }
 }
 
-/// Creates a unique temporary directory for test files.
-fn create_temp_dir() -> std::path::PathBuf {
-    let unique_id = std::process::id();
-    let temp_dir = std::env::temp_dir().join(format!("h3llo-test-{}", unique_id));
-    std::fs::create_dir_all(&temp_dir).expect("create temp dir");
-    temp_dir
-}
-
 /// Creates the test Docker network if it doesn't exist.
 /// Handles race conditions when multiple tests run in parallel.
 fn ensure_network_exists() {
@@ -135,16 +127,16 @@ async fn test_two_node_bareudp_tunnel() {
     // Ensure test network exists for hostname resolution
     ensure_network_exists();
 
-    // Create temporary config files
-    let temp_dir = create_temp_dir();
+    // Create temporary config files (TempDir auto-cleans on drop)
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
 
-    let node_a_config_path = temp_dir.join("node-a.yaml");
-    let node_b_config_path = temp_dir.join("node-b.yaml");
+    let node_a_config_path = temp_dir.path().join("node-a.yaml");
+    let node_b_config_path = temp_dir.path().join("node-b.yaml");
     std::fs::write(&node_a_config_path, NODE_A_CONFIG).expect("write node-a config");
     std::fs::write(&node_b_config_path, NODE_B_CONFIG).expect("write node-b config");
 
     // Start both nodes - h3llo handles DNS resolution timing via refresh interval.
-    // No need to control startup order; DNS refresh (2s) ensures eventual resolution.
+    // No need to control startup order; DNS refresh (1s) ensures eventual resolution.
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
@@ -216,12 +208,10 @@ async fn test_two_node_bareudp_tunnel() {
         "ping b->a failed (exit={ping_ba_exit:?})"
     );
 
-    // Cleanup happens automatically when containers go out of scope
+    // Cleanup happens automatically when containers and temp_dir go out of scope
     drop(node_b);
     drop(node_a);
-
-    // Clean up temp files
-    let _ = std::fs::remove_dir_all(&temp_dir);
+    drop(temp_dir);
 }
 
 /// Integration test: BareUDP source IP filtering.
@@ -237,7 +227,7 @@ async fn test_source_ip_filtering() {
 
     ensure_network_exists();
 
-    let temp_dir = create_temp_dir();
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
 
     // Node C has a different VPN IP (10.0.0.3) not in node-a's allowed_ips
     let node_c_config = r#"
@@ -287,8 +277,8 @@ peers:
         - 10.0.0.2/32
 "#;
 
-    let node_a_config_path = temp_dir.join("node-a-filter.yaml");
-    let node_c_config_path = temp_dir.join("node-c.yaml");
+    let node_a_config_path = temp_dir.path().join("node-a-filter.yaml");
+    let node_c_config_path = temp_dir.path().join("node-c.yaml");
     std::fs::write(&node_a_config_path, node_a_config).expect("write node-a config");
     std::fs::write(&node_c_config_path, node_c_config).expect("write node-c config");
 
@@ -347,7 +337,7 @@ peers:
 
     drop(node_c);
     drop(node_a);
-    let _ = std::fs::remove_dir_all(&temp_dir);
+    drop(temp_dir);
 }
 
 /// Integration test: MTU boundary checks.
@@ -411,14 +401,14 @@ peers:
         - 10.0.0.1/32
 "#;
 
-    let temp_dir = create_temp_dir();
-    let node_a_config_path = temp_dir.join("node-a-mtu.yaml");
-    let node_b_config_path = temp_dir.join("node-b-mtu.yaml");
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let node_a_config_path = temp_dir.path().join("node-a-mtu.yaml");
+    let node_b_config_path = temp_dir.path().join("node-b-mtu.yaml");
     std::fs::write(&node_a_config_path, node_a_mtu_config).expect("write node-a config");
     std::fs::write(&node_b_config_path, node_b_mtu_config).expect("write node-b config");
 
     // Start both nodes - h3llo handles DNS resolution timing via refresh interval.
-    // No need to control startup order; DNS refresh (2s) ensures eventual resolution.
+    // No need to control startup order; DNS refresh (1s) ensures eventual resolution.
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
@@ -490,5 +480,5 @@ peers:
 
     drop(node_b);
     drop(node_a);
-    let _ = std::fs::remove_dir_all(&temp_dir);
+    drop(temp_dir);
 }
