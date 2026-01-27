@@ -1,6 +1,7 @@
 //! Provides interface-binding helpers for DNS sockets and route probing.
 use socket2::{Domain, Protocol, Socket, Type};
 use thiserror::Error;
+use tracing::warn;
 
 use std::collections::HashSet;
 use std::io;
@@ -20,26 +21,6 @@ use ipnet::{Ipv4Net, Ipv6Net};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use route_manager::{AsyncRouteManager, Route};
 
-/// Captures warnings emitted during bind decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BindWarning {
-    /// Route probing failed; continuing unbound.
-    ProbeFailed(String),
-    /// Preferred interface was not found in probe results.
-    PreferredNotFound { interface: String },
-    /// Binding to the requested interface failed; continuing unbound.
-    BindFailed { interface: String, error: String },
-    /// Binding is not supported on this platform; continuing unbound.
-    BindUnsupported { interface: String, platform: String },
-    /// Socket remains unbound to any interface; continuing unbound.
-    Unbound { reason: String },
-    /// Multiple interfaces were found; using the first entry.
-    AmbiguousInterfaces {
-        chosen: String,
-        alternatives: Vec<String>,
-    },
-}
-
 /// Creates a UDP socket bound to `bind_addr` and optionally pinned to `bind_interface`.
 ///
 /// # Arguments
@@ -47,14 +28,14 @@ pub enum BindWarning {
 /// - `bind_interface`: Optional interface name for binding.
 ///
 /// # Returns
-/// A tokio `UdpSocket` plus accumulated bind warnings.
+/// A tokio `UdpSocket`. Binding warnings are logged directly.
 ///
 /// # Errors
 /// Returns an `io::Error` when socket creation or binding fails.
 pub fn bind_udp_socket(
     bind_addr: SocketAddr,
     bind_interface: Option<&str>,
-) -> io::Result<(tokio::net::UdpSocket, Vec<BindWarning>)> {
+) -> io::Result<tokio::net::UdpSocket> {
     let domain = match bind_addr {
         SocketAddr::V4(_) => Domain::IPV4,
         SocketAddr::V6(_) => Domain::IPV6,
@@ -63,56 +44,55 @@ pub fn bind_udp_socket(
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
 
-    let mut warnings = Vec::new();
-
     if let Some(interface) = bind_interface {
-        if let Err(warning) = bind_to_device(&socket, domain, interface) {
-            warnings.push(warning);
+        if let Err(e) = bind_to_device(&socket, domain, interface) {
+            warn!(
+                interface = %interface,
+                error = %e,
+                "bind to interface failed, continuing unbound"
+            );
         }
     }
 
     socket.bind(&bind_addr.into())?;
     let udp = tokio::net::UdpSocket::from_std(socket.into())?;
-    Ok((udp, warnings))
+    Ok(udp)
 }
 
-/// Selects a bind interface by probing routes toward `target`, emitting warnings on probe failures, empty sets, or ambiguity.
+/// Selects a bind interface by probing routes toward `target`, logging warnings on probe failures, empty sets, or ambiguity.
 ///
 /// # Arguments
 /// - `target`: Destination IP used for route probing.
 /// - `tun_if`: Optional TUN interface name to exclude.
-/// - `preferred_if`: Optional preferred interface; blank values are ignored. Missing preferred entries emit warnings and fall back to probed results.
+/// - `preferred_if`: Optional preferred interface; blank values are ignored.
 /// - `probe`: Route probe implementation.
 ///
 /// # Returns
-/// The chosen interface name (first entry) and accumulated warnings; returns `None` when probing fails or yields no match.
+/// The chosen interface name (first entry); returns `None` when probing fails or yields no match.
+/// Warnings are logged directly.
 pub async fn select_bind_interface<P: RouteProbe>(
     target: IpAddr,
     tun_if: Option<&str>,
     preferred_if: Option<&str>,
     probe: &P,
-) -> (Option<String>, Vec<BindWarning>) {
+) -> Option<String> {
     match probe.probe_interfaces(&target.to_string(), tun_if).await {
         Ok(interfaces) => {
             if interfaces.is_empty() {
-                return (
-                    None,
-                    vec![BindWarning::Unbound {
-                        reason: format!("no interface found for {target}"),
-                    }],
-                );
+                warn!(target = %target, "no interface found, socket will remain unbound");
+                return None;
             }
 
-            let mut warnings = Vec::new();
             let mut candidates = if let Some(preferred) = preferred_if {
                 let filtered = filter_preferred_interfaces(
                     interfaces.clone(),
                     Some(vec![preferred.to_string()]),
                 );
                 if filtered.is_empty() {
-                    warnings.push(BindWarning::PreferredNotFound {
-                        interface: preferred.to_string(),
-                    });
+                    warn!(
+                        interface = %preferred,
+                        "preferred interface not found, falling back to probed"
+                    );
                     interfaces
                 } else {
                     filtered
@@ -123,59 +103,56 @@ pub async fn select_bind_interface<P: RouteProbe>(
 
             let chosen = candidates.remove(0);
             if !candidates.is_empty() {
-                warnings.push(BindWarning::AmbiguousInterfaces {
-                    chosen: chosen.clone(),
-                    alternatives: candidates,
-                });
+                warn!(
+                    chosen = %chosen,
+                    alternatives = ?candidates,
+                    "multiple interfaces found, using first"
+                );
             }
-            (Some(chosen), warnings)
+            Some(chosen)
         }
-        Err(err) => (None, vec![BindWarning::ProbeFailed(err.to_string())]),
+        Err(err) => {
+            warn!(error = %err, "route probe failed, socket will remain unbound");
+            None
+        }
     }
 }
 
 /// Binds `socket` to `interface` for the given `domain` using platform-specific mechanisms.
 ///
-/// # Arguments
-/// - `socket`: Socket to be bound to an outbound interface.
-/// - `domain`: Address family (`Domain::IPV4` or `Domain::IPV6`).
-/// - `interface`: Interface name to bind; trimmed before use.
-///
-/// # Returns
-/// `Ok(())` on success.
-///
 /// # Errors
-/// Returns a `BindWarning` when binding fails or is unsupported; callers should log and continue unbound.
-pub fn bind_to_device(socket: &Socket, domain: Domain, interface: &str) -> Result<(), BindWarning> {
+/// Returns an `io::Error` when binding fails or is unsupported.
+pub fn bind_to_device(socket: &Socket, domain: Domain, interface: &str) -> io::Result<()> {
     let iface = interface.trim();
     if iface.is_empty() {
-        return Err(BindWarning::BindFailed {
-            interface: interface.to_string(),
-            error: "interface is empty".to_string(),
-        });
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface is empty",
+        ));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        bind_to_device_impl(socket, domain, iface).map_err(|err| BindWarning::BindFailed {
-            interface: iface.to_string(),
-            error: err.to_string(),
-        })
+        bind_to_device_impl(socket, domain, iface)
     }
 
     #[cfg(target_os = "windows")]
     {
-        bind_to_device_impl(socket, domain, iface).map_err(|err| BindWarning::BindFailed {
-            interface: iface.to_string(),
-            error: err.to_string(),
-        })
+        bind_to_device_impl(socket, domain, iface)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    Err(BindWarning::BindUnsupported {
-        interface: iface.to_string(),
-        platform: std::env::consts::OS.to_string(),
-    })
+    {
+        warn!(
+            interface = %iface,
+            platform = %std::env::consts::OS,
+            "bind to interface not supported on this platform"
+        );
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "platform unsupported",
+        ))
+    }
 }
 
 /// Probes the system routing table to identify the outbound interface.
@@ -489,6 +466,7 @@ fn ifindex_to_name(ifindex: u32) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_test::traced_test;
 
     /// Test double that returns a fixed probe result.
     #[derive(Clone)]
@@ -521,26 +499,26 @@ mod tests {
         assert!(filtered.is_empty());
     }
 
+    #[traced_test]
     #[tokio::test]
-    async fn select_bind_interface_warns_on_empty_results() {
+    async fn select_bind_interface_logs_warning_on_empty_results() {
         let probe = FakeRouteProbe {
             result: Ok(Vec::new()),
         };
-        let (iface, warnings) =
+        let iface =
             select_bind_interface(IpAddr::V4("1.1.1.1".parse().unwrap()), None, None, &probe).await;
         assert!(iface.is_none());
-        assert!(matches!(
-            warnings.as_slice(),
-            [BindWarning::Unbound { reason }] if reason.contains("no interface")
-        ));
+        assert!(logs_contain("no interface found"));
+        assert!(logs_contain("unbound"));
     }
 
+    #[traced_test]
     #[tokio::test]
-    async fn select_bind_interface_warns_on_missing_preference_and_falls_back() {
+    async fn select_bind_interface_logs_warning_on_missing_preference() {
         let probe = FakeRouteProbe {
             result: Ok(vec!["eth0".to_string(), "eth1".to_string()]),
         };
-        let (iface, warnings) = select_bind_interface(
+        let iface = select_bind_interface(
             IpAddr::V4("8.8.4.4".parse().unwrap()),
             None,
             Some("wlan0"),
@@ -548,44 +526,35 @@ mod tests {
         )
         .await;
         assert_eq!(iface.as_deref(), Some("eth0"));
-        assert!(warnings.iter().any(|warn| matches!(
-            warn,
-            BindWarning::PreferredNotFound { interface } if interface == "wlan0"
-        )));
-        assert!(warnings.iter().any(|warn| matches!(
-            warn,
-            BindWarning::AmbiguousInterfaces { chosen, alternatives }
-                if chosen == "eth0" && alternatives == &vec!["eth1".to_string()]
-        )));
+        assert!(logs_contain("preferred interface not found"));
+        assert!(logs_contain("wlan0"));
+        assert!(logs_contain("multiple interfaces found"));
     }
 
+    #[traced_test]
     #[tokio::test]
-    async fn select_bind_interface_warns_on_ambiguity_and_picks_first() {
+    async fn select_bind_interface_logs_warning_on_ambiguity() {
         let probe = FakeRouteProbe {
             result: Ok(vec!["eth0".to_string(), "eth1".to_string()]),
         };
-        let (iface, warnings) =
+        let iface =
             select_bind_interface(IpAddr::V4("8.8.8.8".parse().unwrap()), None, None, &probe).await;
         assert_eq!(iface.as_deref(), Some("eth0"));
-        assert!(matches!(
-            warnings.as_slice(),
-            [BindWarning::AmbiguousInterfaces { chosen, alternatives }]
-                if chosen == "eth0" && alternatives == &vec!["eth1".to_string()]
-        ));
+        assert!(logs_contain("multiple interfaces found"));
+        assert!(logs_contain("eth0"));
     }
 
+    #[traced_test]
     #[tokio::test]
-    async fn select_bind_interface_warns_on_probe_error() {
+    async fn select_bind_interface_logs_warning_on_probe_error() {
         let probe = FakeRouteProbe {
             result: Err(RouteProbeError::Probe("boom".into())),
         };
-        let (iface, warnings) =
+        let iface =
             select_bind_interface(IpAddr::V4("9.9.9.9".parse().unwrap()), None, None, &probe).await;
         assert!(iface.is_none());
-        assert!(matches!(
-            warnings.as_slice(),
-            [BindWarning::ProbeFailed(msg)] if msg.contains("boom")
-        ));
+        assert!(logs_contain("route probe failed"));
+        assert!(logs_contain("boom"));
     }
 
     /// Prefers longest-prefix matches and deduplicates interface indexes.

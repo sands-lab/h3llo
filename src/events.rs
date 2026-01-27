@@ -1,6 +1,5 @@
 //! Shared events flowing into the orchestrator.
 
-use crate::bind::BindWarning;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
@@ -129,8 +128,6 @@ pub enum DnsEventDetail {
     Timeout(DnsTimeout),
     /// Packet failed validation or did not match pending queries.
     Unexpected(DnsUnexpected),
-    /// Bind-related warning encountered during socket setup.
-    BindWarning(BindWarning),
 }
 
 /// Describes a DNS answer and any attached warnings.

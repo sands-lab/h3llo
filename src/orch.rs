@@ -1,20 +1,20 @@
 //! BareUDP-only runtime orchestration.
 
 use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareUdpTx};
-use crate::bind::{BindWarning, DefaultRouteProbe};
+use crate::bind::DefaultRouteProbe;
 use crate::config::{parse_udp_uri, Config, Peer, UdpEndpoint};
 use crate::dns::{DnsCommand, DnsResolver};
 use crate::events::{DnsEventDetail, Event, TransportEvent};
-use crate::route::{sync_tun_routes, RouteManagerHandle, RouteSyncWarning};
+use crate::route::{sync_tun_routes, RouteManagerHandle};
 use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
-use log::warn;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
+use tracing::{debug, error, info, warn};
 
 const PACKET_QUEUE_DEPTH: usize = 256;
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
@@ -281,11 +281,11 @@ impl Orchestrator {
                 result = self.join_set.join_next() => {
                     match result {
                         Some(Ok(label)) => {
-                            log::error!("task '{}' exited unexpectedly", label);
+                            error!("task '{}' exited unexpectedly", label);
                             return Err(OrchestratorError::TaskExited(label));
                         }
                         Some(Err(err)) => {
-                            log::error!("task join failed: {}", err);
+                            error!("task join failed: {}", err);
                             return Err(OrchestratorError::TaskJoin(err.to_string()));
                         }
                         None => return Ok(()),
@@ -294,11 +294,11 @@ impl Orchestrator {
                 result = tokio::signal::ctrl_c() => {
                     match result {
                         Ok(()) => {
-                            log::info!("shutdown signal received, stopping...");
+                            info!("shutdown signal received, stopping...");
                             break;
                         }
                         Err(e) => {
-                            log::warn!("signal handler error: {e}");
+                            warn!("signal handler error: {e}");
                         }
                     }
                 }
@@ -339,17 +339,16 @@ impl Orchestrator {
                         }
                     }
                 } else {
-                    log::debug!(
+                    debug!(
                         "dns event from {}: {:?}",
-                        dns_event.server,
-                        dns_event.detail
+                        dns_event.server, dns_event.detail
                     );
                 }
             }
             Event::Transport(TransportEvent::Metrics(metrics)) => {
                 let labels = &metrics.labels;
                 let stats = &metrics.stats;
-                log::debug!(
+                debug!(
                     "{:?} {:?} {}: {} pkts/{} bytes ok, {} pkts/{} bytes dropped",
                     labels.kind,
                     labels.direction,
@@ -362,18 +361,16 @@ impl Orchestrator {
                 if stats.dropped.packets > 0 {
                     for (reason, counters) in &stats.drop_reasons {
                         if counters.packets > 0 {
-                            log::debug!(
+                            debug!(
                                 "  drop reason {:?}: {} pkts/{} bytes",
-                                reason,
-                                counters.packets,
-                                counters.bytes
+                                reason, counters.packets, counters.bytes
                             );
                         }
                     }
                 }
             }
             Event::Other(msg) => {
-                log::debug!("other event: {}", msg);
+                debug!("other event: {}", msg);
             }
         }
     }
@@ -535,19 +532,14 @@ async fn spawn_bare_tx_for_peer(
     }
 
     let probe = DefaultRouteProbe;
-    let (tx_socket, warnings) =
-        match BareUdpTx::from_config(destination, bindif, Some(tun_if), &probe).await {
-            Ok(result) => result,
-            Err(err) => {
-                warn!("bare peer '{}' socket setup failed: {err}", peer_id);
-                active_ips.remove(&destination.ip());
-                return None;
-            }
-        };
-
-    for warning in warnings {
-        log_bind_warning(&format!("peer {}", peer_id), &warning);
-    }
+    let tx_socket = match BareUdpTx::from_config(destination, bindif, Some(tun_if), &probe).await {
+        Ok(result) => result,
+        Err(err) => {
+            warn!("bare peer '{}' socket setup failed: {err}", peer_id);
+            active_ips.remove(&destination.ip());
+            return None;
+        }
+    };
 
     let (packet_tx, packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
     let tx_handle = spawn_udp_tx(
@@ -564,14 +556,11 @@ async fn spawn_bare_tx_for_peer(
 /// Performs system route synchronization, logging warnings on failure.
 async fn sync_system_routes(tun_if: &str, tun_addrs: &[IpNet], allowed: &[IpNet]) {
     match RouteManagerHandle::new() {
-        Ok(mut handle) => match sync_tun_routes(tun_if, tun_addrs, allowed, &mut handle).await {
-            Ok(warnings) => {
-                for warning in warnings {
-                    log_route_warning(&warning);
-                }
+        Ok(mut handle) => {
+            if let Err(err) = sync_tun_routes(tun_if, tun_addrs, allowed, &mut handle).await {
+                warn!("route sync failed: {err}");
             }
-            Err(err) => warn!("route sync failed: {err}"),
-        },
+        }
         Err(err) => warn!("route manager unavailable: {err}"),
     }
 }
@@ -687,39 +676,6 @@ fn populate_and_resolve_dns(
     }
 
     Ok(())
-}
-
-fn log_bind_warning(context: &str, warning: &BindWarning) {
-    warn!("bind warning ({}): {:?}", context, warning);
-}
-
-fn log_route_warning(warning: &RouteSyncWarning) {
-    match warning {
-        RouteSyncWarning::AddFailed { prefix, error } => {
-            warn!("route add failed for {}: {}", prefix, error);
-        }
-        RouteSyncWarning::DeleteFailed { prefix, error } => {
-            warn!("route delete failed for {}: {}", prefix, error);
-        }
-        RouteSyncWarning::DefaultRouteSplit { prefix } => {
-            warn!("default route {} split into two /1 prefixes", prefix);
-        }
-        RouteSyncWarning::Conflict {
-            prefix,
-            existing_ifindex,
-        } => {
-            warn!(
-                "route conflict for {} (existing ifindex {})",
-                prefix, existing_ifindex
-            );
-        }
-        RouteSyncWarning::UnsupportedRoute { reason } => {
-            warn!("unsupported route skipped: {}", reason);
-        }
-        RouteSyncWarning::MissingIfIndex { prefix } => {
-            warn!("route missing ifindex skipped: {}", prefix);
-        }
-    }
 }
 
 async fn wrap_task(label: impl Into<String>, handle: JoinHandle<()>) -> String {
