@@ -62,7 +62,7 @@ jobs:
         run: |
           cargo test --test integration-container-tun --no-run
           cargo test --test integration-container-route --no-run
-      - name: Run E2E tests
-        run: cargo test --test e2e -- --ignored --nocapture
       - name: Run integration tests
         run: cargo test --test integration -- --ignored --nocapture
+      - name: Run E2E tests
+        run: cargo test --test e2e -- --ignored --nocapture
