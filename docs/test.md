@@ -150,15 +150,14 @@ When tests with real side effects are needed:
 4. Uses testcontainers `with_copy_to` for binary injection
 5. Uses `WaitFor::Exit` to wait for container exit and verify exit code
 
-#### GLIBC Compatibility
+#### Static Binary Injection
 
-The runtime container uses `debian:trixie-slim` (GLIBC 2.41) to ensure compatibility
-with GitHub Actions `ubuntu-latest` runner (GLIBC 2.39). This allows test binaries
-compiled natively on CI to execute inside containers without GLIBC version mismatch
-errors.
+Container test binaries are built with `--target x86_64-unknown-linux-musl` to produce
+fully static executables. Static musl binaries run on any Linux distribution without
+runtime library dependencies, eliminating GLIBC version compatibility concerns.
 
-GLIBC is forward-compatible: binaries compiled against an older GLIBC (2.39) run on
-systems with a newer GLIBC (2.41), but not vice versa.
+The global allocator is set to mimalloc for musl builds to avoid potential performance
+issues with musl's default allocator in multi-threaded workloads.
 
 #### TUN Device Tests (`integration-container-tun`)
 
