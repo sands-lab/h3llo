@@ -8,7 +8,7 @@ local:
   table: true # optional, default: true (manage system routes)
   dns: # optional
     server: udp://1.1.1.1:53 # optional, default: udp://1.1.1.1:53
-    refresh: 60 # optional, default: 60 (seconds; 0 disables; minimum 30 when nonzero)
+    refresh: 60 # optional, default: 60 (seconds; 0 disables; minimum 1s, recommended 30s+)
     bindif: eth0 # optional, default: auto-detect; warn and fallback to unbound on failure
   h3: # optional; when present, all fields below are required unless noted
     listen: https://[::]:443/path # required when local.h3 is set
@@ -52,7 +52,7 @@ peers: # optional, default: []
 - `local.table` (default `true`): Update the system routing table to steer matching traffic into the h3llo TUN. When `false`, h3llo does not touch system routes; the OS still installs host routes (`/32` or `/128`) for `local.tun.addrs`.
 - `local.h3.admin.name` / `local.h3.admin.pass` (optional; both longer than 8 characters): Control-plane Basic Auth credentials bound to HTTP/3. Enable GET/POST APIs only when both are set; authentication matrix is described in `docs/protocol.md`.
 - `local.dns.server` (default `udp://1.1.1.1:53`): DNS server address as a UDP URI with an IP literal and port; outbound binding/recursive-routing guards are detailed in `docs/internals.md`.
-- `local.dns.refresh` (default `60`): DNS refresh timer in seconds (`0` disables). Nonzero values are clamped to a minimum of `30`; the resolver batches hostnames per tick (see `docs/internals.md`).
+- `local.dns.refresh` (default `60`): DNS refresh timer in seconds (`0` disables). Minimum is `1` second; `30`+ recommended for production to avoid excessive queries. The resolver batches hostnames per tick (see `docs/internals.md`).
 - `local.dns.bindif` (optional): Outbound interface for DNS resolution; prefer it when present in probe results, otherwise warn and fall back to a probed interface. Auto-detects at most one interface when omitted. Binding behavior and fallbacks are in `docs/internals.md`.
 - `local.h3.listen`: HTTP/3 listen address (scheme/host/port/path) for inbound peers when H3 is enabled; required when `local.h3` is set.
 - `local.h3.cert` / `local.h3.key`: Certificate and private key for QUIC/TLS, enabling encryption and peer authentication.
