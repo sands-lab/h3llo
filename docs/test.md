@@ -131,6 +131,16 @@ When tests with real side effects are needed:
 4. Uses testcontainers `with_copy_to` for binary injection
 5. Uses `WaitFor::Exit` to wait for container exit and verify exit code
 
+#### GLIBC Compatibility
+
+The runtime container uses `debian:trixie-slim` (GLIBC 2.41) to ensure compatibility
+with GitHub Actions `ubuntu-latest` runner (GLIBC 2.39). This allows test binaries
+compiled natively on CI to execute inside containers without GLIBC version mismatch
+errors.
+
+GLIBC is forward-compatible: binaries compiled against an older GLIBC (2.39) run on
+systems with a newer GLIBC (2.41), but not vice versa.
+
 #### TUN Device Tests (`integration-container-tun`)
 
 Container binary: `tests/integration/container/tun.rs`

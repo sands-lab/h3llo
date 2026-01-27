@@ -10,7 +10,8 @@
 #   docker build --target test -t h3llo:test .
 
 # Stage 1: Chef - Install cargo-chef and prepare recipe
-FROM rust:bookworm AS chef
+# Using rust:trixie (Debian 13) for GLIBC 2.41 compatibility with CI runner (2.39)
+FROM rust:trixie AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
@@ -31,7 +32,9 @@ COPY src ./src
 RUN cargo build --release --bin h3llo
 
 # Stage 4: Runtime - Minimal production image
-FROM debian:bookworm-slim AS runtime
+# Debian Trixie (13) provides GLIBC 2.41, compatible with GitHub Actions ubuntu-latest (2.39).
+# This allows test binaries compiled natively on CI to execute inside containers.
+FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/h3llo /usr/local/bin/h3llo
