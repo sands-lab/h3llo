@@ -109,7 +109,7 @@ pub struct Orchestrator {
     bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
 
     /// DNS resolver command sender for refresh commands.
-    dns_cmd_tx: Option<mpsc::UnboundedSender<DnsCommand>>,
+    dns_cmd_tx: mpsc::UnboundedSender<DnsCommand>,
 
     /// Whether to manage system routes (`local.table`).
     manage_routes: bool,
@@ -139,11 +139,7 @@ impl Orchestrator {
         let tun_if = config.local.tun.ifname.clone();
         let mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
-        let tun_addrs = if manage_routes {
-            tun_prefixes(&config.local.tun.addrs)?
-        } else {
-            Vec::new()
-        };
+        let tun_addrs = tun_prefixes(&config.local.tun.addrs)?;
 
         // Resolve listen address synchronously (blocking for hostname)
         let listen_addr = resolve_listen_addr(&listen_endpoint)?;
@@ -217,31 +213,23 @@ impl Orchestrator {
         // Spawn DNS resolver first, then populate pending_dns and send commands.
         // This follows the actor pattern: create receiver before sending messages.
         // IP literals are detected and emit immediate DnsAnswer events.
-        let dns_cmd_tx = if !peers.is_empty() || !dns_refresh.is_zero() {
-            let resolver = DnsResolver::from_config(
-                &config.local.dns,
-                Some(tun_if.clone()),
-                DNS_QUERY_TIMEOUT,
-            )
-            .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
-
-            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-            let probe = DefaultRouteProbe;
-            let handle = resolver
-                .spawn(probe, cmd_rx, events_tx.clone())
-                .await
+        let resolver =
+            DnsResolver::from_config(&config.local.dns, Some(tun_if.clone()), DNS_QUERY_TIMEOUT)
                 .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
-            // Populate pending_dns and send resolve commands atomically.
-            // All endpoints (IP literals and hostnames) flow through DNS resolver;
-            // IP literals are detected and emit immediate DnsAnswer events.
-            populate_and_resolve_dns(&config.peers, &mut pending_dns, &cmd_tx)?;
+        let (dns_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let probe = DefaultRouteProbe;
+        let handle = resolver
+            .spawn(probe, cmd_rx, events_tx.clone())
+            .await
+            .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
-            join_set.spawn(wrap_task("dns_resolver", handle));
-            Some(cmd_tx)
-        } else {
-            None
-        };
+        // Populate pending_dns and send resolve commands atomically.
+        // All endpoints (IP literals and hostnames) flow through DNS resolver;
+        // IP literals are detected and emit immediate DnsAnswer events.
+        populate_and_resolve_dns(&config.peers, &mut pending_dns, &dns_cmd_tx)?;
+
+        join_set.spawn(wrap_task("dns_resolver", handle));
 
         if peer_txs.is_empty() && pending_dns.is_empty() {
             warn!("no active BareUDP peers; traffic will be dropped");
@@ -287,7 +275,7 @@ impl Orchestrator {
                 Some(event) = self.events_rx.recv() => {
                     self.handle_event(event).await;
                 }
-                _ = dns_ticker.tick(), if !self.dns_refresh.is_zero() && self.dns_cmd_tx.is_some() => {
+                _ = dns_ticker.tick(), if !self.dns_refresh.is_zero() => {
                     self.refresh_dns().await;
                 }
                 result = self.join_set.join_next() => {
@@ -385,17 +373,14 @@ impl Orchestrator {
     /// deduplicated by `active_ips` in `spawn_bare_tx_for_peer`.
     /// IP literals now flow through DNS resolver (emits immediate answer).
     async fn refresh_dns(&mut self) {
-        let cmd_tx = match &self.dns_cmd_tx {
-            Some(tx) => tx,
-            None => return,
-        };
-
         // Clear stale entries before repopulating to prevent duplicate accumulation
         self.pending_dns.clear();
 
         // Re-populate pending_dns and send resolve commands. Errors should not
         // occur since peers were validated at startup, but log if they do.
-        if let Err(err) = populate_and_resolve_dns(&self.peers, &mut self.pending_dns, cmd_tx) {
+        if let Err(err) =
+            populate_and_resolve_dns(&self.peers, &mut self.pending_dns, &self.dns_cmd_tx)
+        {
             warn!(
                 "dns refresh: unexpected error parsing peer endpoint: {}",
                 err
@@ -773,6 +758,7 @@ mod test_support {
         pub events_tx: mpsc::UnboundedSender<Event>,
         pub tun_cmd_rx: mpsc::UnboundedReceiver<TunRxCommand>,
         pub bare_rx_cmd_rx: mpsc::UnboundedReceiver<BareUdpRxCommand>,
+        pub dns_cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
     }
 
     impl TestableOrchestratorBuilder {
@@ -799,6 +785,7 @@ mod test_support {
             let (events_tx, events_rx) = mpsc::unbounded_channel();
             let (tun_cmd_tx, tun_cmd_rx) = mpsc::unbounded_channel();
             let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel();
+            let (dns_cmd_tx, dns_cmd_rx) = mpsc::unbounded_channel();
 
             let orch = Orchestrator {
                 events_rx,
@@ -813,7 +800,7 @@ mod test_support {
                 peer_txs: self.peer_txs,
                 tun_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
-                dns_cmd_tx: None,
+                dns_cmd_tx,
                 manage_routes: self.manage_routes,
                 tun_addrs: self.tun_addrs,
             };
@@ -824,6 +811,7 @@ mod test_support {
                     events_tx,
                     tun_cmd_rx,
                     bare_rx_cmd_rx,
+                    dns_cmd_rx,
                 },
             )
         }
@@ -1513,14 +1501,12 @@ mod tests {
             },
         };
 
-        let (dns_cmd_tx, mut dns_cmd_rx) = mpsc::unbounded_channel();
-
-        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+        let (mut orch, handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer1, peer2])
             .build();
 
-        orch.dns_cmd_tx = Some(dns_cmd_tx);
         orch.refresh_dns().await;
+        let mut dns_cmd_rx = handles.dns_cmd_rx;
 
         // Verify only ONE DNS command sent (hostname deduplicated)
         let cmd = dns_cmd_rx.try_recv().expect("should receive command");
@@ -1539,7 +1525,6 @@ mod tests {
     #[tokio::test]
     async fn refresh_dns_replaces_stale_pending_entries() {
         let peer = bare_peer("peer1", &["10.0.0.0/24"]);
-        let (dns_cmd_tx, _) = mpsc::unbounded_channel();
 
         let (mut orch, _handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer.clone()])
@@ -1558,7 +1543,6 @@ mod tests {
             },
         );
 
-        orch.dns_cmd_tx = Some(dns_cmd_tx);
         orch.refresh_dns().await;
 
         // Stale entry should be replaced
@@ -1574,33 +1558,14 @@ mod tests {
     #[tokio::test]
     async fn refresh_dns_handles_closed_channel_gracefully() {
         let peer = bare_peer("peer1", &["10.0.0.0/24"]);
-        let (dns_cmd_tx, dns_cmd_rx) = mpsc::unbounded_channel();
-        drop(dns_cmd_rx); // Close receiver
 
-        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+        let (mut orch, handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer])
             .build();
 
-        orch.dns_cmd_tx = Some(dns_cmd_tx);
+        drop(handles.dns_cmd_rx); // Close receiver
 
         // Should not panic, just log warning
         orch.refresh_dns().await;
-    }
-
-    #[tokio::test]
-    async fn refresh_dns_noop_without_dns_cmd_tx() {
-        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
-
-        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
-            .with_peers(vec![peer])
-            .build();
-
-        // dns_cmd_tx is None by default
-        assert!(orch.dns_cmd_tx.is_none());
-
-        orch.refresh_dns().await;
-
-        // pending_dns should remain empty (early return)
-        assert!(orch.pending_dns.is_empty());
     }
 }
