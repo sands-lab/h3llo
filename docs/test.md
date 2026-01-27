@@ -100,6 +100,25 @@ NOT side effects (safe for inline tests):
 - Each test creates isolated containers with bind-mounted configs
 - Cleanup is automatic when containers go out of scope
 
+### Container Test Logging Requirements
+
+All Docker container tests MUST output container logs on failure:
+
+1. **Container binary tests** (Container Test Pattern): Capture `stderr_to_vec()` before checking exit code; print on non-zero exit
+2. **Container service tests** (e.g., CoreDNS): Include error context in panic messages when container startup fails
+3. **E2E multi-node tests**: Capture both stdout and stderr from exec commands; print on assertion failure
+
+This ensures CI failures are debuggable without manual reproduction.
+
+### Shared Test Utilities
+
+The `tests/integration/native/common/` module provides utilities shared across Container Test Pattern tests:
+
+- `ensure_image_exists(image, tag)` - Check for Docker image before test
+- `get_container_exit_code(container_id)` - Retrieve container exit code via docker inspect
+- `find_test_binary(binary_name)` - Locate compiled test binaries in target directory
+- `TEST_IMAGE`, `TEST_TAG` - Default image constants ("h3llo", "test")
+
 ### E2E Test Scenarios (`tests/e2e/bareudp.rs`)
 
 1. **Two-node BareUDP tunnel**: Verifies bidirectional VPN connectivity between two containers

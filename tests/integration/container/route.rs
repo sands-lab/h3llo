@@ -155,7 +155,7 @@ async fn routes_on_interface(
     let prefixes: Vec<IpNet> = all_routes
         .iter()
         .filter(|r| r.if_index() == Some(ifindex))
-        .filter_map(|r| ipnet_from_route(r))
+        .filter_map(ipnet_from_route)
         .collect();
     Ok(prefixes)
 }

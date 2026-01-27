@@ -818,14 +818,14 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.local.table, true);
+        assert!(cfg.local.table);
         assert_eq!(cfg.local.dns.server, "udp://1.1.1.1:53");
         assert_eq!(cfg.local.dns.refresh, 60);
         assert_eq!(cfg.local.dns.bindif, None);
         assert_eq!(cfg.local.tun.ifname, "h3llo0");
         assert_eq!(cfg.local.tun.mtu, 1410);
-        assert_eq!(cfg.peers[0].enabled, true);
-        assert_eq!(cfg.peers[0].h3.is_some(), true);
+        assert!(cfg.peers[0].enabled);
+        assert!(cfg.peers[0].h3.is_some());
         if let Some(h3) = cfg.peers[0].h3.as_ref() {
             assert!(h3.endpoints.is_empty());
             assert_eq!(h3.retry, 10);
