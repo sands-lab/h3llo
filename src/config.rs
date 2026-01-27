@@ -74,7 +74,7 @@ pub struct LocalDns {
     /// DNS server address as a UDP URI (IPv4/IPv6 literal), e.g., `udp://1.1.1.1:53`.
     #[serde(default = "default_dns_server")]
     pub server: String,
-    /// DNS refresh interval in seconds (`0` disables; minimum 1s, recommended 30s+).
+    /// DNS refresh interval in seconds (`0` disables; any non-zero value enables refresh; 30s+ recommended for production).
     #[serde(default = "default_dns_refresh")]
     pub refresh: u64,
     /// Optional outbound interface binding for DNS resolution.
