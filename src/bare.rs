@@ -123,11 +123,16 @@ pub fn spawn_udp_rx(
                         Err(_) => break,
                     }
                 }
-                Some(command) = cmd_rx.recv() => {
-                    match command {
-                        BareUdpRxCommand::UpdateAllowedSources(update) => {
-                            allowed_sources = update;
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(command) => {
+                            match command {
+                                BareUdpRxCommand::UpdateAllowedSources(update) => {
+                                    allowed_sources = update;
+                                }
+                            }
                         }
+                        None => break, // Channel closed, exit gracefully
                     }
                 }
                 _ = ticker.tick() => {
@@ -415,5 +420,58 @@ mod tests {
         assert_eq!(metrics.stats.dropped.bytes, 0);
 
         handle.abort();
+    }
+
+    // ========== Actor Lifecycle Tests ==========
+
+    #[tokio::test]
+    async fn spawn_udp_rx_returns_working_cmd_tx() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (packet_tx, _packet_rx) = mpsc::channel(4);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let context = BareUdpRx { socket, mtu: 64 };
+
+        let (cmd_tx, handle) = spawn_udp_rx(
+            context,
+            HashSet::new(),
+            packet_tx,
+            events_tx,
+            Duration::from_secs(60),
+        );
+
+        // Verify cmd_tx is functional by sending an allowed sources update
+        assert!(cmd_tx
+            .send(BareUdpRxCommand::UpdateAllowedSources(HashSet::from([
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))
+            ])))
+            .is_ok());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_rx_actor_exits_when_sender_dropped() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (packet_tx, _packet_rx) = mpsc::channel(4);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let context = BareUdpRx { socket, mtu: 64 };
+
+        let (cmd_tx, join_handle) = spawn_udp_rx(
+            context,
+            HashSet::new(),
+            packet_tx,
+            events_tx,
+            Duration::from_secs(60),
+        );
+
+        // Drop sender to signal shutdown
+        drop(cmd_tx);
+
+        // Actor should exit gracefully
+        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
+        assert!(
+            result.is_ok(),
+            "udp_rx actor should shut down after sender dropped"
+        );
     }
 }

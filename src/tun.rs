@@ -443,11 +443,16 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                         Err(_) => break,
                     }
                 }
-                Some(command) = cmd_rx.recv() => {
-                    match command {
-                        TunRxCommand::UpdateRouting { routing: new_routing } => {
-                            routing = new_routing;
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(command) => {
+                            match command {
+                                TunRxCommand::UpdateRouting { routing: new_routing } => {
+                                    routing = new_routing;
+                                }
+                            }
                         }
+                        None => break, // Channel closed, exit gracefully
                     }
                 }
                 _ = ticker.tick() => {
@@ -979,5 +984,46 @@ mod tests {
         assert!(peer1_rx.try_recv().is_err());
 
         tun_rx_task.abort();
+    }
+
+    // ========== Actor Lifecycle Tests ==========
+
+    #[tokio::test]
+    async fn spawn_tun_rx_returns_working_cmd_tx() {
+        let (rx_tun, _tx_tun, _inject_tx, _output_rx) = memory_tun("mem-lifecycle", 64);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let routing = RoutingTable::new();
+
+        let (cmd_tx, handle) = spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_secs(60));
+
+        // Verify cmd_tx is functional by sending a routing update
+        let new_routing = RoutingTable::new();
+        assert!(cmd_tx
+            .send(TunRxCommand::UpdateRouting {
+                routing: new_routing
+            })
+            .is_ok());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn tun_rx_actor_exits_when_sender_dropped() {
+        let (rx_tun, _tx_tun, _inject_tx, _output_rx) = memory_tun("mem-shutdown", 64);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let routing = RoutingTable::new();
+
+        let (cmd_tx, join_handle) =
+            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_secs(60));
+
+        // Drop sender to signal shutdown
+        drop(cmd_tx);
+
+        // Actor should exit gracefully
+        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
+        assert!(
+            result.is_ok(),
+            "tun_rx actor should shut down after sender dropped"
+        );
     }
 }
