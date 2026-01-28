@@ -16,7 +16,6 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
-const PACKET_QUEUE_DEPTH: usize = 256;
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -127,8 +126,6 @@ impl Orchestrator {
 
         // Control plane: unbounded to prevent deadlocks from actor cycles.
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        // Data plane: bounded for backpressure on high-throughput packet path.
-        let (bare_packet_tx, bare_packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
 
         // Extract validated peers for storage (enabled BareUDP peers only)
         let peers: Vec<Peer> = config
@@ -148,18 +145,15 @@ impl Orchestrator {
         // Spawn TUN actors - actors create their own command channels
         let (tun_cmd_tx, tun_rx_handle) =
             tun::spawn_tun_rx(tun_reader, routing, events_tx.clone(), METRICS_INTERVAL);
-        let tun_tx_handle = tun::spawn_tun_tx(
-            tun_writer,
-            bare_packet_rx,
-            events_tx.clone(),
-            METRICS_INTERVAL,
-        );
+        // TUN-Tx actor creates its own packet channel; returns sender for BareUDP-Rx to use
+        let (tun_packet_tx, tun_tx_handle) =
+            tun::spawn_tun_tx(tun_writer, events_tx.clone(), METRICS_INTERVAL);
 
-        // Spawn BareUDP RX - actor creates its own command channel
+        // BareUDP RX forwards received packets to TUN TX's packet channel
         let (bare_rx_cmd_tx, bare_rx_handle) = spawn_udp_rx(
             bare_rx,
             HashSet::new(),
-            bare_packet_tx,
+            tun_packet_tx,
             events_tx.clone(),
             METRICS_INTERVAL,
         );
@@ -482,14 +476,8 @@ async fn spawn_bare_tx_for_peer(
         }
     };
 
-    let (packet_tx, packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
-    let tx_handle = spawn_udp_tx(
-        tx_socket,
-        destination,
-        packet_rx,
-        events_tx,
-        METRICS_INTERVAL,
-    );
+    // BareUDP TX actor creates its own packet channel; returns sender
+    let (packet_tx, tx_handle) = spawn_udp_tx(tx_socket, destination, events_tx, METRICS_INTERVAL);
 
     Some((packet_tx, tx_handle))
 }

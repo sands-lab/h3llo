@@ -1,6 +1,7 @@
 //! BareUDP transport: socket setup, source-IP filtering, and send/receive loops.
 
 pub use crate::udp::bind_socket;
+use crate::PACKET_QUEUE_DEPTH;
 
 use crate::bind::RouteProbe;
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
@@ -149,22 +150,26 @@ pub fn spawn_udp_rx(
 
 /// Spawns the BareUDP send loop, emitting metrics while forwarding packets to `destination`.
 ///
+/// Creates a bounded packet channel internally (actor owns the receiver).
+/// Returns the packet sender and join handle.
+///
 /// # Arguments
 /// - `tx`: Send-only socket.
 /// - `destination`: Remote peer socket address.
-/// - `packet_rx`: Bounded channel supplying packets to send (data plane).
 /// - `events_tx`: Unbounded channel for emitting transmit metrics.
 /// - `interval`: Metrics emission interval.
 pub fn spawn_udp_tx(
     tx: BareUdpTx,
     destination: SocketAddr,
-    mut packet_rx: mpsc::Receiver<Vec<u8>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
-) -> JoinHandle<()> {
+) -> (mpsc::Sender<Vec<u8>>, JoinHandle<()>) {
+    // Actor creates and owns its data-plane channel receiver
+    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
+
     let BareUdpTx { socket } = tx;
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Tx);
         let mut ticker = time::interval(interval);
 
@@ -191,7 +196,9 @@ pub fn spawn_udp_tx(
                 }
             }
         }
-    })
+    });
+
+    (packet_tx, handle)
 }
 
 #[cfg(test)]
@@ -291,18 +298,12 @@ mod tests {
         let dest = receiver.local_addr().unwrap();
 
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
         let context = BareUdpTx {
             socket: sender_socket,
         };
-        let handle = spawn_udp_tx(
-            context,
-            dest,
-            packet_rx,
-            events_tx,
-            Duration::from_millis(200),
-        );
+        let (packet_tx, handle) =
+            spawn_udp_tx(context, dest, events_tx, Duration::from_millis(200));
 
         packet_tx.send(vec![9, 8, 7]).await.unwrap();
 
@@ -375,18 +376,11 @@ mod tests {
         let dest = receiver.local_addr().unwrap();
 
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let context = BareUdpTx {
             socket: sender_socket,
         };
-        let handle = spawn_udp_tx(
-            context,
-            dest,
-            packet_rx,
-            events_tx,
-            Duration::from_millis(10),
-        );
+        let (packet_tx, handle) = spawn_udp_tx(context, dest, events_tx, Duration::from_millis(10));
 
         packet_tx.send(vec![5, 4, 3, 2]).await.unwrap();
 
@@ -472,6 +466,51 @@ mod tests {
         assert!(
             matches!(result, Ok(Ok(()))),
             "udp_rx actor should shut down cleanly after sender dropped, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_udp_tx_returns_working_packet_tx() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let context = BareUdpTx {
+            socket: sender_socket,
+        };
+
+        let (packet_tx, handle) = spawn_udp_tx(context, dest, events_tx, Duration::from_secs(60));
+
+        // Verify packet_tx is functional by sending a packet
+        assert!(packet_tx.send(vec![1, 2, 3]).await.is_ok());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_tx_actor_exits_when_sender_dropped() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let context = BareUdpTx {
+            socket: sender_socket,
+        };
+
+        let (packet_tx, join_handle) =
+            spawn_udp_tx(context, dest, events_tx, Duration::from_secs(60));
+
+        // Drop sender to signal shutdown
+        drop(packet_tx);
+
+        // Actor should exit gracefully (check both timeout and join result)
+        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "udp_tx actor should shut down cleanly after sender dropped, got {:?}",
             result
         );
     }
