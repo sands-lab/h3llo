@@ -100,11 +100,10 @@ async fn spawn_resolver(
     mpsc::UnboundedReceiver<Event>,
     tokio::task::JoinHandle<()>,
 ) {
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let resolver = DnsResolver::new(server, None, None, timeout);
-    let handle = resolver
-        .spawn(NoopProbe, cmd_rx, event_tx)
+    let (cmd_tx, handle) = resolver
+        .spawn(NoopProbe, event_tx)
         .await
         .expect("resolver spawn failed");
     (cmd_tx, event_rx, handle)

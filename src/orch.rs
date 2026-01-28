@@ -129,8 +129,6 @@ impl Orchestrator {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         // Data plane: bounded for backpressure on high-throughput packet path.
         let (bare_packet_tx, bare_packet_rx) = mpsc::channel(PACKET_QUEUE_DEPTH);
-        let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel::<BareUdpRxCommand>();
-        let (tun_cmd_tx, tun_cmd_rx) = mpsc::unbounded_channel::<TunRxCommand>();
 
         // Extract validated peers for storage (enabled BareUDP peers only)
         let peers: Vec<Peer> = config
@@ -147,14 +145,9 @@ impl Orchestrator {
         // Start with empty routing table; routes populated as DNS answers arrive
         let routing = RoutingTable::new();
 
-        // Spawn TUN actors
-        let tun_rx_handle = tun::spawn_tun_rx(
-            tun_reader,
-            routing,
-            tun_cmd_rx,
-            events_tx.clone(),
-            METRICS_INTERVAL,
-        );
+        // Spawn TUN actors - actors create their own command channels
+        let (tun_cmd_tx, tun_rx_handle) =
+            tun::spawn_tun_rx(tun_reader, routing, events_tx.clone(), METRICS_INTERVAL);
         let tun_tx_handle = tun::spawn_tun_tx(
             tun_writer,
             bare_packet_rx,
@@ -162,11 +155,10 @@ impl Orchestrator {
             METRICS_INTERVAL,
         );
 
-        // Spawn BareUDP RX with empty active IPs (updated via commands as DNS answers arrive)
-        let bare_rx_handle = spawn_udp_rx(
+        // Spawn BareUDP RX - actor creates its own command channel
+        let (bare_rx_cmd_tx, bare_rx_handle) = spawn_udp_rx(
             bare_rx,
             HashSet::new(),
-            bare_rx_cmd_rx,
             bare_packet_tx,
             events_tx.clone(),
             METRICS_INTERVAL,
@@ -178,17 +170,14 @@ impl Orchestrator {
 
         let dns_refresh = Duration::from_secs(config.local.dns.refresh);
 
-        // Spawn DNS resolver first, then send resolve commands.
-        // This follows the actor pattern: create receiver before sending messages.
-        // IP literals are detected and emit immediate DnsAnswer events.
+        // Spawn DNS resolver - actor creates its own command channel
         let resolver =
             DnsResolver::from_config(&config.local.dns, Some(tun_if.clone()), DNS_QUERY_TIMEOUT)
                 .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
-        let (dns_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let probe = DefaultRouteProbe;
-        let handle = resolver
-            .spawn(probe, cmd_rx, events_tx.clone())
+        let (dns_cmd_tx, handle) = resolver
+            .spawn(probe, events_tx.clone())
             .await
             .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 

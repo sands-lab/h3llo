@@ -29,9 +29,11 @@ Concurrency model overview: h3llo adopts the actor model—each coroutine (actor
 
 Actor design principles:
 - **Isolated state**: each actor (TUN-Rx, TUN-Tx, DNS Resolver, BareUDP-Rx/Tx, Orchestrator, H3 connections) maintains its own state; no `Arc<Mutex<_>>` across actors.
+- **Actor-owned message box**: each actor creates its own command channel (`mpsc::unbounded_channel`) during spawn. The actor owns the receiver; the caller receives the sender via tuple return `(cmd_tx, JoinHandle)`. This ensures clear ownership and enables graceful shutdown when all senders are dropped.
 - **Message passing**: actors communicate through typed `mpsc::channel` queues; the `Event` enum and command types define the message protocol.
 - **Async select loop**: each actor runs a `tokio::select!` loop over its input channels, I/O sources, and timers.
-- **Supervision**: the Orchestrator spawns and monitors child actors (DNS resolver, H3 dialers); task exits propagate upward via `JoinSet`.
+- **Supervision**: the Orchestrator holds senders to child actors; task JoinHandles are registered with `JoinSet` for lifecycle monitoring.
+- **Graceful shutdown**: when all senders to an actor's command channel are dropped, `recv()` returns `None`. The actor detects this and exits its event loop gracefully.
 
 #### Channel Capacity Policy
 
