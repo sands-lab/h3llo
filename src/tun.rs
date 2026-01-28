@@ -1,5 +1,6 @@
 //! TUN management: device creation, read/write loops with backpressure, and metrics reporting.
 
+use crate::actor::{ActorError, ActorExitResult};
 use crate::config::{LocalTun, Peer};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::{extract_dst_ip, retry_on_interrupted};
@@ -396,9 +397,13 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut routing: RoutingTable,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
-) -> (mpsc::UnboundedSender<TunRxCommand>, JoinHandle<()>) {
+) -> (
+    mpsc::UnboundedSender<TunRxCommand>,
+    JoinHandle<ActorExitResult>,
+) {
     // Actor creates and owns its command channel receiver
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+    let tun_name = tun.name().to_string();
 
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
@@ -441,7 +446,9 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             }
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
+                        Err(err) => {
+                            return Err(ActorError::TunRxRecv { name: tun_name, source: err });
+                        }
                     }
                 }
                 cmd = cmd_rx.recv() => {
@@ -453,12 +460,12 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                                 }
                             }
                         }
-                        None => break, // Channel closed, exit gracefully
+                        None => return Ok(()), // Channel closed, exit gracefully
                     }
                 }
                 _ = ticker.tick() => {
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
-                        break;
+                        return Ok(()); // Events channel closed during shutdown
                     }
                 }
             }
@@ -477,9 +484,10 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     mut tun: T,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
-) -> (mpsc::Sender<Vec<u8>>, JoinHandle<()>) {
+) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
     let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
+    let tun_name = tun.name().to_string();
 
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
@@ -491,7 +499,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                 maybe_packet = packet_rx.recv() => {
                     let packet = match maybe_packet {
                         Some(packet) => packet,
-                        None => break,
+                        None => return Ok(()), // Channel closed, exit gracefully
                     };
 
                     if packet.len() > mtu {
@@ -501,15 +509,15 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
 
                     match retry_on_interrupted!(tun.send(&packet).await) {
                         Ok(written) => counters.record_success(written),
-                        Err(_) => {
+                        Err(err) => {
                             counters.record_drop(DropReason::SendError, packet.len());
-                            break;
+                            return Err(ActorError::TunTxSend { name: tun_name, source: err });
                         }
                     }
                 }
                 _ = ticker.tick() => {
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
-                        break;
+                        return Ok(()); // Events channel closed during shutdown
                     }
                 }
             }
@@ -1028,7 +1036,7 @@ mod tests {
         // Actor should exit gracefully (check both timeout and join result)
         let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
         assert!(
-            matches!(result, Ok(Ok(()))),
+            matches!(result, Ok(Ok(Ok(())))),
             "tun_rx actor should shut down cleanly after sender dropped, got {:?}",
             result
         );
@@ -1060,7 +1068,7 @@ mod tests {
         // Actor should exit gracefully (check both timeout and join result)
         let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
         assert!(
-            matches!(result, Ok(Ok(()))),
+            matches!(result, Ok(Ok(Ok(())))),
             "tun_tx actor should shut down cleanly after sender dropped, got {:?}",
             result
         );

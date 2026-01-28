@@ -1,5 +1,6 @@
 //! BareUDP transport: socket setup, source-IP filtering, and send/receive loops.
 
+use crate::actor::{ActorError, ActorExitResult};
 pub use crate::bind::bind_udp_socket;
 use crate::bind::{RouteProbe, UdpError};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
@@ -88,11 +89,18 @@ pub fn spawn_udp_rx(
     packet_tx: mpsc::Sender<Vec<u8>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
-) -> (mpsc::UnboundedSender<BareUdpRxCommand>, JoinHandle<()>) {
+) -> (
+    mpsc::UnboundedSender<BareUdpRxCommand>,
+    JoinHandle<ActorExitResult>,
+) {
     // Actor creates and owns its command channel receiver
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
     let BareUdpRx { socket, mtu } = rx;
+    let local_addr = socket
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
 
     let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; mtu];
@@ -114,12 +122,14 @@ pub fn spawn_udp_rx(
                             let packet = buf[..len].to_vec();
                             if packet_tx.send(packet).await.is_err() {
                                 counters.record_drop(DropReason::ChannelClosed, len);
-                                break;
+                                return Ok(()); // Downstream closed, exit gracefully
                             }
                             counters.record_success(len);
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
+                        Err(err) => {
+                            return Err(ActorError::BareRxRecv { addr: local_addr, source: err });
+                        }
                     }
                 }
                 cmd = cmd_rx.recv() => {
@@ -131,12 +141,12 @@ pub fn spawn_udp_rx(
                                 }
                             }
                         }
-                        None => break, // Channel closed, exit gracefully
+                        None => return Ok(()), // Channel closed, exit gracefully
                     }
                 }
                 _ = ticker.tick() => {
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
-                        break;
+                        return Ok(()); // Events channel closed during shutdown
                     }
                 }
             }
@@ -161,9 +171,10 @@ pub fn spawn_udp_tx(
     destination: SocketAddr,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
-) -> (mpsc::Sender<Vec<u8>>, JoinHandle<()>) {
+) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
     let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
+    let dest_str = destination.to_string();
 
     let BareUdpTx { socket } = tx;
 
@@ -176,20 +187,20 @@ pub fn spawn_udp_tx(
                 maybe_packet = packet_rx.recv() => {
                     let packet = match maybe_packet {
                         Some(packet) => packet,
-                        None => break,
+                        None => return Ok(()), // Channel closed, exit gracefully
                     };
 
                     match retry_on_interrupted!(socket.send_to(&packet, destination).await) {
                         Ok(written) => counters.record_success(written),
-                        Err(_) => {
+                        Err(err) => {
                             counters.record_drop(DropReason::SendError, packet.len());
-                            break;
+                            return Err(ActorError::BareTxSend { dest: dest_str, source: err });
                         }
                     }
                 }
                 _ = ticker.tick() => {
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
-                        break;
+                        return Ok(()); // Events channel closed during shutdown
                     }
                 }
             }
@@ -462,7 +473,7 @@ mod tests {
         // Actor should exit gracefully (check both timeout and join result)
         let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
         assert!(
-            matches!(result, Ok(Ok(()))),
+            matches!(result, Ok(Ok(Ok(())))),
             "udp_rx actor should shut down cleanly after sender dropped, got {:?}",
             result
         );
@@ -507,7 +518,7 @@ mod tests {
         // Actor should exit gracefully (check both timeout and join result)
         let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
         assert!(
-            matches!(result, Ok(Ok(()))),
+            matches!(result, Ok(Ok(Ok(())))),
             "udp_tx actor should shut down cleanly after sender dropped, got {:?}",
             result
         );

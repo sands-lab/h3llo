@@ -1,5 +1,6 @@
 //! BareUDP-only runtime orchestration.
 
+use crate::actor::{ActorError, ActorExitResult};
 use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareUdpTx};
 use crate::bind::DefaultRouteProbe;
 use crate::config::{parse_udp_uri, Config, Peer};
@@ -49,10 +50,10 @@ pub enum OrchestratorError {
     /// Route sync failed.
     #[error("route sync failed: {0}")]
     RouteSync(String),
-    /// A runtime task exited unexpectedly.
-    #[error("runtime task exited: {0}")]
-    TaskExited(String),
-    /// A runtime task failed to join.
+    /// An actor exited with an error.
+    #[error("actor error: {0}")]
+    ActorError(#[from] ActorError),
+    /// A runtime task failed to join (panic or cancel).
     #[error("runtime task join failed: {0}")]
     TaskJoin(String),
 }
@@ -64,7 +65,7 @@ pub enum OrchestratorError {
 pub struct Orchestrator {
     events_rx: mpsc::UnboundedReceiver<Event>,
     events_tx: mpsc::UnboundedSender<Event>,
-    join_set: JoinSet<String>,
+    join_set: JoinSet<Result<ActorExitResult, tokio::task::JoinError>>,
 
     dns_refresh: Duration,
 
@@ -158,9 +159,9 @@ impl Orchestrator {
             METRICS_INTERVAL,
         );
 
-        join_set.spawn(wrap_task("tun_rx", tun_rx_handle));
-        join_set.spawn(wrap_task("tun_tx", tun_tx_handle));
-        join_set.spawn(wrap_task("bare_rx", bare_rx_handle));
+        join_set.spawn(tun_rx_handle);
+        join_set.spawn(tun_tx_handle);
+        join_set.spawn(bare_rx_handle);
 
         let dns_refresh = Duration::from_secs(config.local.dns.refresh);
 
@@ -179,7 +180,7 @@ impl Orchestrator {
         // IP literals are detected by resolver and emit immediate DnsAnswer events.
         send_resolve_commands(&peers, &dns_cmd_tx)?;
 
-        join_set.spawn(wrap_task("dns_resolver", handle));
+        join_set.spawn(handle);
 
         if peers.iter().all(|p| !p.enabled || p.bare.is_none()) {
             warn!("no active BareUDP peers; traffic will be dropped");
@@ -229,15 +230,24 @@ impl Orchestrator {
                 }
                 result = self.join_set.join_next() => {
                     match result {
-                        Some(Ok(label)) => {
-                            error!("task '{}' exited unexpectedly", label);
-                            return Err(OrchestratorError::TaskExited(label));
+                        Some(Ok(Ok(Ok(())))) => {
+                            // Graceful shutdown of one actor; continue running
+                            debug!("an actor exited gracefully");
                         }
-                        Some(Err(err)) => {
-                            error!("task join failed: {}", err);
-                            return Err(OrchestratorError::TaskJoin(err.to_string()));
+                        Some(Ok(Ok(Err(actor_error)))) => {
+                            // Actor exited with error
+                            error!("actor error: {}", actor_error);
+                            return Err(OrchestratorError::ActorError(actor_error));
                         }
-                        None => return Ok(()),
+                        Some(Ok(Err(join_err))) | Some(Err(join_err)) => {
+                            // Task panicked or was cancelled
+                            error!("task join failed (panic/cancel): {}", join_err);
+                            return Err(OrchestratorError::TaskJoin(join_err.to_string()));
+                        }
+                        None => {
+                            // All actors have exited
+                            return Ok(());
+                        }
                     }
                 }
                 result = tokio::signal::ctrl_c() => {
@@ -359,8 +369,7 @@ impl Orchestrator {
                 .await
                 {
                     self.peer_txs.insert(peer.id.clone(), packet_tx);
-                    let label = format!("bare_tx:{}", peer.id);
-                    self.join_set.spawn(wrap_task(label, tx_handle));
+                    self.join_set.spawn(tx_handle);
                     any_spawned = true;
                 }
             }
@@ -460,7 +469,7 @@ async fn spawn_bare_tx_for_peer(
     tun_if: &str,
     events_tx: mpsc::UnboundedSender<Event>,
     active_ips: &mut HashSet<IpAddr>,
-) -> Option<(mpsc::Sender<Vec<u8>>, JoinHandle<()>)> {
+) -> Option<(mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>)> {
     // Dedup by IP
     if !active_ips.insert(destination.ip()) {
         return None;
@@ -575,12 +584,6 @@ fn send_resolve_commands(
     }
 
     Ok(())
-}
-
-async fn wrap_task(label: impl Into<String>, handle: JoinHandle<()>) -> String {
-    let name = label.into();
-    let _ = handle.await;
-    name
 }
 
 #[cfg(test)]
@@ -731,14 +734,25 @@ mod tests {
         }))
     }
 
-    #[tokio::test]
-    async fn orchestrator_error_includes_task_label() {
-        // Verify that OrchestratorError::TaskExited includes the task label
-        let error = OrchestratorError::TaskExited("tun_rx".to_string());
+    #[test]
+    fn orchestrator_error_includes_actor_context() {
+        // Verify that OrchestratorError::ActorError includes actor context
+        use crate::actor::ActorError;
+        use std::io;
+
+        let actor_err = ActorError::TunRxRecv {
+            name: "tun0".to_string(),
+            source: io::Error::new(io::ErrorKind::Other, "test error"),
+        };
+        let error = OrchestratorError::ActorError(actor_err);
         let error_msg = error.to_string();
         assert!(
             error_msg.contains("tun_rx"),
-            "error message should contain task label"
+            "error message should contain actor type"
+        );
+        assert!(
+            error_msg.contains("tun0"),
+            "error message should contain interface name"
         );
     }
 
