@@ -19,3 +19,4 @@
 - Channel 命名：统一使用 `cmd` 缩写（不使用 `command`）表示命令通道；下划线前缀仅用于确实未使用的变量。
 - Channel 容量策略：控制面通道（命令、事件）使用 `mpsc::unbounded_channel()` 防止死锁；数据面通道（数据包）使用 `mpsc::channel(capacity)` 实现背压。
 - 死锁预防：Actor 之间的消息循环可能导致死锁，unbounded channel 的 `send()` 立即返回，因此不会参与死锁循环。
+- 控制面通道发送失败时，【应当】使用 `if let Err(e)` 捕获错误并记录错误值；shutdown 路径的通道关闭检测（如 `events_tx.send(...).is_err()` 后返回 `Ok(())`）除外，因为通道关闭是预期行为。
