@@ -81,10 +81,11 @@ impl DnsResolver {
         Ok(Self::new(server, local_dns.bindif.clone(), tun_if, timeout))
     }
 
-    /// Spawns the DNS resolver coroutine, returning its join handle.
+    /// Spawns the DNS resolver coroutine.
     ///
-    /// Uses unbounded channels to prevent deadlocks when orchestrator sends
-    /// resolve commands during event handling cycles.
+    /// Creates an unbounded command channel internally (actor owns the receiver).
+    /// Returns the command sender and join handle. The actor exits when all
+    /// senders are dropped, closing the channel naturally.
     ///
     /// # Errors
     ///
@@ -92,9 +93,11 @@ impl DnsResolver {
     pub async fn spawn<P: RouteProbe + Send + Sync + 'static>(
         self,
         probe: P,
-        cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
         events_tx: mpsc::UnboundedSender<Event>,
-    ) -> Result<JoinHandle<()>, ResolveInitError> {
+    ) -> Result<(mpsc::UnboundedSender<DnsCommand>, JoinHandle<()>), ResolveInitError> {
+        // Actor creates and owns its command channel receiver
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
         let socket = self.prepare_socket(&probe).await?;
         let mut task = ResolverTask::new(self.server, self.timeout, cmd_rx, events_tx, socket);
 
@@ -102,7 +105,7 @@ impl DnsResolver {
             task.run().await;
         });
 
-        Ok(handle)
+        Ok((cmd_tx, handle))
     }
 
     /// Prepares and connects a UDP socket to the DNS server.
@@ -568,14 +571,13 @@ mod tests {
         mpsc::UnboundedReceiver<Event>,
         JoinHandle<()>,
     ) {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let resolver = DnsResolver::new(server, bindif, None, Duration::from_millis(50));
         let probe = FakeRouteProbe {
             result: Ok(Vec::new()),
         };
-        let handle = resolver
-            .spawn(probe, cmd_rx, event_tx)
+        let (cmd_tx, handle) = resolver
+            .spawn(probe, event_tx)
             .await
             .expect("resolver spawn");
 
@@ -984,5 +986,56 @@ mod tests {
         }
 
         handle.abort();
+    }
+
+    // ========== Actor Lifecycle Tests ==========
+
+    #[tokio::test]
+    async fn spawn_returns_working_cmd_tx() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+
+        let resolver = DnsResolver::new(server_addr, None, None, Duration::from_millis(50));
+        let probe = FakeRouteProbe {
+            result: Ok(Vec::new()),
+        };
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _handle) = resolver
+            .spawn(probe, event_tx)
+            .await
+            .expect("resolver spawn");
+
+        // Verify cmd_tx is functional
+        assert!(cmd_tx
+            .send(DnsCommand::Resolve {
+                host: "test.example".to_string()
+            })
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn actor_exits_when_sender_dropped() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+
+        let resolver = DnsResolver::new(server_addr, None, None, Duration::from_millis(50));
+        let probe = FakeRouteProbe {
+            result: Ok(Vec::new()),
+        };
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, join_handle) = resolver
+            .spawn(probe, event_tx)
+            .await
+            .expect("resolver spawn");
+
+        // Drop sender to signal shutdown
+        drop(cmd_tx);
+
+        // Actor should exit gracefully
+        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
+        assert!(
+            result.is_ok(),
+            "actor should shut down after sender dropped"
+        );
     }
 }

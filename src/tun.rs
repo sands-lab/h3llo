@@ -378,25 +378,28 @@ fn parse_addrs(raw_addrs: &[String]) -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), Tun
     Ok((v4, v6))
 }
 
-/// Spawns the TUN read loop, pushing packets into peer TX channels with backpressure and emitting RX metrics.
+/// Spawns the TUN read loop.
+///
+/// Creates an unbounded command channel internally (actor owns the receiver).
+/// Returns the command sender and join handle.
 ///
 /// # Arguments
 ///
 /// * `tun` - TUN device reader.
-/// * `routing` - Initial routing table for destination lookups (includes embedded TX channels).
-/// * `cmd_rx` - Unbounded channel for receiving runtime commands (e.g., routing updates).
-///   Unbounded to prevent deadlocks when orchestrator sends commands during event handling.
+/// * `routing` - Initial routing table for destination lookups.
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
 #[allow(dead_code)]
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
     mut routing: RoutingTable,
-    mut cmd_rx: mpsc::UnboundedReceiver<TunRxCommand>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) -> (mpsc::UnboundedSender<TunRxCommand>, JoinHandle<()>) {
+    // Actor creates and owns its command channel receiver
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+    let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
         let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
         let mut ticker = time::interval(interval);
@@ -454,7 +457,9 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                 }
             }
         }
-    })
+    });
+
+    (cmd_tx, handle)
 }
 
 /// Spawns the TUN write loop, dropping oversize packets with counting and emitting TX metrics.
@@ -697,15 +702,8 @@ mod tests {
         peer_txs.insert("peer1".to_string(), peer_tx);
         let routing = RoutingTable::from_peers(&[peer_config], &peer_txs).unwrap();
 
-        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TunRxCommand>();
-
-        let tun_rx_task = spawn_tun_rx(
-            rx_tun,
-            routing,
-            cmd_rx,
-            events_tx,
-            Duration::from_millis(10),
-        );
+        let (_cmd_tx, tun_rx_task) =
+            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_millis(10));
 
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
         let packet = peer_rx
@@ -941,9 +939,8 @@ mod tests {
         peer_txs.insert("peer1".to_string(), peer1_tx);
         let routing = RoutingTable::from_peers(&[peer1_config], &peer_txs).unwrap();
 
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TunRxCommand>();
-
-        let tun_rx_task = spawn_tun_rx(rx_tun, routing, cmd_rx, events_tx, Duration::from_secs(60));
+        let (cmd_tx, tun_rx_task) =
+            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_secs(60));
 
         // Send packet - should go to peer1
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
