@@ -1,5 +1,11 @@
 //! Library entry point for h3llo.
 
+/// Data-plane packet queue depth for bounded backpressure channels.
+///
+/// Used by TUN-Tx and BareUDP-Tx actors when creating internal packet channels.
+/// See `docs/internals.md` Channel Capacity Policy section for rationale.
+pub(crate) const PACKET_QUEUE_DEPTH: usize = 256;
+
 pub mod bare;
 pub mod bind;
 pub mod config;

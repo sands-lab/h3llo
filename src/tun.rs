@@ -4,6 +4,7 @@ use crate::config::{LocalTun, Peer};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::{extract_dst_ip, retry_on_interrupted};
 use crate::metrics::TransportCounters;
+use crate::PACKET_QUEUE_DEPTH;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use ipnet_trie::IpnetTrie;
 use std::collections::HashMap;
@@ -468,14 +469,19 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
 }
 
 /// Spawns the TUN write loop, dropping oversize packets with counting and emitting TX metrics.
+///
+/// Creates a bounded packet channel internally (actor owns the receiver).
+/// Returns the packet sender and join handle.
 #[allow(dead_code)]
 pub(crate) fn spawn_tun_tx<T: TunTx>(
     mut tun: T,
-    mut packet_rx: mpsc::Receiver<Vec<u8>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) -> (mpsc::Sender<Vec<u8>>, JoinHandle<()>) {
+    // Actor creates and owns its data-plane channel receiver
+    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
+
+    let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
         let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Tx);
         let mut ticker = time::interval(interval);
@@ -508,7 +514,9 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                 }
             }
         }
-    })
+    });
+
+    (packet_tx, handle)
 }
 
 // ============================================================================
@@ -744,9 +752,8 @@ mod tests {
     #[tokio::test]
     async fn tun_tx_drops_oversize_and_reports_metrics() {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) = memory_tun("mem1", 4);
-        let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let tun_tx_task = spawn_tun_tx(tx_tun, packet_rx, events_tx, Duration::from_millis(10));
+        let (packet_tx, tun_tx_task) = spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(10));
 
         packet_tx.send(vec![0, 1, 2, 3, 4, 5]).await.unwrap();
         packet_tx.send(vec![9, 9, 9]).await.unwrap();
@@ -796,9 +803,8 @@ mod tests {
     async fn tun_tx_retries_interrupted_send() {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) =
             memory_tun_with_errors("mem-interrupt", 16, vec![std::io::ErrorKind::Interrupted]);
-        let (packet_tx, packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let tun_tx_task = spawn_tun_tx(tx_tun, packet_rx, events_tx, Duration::from_millis(5));
+        let (packet_tx, tun_tx_task) = spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(5));
 
         packet_tx.send(vec![1, 2, 3]).await.unwrap();
 
@@ -1024,6 +1030,38 @@ mod tests {
         assert!(
             matches!(result, Ok(Ok(()))),
             "tun_rx actor should shut down cleanly after sender dropped, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_tun_tx_returns_working_packet_tx() {
+        let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-lifecycle", 64);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+
+        let (packet_tx, handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60));
+
+        // Verify packet_tx is functional by sending a packet
+        assert!(packet_tx.send(vec![1, 2, 3]).await.is_ok());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn tun_tx_actor_exits_when_sender_dropped() {
+        let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-shutdown", 64);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+
+        let (packet_tx, join_handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60));
+
+        // Drop sender to signal shutdown
+        drop(packet_tx);
+
+        // Actor should exit gracefully (check both timeout and join result)
+        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "tun_tx actor should shut down cleanly after sender dropped, got {:?}",
             result
         );
     }
