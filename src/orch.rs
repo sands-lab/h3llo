@@ -379,24 +379,20 @@ impl Orchestrator {
         if any_spawned {
             // 1. Update allowed sources (fast, in-memory filter)
             if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
-                if cmd_tx
-                    .send(BareUdpRxCommand::UpdateAllowedSources(
-                        self.active_ips.clone(),
-                    ))
-                    .is_err()
-                {
-                    warn!("failed to send allowed sources update command");
+                if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAllowedSources(
+                    self.active_ips.clone(),
+                )) {
+                    warn!(error = %e, "failed to send allowed sources update command");
                 }
             }
 
             // 2. Update internal routing table
             if let Ok(routing) = RoutingTable::from_peers(&self.peers, &self.peer_txs) {
-                if self
+                if let Err(e) = self
                     .tun_cmd_tx
                     .send(TunRxCommand::UpdateRouting { routing })
-                    .is_err()
                 {
-                    warn!("failed to send routing update command");
+                    warn!(error = %e, "failed to send routing update command");
                 }
             }
 
@@ -572,14 +568,12 @@ fn send_resolve_commands(
         })?;
 
         // Send resolve command only once per hostname (deduplication)
-        if seen_hosts.insert(endpoint.host.clone())
-            && dns_cmd_tx
-                .send(DnsCommand::Resolve {
-                    host: endpoint.host,
-                })
-                .is_err()
-        {
-            warn!("dns: resolver channel closed");
+        if seen_hosts.insert(endpoint.host.clone()) {
+            if let Err(e) = dns_cmd_tx.send(DnsCommand::Resolve {
+                host: endpoint.host.clone(),
+            }) {
+                warn!(host = %endpoint.host, error = %e, "dns: resolver channel closed");
+            }
         }
     }
 
