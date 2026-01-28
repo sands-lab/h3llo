@@ -118,9 +118,6 @@ pub struct PeerH3 {
     /// Optional dialing endpoints (scheme/host/port/path); omit or leave empty for listen-only posture.
     #[serde(default, deserialize_with = "deserialize_endpoints")]
     pub endpoints: Vec<String>,
-    /// Seconds between reconnect attempts when dialing fails (default: 10).
-    #[serde(default = "default_peer_h3_retry_secs")]
-    pub retry: u64,
     /// Remote peer secret (> 8 characters) required whenever HTTP/3 is configured, including listen-only peers.
     pub secret: String,
     /// Optional custom CA bundle.
@@ -437,10 +434,6 @@ fn default_mtu() -> u16 {
     1410
 }
 
-fn default_peer_h3_retry_secs() -> u64 {
-    10
-}
-
 /// Represents a UDP endpoint parsed from a `udp://` URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpEndpoint {
@@ -563,7 +556,6 @@ mod tests {
                 h3: Some(PeerH3 {
                     secret: "example-node-2-secret".to_string(),
                     endpoints: vec!["https://peer.example.com:443/path".to_string()],
-                    retry: 10,
                     ca: None,
                     insecure: false,
                     bindifs: None,
@@ -828,7 +820,6 @@ peers:
         assert!(cfg.peers[0].h3.is_some());
         if let Some(h3) = cfg.peers[0].h3.as_ref() {
             assert!(h3.endpoints.is_empty());
-            assert_eq!(h3.retry, 10);
             assert!(h3.bindifs.is_none());
         } else {
             panic!("peer h3 should be present");
@@ -849,7 +840,6 @@ peers:
 - id: example-node-2
   h3:
     secret: example-node-2-secret
-    retry: 5
     endpoints:
       - https://peer.example.com/path
       - https://peer.example.com/path
@@ -865,7 +855,6 @@ peers:
         assert_eq!(cfg.local.dns.server, "udp://8.8.8.8:53");
         assert_eq!(cfg.local.dns.refresh, 60);
         let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
-        assert_eq!(h3.retry, 5);
         assert_eq!(
             h3.endpoints,
             vec![

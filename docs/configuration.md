@@ -31,7 +31,6 @@ peers: # optional, default: []
     secret: example-secret # required whenever peers[].h3 is set (including listen-only)
     endpoints:
       - https://node1.example.com:443/path # optional; deduped; order does not imply priority
-    retry: 10 # optional, default: 10 (seconds between reconnect attempts)
     ca: ./ca.pem # optional
     insecure: false # optional, default: false
     bindifs:
@@ -65,7 +64,6 @@ peers: # optional, default: []
 - `peers[].h3.secret`: Remote peer authentication secret; required (and must be longer than 8 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. HTTP Basic Auth for CONNECT uses `username = remote local.id` and `password = peers[username].h3.secret` on the server side; clients send `password = peers[target].h3.secret`.
 - `peers[].enabled` (default `true`): Whether this peer entry is active.
 - `peers[].h3.endpoints` (optional, deduped): List of HTTP/3 dialing addresses (scheme/host/port/path); omit or leave empty to wait for inbound HTTP/3 from the peer. Mutually exclusive with peers[].bare; dialing/multipath details are in `docs/internals.md`.
-- `peers[].h3.retry` (default `10`): Seconds between reconnect attempts when dialing fails (including TLS/handshake errors); selection and rebuild behavior is in `docs/internals.md`.
 - `peers[].h3.bindifs` (optional): Interface list for HTTP/3 dialers. When omitted, auto-detects at most one interface; when set, the list must include at least one interface. Probe/bind fallbacks and recursive-routing warnings are described in `docs/internals.md`.
 - `peers[].h3.ca`: Custom CA bundle path for validating the peer’s certificate (useful for self-signed certs); otherwise the system trust store is used.
 - `peers[].h3.insecure` (default `false`): Skip TLS certificate validation (not recommended; prefer `ca`).
