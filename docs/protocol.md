@@ -34,7 +34,7 @@ h3llo intentionally omits the following optional features from RFC 9484:
 H3 connection management and multipath:
 - Dialing set: build one connection for every combination of DNS answer, `peers[].h3.endpoints`, and `peers[].h3.bindifs` when set (auto-detected bindif yields at most one entry when unspecified). Deduplicate endpoints before dialing.
 - Preference: no endpoint priority is implied; TUN-Rx prefers the earliest-established connection until it disconnects or is invalidated because the IP left the DNS result set or the interface is not within `bindifs`. New connections join the end of the ordering; warn if more than `10` connections exist for a peer.
-- Failures: TLS/handshake failures count as dial failures and retry every `peers[].h3.retry` seconds. Bind failures warn and fall back to unbound sockets, which can risk recursive routing if the system route points to the TUN.
+- Failures: TLS/handshake failures count as dial failures. Bind failures warn and fall back to unbound sockets, which can risk recursive routing if the system route points to the TUN.
 
 ```mermaid
 sequenceDiagram
@@ -179,7 +179,6 @@ peers:
   enabled: true
   h3:
     secret: peer-secret-123
-    retry: 10
     endpoints:
       - https://node1.example.com:443/path
     ca: ./ca.pem
