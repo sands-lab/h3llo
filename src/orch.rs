@@ -570,9 +570,10 @@ fn send_resolve_commands(
         // Send resolve command only once per hostname (deduplication)
         if seen_hosts.insert(endpoint.host.clone()) {
             if let Err(e) = dns_cmd_tx.send(DnsCommand::Resolve {
-                host: endpoint.host.clone(),
+                host: endpoint.host,
             }) {
-                warn!(host = %endpoint.host, error = %e, "dns: resolver channel closed");
+                let DnsCommand::Resolve { ref host } = e.0;
+                warn!(host = %host, error = %e, "dns: resolver channel closed");
             }
         }
     }
