@@ -467,11 +467,12 @@ mod tests {
         // Drop sender to signal shutdown
         drop(cmd_tx);
 
-        // Actor should exit gracefully
+        // Actor should exit gracefully (check both timeout and join result)
         let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
         assert!(
-            result.is_ok(),
-            "udp_rx actor should shut down after sender dropped"
+            matches!(result, Ok(Ok(()))),
+            "udp_rx actor should shut down cleanly after sender dropped, got {:?}",
+            result
         );
     }
 }
