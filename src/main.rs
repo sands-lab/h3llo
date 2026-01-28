@@ -1,5 +1,9 @@
 //! h3llo executable entrypoint.
 
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use h3llo::config::Config;
 use h3llo::orch::run_bare;
 use std::env;

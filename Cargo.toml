@@ -25,6 +25,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tun-rs = { version = "2", features = ["async"] }
 ipnet-trie = "0.3"
 
+# Use mimalloc for musl targets to avoid musl's slow default allocator
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "process"] }
 testcontainers = "0.23"
