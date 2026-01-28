@@ -1,13 +1,11 @@
 //! BareUDP transport: socket setup, source-IP filtering, and send/receive loops.
 
-pub use crate::udp::bind_socket;
-use crate::PACKET_QUEUE_DEPTH;
-
-use crate::bind::RouteProbe;
+pub use crate::bind::bind_udp_socket;
+use crate::bind::{RouteProbe, UdpError};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_interrupted;
 use crate::metrics::TransportCounters;
-use crate::udp::UdpError;
+use crate::PACKET_QUEUE_DEPTH;
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -68,7 +66,7 @@ impl BareUdpTx {
         } else {
             SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0))
         };
-        let socket = bind_socket(bind_addr, bindif, destination.ip(), tun_if, probe).await?;
+        let socket = bind_udp_socket(bind_addr, bindif, destination.ip(), tun_if, probe).await?;
         Ok(Self { socket })
     }
 }

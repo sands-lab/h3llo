@@ -1,12 +1,11 @@
 //! DNS resolver coroutine: consumes resolve commands, processes UDP responses, retries on timeout, and emits events.
 
-use crate::bind::RouteProbe;
+use crate::bind::{bind_udp_socket, RouteProbe};
 use crate::config::{parse_dns_server_uri, LocalDns};
 use crate::events::{
     DnsAnswer, DnsAnswerRecord, DnsAnswerWarning, DnsEvent, DnsEventDetail, DnsRecordType,
     DnsTimeout, DnsUnexpected, DnsUnexpectedKind, Event,
 };
-use crate::udp::bind_socket;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use rand::Rng;
@@ -122,7 +121,7 @@ impl DnsResolver {
             SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
         };
 
-        let socket = bind_socket(
+        let socket = bind_udp_socket(
             bind_addr,
             self.bind_interface.as_deref(),
             self.server.ip(),
