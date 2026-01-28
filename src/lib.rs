@@ -16,7 +16,6 @@ mod metrics;
 pub mod orch;
 pub mod route;
 pub mod tun;
-pub mod udp;
 
 /// Test utilities module exposed via the `test-utils` feature.
 ///
