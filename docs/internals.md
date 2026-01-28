@@ -32,7 +32,10 @@ Actor design principles:
 - **Actor-owned message box**: each actor creates its own channels during spawn. Control-plane command channels use `mpsc::unbounded_channel()`; data-plane packet channels use `mpsc::channel(PACKET_QUEUE_DEPTH)`. The actor owns the receiver; the caller receives the sender via tuple return (e.g., `(cmd_tx, JoinHandle)` or `(packet_tx, JoinHandle)`). This ensures clear ownership and enables graceful shutdown when all senders are dropped.
 - **Message passing**: actors communicate through typed `mpsc::channel` queues; the `Event` enum and command types define the message protocol.
 - **Async select loop**: each actor runs a `tokio::select!` loop over its input channels, I/O sources, and timers.
-- **Supervision**: the Orchestrator holds senders to child actors; task JoinHandles are registered with `JoinSet` for lifecycle monitoring.
+- **Supervision**: the Orchestrator holds senders to child actors; task JoinHandles are registered with `JoinSet` for lifecycle monitoring. Actors return `ActorExitResult`:
+  - `Ok(())` for graceful shutdown (e.g., command channel closed)
+  - `Err(ActorError)` for I/O errors requiring orchestrator action
+  The orchestrator continues running on graceful exits but terminates on actor errors or task panics.
 - **Graceful shutdown**: when all senders to an actor's command channel are dropped, `recv()` returns `None`. The actor detects this and exits its event loop gracefully.
 
 #### Channel Capacity Policy

@@ -14,6 +14,7 @@ use std::time::Duration;
 const RESOLVER_TIMEOUT: Duration = Duration::from_secs(5);
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+use h3llo::actor::ActorExitResult;
 use h3llo::bind::{RouteProbe, RouteProbeError};
 use h3llo::dns::{DnsCommand, DnsResolver};
 use h3llo::events::{DnsAnswer, DnsAnswerWarning, DnsEventDetail, DnsRecordType, Event};
@@ -98,7 +99,7 @@ async fn spawn_resolver(
 ) -> (
     mpsc::UnboundedSender<DnsCommand>,
     mpsc::UnboundedReceiver<Event>,
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<ActorExitResult>,
 ) {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let resolver = DnsResolver::new(server, None, None, timeout);

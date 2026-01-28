@@ -1,5 +1,6 @@
 //! DNS resolver coroutine: consumes resolve commands, processes UDP responses, retries on timeout, and emits events.
 
+use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{bind_udp_socket, RouteProbe};
 use crate::config::{parse_dns_server_uri, LocalDns};
 use crate::events::{
@@ -93,16 +94,21 @@ impl DnsResolver {
         self,
         probe: P,
         events_tx: mpsc::UnboundedSender<Event>,
-    ) -> Result<(mpsc::UnboundedSender<DnsCommand>, JoinHandle<()>), ResolveInitError> {
+    ) -> Result<
+        (
+            mpsc::UnboundedSender<DnsCommand>,
+            JoinHandle<ActorExitResult>,
+        ),
+        ResolveInitError,
+    > {
         // Actor creates and owns its command channel receiver
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         let socket = self.prepare_socket(&probe).await?;
+        let server_str = self.server.to_string();
         let mut task = ResolverTask::new(self.server, self.timeout, cmd_rx, events_tx, socket);
 
-        let handle = tokio::spawn(async move {
-            task.run().await;
-        });
+        let handle = tokio::spawn(async move { task.run(server_str).await });
 
         Ok((cmd_tx, handle))
     }
@@ -180,19 +186,30 @@ impl ResolverTask {
     }
 
     /// Runs the resolver loop with select over commands, UDP socket, and timer ticks.
-    async fn run(&mut self) {
+    async fn run(&mut self, server_str: String) -> ActorExitResult {
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
         let mut ticker = time::interval(TICK_INTERVAL);
 
         loop {
             tokio::select! {
                 maybe_cmd = self.cmd_rx.recv() => self.handle_command(maybe_cmd).await,
-                result = self.socket.recv(&mut buf) => self.handle_recv(result, &buf).await,
+                result = self.socket.recv(&mut buf) => {
+                    match result {
+                        Ok(len) if len > 0 => {
+                            self.handle_packet(&buf[..len]).await;
+                        }
+                        Ok(_) => {}
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                        Err(err) => {
+                            return Err(ActorError::DnsRecv { server: server_str, source: err });
+                        }
+                    }
+                }
                 _ = ticker.tick() => self.handle_tick().await,
             }
 
             if self.cmd_rx_closed && self.pending.is_empty() {
-                break;
+                return Ok(());
             }
         }
     }
@@ -296,18 +313,6 @@ impl ResolverTask {
                 return candidate;
             }
         }
-    }
-
-    /// Handles UDP socket reads and dispatches decoded packets.
-    async fn handle_recv(&mut self, result: io::Result<usize>, buf: &[u8]) {
-        let len = match result {
-            Ok(len) if len > 0 => len,
-            Ok(_) => return,
-            Err(_) => return,
-        };
-
-        let data = &buf[..len];
-        self.handle_packet(data).await;
     }
 
     /// Parses a DNS packet and emits the corresponding event.
@@ -568,7 +573,7 @@ mod tests {
     ) -> (
         mpsc::UnboundedSender<DnsCommand>,
         mpsc::UnboundedReceiver<Event>,
-        JoinHandle<()>,
+        JoinHandle<ActorExitResult>,
     ) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let resolver = DnsResolver::new(server, bindif, None, Duration::from_millis(50));
@@ -1033,7 +1038,7 @@ mod tests {
         // Actor should exit gracefully (check both timeout and join result)
         let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
         assert!(
-            matches!(result, Ok(Ok(()))),
+            matches!(result, Ok(Ok(Ok(())))),
             "actor should shut down cleanly after sender dropped, got {:?}",
             result
         );
