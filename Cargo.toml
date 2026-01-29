@@ -25,6 +25,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tun-rs = { version = "2", features = ["async"] }
 ipnet-trie = "0.3"
 
+# HTTP/3 and QUIC
+quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+h3-datagram = "0.0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rustls-native-certs = "0.8"
+webpki-roots = "0.26"
+base64 = "0.22"
+http = "1"
+bytes = "1"
+
 # Use mimalloc for musl targets to avoid musl's slow default allocator
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = "0.1"
@@ -34,6 +47,7 @@ tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-
 testcontainers = "0.23"
 tempfile = "3"
 tracing-test = "0.2"
+rcgen = "0.13"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 route_manager = { version = "0.2.9", features = ["async"] }

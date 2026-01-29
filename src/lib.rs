@@ -7,11 +7,13 @@
 pub(crate) const PACKET_QUEUE_DEPTH: usize = 256;
 
 pub mod actor;
+pub mod auth;
 pub mod bare;
 pub mod bind;
 pub mod config;
 pub mod dns;
 pub mod events;
+pub mod h3;
 mod helpers;
 mod metrics;
 pub mod orch;
