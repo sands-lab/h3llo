@@ -62,6 +62,33 @@ pub enum ActorError {
         /// Underlying I/O error.
         source: io::Error,
     },
+
+    /// HTTP/3 receive loop exited with error.
+    #[error("h3_rx[{peer}]: recv failed: {reason}")]
+    H3RxRecv {
+        /// Peer identifier.
+        peer: String,
+        /// Error description.
+        reason: String,
+    },
+
+    /// HTTP/3 transmit loop exited with error.
+    #[error("h3_tx[{peer}]: send failed: {reason}")]
+    H3TxSend {
+        /// Peer identifier.
+        peer: String,
+        /// Error description.
+        reason: String,
+    },
+
+    /// HTTP/3 dial failed.
+    #[error("h3_dial[{peer}]: dial failed: {reason}")]
+    H3Dial {
+        /// Peer identifier.
+        peer: String,
+        /// Error description.
+        reason: String,
+    },
 }
 
 #[cfg(test)]
