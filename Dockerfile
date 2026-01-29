@@ -11,7 +11,8 @@
 
 # Stage 1: Chef - Install cargo-chef with Alpine musl
 FROM rust:alpine AS chef
-RUN apk add --no-cache musl-dev
+# boring-sys (BoringSSL) requires C++ compiler, cmake, perl, and go
+RUN apk add --no-cache musl-dev g++ cmake make perl go git
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
