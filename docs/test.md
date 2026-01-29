@@ -3,7 +3,7 @@
 Practical testing guide for h3llo BareUDP VPN. Audience: Rust developers who need quick, repeatable checks across unit tests, mocked components, and multi-node integration tests.
 
 - Layered: unit → local component (mocked network) → Docker integration (testcontainers-rs) → E2E.
-- Decoupled: abstract transport via traits so business logic is mockable without quiche.
+- Decoupled: user-level transports (BareUDP, H3) do not need to be mocked.
 - Repeatable: commands and snippets are ready to adapt into your test suite or CI jobs.
 
 ## Directory Structure
@@ -31,7 +31,7 @@ tests/
 ## Local Unit Tests
 
 - Run fast loops with cargo: `cargo test --lib -- --nocapture` or narrow scope (`cargo test packet_handler`).
-- Decouple transport: define a trait for H3/QUIC operations; production uses tokio-quiche, tests use in-memory mocks.
+- User-level transports (BareUDP, H3) do not need to be mocked; test directly against production code.
 
 ## Local Component Tests (mocked network requests)
 
