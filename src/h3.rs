@@ -305,7 +305,7 @@ pub fn spawn_h3_rx(
                     match result {
                         Ok(datagram) => {
                             let Some(payload) = unwrap_datagram(&datagram) else {
-                                counters.record_drop(DropReason::InvalidIpVersion, datagram.len());
+                                counters.record_drop(DropReason::InvalidFraming, datagram.len());
                                 continue;
                             };
                             if payload.is_empty() { continue; }
