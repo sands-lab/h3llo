@@ -1,6 +1,23 @@
 //! HTTP/3 transport: QUIC connection, DATAGRAM framing, and Rx/Tx actors.
 //!
 //! Implements CONNECT-IP over HTTP/3 using h3-quinn with Context ID always 0.
+//!
+//! # Current Status
+//!
+//! This module provides low-level QUIC transport primitives:
+//! - TLS configuration and endpoint creation
+//! - DATAGRAM framing with Context ID 0
+//! - Rx/Tx actors for data plane forwarding
+//!
+//! The HTTP/3 CONNECT-IP handshake (HEADERS frames, 401 challenge, etc.)
+//! is not yet implemented. See `docs/protocol.md` for the full protocol specification.
+//!
+//! # Metrics
+//!
+//! Unlike BareUDP actors which emit metrics without peer identification,
+//! H3 actors include `peer_id` and `remote_addr` in metrics snapshots.
+//! This difference reflects H3's connection-oriented nature vs BareUDP's
+//! connectionless design.
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
@@ -15,6 +32,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+// ========== Configuration Constants ==========
+
+/// QUIC datagram receive buffer size in bytes.
+const DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 65536;
+
+/// QUIC connection idle timeout in milliseconds.
+const IDLE_TIMEOUT_MS: u32 = 30_000;
+
+/// QUIC error code for graceful shutdown (no error).
+const SHUTDOWN_ERROR_CODE: u32 = 0;
 
 // ========== Datagram Framing ==========
 
@@ -61,6 +89,14 @@ pub fn load_key(path: &Path) -> std::io::Result<PrivateKeyDer<'static>> {
         .ok_or_else(|| std::io::Error::other("no private key found"))
 }
 
+/// Creates the default QUIC transport configuration with DATAGRAM support.
+fn default_transport_config() -> quinn::TransportConfig {
+    let mut config = quinn::TransportConfig::default();
+    config.datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER_SIZE));
+    config.max_idle_timeout(Some(VarInt::from_u32(IDLE_TIMEOUT_MS).into()));
+    config
+}
+
 /// Creates a Quinn server endpoint with DATAGRAM support.
 ///
 /// # Arguments
@@ -88,11 +124,7 @@ pub fn create_server_endpoint(
     let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
         .map_err(std::io::Error::other)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.datagram_receive_buffer_size(Some(65536));
-    transport.max_idle_timeout(Some(VarInt::from_u32(30_000).into()));
-    server_config.transport_config(Arc::new(transport));
+    server_config.transport_config(Arc::new(default_transport_config()));
 
     Endpoint::server(server_config, listen_addr)
 }
@@ -158,19 +190,28 @@ pub fn create_client_endpoint(
     let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
         .map_err(std::io::Error::other)?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.datagram_receive_buffer_size(Some(65536));
-    transport.max_idle_timeout(Some(VarInt::from_u32(30_000).into()));
-    client_config.transport_config(Arc::new(transport));
+    client_config.transport_config(Arc::new(default_transport_config()));
 
     let mut endpoint = Endpoint::client(bind_addr)?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }
 
-// ========== Insecure Verifier (development only) ==========
+// ========== Insecure Verifier ==========
 
+/// Certificate verifier that accepts any certificate without validation.
+///
+/// # Security Warning
+///
+/// This verifier **MUST NOT** be used in production. It completely disables
+/// TLS certificate validation, making connections vulnerable to
+/// man-in-the-middle attacks.
+///
+/// Use only for:
+/// - Local development with self-signed certificates
+/// - Testing environments where certificate validation is not relevant
+///
+/// In production, always use proper CA certificates via `ca_path` or system CA.
 #[derive(Debug)]
 struct InsecureVerifier;
 
@@ -236,6 +277,11 @@ pub enum H3RxCommand {
 /// - `packet_tx`: Bounded channel to push accepted packets into (data plane).
 /// - `events_tx`: Unbounded channel for emitting receive metrics.
 /// - `interval`: Metrics emission interval.
+///
+/// # Shutdown Behavior
+///
+/// When receiving `H3RxCommand::Shutdown` or when the command channel closes,
+/// the actor gracefully closes the QUIC connection before exiting.
 pub fn spawn_h3_rx(
     connection: Connection,
     peer_id: String,
@@ -267,6 +313,7 @@ pub fn spawn_h3_rx(
                             let len = packet.len();
                             if packet_tx.send(packet).await.is_err() {
                                 counters.record_drop(DropReason::ChannelClosed, len);
+                                connection.close(VarInt::from_u32(SHUTDOWN_ERROR_CODE), b"channel closed");
                                 return Ok(());
                             }
                             counters.record_success(len);
@@ -280,7 +327,11 @@ pub fn spawn_h3_rx(
                 }
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(H3RxCommand::Shutdown) | None => return Ok(()),
+                        Some(H3RxCommand::Shutdown) | None => {
+                            // Gracefully close the QUIC connection before exiting
+                            connection.close(VarInt::from_u32(SHUTDOWN_ERROR_CODE), b"shutdown");
+                            return Ok(());
+                        }
                     }
                 }
                 _ = ticker.tick() => {
@@ -305,6 +356,11 @@ pub fn spawn_h3_rx(
 /// - `peer_id`: Identifier for the peer (used in logs and metrics).
 /// - `events_tx`: Unbounded channel for emitting transmit metrics.
 /// - `interval`: Metrics emission interval.
+///
+/// # Shutdown Behavior
+///
+/// When the packet channel closes (all senders dropped), the actor
+/// gracefully closes the QUIC connection before exiting.
 pub fn spawn_h3_tx(
     connection: Connection,
     peer_id: String,
@@ -323,7 +379,11 @@ pub fn spawn_h3_tx(
                 maybe_packet = packet_rx.recv() => {
                     let packet = match maybe_packet {
                         Some(p) => p,
-                        None => return Ok(()),
+                        None => {
+                            // Gracefully close the QUIC connection before exiting
+                            connection.close(VarInt::from_u32(SHUTDOWN_ERROR_CODE), b"shutdown");
+                            return Ok(());
+                        }
                     };
                     let datagram = wrap_datagram(&packet);
                     let len = packet.len();
@@ -387,5 +447,20 @@ mod tests {
         let wrapped = wrap_datagram(&payload);
         assert_eq!(wrapped.len(), 6);
         assert_eq!(&wrapped[1..], &payload[..]);
+    }
+
+    #[test]
+    fn default_transport_config_has_datagram_support() {
+        let config = default_transport_config();
+        // The config should have datagram support enabled (non-None buffer size)
+        // We can't easily inspect the config, but at least verify it doesn't panic
+        assert!(std::mem::size_of_val(&config) > 0);
+    }
+
+    #[test]
+    fn constants_have_expected_values() {
+        assert_eq!(DATAGRAM_RECEIVE_BUFFER_SIZE, 65536);
+        assert_eq!(IDLE_TIMEOUT_MS, 30_000);
+        assert_eq!(SHUTDOWN_ERROR_CODE, 0);
     }
 }

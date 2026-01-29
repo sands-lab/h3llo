@@ -2,6 +2,10 @@
 //!
 //! Provides generation and validation functions reusable across
 //! CONNECT-IP authentication (Step 9) and control plane (Step 10).
+//!
+//! # Security
+//!
+//! All password comparisons use constant-time operations to prevent timing attacks.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -19,7 +23,26 @@ pub fn generate_basic_auth(username: &str, password: &str) -> String {
     format!("Basic {}", BASE64.encode(credentials))
 }
 
+/// Constant-time byte slice comparison to prevent timing attacks.
+///
+/// Returns `true` if both slices are equal, `false` otherwise.
+/// The comparison always examines all bytes regardless of where differences occur.
+#[inline]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    // XOR all bytes and accumulate; result is 0 only if all bytes match
+    let diff = a
+        .iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    diff == 0
+}
+
 /// Parses and validates HTTP Basic Auth credentials.
+///
+/// Uses constant-time comparison to prevent timing attacks.
 ///
 /// # Arguments
 /// - `header_value`: The Authorization header value
@@ -45,13 +68,17 @@ pub fn validate_basic_auth(
     let Some((user, pass)) = credentials.split_once(':') else {
         return false;
     };
-    user == expected_username && pass == expected_password
+    // Use constant-time comparison for both username and password
+    constant_time_eq(user.as_bytes(), expected_username.as_bytes())
+        && constant_time_eq(pass.as_bytes(), expected_password.as_bytes())
 }
 
 /// Validates CONNECT-IP authentication against peer secrets.
 ///
 /// Per `docs/protocol.md`: client sends `username = local.id`,
 /// `password = peers[target].h3.secret`.
+///
+/// Uses constant-time comparison to prevent timing attacks.
 ///
 /// # Returns
 /// The peer ID if authentication succeeds, or an error description.
@@ -68,7 +95,10 @@ pub fn validate_connect_auth<'a>(
     let (username, password) = credentials.split_once(':').ok_or("missing colon")?;
 
     for (peer_id, secret) in peer_secrets {
-        if peer_id == username && secret == password {
+        // Use constant-time comparison to prevent timing attacks
+        let user_match = constant_time_eq(peer_id.as_bytes(), username.as_bytes());
+        let pass_match = constant_time_eq(secret.as_bytes(), password.as_bytes());
+        if user_match && pass_match {
             return Ok(peer_id.to_string());
         }
     }
@@ -129,5 +159,27 @@ mod tests {
     fn validate_connect_auth_invalid_base64() {
         let result = validate_connect_auth(Some("Basic !!!invalid!!!"), [("p", "s")]);
         assert_eq!(result, Err("invalid base64"));
+    }
+
+    // ========== Constant-time comparison tests ==========
+
+    #[test]
+    fn constant_time_eq_same_values() {
+        assert!(constant_time_eq(b"password", b"password"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_values() {
+        assert!(!constant_time_eq(b"password", b"passwort"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[test]
+    fn constant_time_eq_empty() {
+        assert!(constant_time_eq(b"", b""));
     }
 }
