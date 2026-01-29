@@ -2,8 +2,8 @@
 
 use h3llo::auth::{generate_basic_auth, validate_basic_auth, validate_connect_auth};
 use h3llo::h3::{
-    create_client_endpoint, create_server_endpoint, load_certs, load_key, unwrap_datagram,
-    wrap_datagram, CONTEXT_ID_ZERO,
+    accept_connect_ip, connect_ip_client, create_client_endpoint, create_server_endpoint,
+    load_certs, load_key, unwrap_datagram, wrap_datagram, ConnectIpError, CONTEXT_ID_ZERO,
 };
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -210,6 +210,133 @@ async fn create_client_endpoint_with_custom_ca() {
 
     // Clean up
     endpoint.close(0u32.into(), b"test done");
+}
+
+// ========== CONNECT-IP Handshake Tests ==========
+
+#[tokio::test]
+async fn connect_ip_handshake_success() {
+    let (cert_file, key_file) = generate_test_cert();
+    let server_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+
+    // Create server endpoint
+    let server_endpoint = create_server_endpoint(server_addr, cert_file.path(), key_file.path())
+        .expect("server endpoint");
+    let actual_addr = server_endpoint.local_addr().unwrap();
+
+    // Create client endpoint with the test cert as CA
+    let client_endpoint = create_client_endpoint(
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        Some(cert_file.path()),
+        false,
+    )
+    .expect("client endpoint");
+
+    let peer_secrets = [("test-peer", "test-secret-12345")];
+
+    // Spawn server accept task
+    let server_handle = tokio::spawn({
+        let endpoint = server_endpoint.clone();
+        async move {
+            let incoming = endpoint.accept().await.expect("accept incoming");
+            let quic_conn = incoming.await.expect("quic connection");
+            accept_connect_ip(quic_conn, "/tunnel", peer_secrets).await
+        }
+    });
+
+    // Client connects
+    let quic_conn = client_endpoint
+        .connect(actual_addr, "localhost")
+        .expect("connect")
+        .await
+        .expect("quic connection");
+
+    let client_result = connect_ip_client(
+        quic_conn,
+        &format!("localhost:{}", actual_addr.port()),
+        "/tunnel",
+        "test-peer",
+        "test-secret-12345",
+    )
+    .await;
+
+    assert!(
+        client_result.is_ok(),
+        "client handshake should succeed: {:?}",
+        client_result.err()
+    );
+
+    let server_result = server_handle.await.unwrap();
+    assert!(
+        server_result.is_ok(),
+        "server handshake should succeed: {:?}",
+        server_result.err()
+    );
+
+    let (peer_id, _, _) = server_result.unwrap();
+    assert_eq!(peer_id, "test-peer");
+
+    // Cleanup
+    server_endpoint.close(0u32.into(), b"done");
+    client_endpoint.close(0u32.into(), b"done");
+}
+
+#[tokio::test]
+async fn connect_ip_rejects_invalid_credentials() {
+    let (cert_file, key_file) = generate_test_cert();
+    let server_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+
+    let server_endpoint = create_server_endpoint(server_addr, cert_file.path(), key_file.path())
+        .expect("server endpoint");
+    let actual_addr = server_endpoint.local_addr().unwrap();
+
+    let client_endpoint = create_client_endpoint(
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        Some(cert_file.path()),
+        false,
+    )
+    .expect("client endpoint");
+
+    // Server expects different credentials
+    let peer_secrets = [("test-peer", "correct-secret")];
+
+    let server_handle = tokio::spawn({
+        let endpoint = server_endpoint.clone();
+        async move {
+            let incoming = endpoint.accept().await.expect("accept incoming");
+            let quic_conn = incoming.await.expect("quic connection");
+            accept_connect_ip(quic_conn, "/tunnel", peer_secrets).await
+        }
+    });
+
+    let quic_conn = client_endpoint
+        .connect(actual_addr, "localhost")
+        .expect("connect")
+        .await
+        .expect("quic connection");
+
+    // Client sends wrong secret
+    let client_result = connect_ip_client(
+        quic_conn,
+        &format!("localhost:{}", actual_addr.port()),
+        "/tunnel",
+        "test-peer",
+        "wrong-secret",
+    )
+    .await;
+
+    // Client should receive error - either AuthFailed (401) or connection closed
+    // The race between server sending 401 and closing connection can cause either
+    assert!(
+        client_result.is_err(),
+        "client should fail with invalid credentials"
+    );
+
+    let server_result = server_handle.await.unwrap();
+    assert!(matches!(server_result, Err(ConnectIpError::AuthFailed)));
+
+    server_endpoint.close(0u32.into(), b"done");
+    client_endpoint.close(0u32.into(), b"done");
 }
 
 // ========== Actor Lifecycle Tests ==========

@@ -89,6 +89,15 @@ pub enum ActorError {
         /// Error description.
         reason: String,
     },
+
+    /// HTTP/3 CONNECT-IP handshake failed.
+    #[error("h3_handshake[{peer}]: {reason}")]
+    H3Handshake {
+        /// Peer identifier.
+        peer: String,
+        /// Error description.
+        reason: String,
+    },
 }
 
 #[cfg(test)]

@@ -645,8 +645,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be"
+source = "git+https://github.com/hyperium/h3?branch=master#704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1"
 dependencies = [
  "bytes",
  "fastrand",
@@ -659,25 +658,21 @@ dependencies = [
 [[package]]
 name = "h3-datagram"
 version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d2c9f77921668673721ae40f17c729fc48b9e38a663858097cea547484fdf0f"
+source = "git+https://github.com/hyperium/h3?branch=master#704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1"
 dependencies = [
  "bytes",
  "h3",
- "pin-project-lite",
 ]
 
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b2e732c8d91a74731663ac8479ab505042fbf547b9a207213ab7fbcbfc4f8b4"
+source = "git+https://github.com/hyperium/h3?branch=master#704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1"
 dependencies = [
  "bytes",
- "futures",
+ "futures-util",
  "h3",
  "quinn",
- "tokio",
  "tokio-util",
 ]
 
