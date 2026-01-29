@@ -296,7 +296,13 @@ pub async fn spawn_h3_listener(
     peer_secrets: HashMap<String, String>,
     _tun_tx: mpsc::Sender<Vec<u8>>,
     _events_tx: mpsc::UnboundedSender<Event>,
-) -> Result<(mpsc::UnboundedSender<H3ListenerCommand>, JoinHandle<ActorExitResult>), ListenerError> {
+) -> Result<
+    (
+        mpsc::UnboundedSender<H3ListenerCommand>,
+        JoinHandle<ActorExitResult>,
+    ),
+    ListenerError,
+> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     // TODO: secrets will be used for auth when accept loop is fully implemented
     let _ = peer_secrets;
