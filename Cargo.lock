@@ -706,6 +706,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "socket2",
+ "subtle",
  "tempfile",
  "testcontainers",
  "thiserror 2.0.17",
