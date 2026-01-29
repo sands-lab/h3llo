@@ -12,6 +12,7 @@ pub mod bind;
 pub mod config;
 pub mod dns;
 pub mod events;
+pub mod h3;
 mod helpers;
 mod metrics;
 pub mod orch;

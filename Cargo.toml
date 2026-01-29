@@ -24,6 +24,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tun-rs = { version = "2", features = ["async"] }
 ipnet-trie = "0.3"
+tokio-quiche = "0.14"
+rustls-pemfile = "2"
+base64 = "0.22"
 
 # Use mimalloc for musl targets to avoid musl's slow default allocator
 [target.'cfg(target_env = "musl")'.dependencies]
