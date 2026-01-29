@@ -27,7 +27,7 @@ jobs:
       - name: Cargo clippy
         run: cargo clippy --target x86_64-unknown-linux-musl -- -D warnings
       - name: Generate coverage
-        run: cargo llvm-cov --lib --codecov --output-path codecov.json
+        run: cargo llvm-cov --target x86_64-unknown-linux-musl --lib --codecov --output-path codecov.json
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
         with:
