@@ -19,18 +19,20 @@ RUN apt-get update && apt-get install -y \
     clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Download musl cross-compilation toolchain from musl.cc (includes g++)
-RUN curl -sSfL https://musl.cc/x86_64-linux-musl-cross.tgz | tar -xzf - -C /opt
-ENV PATH="/opt/x86_64-linux-musl-cross/bin:$PATH"
+# Download musl cross-compilation toolchain from GitHub (auto-redirects to latest release)
+# Source: https://github.com/cross-tools/musl-cross
+RUN curl -sSfL https://github.com/cross-tools/musl-cross/releases/latest/download/x86_64-unknown-linux-musl.tar.xz \
+    | tar -xJf - -C /opt
+ENV PATH="/opt/x86_64-unknown-linux-musl/bin:$PATH"
 
 # Add musl target
 RUN rustup target add x86_64-unknown-linux-musl
 
 # Configure compilers for musl target
-ENV CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc
-ENV CXX_x86_64_unknown_linux_musl=x86_64-linux-musl-g++
-ENV AR_x86_64_unknown_linux_musl=x86_64-linux-musl-ar
-ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc
+ENV CC_x86_64_unknown_linux_musl=x86_64-unknown-linux-musl-gcc
+ENV CXX_x86_64_unknown_linux_musl=x86_64-unknown-linux-musl-g++
+ENV AR_x86_64_unknown_linux_musl=x86_64-unknown-linux-musl-ar
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-unknown-linux-musl-gcc
 
 RUN cargo install cargo-chef --locked
 WORKDIR /app
