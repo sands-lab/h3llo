@@ -68,3 +68,8 @@ harness = false
 name = "integration-container-route"
 path = "tests/integration/container/route.rs"
 harness = false
+
+# Patch datagram-socket for musl compatibility (msghdr private padding fields)
+# See: https://github.com/rust-lang/libc/issues/2344
+[patch.crates-io]
+datagram-socket = { git = "https://github.com/Tonny-Gu/quiche", subdirectory = "datagram-socket" }

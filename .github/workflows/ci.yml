@@ -40,12 +40,23 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Install musl toolchain and dependencies
+        run: |
+          # Download prebuilt musl toolchain from musl.cc (includes g++ for C++ support)
+          curl -sSfL https://musl.cc/x86_64-linux-musl-cross.tgz | sudo tar -xzf - -C /opt
+          echo "/opt/x86_64-linux-musl-cross/bin" >> $GITHUB_PATH
+          # Install boring-sys build dependencies
+          sudo apt-get update
+          sudo apt-get install -y cmake perl golang-go clang
       - name: Build container test binaries
         run: |
-          cross test --test integration-container-tun --target x86_64-unknown-linux-musl --no-run
-          cross test --test integration-container-route --target x86_64-unknown-linux-musl --no-run
+          cargo test --test integration-container-tun --target x86_64-unknown-linux-musl --no-run
+          cargo test --test integration-container-route --target x86_64-unknown-linux-musl --no-run
+        env:
+          CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
+          CXX_x86_64_unknown_linux_musl: x86_64-linux-musl-g++
+          AR_x86_64_unknown_linux_musl: x86_64-linux-musl-ar
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
       - name: Run integration tests
         run: cargo test --test integration -- --ignored --nocapture
       - name: Run E2E tests
