@@ -313,6 +313,18 @@ impl Orchestrator {
                     }
                 }
             }
+            Event::Transport(TransportEvent::H3Connected(event)) => {
+                debug!(
+                    "H3 connection established: peer={} remote={} direction={:?}",
+                    event.peer_id, event.remote_addr, event.direction
+                );
+            }
+            Event::Transport(TransportEvent::H3Closed(event)) => {
+                debug!(
+                    "H3 connection closed: peer={} reason={:?}",
+                    event.peer_id, event.reason
+                );
+            }
             Event::Other(msg) => {
                 debug!("other event: {}", msg);
             }
