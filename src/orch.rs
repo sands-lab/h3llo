@@ -1,6 +1,6 @@
 //! BareUDP-only runtime orchestration.
 
-use crate::actor::{ActorError, ActorExitResult};
+use crate::actor::{ActorError, ActorExitResult, ActorKind};
 use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareUdpTx};
 use crate::bind::DefaultRouteProbe;
 use crate::config::{parse_udp_uri, Config, Peer};
@@ -9,7 +9,7 @@ use crate::events::{DnsEventDetail, Event, TransportEvent};
 use crate::route::{sync_tun_routes, RouteManagerHandle};
 use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use thiserror::Error;
@@ -19,6 +19,56 @@ use tracing::{debug, error, info, warn};
 
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Unique identifier for a bound within the orchestrator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BoundId(u64);
+
+/// A single active connection bound to a peer.
+#[derive(Debug)]
+struct BoundState {
+    /// Unique identifier for tracking.
+    #[allow(dead_code)]
+    id: BoundId,
+    /// Destination socket address.
+    dest: SocketAddr,
+    /// TX channel for sending packets.
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
+/// Entry for a single peer in the unified pool.
+#[derive(Debug)]
+struct PeerEntry {
+    /// Peer configuration (read-only after creation).
+    config: Peer,
+    /// Active bounds (connections) for this peer.
+    bounds: Vec<BoundState>,
+}
+
+impl PeerEntry {
+    /// Creates a new peer entry from configuration.
+    fn new(config: Peer) -> Self {
+        Self {
+            config,
+            bounds: Vec::new(),
+        }
+    }
+
+    /// Returns the preferred TX channel (first bound) or None if disconnected.
+    fn preferred_tx(&self) -> Option<&mpsc::Sender<Vec<u8>>> {
+        self.bounds.first().map(|b| &b.tx)
+    }
+
+    /// Returns all active destination IPs for this peer.
+    fn active_ips(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.bounds.iter().map(|b| b.dest.ip())
+    }
+
+    /// Returns true if a bound exists for the given destination IP.
+    fn has_bound_for_ip(&self, ip: IpAddr) -> bool {
+        self.bounds.iter().any(|b| b.dest.ip() == ip)
+    }
+}
 
 /// Errors returned by the orchestrator.
 #[derive(Debug, Error)]
@@ -60,8 +110,9 @@ pub enum OrchestratorError {
 
 /// BareUDP runtime orchestrator.
 ///
-/// Manages child actors (TUN-Rx/Tx, BareUDP-Rx/Tx, DNS resolver) and processes runtime events.
-/// Uses a single unified event loop for both initialization and runtime.
+/// Manages child actors with selective supervision:
+/// - Critical actors (TUN, BareUDP-Rx): failure causes immediate exit
+/// - Peer actors (BareUDP-Tx, H3): failure logged (reconnection deferred to future iteration)
 pub struct Orchestrator {
     events_rx: mpsc::UnboundedReceiver<Event>,
     events_tx: mpsc::UnboundedSender<Event>,
@@ -73,9 +124,10 @@ pub struct Orchestrator {
     tun_if: String,
     #[allow(dead_code)]
     mtu: usize,
-    peers: Vec<Peer>,
-    active_ips: HashSet<IpAddr>,
-    peer_txs: HashMap<String, mpsc::Sender<Vec<u8>>>,
+    /// Unified peer state: config + active bounds.
+    peers: HashMap<String, PeerEntry>,
+    /// Counter for generating unique BoundIds.
+    bound_counter: u64,
     tun_cmd_tx: mpsc::UnboundedSender<TunRxCommand>,
     bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
 
@@ -89,6 +141,30 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
+    /// Returns set of all active destination IPs (for BareRx filtering).
+    fn active_ips(&self) -> std::collections::HashSet<IpAddr> {
+        self.peers.values().flat_map(|e| e.active_ips()).collect()
+    }
+
+    /// Returns map of peer ID to preferred TX channel (for routing table).
+    fn peer_txs(&self) -> HashMap<String, mpsc::Sender<Vec<u8>>> {
+        self.peers
+            .iter()
+            .filter_map(|(id, e)| e.preferred_tx().map(|tx| (id.clone(), tx.clone())))
+            .collect()
+    }
+
+    /// Returns peer configurations as a Vec (for routing table and route sync).
+    fn peer_configs(&self) -> Vec<Peer> {
+        self.peers.values().map(|e| e.config.clone()).collect()
+    }
+
+    /// Generates a new unique BoundId.
+    fn next_bound_id(&mut self) -> BoundId {
+        self.bound_counter += 1;
+        BoundId(self.bound_counter)
+    }
+
     /// Creates a new orchestrator from configuration.
     ///
     /// Initializes TUN interface, BareUDP sockets, routing table, and spawns
@@ -128,16 +204,14 @@ impl Orchestrator {
         // Control plane: unbounded to prevent deadlocks from actor cycles.
         let (events_tx, events_rx) = mpsc::unbounded_channel();
 
-        // Extract validated peers for storage (enabled BareUDP peers only)
-        let peers: Vec<Peer> = config
+        // Initialize unified peer state from config (enabled BareUDP peers only)
+        let peers: HashMap<String, PeerEntry> = config
             .peers
             .iter()
             .filter(|p| p.enabled && p.bare.is_some())
-            .cloned()
+            .map(|p| (p.id.clone(), PeerEntry::new(p.clone())))
             .collect();
 
-        let peer_txs = HashMap::new();
-        let active_ips = HashSet::new();
         let mut join_set = JoinSet::new();
 
         // Start with empty routing table; routes populated as DNS answers arrive
@@ -153,7 +227,7 @@ impl Orchestrator {
         // BareUDP RX forwards received packets to TUN TX's packet channel
         let (bare_rx_cmd_tx, bare_rx_handle) = spawn_udp_rx(
             bare_rx,
-            HashSet::new(),
+            std::collections::HashSet::new(),
             tun_packet_tx,
             events_tx.clone(),
             METRICS_INTERVAL,
@@ -178,11 +252,15 @@ impl Orchestrator {
 
         // Send initial resolve commands for all peer endpoints.
         // IP literals are detected by resolver and emit immediate DnsAnswer events.
-        send_resolve_commands(&peers, &dns_cmd_tx)?;
+        let peer_configs: Vec<Peer> = peers.values().map(|e| e.config.clone()).collect();
+        send_resolve_commands(&peer_configs, &dns_cmd_tx)?;
 
         join_set.spawn(handle);
 
-        if peers.iter().all(|p| !p.enabled || p.bare.is_none()) {
+        if peers
+            .values()
+            .all(|e| !e.config.enabled || e.config.bare.is_none())
+        {
             warn!("no active BareUDP peers; traffic will be dropped");
         }
 
@@ -194,8 +272,7 @@ impl Orchestrator {
             tun_if,
             mtu,
             peers,
-            active_ips,
-            peer_txs,
+            bound_counter: 0,
             tun_cmd_tx,
             bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
             dns_cmd_tx,
@@ -235,9 +312,26 @@ impl Orchestrator {
                             debug!("an actor exited gracefully");
                         }
                         Some(Ok(Ok(Err(actor_error)))) => {
-                            // Actor exited with error
-                            error!("actor error: {}", actor_error);
-                            return Err(OrchestratorError::ActorError(actor_error));
+                            match actor_error.kind() {
+                                ActorKind::Critical => {
+                                    // Critical actor failure - exit h3llo
+                                    error!("critical actor failed: {}", actor_error);
+                                    return Err(OrchestratorError::ActorError(actor_error));
+                                }
+                                ActorKind::Restartable => {
+                                    // Peer actor failure - log and continue
+                                    // TODO: implement reconnection delay in future iteration
+                                    warn!("peer actor failed (reconnection not yet implemented): {}", actor_error);
+                                    // Remove the failed bound from the peer entry
+                                    if let ActorError::BareTxSend { dest, .. } = &actor_error {
+                                        if let Ok(dest_addr) = dest.parse::<SocketAddr>() {
+                                            for entry in self.peers.values_mut() {
+                                                entry.bounds.retain(|b| b.dest != dest_addr);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Some(Ok(Err(join_err))) | Some(Err(join_err)) => {
                             // Task panicked or was cancelled
@@ -333,11 +427,12 @@ impl Orchestrator {
 
     /// Sends DNS resolve commands for all peer endpoints (periodic refresh).
     ///
-    /// Existing TX actors for unchanged IPs are deduplicated by `active_ips`
-    /// in `spawn_bare_tx_for_peer`. IP literals flow through DNS resolver
+    /// Existing TX actors for unchanged IPs are deduplicated by
+    /// `PeerEntry::has_bound_for_ip`. IP literals flow through DNS resolver
     /// (emits immediate answer).
     async fn refresh_dns(&mut self) {
-        if let Err(err) = send_resolve_commands(&self.peers, &self.dns_cmd_tx) {
+        let peer_configs = self.peer_configs();
+        if let Err(err) = send_resolve_commands(&peer_configs, &self.dns_cmd_tx) {
             warn!("dns refresh: unexpected error: {}", err);
         }
     }
@@ -350,11 +445,15 @@ impl Orchestrator {
     async fn handle_dns_answer(&mut self, answer: &crate::events::DnsAnswer) {
         let mut any_spawned = false;
 
-        for peer in &self.peers {
-            if !peer.enabled {
+        // Collect peer IDs to process (to avoid borrow conflicts)
+        let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
+
+        for peer_id in peer_ids {
+            let entry = self.peers.get(&peer_id).unwrap();
+            if !entry.config.enabled {
                 continue;
             }
-            let Some(bare) = peer.bare.as_ref() else {
+            let Some(bare) = entry.config.bare.as_ref() else {
                 continue;
             };
             let Ok(endpoint) = parse_udp_uri(&bare.endpoint) else {
@@ -370,17 +469,31 @@ impl Orchestrator {
             // Spawn TX actors for all resolved IPs
             for record in &answer.records {
                 let destination = SocketAddr::new(record.address, endpoint.port);
-                if let Some((packet_tx, tx_handle)) = spawn_bare_tx_for_peer(
-                    &peer.id,
+
+                // Check if already have a bound for this IP
+                let entry = self.peers.get(&peer_id).unwrap();
+                if entry.has_bound_for_ip(destination.ip()) {
+                    continue;
+                }
+
+                // Spawn new bound
+                let bindif = entry.config.bare.as_ref().and_then(|b| b.bindif.as_deref());
+                if let Some((packet_tx, tx_handle)) = spawn_bare_tx(
+                    &peer_id,
                     destination,
-                    bare.bindif.as_deref(),
+                    bindif,
                     &self.tun_if,
                     self.events_tx.clone(),
-                    &mut self.active_ips,
                 )
                 .await
                 {
-                    self.peer_txs.insert(peer.id.clone(), packet_tx);
+                    let bound_id = self.next_bound_id();
+                    let entry = self.peers.get_mut(&peer_id).unwrap();
+                    entry.bounds.push(BoundState {
+                        id: bound_id,
+                        dest: destination,
+                        tx: packet_tx,
+                    });
                     self.join_set.spawn(tx_handle);
                     any_spawned = true;
                 }
@@ -391,15 +504,17 @@ impl Orchestrator {
         if any_spawned {
             // 1. Update allowed sources (fast, in-memory filter)
             if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
-                if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAllowedSources(
-                    self.active_ips.clone(),
-                )) {
+                if let Err(e) =
+                    cmd_tx.send(BareUdpRxCommand::UpdateAllowedSources(self.active_ips()))
+                {
                     warn!(error = %e, "failed to send allowed sources update command");
                 }
             }
 
             // 2. Update internal routing table
-            if let Ok(routing) = RoutingTable::from_peers(&self.peers, &self.peer_txs) {
+            let peer_configs = self.peer_configs();
+            let peer_txs = self.peer_txs();
+            if let Ok(routing) = RoutingTable::from_peers(&peer_configs, &peer_txs) {
                 if let Err(e) = self
                     .tun_cmd_tx
                     .send(TunRxCommand::UpdateRouting { routing })
@@ -410,7 +525,7 @@ impl Orchestrator {
 
             // 3. Sync system routes if enabled
             if self.manage_routes {
-                match collect_allowed_ips(&self.peers) {
+                match collect_allowed_ips(&peer_configs) {
                     Ok(allowed) => {
                         sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await
                     }
@@ -466,29 +581,21 @@ fn resolve_listen_addr(
     Ok(addrs[0])
 }
 
-/// Spawns a BareUDP TX actor for a peer.
+/// Spawns a BareUDP TX actor for a peer destination.
 ///
 /// Returns the packet sender and task handle, or None if socket setup fails.
-/// Updates `active_ips` with the destination IP for deduplication.
-async fn spawn_bare_tx_for_peer(
+async fn spawn_bare_tx(
     peer_id: &str,
     destination: SocketAddr,
     bindif: Option<&str>,
     tun_if: &str,
     events_tx: mpsc::UnboundedSender<Event>,
-    active_ips: &mut HashSet<IpAddr>,
 ) -> Option<(mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>)> {
-    // Dedup by IP
-    if !active_ips.insert(destination.ip()) {
-        return None;
-    }
-
     let probe = DefaultRouteProbe;
     let tx_socket = match BareUdpTx::from_config(destination, bindif, Some(tun_if), &probe).await {
         Ok(result) => result,
         Err(err) => {
             warn!("bare peer '{}' socket setup failed: {err}", peer_id);
-            active_ips.remove(&destination.ip());
             return None;
         }
     };
@@ -562,7 +669,7 @@ fn send_resolve_commands(
     peers: &[Peer],
     dns_cmd_tx: &mpsc::UnboundedSender<DnsCommand>,
 ) -> Result<(), OrchestratorError> {
-    let mut seen_hosts = HashSet::new();
+    let mut seen_hosts = std::collections::HashSet::new();
 
     for peer in peers {
         if !peer.enabled {
@@ -603,9 +710,8 @@ mod test_support {
     pub struct TestableOrchestratorBuilder {
         tun_if: String,
         mtu: usize,
-        peers: Vec<Peer>,
-        active_ips: HashSet<IpAddr>,
-        peer_txs: HashMap<String, mpsc::Sender<Vec<u8>>>,
+        peers: HashMap<String, PeerEntry>,
+        bound_counter: u64,
         dns_refresh: Duration,
         manage_routes: bool,
         tun_addrs: Vec<IpNet>,
@@ -616,9 +722,8 @@ mod test_support {
             Self {
                 tun_if: "test0".to_string(),
                 mtu: 1400,
-                peers: Vec::new(),
-                active_ips: HashSet::new(),
-                peer_txs: HashMap::new(),
+                peers: HashMap::new(),
+                bound_counter: 0,
                 dns_refresh: Duration::ZERO,
                 manage_routes: false,
                 tun_addrs: Vec::new(),
@@ -637,12 +742,27 @@ mod test_support {
 
     impl TestableOrchestratorBuilder {
         pub fn with_peers(mut self, peers: Vec<Peer>) -> Self {
-            self.peers = peers;
+            self.peers = peers
+                .into_iter()
+                .map(|p| (p.id.clone(), PeerEntry::new(p)))
+                .collect();
             self
         }
 
-        pub fn with_peer_txs(mut self, peer_txs: HashMap<String, mpsc::Sender<Vec<u8>>>) -> Self {
-            self.peer_txs = peer_txs;
+        pub fn with_peer_tx(
+            mut self,
+            peer_id: &str,
+            dest: SocketAddr,
+            tx: mpsc::Sender<Vec<u8>>,
+        ) -> Self {
+            if let Some(entry) = self.peers.get_mut(peer_id) {
+                self.bound_counter += 1;
+                entry.bounds.push(BoundState {
+                    id: BoundId(self.bound_counter),
+                    dest,
+                    tx,
+                });
+            }
             self
         }
 
@@ -664,8 +784,7 @@ mod test_support {
                 tun_if: self.tun_if,
                 mtu: self.mtu,
                 peers: self.peers,
-                active_ips: self.active_ips,
-                peer_txs: self.peer_txs,
+                bound_counter: self.bound_counter,
                 tun_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
                 dns_cmd_tx,
@@ -695,6 +814,48 @@ mod tests {
         Direction, DnsAnswer, DnsAnswerRecord, DnsEvent, DnsEventDetail, DnsRecordType,
         TransportEvent, TransportKind, TransportLabels, TransportMetrics, TransportStats,
     };
+
+    // ========== PeerEntry unit tests ==========
+
+    #[test]
+    fn peer_entry_tracks_multiple_bounds() {
+        let config = Peer {
+            id: "peer-1".to_string(),
+            enabled: true,
+            h3: None,
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".to_string()],
+            },
+        };
+        let mut entry = PeerEntry::new(config);
+
+        assert!(entry.bounds.is_empty());
+        assert!(entry.preferred_tx().is_none());
+
+        let (tx1, _rx1) = mpsc::channel(1);
+        entry.bounds.push(BoundState {
+            id: BoundId(1),
+            dest: "1.2.3.4:5353".parse().unwrap(),
+            tx: tx1,
+        });
+
+        assert!(!entry.bounds.is_empty());
+        assert!(entry.preferred_tx().is_some());
+        assert!(entry.has_bound_for_ip("1.2.3.4".parse().unwrap()));
+        assert!(!entry.has_bound_for_ip("5.6.7.8".parse().unwrap()));
+
+        let (tx2, _rx2) = mpsc::channel(1);
+        entry.bounds.push(BoundState {
+            id: BoundId(2),
+            dest: "5.6.7.8:5353".parse().unwrap(),
+            tx: tx2,
+        });
+
+        assert_eq!(entry.bounds.len(), 2);
+        assert_eq!(entry.active_ips().count(), 2);
+        assert!(entry.has_bound_for_ip("5.6.7.8".parse().unwrap()));
+    }
 
     /// Helper to create test peers with BareUDP configuration.
     fn bare_peer(id: &str, allowed: &[&str]) -> Peer {
@@ -968,19 +1129,19 @@ mod tests {
     async fn handle_event_processes_metrics_without_state_change() {
         let peer = bare_peer("peer1", &["10.0.0.0/24"]);
         let (peer_tx, _peer_rx) = mpsc::channel(1);
-        let mut peer_txs = HashMap::new();
-        peer_txs.insert("peer1".to_string(), peer_tx);
+        let dest: SocketAddr = "127.0.0.1:5353".parse().unwrap();
 
         let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer])
-            .with_peer_txs(peer_txs)
+            .with_peer_tx("peer1", dest, peer_tx)
             .build();
 
         orch.handle_event(make_metrics_event()).await;
 
         // State preserved: existing entries not modified
-        assert_eq!(orch.peer_txs.len(), 1);
-        assert!(orch.peer_txs.contains_key("peer1"));
+        assert_eq!(orch.peers.len(), 1);
+        assert!(orch.peers.contains_key("peer1"));
+        assert_eq!(orch.peers.get("peer1").unwrap().bounds.len(), 1);
 
         // No commands sent to child actors
         assert!(handles.tun_cmd_rx.try_recv().is_err());
@@ -991,19 +1152,18 @@ mod tests {
     async fn handle_event_processes_other_event() {
         let peer = bare_peer("peer1", &["10.0.0.0/24"]);
         let (peer_tx, _peer_rx) = mpsc::channel(1);
-        let mut peer_txs = HashMap::new();
-        peer_txs.insert("peer1".to_string(), peer_tx);
+        let dest: SocketAddr = "127.0.0.1:5353".parse().unwrap();
 
         let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer])
-            .with_peer_txs(peer_txs)
+            .with_peer_tx("peer1", dest, peer_tx)
             .build();
 
         orch.handle_event(Event::Other("test message".to_string()))
             .await;
 
         // State preserved
-        assert_eq!(orch.peer_txs.len(), 1);
+        assert_eq!(orch.peers.len(), 1);
 
         // No commands sent
         assert!(handles.tun_cmd_rx.try_recv().is_err());
@@ -1034,8 +1194,8 @@ mod tests {
         });
         orch.handle_event(answer).await;
 
-        // No peer TX created (hostname doesn't match)
-        assert!(orch.peer_txs.is_empty());
+        // No bounds created (hostname doesn't match)
+        assert!(orch.peers.get("peer1").unwrap().bounds.is_empty());
         // No commands sent
         assert!(handles.tun_cmd_rx.try_recv().is_err());
         assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
@@ -1060,8 +1220,8 @@ mod tests {
         });
         orch.handle_event(answer).await;
 
-        // No peer TX created (empty records)
-        assert!(orch.peer_txs.is_empty());
+        // No bounds created (empty records)
+        assert!(orch.peers.get("peer1").unwrap().bounds.is_empty());
         // No commands sent
         assert!(handles.tun_cmd_rx.try_recv().is_err());
         assert!(handles.bare_rx_cmd_rx.try_recv().is_err());

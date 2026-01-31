@@ -6,6 +6,18 @@
 use std::io;
 use thiserror::Error;
 
+/// Classifies actors by their supervision policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorKind {
+    /// Critical actors whose failure should exit h3llo.
+    /// Includes: tun_rx, tun_tx, bare_rx, dns_resolver
+    Critical,
+    /// Restartable actors that could be reconnected on failure.
+    /// Includes: bare_tx, h3_tx, h3_rx
+    /// Note: Reconnection logic is not yet implemented.
+    Restartable,
+}
+
 /// Exit result type for all actors.
 ///
 /// - `Ok(())` indicates graceful shutdown (e.g., command channel closed).
@@ -82,9 +94,82 @@ pub enum ActorError {
     },
 }
 
+impl ActorError {
+    /// Returns the supervision classification for this error type.
+    pub fn kind(&self) -> ActorKind {
+        match self {
+            // Critical actors - failure exits h3llo
+            ActorError::TunRxRecv { .. } => ActorKind::Critical,
+            ActorError::TunTxSend { .. } => ActorKind::Critical,
+            ActorError::BareRxRecv { .. } => ActorKind::Critical,
+            ActorError::DnsRecv { .. } => ActorKind::Critical,
+            // Restartable actors - could be reconnected (future work)
+            ActorError::BareTxSend { .. } => ActorKind::Restartable,
+            ActorError::H3RxRecv { .. } => ActorKind::Restartable,
+            ActorError::H3TxSend { .. } => ActorKind::Restartable,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actor_kind_critical_for_infrastructure() {
+        let errors = vec![
+            ActorError::TunRxRecv {
+                name: "tun0".into(),
+                source: io::Error::new(io::ErrorKind::Other, "test"),
+            },
+            ActorError::TunTxSend {
+                name: "tun0".into(),
+                source: io::Error::new(io::ErrorKind::Other, "test"),
+            },
+            ActorError::BareRxRecv {
+                addr: "0.0.0.0:5353".into(),
+                source: io::Error::new(io::ErrorKind::Other, "test"),
+            },
+            ActorError::DnsRecv {
+                server: "8.8.8.8:53".into(),
+                source: io::Error::new(io::ErrorKind::Other, "test"),
+            },
+        ];
+        for err in errors {
+            assert_eq!(
+                err.kind(),
+                ActorKind::Critical,
+                "expected Critical for {}",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn actor_kind_restartable_for_peer_actors() {
+        let errors = vec![
+            ActorError::BareTxSend {
+                dest: "1.2.3.4:5353".into(),
+                source: io::Error::new(io::ErrorKind::Other, "test"),
+            },
+            ActorError::H3RxRecv {
+                peer_id: "peer-1".into(),
+                reason: "connection reset".into(),
+            },
+            ActorError::H3TxSend {
+                peer_id: "peer-1".into(),
+                reason: "flow control".into(),
+            },
+        ];
+        for err in errors {
+            assert_eq!(
+                err.kind(),
+                ActorKind::Restartable,
+                "expected Restartable for {}",
+                err
+            );
+        }
+    }
 
     #[test]
     fn actor_error_display_includes_context() {
