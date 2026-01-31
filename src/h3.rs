@@ -13,7 +13,7 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_basic_auth, validate_connect_auth};
-use crate::bind::{bind_udp_socket, RouteProbe};
+use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::events::{Direction, Event, TransportEvent, TransportKind};
 use crate::metrics::TransportCounters;
 use crate::PACKET_QUEUE_DEPTH;
@@ -182,21 +182,10 @@ pub async fn dial_h3<P: RouteProbe>(
 ) -> Result<H3Connection, DialError> {
     debug!(%remote_addr, %server_name, %local_id, "dialing H3 endpoint");
 
-    // Bind socket to interface
-    let bind_addr = if remote_addr.is_ipv4() {
-        SocketAddr::from(([0, 0, 0, 0], 0))
-    } else {
-        SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0))
-    };
-
-    let socket = bind_udp_socket(bind_addr, bindif, remote_addr.ip(), tun_if, probe)
+    // Create connected socket with route probing
+    let socket = make_client_udp_socket(remote_addr, tun_if, bindif, probe)
         .await
-        .map_err(|e| DialError::Tls(format!("socket bind failed: {}", e)))?;
-
-    socket
-        .connect(remote_addr)
-        .await
-        .map_err(|e| DialError::Handshake(format!("connect failed: {}", e)))?;
+        .map_err(|e| DialError::Tls(format!("socket setup failed: {}", e)))?;
 
     // CA certificate path is used for TLS verification via tokio-quiche config
     // (currently using system roots; custom CA support is a future enhancement)
@@ -465,9 +454,6 @@ pub enum H3ListenerCommand {
 /// * `key_path` - Path to TLS private key.
 /// * `peer_secrets` - Map of peer ID to expected secret for authentication.
 /// * `conn_tx` - Unbounded channel for emitting established connections.
-/// * `bindif` - Optional interface name to bind the socket.
-/// * `tun_if` - Optional TUN interface name to exclude from probing.
-/// * `probe` - Route probe implementation for interface selection.
 ///
 /// # Returns
 ///
@@ -477,16 +463,12 @@ pub enum H3ListenerCommand {
 /// # Errors
 ///
 /// Returns `ListenerError` if listener setup fails.
-#[allow(clippy::too_many_arguments)]
-pub async fn spawn_h3_listener<P: RouteProbe + Send + Sync + 'static>(
+pub async fn spawn_h3_listener(
     listen_addr: SocketAddr,
     cert_path: &Path,
     key_path: &Path,
     mut peer_secrets: HashMap<String, String>,
     conn_tx: mpsc::UnboundedSender<H3Connection>,
-    bindif: Option<&str>,
-    tun_if: Option<&str>,
-    probe: P,
 ) -> Result<
     (
         mpsc::UnboundedSender<H3ListenerCommand>,
@@ -497,12 +479,11 @@ pub async fn spawn_h3_listener<P: RouteProbe + Send + Sync + 'static>(
     // Create command channel (actor owns receiver directly - direct select pattern)
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<H3ListenerCommand>();
 
-    debug!(%listen_addr, bindif = ?bindif, "starting H3 listener");
+    debug!(%listen_addr, "starting H3 listener");
 
-    // Bind socket to interface
-    let socket = bind_udp_socket(listen_addr, bindif, listen_addr.ip(), tun_if, &probe)
-        .await
-        .map_err(|e| ListenerError::Bind(e.to_string()))?;
+    // Server socket binds directly to listen address (no route probing needed)
+    let socket =
+        make_server_udp_socket(listen_addr).map_err(|e| ListenerError::Bind(e.to_string()))?;
 
     // Convert Path to &str for TlsCertificatePaths
     let cert_str = cert_path
@@ -536,10 +517,6 @@ pub async fn spawn_h3_listener<P: RouteProbe + Send + Sync + 'static>(
     .map_err(|e| ListenerError::Bind(format!("listen failed: {}", e)))?;
 
     let mut accept_stream = listeners.remove(0);
-
-    // Need to make cert/key paths owned for the spawned task
-    // (already validated above)
-    let _ = probe; // RouteProbe not needed after socket bind
 
     let handle = tokio::spawn(async move {
         // Actor owns peer_secrets directly (Option 2A: message passing pattern)
