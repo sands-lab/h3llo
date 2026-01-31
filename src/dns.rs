@@ -1,7 +1,7 @@
 //! DNS resolver coroutine: consumes resolve commands, processes UDP responses, retries on timeout, and emits events.
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::bind::{bind_udp_socket, RouteProbe};
+use crate::bind::{make_client_udp_socket, RouteProbe};
 use crate::config::{parse_dns_server_uri, LocalDns};
 use crate::events::{
     DnsAnswer, DnsAnswerRecord, DnsAnswerWarning, DnsEvent, DnsEventDetail, DnsRecordType,
@@ -122,27 +122,14 @@ impl DnsResolver {
         &self,
         probe: &P,
     ) -> Result<UdpSocket, ResolveInitError> {
-        let bind_addr: SocketAddr = match self.server {
-            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
-            SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
-        };
-
-        let socket = bind_udp_socket(
-            bind_addr,
-            self.bind_interface.as_deref(),
-            self.server.ip(),
+        make_client_udp_socket(
+            self.server,
             self.tun_if.as_deref(),
+            self.bind_interface.as_deref(),
             probe,
         )
         .await
-        .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
-
-        socket
-            .connect(self.server)
-            .await
-            .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
-
-        Ok(socket)
+        .map_err(|e| ResolveInitError::Socket(e.to_string()))
     }
 }
 

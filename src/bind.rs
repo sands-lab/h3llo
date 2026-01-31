@@ -1,5 +1,6 @@
 //! Provides interface-binding helpers for DNS sockets and route probing.
-use socket2::{Domain, Protocol, Socket, Type};
+pub use socket2::Domain;
+use socket2::{Protocol, Socket, Type};
 use thiserror::Error;
 use tracing::warn;
 
@@ -30,28 +31,27 @@ pub enum UdpError {
     Socket(String),
 }
 
-/// Creates a UDP socket bound to `bind_addr` and optionally pinned to `bind_interface`.
+/// Creates a raw UDP socket with explicit domain and optional bind address.
 ///
-/// Low-level binding without interface probing or localhost detection.
-/// Prefer `bind_udp_socket` for most use cases.
+/// Low-level socket creation without interface probing or localhost detection.
+/// Prefer `make_server_udp_socket` for listen sockets or `make_client_udp_socket`
+/// for sockets that connect to a specific target.
 ///
 /// # Arguments
-/// - `bind_addr`: Local address to bind.
+/// - `domain`: Socket domain (IPv4 or IPv6).
+/// - `bind_addr`: Local address to bind, or `None` for ephemeral port.
 /// - `bind_interface`: Optional interface name for binding.
 ///
 /// # Returns
-/// A tokio `UdpSocket`. Binding warnings are logged directly.
+/// A tokio `UdpSocket`. Interface binding warnings are logged directly.
 ///
 /// # Errors
 /// Returns an `io::Error` when socket creation or binding fails.
-fn bind_udp_socket_raw(
-    bind_addr: SocketAddr,
+pub fn make_udp_socket_raw(
+    domain: Domain,
+    bind_addr: Option<SocketAddr>,
     bind_interface: Option<&str>,
 ) -> io::Result<UdpSocket> {
-    let domain = match bind_addr {
-        SocketAddr::V4(_) => Domain::IPV4,
-        SocketAddr::V6(_) => Domain::IPV6,
-    };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
@@ -66,37 +66,119 @@ fn bind_udp_socket_raw(
         }
     }
 
-    socket.bind(&bind_addr.into())?;
+    if let Some(addr) = bind_addr {
+        socket.bind(&addr.into())?;
+    }
+
     let udp = UdpSocket::from_std(socket.into())?;
     Ok(udp)
 }
 
-/// Binds a UDP socket to `listen` and optionally to a probed interface.
+/// Creates a UDP socket for receiving packets on a listen address.
+///
+/// This is the simple path for server sockets that do not need route probing.
+/// The socket is bound to the specified address without interface selection.
+///
+/// # Arguments
+/// - `listen`: Local socket address to bind.
+///
+/// # Errors
+/// Returns `UdpError::Socket` when socket creation or binding fails.
+pub fn make_server_udp_socket(listen: SocketAddr) -> Result<UdpSocket, UdpError> {
+    let domain = match listen {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    make_udp_socket_raw(domain, Some(listen), None).map_err(|e| UdpError::Socket(e.to_string()))
+}
+
+/// Creates a connected UDP socket for sending packets to a target.
+///
+/// Probes the routing table to select an appropriate interface for reaching `target`,
+/// excluding the TUN interface to avoid routing loops. Skips interface binding for
+/// localhost targets (127.x.x.x, ::1) to support Docker DNS and other localhost services.
+///
+/// The socket is automatically connected to `target`, allowing use of `send()`/`recv()`
+/// instead of `send_to()`/`recv_from()`.
+///
+/// # Arguments
+/// - `target`: Remote socket address to connect to.
+/// - `tun_if`: Optional TUN interface name to exclude from probing.
+/// - `bind_interface`: Optional preferred interface; treated as a filter during probing.
+/// - `probe`: Route probe implementation for testability.
+///
+/// # Returns
+/// A connected UDP socket. The OS assigns an ephemeral port during `connect()`.
+///
+/// # Errors
+/// Returns `UdpError::Socket` when socket creation, binding, or connect fails.
+///
+/// # Example
+/// ```ignore
+/// let probe = DefaultRouteProbe;
+/// let socket = make_client_udp_socket(
+///     "8.8.8.8:53".parse().unwrap(),
+///     Some("tun0"),
+///     None,
+///     &probe,
+/// ).await?;
+/// // Socket is already connected - use send()/recv()
+/// socket.send(&query).await?;
+/// ```
+pub async fn make_client_udp_socket<P: RouteProbe>(
+    target: SocketAddr,
+    tun_if: Option<&str>,
+    bind_interface: Option<&str>,
+    probe: &P,
+) -> Result<UdpSocket, UdpError> {
+    let domain = match target {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+
+    // Skip interface probing for localhost targets
+    let selected_interface = if target.ip().is_loopback() {
+        None
+    } else {
+        select_bind_interface(target.ip(), tun_if, bind_interface, probe).await
+    };
+
+    // No explicit bind address - just bind to interface.
+    // OS will auto-assign ephemeral port when connect() is called.
+    let socket = make_udp_socket_raw(domain, None, selected_interface.as_deref())
+        .map_err(|e| UdpError::Socket(e.to_string()))?;
+
+    socket
+        .connect(target)
+        .await
+        .map_err(|e| UdpError::Socket(format!("connect to {}: {}", target, e)))?;
+
+    Ok(socket)
+}
+
+/// Internal: Binds a UDP socket with interface probing.
+///
+/// **Note**: This function is kept for h3.rs compatibility while that module is WIP.
+/// New code should use `make_server_udp_socket` or `make_client_udp_socket` instead.
+///
+/// TODO(#174): Remove this function once h3.rs is migrated to use `make_client_udp_socket`.
 ///
 /// Binding to an interface is best-effort: missing or ambiguous probe results
 /// are logged as warnings and the socket continues unbound. Skips interface
 /// binding for localhost addresses (127.x.x.x, ::1) to ensure Docker DNS
 /// (127.0.0.11) and other localhost services work correctly.
-///
-/// # Arguments
-/// - `listen`: Local socket address to bind.
-/// - `bind_interface`: Optional preferred interface; treated as a filter during probing.
-/// - `target`: Remote server IP used for route probing.
-/// - `tun_if`: Optional TUN interface name to exclude from probing.
-/// - `probe`: Route probe implementation.
-///
-/// # Errors
-/// Returns `UdpError::Socket` when socket creation or binding fails.
-pub async fn bind_udp_socket<P: RouteProbe>(
+pub(crate) async fn bind_udp_socket<P: RouteProbe>(
     listen: SocketAddr,
     bind_interface: Option<&str>,
     target: IpAddr,
     tun_if: Option<&str>,
     probe: &P,
 ) -> Result<UdpSocket, UdpError> {
-    // Skip interface binding for localhost addresses (127.x.x.x, ::1).
-    // Docker DNS (127.0.0.11) and other localhost services may not work
-    // correctly when the socket is bound to a specific interface like 'lo'.
+    let domain = match listen {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+
     let is_localhost = match target {
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => v6.is_loopback(),
@@ -105,11 +187,10 @@ pub async fn bind_udp_socket<P: RouteProbe>(
     let selected_interface = if is_localhost {
         None
     } else {
-        // Probe using the remote server IP to avoid recursive routing; pick the first match and warn on ambiguity.
         select_bind_interface(target, tun_if, bind_interface, probe).await
     };
 
-    bind_udp_socket_raw(listen, selected_interface.as_deref())
+    make_udp_socket_raw(domain, Some(listen), selected_interface.as_deref())
         .map_err(|e| UdpError::Socket(e.to_string()))
 }
 
@@ -718,5 +799,142 @@ mod tests {
         let indexes =
             matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(192, 168, 0, 10)), Some(2));
         assert_eq!(indexes, vec![1]);
+    }
+
+    // ========== make_udp_socket_raw Tests ==========
+    // Note: These tests use #[tokio::test] even though they don't call async functions.
+    // This is because `UdpSocket::from_std()` requires a tokio runtime to be present.
+
+    #[tokio::test]
+    async fn make_udp_socket_raw_with_none_bind_addr() {
+        let socket = make_udp_socket_raw(Domain::IPV4, None, None);
+        assert!(
+            socket.is_ok(),
+            "socket creation without bind should succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn make_udp_socket_raw_with_ipv4_domain() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let socket = make_udp_socket_raw(Domain::IPV4, Some(addr), None);
+        assert!(
+            socket.is_ok(),
+            "socket creation with IPv4 bind should succeed"
+        );
+
+        let socket = socket.unwrap();
+        let local = socket.local_addr().unwrap();
+        assert!(local.is_ipv4());
+    }
+
+    #[tokio::test]
+    async fn make_udp_socket_raw_with_ipv6_domain() {
+        let addr: SocketAddr = "[::]:0".parse().unwrap();
+        let result = make_udp_socket_raw(Domain::IPV6, Some(addr), None);
+        // May fail on systems without IPv6, which is acceptable
+        if let Ok(socket) = result {
+            assert!(socket.local_addr().unwrap().is_ipv6());
+        }
+    }
+
+    // ========== make_server_udp_socket Tests ==========
+    // Note: These tests use #[tokio::test] even though they don't call async functions.
+    // This is because `UdpSocket::from_std()` requires a tokio runtime to be present.
+
+    #[tokio::test]
+    async fn make_server_udp_socket_binds_to_address() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let socket = make_server_udp_socket(addr);
+        assert!(socket.is_ok(), "make_server_udp_socket should succeed");
+
+        let socket = socket.unwrap();
+        let local = socket.local_addr().unwrap();
+        assert_eq!(local.ip(), addr.ip());
+        assert_ne!(local.port(), 0, "port should be assigned");
+    }
+
+    #[tokio::test]
+    async fn make_server_udp_socket_ipv6() {
+        // This test may pass without assertions on systems without IPv6.
+        // The important behavior is that it doesn't panic.
+        let addr: SocketAddr = "[::]:0".parse().unwrap();
+        let result = make_server_udp_socket(addr);
+        if let Ok(socket) = result {
+            assert!(socket.local_addr().unwrap().is_ipv6());
+        }
+    }
+
+    // ========== make_client_udp_socket Tests ==========
+
+    #[tokio::test]
+    async fn make_client_udp_socket_skips_probe_for_localhost() {
+        let probe = FakeRouteProbe {
+            result: Err(RouteProbeError::Probe("should not be called".into())),
+        };
+
+        let result = make_client_udp_socket(
+            SocketAddr::from(([127, 0, 0, 1], 12345)),
+            None,
+            None,
+            &probe,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "localhost target should succeed without probing"
+        );
+
+        // Verify socket is connected
+        let socket = result.unwrap();
+        assert!(socket.peer_addr().is_ok(), "socket should be connected");
+        assert_eq!(socket.peer_addr().unwrap().port(), 12345);
+    }
+
+    #[tokio::test]
+    async fn make_client_udp_socket_creates_connected_socket() {
+        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let result = make_client_udp_socket(
+            SocketAddr::from(([127, 0, 0, 1], 54321)),
+            None,
+            None,
+            &probe,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let socket = result.unwrap();
+        assert!(socket.peer_addr().is_ok(), "socket should be connected");
+        assert_eq!(
+            socket.peer_addr().unwrap(),
+            SocketAddr::from(([127, 0, 0, 1], 54321))
+        );
+    }
+
+    #[tokio::test]
+    async fn make_client_udp_socket_ipv4_creates_ipv4_socket() {
+        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let result =
+            make_client_udp_socket(SocketAddr::from(([127, 0, 0, 1], 53)), None, None, &probe)
+                .await;
+        assert!(result.is_ok());
+        let socket = result.unwrap();
+        assert!(socket.local_addr().unwrap().is_ipv4());
+    }
+
+    #[tokio::test]
+    async fn make_client_udp_socket_ipv6_creates_ipv6_socket() {
+        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let result = make_client_udp_socket(
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 53)),
+            None,
+            None,
+            &probe,
+        )
+        .await;
+        // May fail on systems without IPv6, which is acceptable
+        if let Ok(socket) = result {
+            assert!(socket.local_addr().unwrap().is_ipv6());
+        }
     }
 }

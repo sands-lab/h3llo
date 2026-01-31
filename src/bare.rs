@@ -1,8 +1,7 @@
 //! BareUDP transport: socket setup, source-IP filtering, and send/receive loops.
 
 use crate::actor::{ActorError, ActorExitResult};
-pub use crate::bind::bind_udp_socket;
-use crate::bind::{RouteProbe, UdpError};
+use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe, UdpError};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_interrupted;
 use crate::metrics::TransportCounters;
@@ -36,10 +35,8 @@ impl BareUdpRx {
     /// # Errors
     ///
     /// Returns `UdpError::Socket` when socket binding fails.
-    pub async fn from_config(listen: SocketAddr, mtu: usize) -> Result<Self, UdpError> {
-        let socket = UdpSocket::bind(listen)
-            .await
-            .map_err(|err| UdpError::Socket(err.to_string()))?;
+    pub fn from_config(listen: SocketAddr, mtu: usize) -> Result<Self, UdpError> {
+        let socket = make_server_udp_socket(listen)?;
         Ok(Self { socket, mtu })
     }
 }
@@ -53,21 +50,18 @@ pub struct BareUdpTx {
 impl BareUdpTx {
     /// Builds a BareUDP TX socket from a resolved destination address.
     ///
+    /// Returns a connected socket, allowing use of `send()` instead of `send_to()`.
+    ///
     /// # Errors
     ///
-    /// Returns `UdpError::Socket` when socket creation or binding fails.
+    /// Returns `UdpError::Socket` when socket creation, binding, or connect fails.
     pub async fn from_config<P: RouteProbe>(
         destination: SocketAddr,
         bindif: Option<&str>,
         tun_if: Option<&str>,
         probe: &P,
     ) -> Result<Self, UdpError> {
-        let bind_addr = if destination.is_ipv4() {
-            SocketAddr::from(([0, 0, 0, 0], 0))
-        } else {
-            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0))
-        };
-        let socket = bind_udp_socket(bind_addr, bindif, destination.ip(), tun_if, probe).await?;
+        let socket = make_client_udp_socket(destination, tun_if, bindif, probe).await?;
         Ok(Self { socket })
     }
 }
@@ -156,25 +150,30 @@ pub fn spawn_udp_rx(
     (cmd_tx, handle)
 }
 
-/// Spawns the BareUDP send loop, emitting metrics while forwarding packets to `destination`.
+/// Spawns the BareUDP send loop, emitting metrics while forwarding packets.
+///
+/// The socket must be connected (created via `BareUdpTx::from_config`), allowing
+/// use of `send()` instead of `send_to()`.
 ///
 /// Creates a bounded packet channel internally (actor owns the receiver).
 /// Returns the packet sender and join handle.
 ///
 /// # Arguments
-/// - `tx`: Send-only socket.
-/// - `destination`: Remote peer socket address.
+/// - `tx`: Send-only connected socket.
 /// - `events_tx`: Unbounded channel for emitting transmit metrics.
 /// - `interval`: Metrics emission interval.
 pub fn spawn_udp_tx(
     tx: BareUdpTx,
-    destination: SocketAddr,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
     let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
-    let dest_str = destination.to_string();
+    let dest_str = tx
+        .socket
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
 
     let BareUdpTx { socket } = tx;
 
@@ -190,7 +189,7 @@ pub fn spawn_udp_tx(
                         None => return Ok(()), // Channel closed, exit gracefully
                     };
 
-                    match retry_on_interrupted!(socket.send_to(&packet, destination).await) {
+                    match retry_on_interrupted!(socket.send(&packet).await) {
                         Ok(written) => counters.record_success(written),
                         Err(err) => {
                             counters.record_drop(DropReason::SendError, packet.len());
@@ -306,13 +305,15 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
+        // Create a connected socket for the sender
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender_socket.connect(dest).await.unwrap();
+
         let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
         let context = BareUdpTx {
             socket: sender_socket,
         };
-        let (packet_tx, handle) =
-            spawn_udp_tx(context, dest, events_tx, Duration::from_millis(200));
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200));
 
         packet_tx.send(vec![9, 8, 7]).await.unwrap();
 
@@ -384,12 +385,15 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
+        // Create a connected socket for the sender
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender_socket.connect(dest).await.unwrap();
+
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let context = BareUdpTx {
             socket: sender_socket,
         };
-        let (packet_tx, handle) = spawn_udp_tx(context, dest, events_tx, Duration::from_millis(10));
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(10));
 
         packet_tx.send(vec![5, 4, 3, 2]).await.unwrap();
 
@@ -484,13 +488,16 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
+        // Create a connected socket for the sender
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender_socket.connect(dest).await.unwrap();
+
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let context = BareUdpTx {
             socket: sender_socket,
         };
 
-        let (packet_tx, handle) = spawn_udp_tx(context, dest, events_tx, Duration::from_secs(60));
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_secs(60));
 
         // Verify packet_tx is functional by sending a packet
         assert!(packet_tx.send(vec![1, 2, 3]).await.is_ok());
@@ -503,14 +510,16 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
+        // Create a connected socket for the sender
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender_socket.connect(dest).await.unwrap();
+
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let context = BareUdpTx {
             socket: sender_socket,
         };
 
-        let (packet_tx, join_handle) =
-            spawn_udp_tx(context, dest, events_tx, Duration::from_secs(60));
+        let (packet_tx, join_handle) = spawn_udp_tx(context, events_tx, Duration::from_secs(60));
 
         // Drop sender to signal shutdown
         drop(packet_tx);
