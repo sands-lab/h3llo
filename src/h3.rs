@@ -13,7 +13,7 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_basic_auth, validate_connect_auth};
-use crate::bind::{bind_udp_socket, RouteProbe};
+use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::events::{Direction, Event, TransportEvent, TransportKind};
 use crate::metrics::TransportCounters;
 use crate::PACKET_QUEUE_DEPTH;
@@ -182,21 +182,10 @@ pub async fn dial_h3<P: RouteProbe>(
 ) -> Result<H3Connection, DialError> {
     debug!(%remote_addr, %server_name, %local_id, "dialing H3 endpoint");
 
-    // Bind socket to interface
-    let bind_addr = if remote_addr.is_ipv4() {
-        SocketAddr::from(([0, 0, 0, 0], 0))
-    } else {
-        SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0))
-    };
-
-    let socket = bind_udp_socket(bind_addr, bindif, remote_addr.ip(), tun_if, probe)
+    // Create connected socket with route probing
+    let socket = make_client_udp_socket(remote_addr, tun_if, bindif, probe)
         .await
-        .map_err(|e| DialError::Tls(format!("socket bind failed: {}", e)))?;
-
-    socket
-        .connect(remote_addr)
-        .await
-        .map_err(|e| DialError::Handshake(format!("connect failed: {}", e)))?;
+        .map_err(|e| DialError::Tls(format!("socket setup failed: {}", e)))?;
 
     // CA certificate path is used for TLS verification via tokio-quiche config
     // (currently using system roots; custom CA support is a future enhancement)
@@ -499,10 +488,9 @@ pub async fn spawn_h3_listener<P: RouteProbe + Send + Sync + 'static>(
 
     debug!(%listen_addr, bindif = ?bindif, "starting H3 listener");
 
-    // Bind socket to interface
-    let socket = bind_udp_socket(listen_addr, bindif, listen_addr.ip(), tun_if, &probe)
-        .await
-        .map_err(|e| ListenerError::Bind(e.to_string()))?;
+    // Server socket binds directly to listen address (no route probing needed)
+    let socket =
+        make_server_udp_socket(listen_addr).map_err(|e| ListenerError::Bind(e.to_string()))?;
 
     // Convert Path to &str for TlsCertificatePaths
     let cert_str = cert_path
@@ -537,9 +525,9 @@ pub async fn spawn_h3_listener<P: RouteProbe + Send + Sync + 'static>(
 
     let mut accept_stream = listeners.remove(0);
 
-    // Need to make cert/key paths owned for the spawned task
-    // (already validated above)
-    let _ = probe; // RouteProbe not needed after socket bind
+    // Suppress unused variable warnings for parameters retained for API compatibility
+    // These will be removed in a future cleanup when spawn_h3_listener signature is simplified
+    let _ = (bindif, tun_if, probe);
 
     let handle = tokio::spawn(async move {
         // Actor owns peer_secrets directly (Option 2A: message passing pattern)

@@ -156,44 +156,6 @@ pub async fn make_client_udp_socket<P: RouteProbe>(
     Ok(socket)
 }
 
-/// Internal: Binds a UDP socket with interface probing.
-///
-/// **Note**: This function is kept for h3.rs compatibility while that module is WIP.
-/// New code should use `make_server_udp_socket` or `make_client_udp_socket` instead.
-///
-/// TODO(#174): Remove this function once h3.rs is migrated to use `make_client_udp_socket`.
-///
-/// Binding to an interface is best-effort: missing or ambiguous probe results
-/// are logged as warnings and the socket continues unbound. Skips interface
-/// binding for localhost addresses (127.x.x.x, ::1) to ensure Docker DNS
-/// (127.0.0.11) and other localhost services work correctly.
-pub(crate) async fn bind_udp_socket<P: RouteProbe>(
-    listen: SocketAddr,
-    bind_interface: Option<&str>,
-    target: IpAddr,
-    tun_if: Option<&str>,
-    probe: &P,
-) -> Result<UdpSocket, UdpError> {
-    let domain = match listen {
-        SocketAddr::V4(_) => Domain::IPV4,
-        SocketAddr::V6(_) => Domain::IPV6,
-    };
-
-    let is_localhost = match target {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => v6.is_loopback(),
-    };
-
-    let selected_interface = if is_localhost {
-        None
-    } else {
-        select_bind_interface(target, tun_if, bind_interface, probe).await
-    };
-
-    make_udp_socket_raw(domain, Some(listen), selected_interface.as_deref())
-        .map_err(|e| UdpError::Socket(e.to_string()))
-}
-
 /// Selects a bind interface by probing routes toward `target`, logging warnings on probe failures, empty sets, or ambiguity.
 ///
 /// # Arguments
@@ -690,73 +652,6 @@ mod tests {
         assert!(iface.is_none());
         assert!(logs_contain("route probe failed"));
         assert!(logs_contain("boom"));
-    }
-
-    // ========== bind_udp_socket Tests ==========
-
-    #[tokio::test]
-    async fn bind_udp_socket_skips_probe_for_localhost_v4() {
-        // Probe that would fail if called
-        let probe = FakeRouteProbe {
-            result: Err(RouteProbeError::Probe("should not be called".into())),
-        };
-
-        let result = bind_udp_socket(
-            SocketAddr::from(([0, 0, 0, 0], 0)),
-            None,
-            IpAddr::V4("127.0.0.1".parse().unwrap()),
-            None,
-            &probe,
-        )
-        .await;
-        assert!(
-            result.is_ok(),
-            "localhost target should succeed without probing"
-        );
-    }
-
-    #[tokio::test]
-    async fn bind_udp_socket_skips_probe_for_localhost_v6() {
-        let probe = FakeRouteProbe {
-            result: Err(RouteProbeError::Probe("should not be called".into())),
-        };
-
-        let result = bind_udp_socket(
-            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
-            None,
-            IpAddr::V6("::1".parse().unwrap()),
-            None,
-            &probe,
-        )
-        .await;
-        // Note: This may fail on systems without IPv6 enabled, which is acceptable.
-        // The important thing is that the probe was NOT called (localhost detection worked).
-        if result.is_err() {
-            // If it failed, it should be a socket error (IPv6 not available), not a probe error.
-            let err_msg = result.unwrap_err().to_string();
-            assert!(
-                !err_msg.contains("should not be called"),
-                "probe should not be called for localhost"
-            );
-        }
-    }
-
-    #[traced_test]
-    #[tokio::test]
-    async fn bind_udp_socket_probes_for_remote_target() {
-        let probe = FakeRouteProbe {
-            result: Ok(vec!["eth0".to_string()]),
-        };
-
-        let result = bind_udp_socket(
-            SocketAddr::from(([0, 0, 0, 0], 0)),
-            None,
-            IpAddr::V4("8.8.8.8".parse().unwrap()),
-            None,
-            &probe,
-        )
-        .await;
-        assert!(result.is_ok());
     }
 
     #[test]
