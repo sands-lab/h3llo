@@ -27,6 +27,9 @@ ipnet-trie = "0.3"
 tokio-quiche = "0.14"
 rustls-pemfile = "2"
 base64 = "0.22"
+http = "1"
+bytes = "1"
+subtle = "2"
 
 # Use mimalloc for musl targets to avoid musl's slow default allocator
 [target.'cfg(target_env = "musl")'.dependencies]
@@ -37,6 +40,7 @@ tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-
 testcontainers = "0.23"
 tempfile = "3"
 tracing-test = "0.2"
+rcgen = "0.13"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 route_manager = { version = "0.2.9", features = ["async"] }

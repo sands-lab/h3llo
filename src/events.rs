@@ -54,6 +54,8 @@ pub enum DropReason {
     ChannelClosed,
     /// Packet has unknown or invalid IP version.
     InvalidIpVersion,
+    /// DATAGRAM framing error (e.g., invalid Context ID).
+    InvalidFraming,
     /// No route found for destination IP.
     NoRoute,
     /// No peer channel available for the route.
