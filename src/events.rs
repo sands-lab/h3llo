@@ -19,6 +19,30 @@ pub enum Event {
 pub enum TransportEvent {
     /// Latest cumulative metrics for a transport direction.
     Metrics(TransportMetrics),
+    /// HTTP/3 connection established.
+    H3Connected(H3ConnectedEvent),
+    /// HTTP/3 connection closed.
+    H3Closed(H3ClosedEvent),
+}
+
+/// HTTP/3 connection established event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H3ConnectedEvent {
+    /// Authenticated peer identifier.
+    pub peer_id: String,
+    /// Remote socket address.
+    pub remote_addr: SocketAddr,
+    /// Whether inbound (listener) or outbound (dialer).
+    pub direction: Direction,
+}
+
+/// HTTP/3 connection closed event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H3ClosedEvent {
+    /// Peer identifier.
+    pub peer_id: String,
+    /// Reason for closure.
+    pub reason: Option<String>,
 }
 
 /// Indicates which transport produced the metrics.
