@@ -122,6 +122,7 @@ pub struct H3Connection {
 /// # Errors
 ///
 /// Returns `DialError` if connection establishment fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn dial_h3<P: RouteProbe>(
     remote_addr: SocketAddr,
     server_name: &str,
@@ -153,10 +154,7 @@ pub async fn dial_h3<P: RouteProbe>(
 
     // Load CA certificate if provided (sync read - TLS certs are small)
     let _ca_cert = if let Some(ca_path) = ca_cert_path {
-        Some(
-            std::fs::read(ca_path)
-                .map_err(|e| DialError::Tls(format!("read CA cert: {}", e)))?,
-        )
+        Some(std::fs::read(ca_path).map_err(|e| DialError::Tls(format!("read CA cert: {}", e)))?)
     } else {
         None
     };
@@ -367,11 +365,13 @@ enum H3ListenerMsg {
 /// # Errors
 ///
 /// Returns `ListenerError` if listener setup fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_h3_listener<P: RouteProbe + Send + Sync + 'static>(
     listen_addr: SocketAddr,
     cert_path: &Path,
     key_path: &Path,
-    #[allow(unused_mut, unused_variables)] // Will be used when tokio-quiche integration is complete
+    #[allow(unused_mut, unused_variables)]
+    // Will be used when tokio-quiche integration is complete
     mut peer_secrets: HashMap<String, String>,
     conn_tx: mpsc::UnboundedSender<H3Connection>,
     bindif: Option<&str>,
@@ -408,10 +408,10 @@ pub async fn spawn_h3_listener<P: RouteProbe + Send + Sync + 'static>(
         .map_err(|e| ListenerError::Bind(e.to_string()))?;
 
     // Load TLS config (sync read - TLS certs are small)
-    let _cert_chain = std::fs::read(cert_path)
-        .map_err(|e| ListenerError::Tls(format!("read cert: {}", e)))?;
-    let _key = std::fs::read(key_path)
-        .map_err(|e| ListenerError::Tls(format!("read key: {}", e)))?;
+    let _cert_chain =
+        std::fs::read(cert_path).map_err(|e| ListenerError::Tls(format!("read cert: {}", e)))?;
+    let _key =
+        std::fs::read(key_path).map_err(|e| ListenerError::Tls(format!("read key: {}", e)))?;
 
     // Suppress unused variable warnings for future implementation
     let _ = (socket, msg_tx, probe, _cert_chain, _key);
