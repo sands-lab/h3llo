@@ -161,6 +161,8 @@ pub async fn make_client_udp_socket<P: RouteProbe>(
 /// **Note**: This function is kept for h3.rs compatibility while that module is WIP.
 /// New code should use `make_server_udp_socket` or `make_client_udp_socket` instead.
 ///
+/// TODO(#174): Remove this function once h3.rs is migrated to use `make_client_udp_socket`.
+///
 /// Binding to an interface is best-effort: missing or ambiguous probe results
 /// are logged as warnings and the socket continues unbound. Skips interface
 /// binding for localhost addresses (127.x.x.x, ::1) to ensure Docker DNS
@@ -829,8 +831,7 @@ mod tests {
         let addr: SocketAddr = "[::]:0".parse().unwrap();
         let result = make_udp_socket_raw(Domain::IPV6, Some(addr), None);
         // May fail on systems without IPv6, which is acceptable
-        if result.is_ok() {
-            let socket = result.unwrap();
+        if let Ok(socket) = result {
             assert!(socket.local_addr().unwrap().is_ipv6());
         }
     }
@@ -851,10 +852,11 @@ mod tests {
 
     #[tokio::test]
     async fn make_server_udp_socket_ipv6() {
+        // This test may pass without assertions on systems without IPv6.
+        // The important behavior is that it doesn't panic.
         let addr: SocketAddr = "[::]:0".parse().unwrap();
         let result = make_server_udp_socket(addr);
-        if result.is_ok() {
-            let socket = result.unwrap();
+        if let Ok(socket) = result {
             assert!(socket.local_addr().unwrap().is_ipv6());
         }
     }
@@ -914,5 +916,21 @@ mod tests {
         assert!(result.is_ok());
         let socket = result.unwrap();
         assert!(socket.local_addr().unwrap().is_ipv4());
+    }
+
+    #[tokio::test]
+    async fn make_client_udp_socket_ipv6_creates_ipv6_socket() {
+        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let result = make_client_udp_socket(
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 53)),
+            None,
+            None,
+            &probe,
+        )
+        .await;
+        // May fail on systems without IPv6, which is acceptable
+        if let Ok(socket) = result {
+            assert!(socket.local_addr().unwrap().is_ipv6());
+        }
     }
 }
