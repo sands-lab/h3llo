@@ -802,6 +802,8 @@ mod tests {
     }
 
     // ========== make_udp_socket_raw Tests ==========
+    // Note: These tests use #[tokio::test] even though they don't call async functions.
+    // This is because `UdpSocket::from_std()` requires a tokio runtime to be present.
 
     #[tokio::test]
     async fn make_udp_socket_raw_with_none_bind_addr() {
@@ -837,6 +839,8 @@ mod tests {
     }
 
     // ========== make_server_udp_socket Tests ==========
+    // Note: These tests use #[tokio::test] even though they don't call async functions.
+    // This is because `UdpSocket::from_std()` requires a tokio runtime to be present.
 
     #[tokio::test]
     async fn make_server_udp_socket_binds_to_address() {
