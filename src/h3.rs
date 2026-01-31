@@ -454,9 +454,6 @@ pub enum H3ListenerCommand {
 /// * `key_path` - Path to TLS private key.
 /// * `peer_secrets` - Map of peer ID to expected secret for authentication.
 /// * `conn_tx` - Unbounded channel for emitting established connections.
-/// * `bindif` - Optional interface name to bind the socket.
-/// * `tun_if` - Optional TUN interface name to exclude from probing.
-/// * `probe` - Route probe implementation for interface selection.
 ///
 /// # Returns
 ///
@@ -466,16 +463,12 @@ pub enum H3ListenerCommand {
 /// # Errors
 ///
 /// Returns `ListenerError` if listener setup fails.
-#[allow(clippy::too_many_arguments)]
-pub async fn spawn_h3_listener<P: RouteProbe + Send + Sync + 'static>(
+pub async fn spawn_h3_listener(
     listen_addr: SocketAddr,
     cert_path: &Path,
     key_path: &Path,
     mut peer_secrets: HashMap<String, String>,
     conn_tx: mpsc::UnboundedSender<H3Connection>,
-    bindif: Option<&str>,
-    tun_if: Option<&str>,
-    probe: P,
 ) -> Result<
     (
         mpsc::UnboundedSender<H3ListenerCommand>,
@@ -486,7 +479,7 @@ pub async fn spawn_h3_listener<P: RouteProbe + Send + Sync + 'static>(
     // Create command channel (actor owns receiver directly - direct select pattern)
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<H3ListenerCommand>();
 
-    debug!(%listen_addr, bindif = ?bindif, "starting H3 listener");
+    debug!(%listen_addr, "starting H3 listener");
 
     // Server socket binds directly to listen address (no route probing needed)
     let socket =
@@ -524,10 +517,6 @@ pub async fn spawn_h3_listener<P: RouteProbe + Send + Sync + 'static>(
     .map_err(|e| ListenerError::Bind(format!("listen failed: {}", e)))?;
 
     let mut accept_stream = listeners.remove(0);
-
-    // Suppress unused variable warnings for parameters retained for API compatibility
-    // These will be removed in a future cleanup when spawn_h3_listener signature is simplified
-    let _ = (bindif, tun_if, probe);
 
     let handle = tokio::spawn(async move {
         // Actor owns peer_secrets directly (Option 2A: message passing pattern)
