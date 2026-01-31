@@ -198,7 +198,6 @@ impl Orchestrator {
 
         // Setup BareUDP RX
         let bare_rx = BareUdpRx::from_config(listen_addr, mtu)
-            .await
             .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
 
         // Control plane: unbounded to prevent deadlocks from actor cycles.
@@ -601,7 +600,7 @@ async fn spawn_bare_tx(
     };
 
     // BareUDP TX actor creates its own packet channel; returns sender
-    let (packet_tx, tx_handle) = spawn_udp_tx(tx_socket, destination, events_tx, METRICS_INTERVAL);
+    let (packet_tx, tx_handle) = spawn_udp_tx(tx_socket, events_tx, METRICS_INTERVAL);
 
     Some((packet_tx, tx_handle))
 }
