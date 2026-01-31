@@ -4,7 +4,7 @@ Internals overview: runtime dependencies, guards against recursive routing and D
 
 ### Dependencies
 
-h3llo primarily depends on tun-rs and h3-quinn (HTTP/3 with DATAGRAM support enabled). h3-quinn was chosen over tokio-quiche because tokio-quiche could not be statically linked at the time of technology selection.
+h3llo primarily depends on tun-rs and tokio-quiche (HTTP/3 with DATAGRAM support enabled). tokio-quiche is statically linkable and provides low-level control over QUIC connections.
 
 ### Recursive Routing and DNS Resolution
 

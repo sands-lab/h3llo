@@ -24,18 +24,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tun-rs = { version = "2", features = ["async"] }
 ipnet-trie = "0.3"
-
-# HTTP/3 and QUIC (Steps 8-9 of docs/plan.md)
-quinn = "0.11"
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
-# h3-datagram: Reserved for future RFC 9297 Quarter Stream ID framing.
-# Currently using manual Context ID 0 prefix; will integrate when CONNECT-IP handshake is implemented.
-h3-datagram = "0.0.2"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-quiche = "0.14"
 rustls-pemfile = "2"
-rustls-native-certs = "0.8"
-webpki-roots = "0.26"
 base64 = "0.22"
 http = "1"
 bytes = "1"
@@ -82,3 +72,8 @@ harness = false
 name = "integration-container-route"
 path = "tests/integration/container/route.rs"
 harness = false
+
+# Patch datagram-socket for musl compatibility (msghdr private padding fields)
+# See: https://github.com/rust-lang/libc/issues/2344
+[patch.crates-io]
+datagram-socket = { git = "https://github.com/Tonny-Gu/quiche", subdirectory = "datagram-socket" }

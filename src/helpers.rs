@@ -81,7 +81,7 @@ pub(crate) mod test_packets {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_dst_ip, retry_on_interrupted, test_packets};
+    use super::{extract_dst_ip, test_packets};
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::{

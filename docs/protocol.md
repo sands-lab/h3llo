@@ -32,8 +32,8 @@ h3llo intentionally omits the following optional features from RFC 9484:
 - URI template parameters `target` and `ipproto`.
 
 H3 connection management and multipath:
-- Dialing set: build one connection for every combination of DNS answer, `peers[].h3.endpoints`, and `peers[].h3.bindifs` when set (auto-detected bindif yields at most one entry when unspecified). Deduplicate endpoints before dialing.
-- Preference: no endpoint priority is implied; TUN-Rx prefers the earliest-established connection until it disconnects or is invalidated because the IP left the DNS result set or the interface is not within `bindifs`. New connections join the end of the ordering; warn if more than `10` connections exist for a peer.
+- **Step 9 (MVP)**: Build one connection per peer using the first `peers[].h3.endpoints` entry and auto-detected bindif. The single connection is used until it disconnects; reconnection uses the same endpoint.
+- **Step 11 (Pooling)**: Build one connection for every combination of DNS answer, `peers[].h3.endpoints`, and `peers[].h3.bindifs`. Prefer earliest-established connection; warn if more than 10 connections exist.
 - Failures: TLS/handshake failures count as dial failures. Bind failures warn and fall back to unbound sockets, which can risk recursive routing if the system route points to the TUN.
 
 ```mermaid

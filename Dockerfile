@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for h3llo BareUDP VPN
-# Static musl build for maximum portability
+# Debian builder + Alpine runtime for static musl binaries
 #
 # Targets:
 #   runtime (default) - Minimal Alpine production image
@@ -9,9 +9,31 @@
 #   docker build --target runtime -t h3llo:latest .
 #   docker build --target test -t h3llo:test .
 
-# Stage 1: Chef - Install cargo-chef with Alpine musl
-FROM rust:alpine AS chef
-RUN apk add --no-cache musl-dev
+# Stage 1: Chef - Install cargo-chef with Debian (supports libclang dynamic loading)
+FROM rust:slim-trixie AS chef
+
+# Install boring-sys dependencies and curl/xz for downloading musl toolchain
+RUN apt-get update && apt-get install -y \
+    curl xz-utils \
+    cmake make perl golang-go git \
+    clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download musl cross-compilation toolchain from GitHub (auto-redirects to latest release)
+# Source: https://github.com/cross-tools/musl-cross
+RUN curl -sSfL https://github.com/cross-tools/musl-cross/releases/latest/download/x86_64-unknown-linux-musl.tar.xz \
+    | tar -xJf - -C /opt
+ENV PATH="/opt/x86_64-unknown-linux-musl/bin:$PATH"
+
+# Add musl target
+RUN rustup target add x86_64-unknown-linux-musl
+
+# Configure compilers for musl target
+ENV CC_x86_64_unknown_linux_musl=x86_64-unknown-linux-musl-gcc
+ENV CXX_x86_64_unknown_linux_musl=x86_64-unknown-linux-musl-g++
+ENV AR_x86_64_unknown_linux_musl=x86_64-unknown-linux-musl-ar
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-unknown-linux-musl-gcc
+
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
@@ -25,17 +47,17 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies (cached as long as recipe.json unchanged)
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 # Build application
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --bin h3llo && \
-    strip /app/target/release/h3llo
+RUN cargo build --release --target x86_64-unknown-linux-musl --bin h3llo && \
+    strip /app/target/x86_64-unknown-linux-musl/release/h3llo
 
 # Stage 4: Runtime - Minimal Alpine production image
 FROM alpine:3.21 AS runtime
 RUN apk add --no-cache ca-certificates
-COPY --from=builder /app/target/release/h3llo /usr/local/bin/h3llo
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/h3llo /usr/local/bin/h3llo
 RUN mkdir -p /etc/h3llo
 WORKDIR /etc/h3llo
 ENTRYPOINT ["/usr/local/bin/h3llo"]

@@ -64,29 +64,20 @@ pub enum ActorError {
     },
 
     /// HTTP/3 receive loop exited with error.
-    #[error("h3_rx[{peer}]: recv failed: {reason}")]
+    #[error("h3_rx[{peer_id}]: recv failed: {reason}")]
     H3RxRecv {
         /// Peer identifier.
-        peer: String,
-        /// Error description.
+        peer_id: String,
+        /// Failure reason.
         reason: String,
     },
 
-    /// HTTP/3 transmit loop exited with error.
-    #[error("h3_tx[{peer}]: send failed: {reason}")]
+    /// HTTP/3 transmit failed.
+    #[error("h3_tx[{peer_id}]: send failed: {reason}")]
     H3TxSend {
         /// Peer identifier.
-        peer: String,
-        /// Error description.
-        reason: String,
-    },
-
-    /// HTTP/3 dial failed.
-    #[error("h3_dial[{peer}]: dial failed: {reason}")]
-    H3Dial {
-        /// Peer identifier.
-        peer: String,
-        /// Error description.
+        peer_id: String,
+        /// Failure reason.
         reason: String,
     },
 }
@@ -128,5 +119,29 @@ mod tests {
         assert!(msg.contains("dns_resolver"));
         assert!(msg.contains("8.8.8.8:53"));
         assert!(msg.contains("recv failed"));
+    }
+
+    #[test]
+    fn actor_error_h3_rx_includes_peer() {
+        let err = ActorError::H3RxRecv {
+            peer_id: "node-2".to_string(),
+            reason: "connection reset".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("h3_rx"));
+        assert!(msg.contains("node-2"));
+        assert!(msg.contains("connection reset"));
+    }
+
+    #[test]
+    fn actor_error_h3_tx_includes_peer() {
+        let err = ActorError::H3TxSend {
+            peer_id: "node-3".to_string(),
+            reason: "flow control blocked".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("h3_tx"));
+        assert!(msg.contains("node-3"));
+        assert!(msg.contains("flow control blocked"));
     }
 }
