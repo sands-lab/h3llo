@@ -75,10 +75,14 @@ async fn send_response_headers(
         .map_err(|_| "failed to send response headers")
 }
 
+/// Handshake timeout for H3 CONNECT-IP connections.
+const H3_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Handles a single inbound H3 CONNECT-IP connection handshake.
 ///
 /// Waits for both auth (Headers) and flow (NewFlow) events in either order,
-/// then sends 200 OK and emits the established connection.
+/// then sends 200 OK and emits the established connection. Times out after
+/// [`H3_HANDSHAKE_TIMEOUT`] to prevent resource exhaustion from stalled clients.
 async fn handle_h3_connection(
     mut controller: tokio_quiche::http3::driver::ServerH3Controller,
     quic_conn: QuicConnection,
@@ -86,66 +90,82 @@ async fn handle_h3_connection(
     secrets: HashMap<String, String>,
     conn_tx: mpsc::UnboundedSender<H3Connection>,
 ) {
-    // State for auth/flow handshake. For CONNECT-IP, NewFlow typically
-    // arrives BEFORE Headers (per tokio-quiche semantics).
-    let mut pending_auth: Option<String> = None;
-    let mut pending_flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
-    let mut pending_sender: Option<OutboundFrameSender> = None;
-    let mut quic_conn = Some(quic_conn);
+    let handshake = async {
+        // State for auth/flow handshake. For CONNECT-IP, NewFlow typically
+        // arrives BEFORE Headers (per tokio-quiche semantics).
+        let mut pending_auth: Option<String> = None;
+        let mut pending_flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
+        let mut pending_sender: Option<OutboundFrameSender> = None;
+        let mut quic_conn = Some(quic_conn);
 
-    while let Some(event) = controller.event_receiver_mut().recv().await {
-        match event {
-            ServerH3Event::Headers {
-                incoming_headers, ..
-            } => match extract_and_validate_auth(&incoming_headers.headers, &secrets) {
-                Ok(peer_id) => {
-                    pending_auth = Some(peer_id);
-                    pending_sender = Some(incoming_headers.send);
+        while let Some(event) = controller.event_receiver_mut().recv().await {
+            match event {
+                ServerH3Event::Headers {
+                    incoming_headers, ..
+                } => match extract_and_validate_auth(&incoming_headers.headers, &secrets) {
+                    Ok(peer_id) => {
+                        pending_auth = Some(peer_id);
+                        pending_sender = Some(incoming_headers.send);
+                    }
+                    Err(reason) => {
+                        warn!(%remote_addr, %reason, "CONNECT-IP auth rejected");
+                        let mut sender = incoming_headers.send;
+                        let _ = send_response_headers(&mut sender, b"401").await;
+                        return;
+                    }
+                },
+                ServerH3Event::Core(H3Event::NewFlow {
+                    flow_id,
+                    send,
+                    recv,
+                }) => {
+                    pending_flow = Some((send, recv, flow_id));
                 }
-                Err(reason) => {
-                    warn!(%remote_addr, %reason, "CONNECT-IP auth rejected");
-                    let mut sender = incoming_headers.send;
-                    let _ = send_response_headers(&mut sender, b"401").await;
+                ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => return,
+                ServerH3Event::Core(H3Event::ConnectionError(e)) => {
+                    warn!(%remote_addr, error = ?e, "H3 connection error");
                     return;
                 }
-            },
-            ServerH3Event::Core(H3Event::NewFlow {
-                flow_id,
-                send,
-                recv,
-            }) => {
-                pending_flow = Some((send, recv, flow_id));
+                _ => continue,
             }
-            ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => return,
-            ServerH3Event::Core(H3Event::ConnectionError(e)) => {
-                warn!(%remote_addr, error = ?e, "H3 connection error");
+
+            // Check if all pieces ready to establish connection
+            if let (Some(peer_id), Some((dgram_tx, dgram_rx, flow_id)), Some(mut sender)) = (
+                pending_auth.take(),
+                pending_flow.take(),
+                pending_sender.take(),
+            ) {
+                if send_response_headers(&mut sender, b"200").await.is_err() {
+                    warn!(%remote_addr, "failed to send 200 response");
+                    return;
+                }
+                debug!(%peer_id, %remote_addr, "H3 connection established");
+                let conn = H3Connection {
+                    peer_id,
+                    remote_addr,
+                    datagram_tx: dgram_tx,
+                    datagram_rx: dgram_rx,
+                    flow_id,
+                    quic_conn: quic_conn.take().expect("finish only once"),
+                };
+                if conn_tx.send(conn).is_err() {
+                    debug!(%remote_addr, "connection channel closed");
+                }
                 return;
             }
-            _ => continue,
         }
 
-        // Check if all pieces ready to establish connection
-        if let (Some(peer_id), Some((dgram_tx, dgram_rx, flow_id)), Some(mut sender)) = (
-            pending_auth.take(),
-            pending_flow.take(),
-            pending_sender.take(),
-        ) {
-            if send_response_headers(&mut sender, b"200").await.is_err() {
-                warn!(%remote_addr, "failed to send 200 response");
-                return;
-            }
-            let conn = H3Connection {
-                peer_id: peer_id.clone(),
-                remote_addr,
-                datagram_tx: dgram_tx,
-                datagram_rx: dgram_rx,
-                flow_id,
-                quic_conn: quic_conn.take().expect("finish only once"),
-            };
-            debug!(peer_id, %remote_addr, "H3 connection established");
-            let _ = conn_tx.send(conn);
-            return;
+        // Event stream closed before handshake completed
+        if pending_auth.is_some() || pending_flow.is_some() {
+            debug!(%remote_addr, "H3 handshake incomplete: connection closed");
         }
+    };
+
+    if time::timeout(H3_HANDSHAKE_TIMEOUT, handshake)
+        .await
+        .is_err()
+    {
+        warn!(%remote_addr, "H3 handshake timeout");
     }
 }
 
