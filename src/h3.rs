@@ -570,17 +570,14 @@ pub async fn spawn_h3_listener(
 
                             // Spawn per-connection handler
                             tokio::spawn(async move {
-                                // State for handling auth/flow events in either order
+                                // State for auth/flow handshake (Headers always arrives before NewFlow per HTTP/3)
                                 let mut pending_auth: Option<String> = None;
-                                let mut pending_flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
                                 let mut response_sender: Option<OutboundFrameSender> = None;
 
                                 while let Some(event) = controller.event_receiver_mut().recv().await {
                                     match event {
-                                        // ServerH3Event::Headers is the enriched server-side event
-                                        // with priority/early-data metadata. H3Event::IncomingHeaders
-                                        // is the core H3 event. Both may fire depending on driver
-                                        // configuration; we handle both to ensure compatibility.
+                                        // ServerH3Event::Headers wraps H3Event::IncomingHeaders with
+                                        // additional server metadata (priority, early-data).
                                         ServerH3Event::Headers { incoming_headers, .. } => {
                                             // Save response sender for later use
                                             response_sender = Some(incoming_headers.send.clone());
@@ -628,53 +625,8 @@ pub async fn spawn_h3_listener(
                                                     debug!("connection channel closed");
                                                 }
                                                 return; // Exit handler after sending connection
-                                            } else {
-                                                // Store flow for later if auth hasn't happened yet
-                                                pending_flow = Some((send, recv, flow_id));
                                             }
-                                        }
-                                        ServerH3Event::Core(H3Event::IncomingHeaders(incoming)) => {
-                                            // Save response sender for later use
-                                            response_sender = Some(incoming.send.clone());
-
-                                            match extract_and_validate_auth(&incoming.headers, &secrets_snapshot) {
-                                                Ok(peer_id) => {
-                                                    // If we already have the flow, emit connection now
-                                                    if let Some((send, recv, flow_id)) = pending_flow.take() {
-                                                        // Send 200 OK response
-                                                        let mut sender = incoming.send;
-                                                        if send_response_headers(&mut sender, b"200").await.is_err() {
-                                                            warn!(%remote_addr, "failed to send 200 response");
-                                                            break;
-                                                        }
-
-                                                        let conn = H3Connection {
-                                                            peer_id: peer_id.clone(),
-                                                            remote_addr,
-                                                            datagram_tx: send,
-                                                            datagram_rx: recv,
-                                                            flow_id,
-                                                            quic_conn,
-                                                        };
-                                                        debug!(peer_id, %remote_addr, "H3 connection established");
-                                                        if conn_tx.send(conn).is_err() {
-                                                            debug!("connection channel closed");
-                                                        }
-                                                        return;
-                                                    }
-                                                    pending_auth = Some(peer_id);
-                                                    debug!(%remote_addr, "CONNECT-IP auth accepted");
-                                                }
-                                                Err(reason) => {
-                                                    warn!(%remote_addr, %reason, "CONNECT-IP auth rejected");
-                                                    // Send 401 Unauthorized response
-                                                    let mut sender = incoming.send;
-                                                    if send_response_headers(&mut sender, b"401").await.is_err() {
-                                                        warn!(%remote_addr, "failed to send 401 response");
-                                                    }
-                                                    break;
-                                                }
-                                            }
+                                            // NewFlow without prior auth - protocol violation, ignore
                                         }
                                         ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => break,
                                         ServerH3Event::Core(H3Event::ConnectionError(e)) => {
