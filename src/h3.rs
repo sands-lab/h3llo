@@ -78,6 +78,44 @@ async fn send_response_headers(
 /// Handshake timeout for H3 CONNECT-IP connections.
 const H3_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Validates CONNECT-IP protocol headers per RFC 9484.
+///
+/// Checks that the request uses Extended CONNECT with:
+/// - `:method` == `CONNECT`
+/// - `:protocol` == `connect-ip`
+/// - `capsule-protocol` == `?1`
+///
+/// # Returns
+///
+/// `Ok(())` if all required headers are present and valid, or an error reason.
+fn validate_connect_ip_headers(headers: &[Header]) -> Result<(), &'static str> {
+    let method = headers
+        .iter()
+        .find(|h| h.name() == b":method")
+        .map(|h| h.value());
+    if method != Some(b"CONNECT") {
+        return Err("invalid :method, expected CONNECT");
+    }
+
+    let protocol = headers
+        .iter()
+        .find(|h| h.name() == b":protocol")
+        .map(|h| h.value());
+    if protocol != Some(b"connect-ip") {
+        return Err("invalid :protocol, expected connect-ip");
+    }
+
+    let capsule = headers
+        .iter()
+        .find(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol"))
+        .map(|h| h.value());
+    if capsule != Some(b"?1") {
+        return Err("invalid capsule-protocol, expected ?1");
+    }
+
+    Ok(())
+}
+
 /// Handles a single inbound H3 CONNECT-IP connection handshake.
 ///
 /// Waits for both auth (Headers) and flow (NewFlow) events in either order,
@@ -102,18 +140,28 @@ async fn handle_h3_connection(
             match event {
                 ServerH3Event::Headers {
                     incoming_headers, ..
-                } => match extract_and_validate_auth(&incoming_headers.headers, &secrets) {
-                    Ok(peer_id) => {
-                        pending_auth = Some(peer_id);
-                        pending_sender = Some(incoming_headers.send);
-                    }
-                    Err(reason) => {
-                        warn!(%remote_addr, %reason, "CONNECT-IP auth rejected");
+                } => {
+                    // Validate CONNECT-IP protocol headers per RFC 9484
+                    if let Err(reason) = validate_connect_ip_headers(&incoming_headers.headers) {
+                        warn!(%remote_addr, %reason, "CONNECT-IP protocol validation failed");
                         let mut sender = incoming_headers.send;
-                        let _ = send_response_headers(&mut sender, b"401").await;
+                        let _ = send_response_headers(&mut sender, b"400").await;
                         return;
                     }
-                },
+
+                    match extract_and_validate_auth(&incoming_headers.headers, &secrets) {
+                        Ok(peer_id) => {
+                            pending_auth = Some(peer_id);
+                            pending_sender = Some(incoming_headers.send);
+                        }
+                        Err(reason) => {
+                            warn!(%remote_addr, %reason, "CONNECT-IP auth rejected");
+                            let mut sender = incoming_headers.send;
+                            let _ = send_response_headers(&mut sender, b"401").await;
+                            return;
+                        }
+                    }
+                }
                 ServerH3Event::Core(H3Event::NewFlow {
                     flow_id,
                     send,
@@ -196,6 +244,9 @@ pub fn decode_datagram(data: &[u8]) -> Option<&[u8]> {
 /// Dial error for H3 connection establishment.
 #[derive(Debug, thiserror::Error)]
 pub enum DialError {
+    /// Socket setup failed.
+    #[error("socket failed: {0}")]
+    Socket(String),
     /// TLS setup failed.
     #[error("tls failed: {0}")]
     Tls(String),
@@ -208,6 +259,9 @@ pub enum DialError {
     /// Authentication failed.
     #[error("auth failed: {0}")]
     Auth(String),
+    /// Handshake timed out.
+    #[error("dial timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// Listener error for H3 server setup.
@@ -279,7 +333,7 @@ pub async fn dial_h3<P: RouteProbe>(
     // Create connected socket with route probing
     let socket = make_client_udp_socket(remote_addr, tun_if, bindif, probe)
         .await
-        .map_err(|e| DialError::Tls(format!("socket setup failed: {}", e)))?;
+        .map_err(|e| DialError::Socket(e.to_string()))?;
 
     // TODO: Implement custom CA certificate support for server verification.
     // Currently using system roots via tokio-quiche defaults.
@@ -316,72 +370,80 @@ pub async fn dial_h3<P: RouteProbe>(
         })
         .map_err(|e| DialError::Handshake(format!("send CONNECT failed: {:?}", e)))?;
 
-    // Wait for response headers and NewFlow event
-    let mut datagram_tx: Option<OutboundFrameSender> = None;
-    let mut datagram_rx: Option<InboundFrameStream> = None;
-    let mut flow_id: Option<u64> = None;
-    let mut status_validated = false;
+    // Wait for response headers and NewFlow event with timeout
+    let handshake_result = time::timeout(H3_HANDSHAKE_TIMEOUT, async {
+        let mut datagram_tx: Option<OutboundFrameSender> = None;
+        let mut datagram_rx: Option<InboundFrameStream> = None;
+        let mut flow_id: Option<u64> = None;
+        let mut status_validated = false;
 
-    while let Some(event) = controller.event_receiver_mut().recv().await {
-        match event {
-            ClientH3Event::Core(H3Event::IncomingHeaders(incoming)) => {
-                // Check status code
-                let status = incoming
-                    .headers
-                    .iter()
-                    .find(|h| h.name() == b":status")
-                    .map(|h| h.value());
-                match status {
-                    Some(b"200") => {
-                        debug!(%remote_addr, "CONNECT-IP accepted");
-                        status_validated = true;
-                        // If NewFlow already arrived, we can exit
-                        if datagram_tx.is_some() {
-                            break;
+        while let Some(event) = controller.event_receiver_mut().recv().await {
+            match event {
+                ClientH3Event::Core(H3Event::IncomingHeaders(incoming)) => {
+                    // Check status code
+                    let status = incoming
+                        .headers
+                        .iter()
+                        .find(|h| h.name() == b":status")
+                        .map(|h| h.value());
+                    match status {
+                        Some(b"200") => {
+                            debug!(%remote_addr, "CONNECT-IP accepted");
+                            status_validated = true;
+                            // If NewFlow already arrived, we can exit
+                            if datagram_tx.is_some() {
+                                break;
+                            }
+                        }
+                        Some(b"401") => {
+                            return Err(DialError::Auth("unauthorized".to_string()));
+                        }
+                        Some(code) => {
+                            let code_str = String::from_utf8_lossy(code);
+                            let code_num: u16 = code_str.parse().unwrap_or(0);
+                            return Err(DialError::Rejected(code_num));
+                        }
+                        None => {
+                            return Err(DialError::Handshake("missing status".to_string()));
                         }
                     }
-                    Some(b"401") => {
-                        return Err(DialError::Auth("unauthorized".to_string()));
-                    }
-                    Some(code) => {
-                        let code_str = String::from_utf8_lossy(code);
-                        let code_num: u16 = code_str.parse().unwrap_or(0);
-                        return Err(DialError::Rejected(code_num));
-                    }
-                    None => {
-                        return Err(DialError::Handshake("missing status".to_string()));
+                }
+                ClientH3Event::Core(H3Event::NewFlow {
+                    flow_id: fid,
+                    send,
+                    recv,
+                }) => {
+                    datagram_tx = Some(send);
+                    datagram_rx = Some(recv);
+                    flow_id = Some(fid);
+                    // Only break if status was already validated
+                    if status_validated {
+                        break;
                     }
                 }
-            }
-            ClientH3Event::Core(H3Event::NewFlow {
-                flow_id: fid,
-                send,
-                recv,
-            }) => {
-                datagram_tx = Some(send);
-                datagram_rx = Some(recv);
-                flow_id = Some(fid);
-                // Only break if status was already validated
-                if status_validated {
-                    break;
+                ClientH3Event::Core(H3Event::ConnectionError(e)) => {
+                    return Err(DialError::Handshake(format!("H3 error: {:?}", e)));
                 }
+                ClientH3Event::Core(H3Event::ConnectionShutdown(_)) => {
+                    return Err(DialError::Handshake("connection shutdown".to_string()));
+                }
+                _ => continue,
             }
-            ClientH3Event::Core(H3Event::ConnectionError(e)) => {
-                return Err(DialError::Handshake(format!("H3 error: {:?}", e)));
-            }
-            ClientH3Event::Core(H3Event::ConnectionShutdown(_)) => {
-                return Err(DialError::Handshake("connection shutdown".to_string()));
-            }
-            _ => continue,
         }
-    }
 
-    let datagram_tx = datagram_tx
-        .ok_or_else(|| DialError::Handshake("no datagram_tx from NewFlow".to_string()))?;
-    let datagram_rx = datagram_rx
-        .ok_or_else(|| DialError::Handshake("no datagram_rx from NewFlow".to_string()))?;
-    let flow_id =
-        flow_id.ok_or_else(|| DialError::Handshake("no flow_id from NewFlow".to_string()))?;
+        let datagram_tx = datagram_tx
+            .ok_or_else(|| DialError::Handshake("no datagram_tx from NewFlow".to_string()))?;
+        let datagram_rx = datagram_rx
+            .ok_or_else(|| DialError::Handshake("no datagram_rx from NewFlow".to_string()))?;
+        let flow_id =
+            flow_id.ok_or_else(|| DialError::Handshake("no flow_id from NewFlow".to_string()))?;
+
+        Ok((datagram_tx, datagram_rx, flow_id))
+    })
+    .await
+    .map_err(|_| DialError::Timeout(H3_HANDSHAKE_TIMEOUT))??;
+
+    let (datagram_tx, datagram_rx, flow_id) = handshake_result;
 
     Ok(H3Connection {
         peer_id: local_id.to_string(),
@@ -425,36 +487,39 @@ pub fn spawn_h3_rx(
                 frame = datagram_rx.recv() => {
                     match frame {
                         Some(inbound_frame) => {
-                            // Extract data from InboundFrame variant
-                            let data: &[u8] = match &inbound_frame {
-                                InboundFrame::Datagram(pooled_dgram) => pooled_dgram.as_ref(),
+                            match &inbound_frame {
+                                InboundFrame::Datagram(pooled_dgram) => {
+                                    let data = pooled_dgram.as_ref();
+                                    if let Some(payload) = decode_datagram(data) {
+                                        let len = payload.len();
+                                        if packet_tx.send(payload.to_vec()).await.is_err() {
+                                            counters.record_drop(
+                                                crate::events::DropReason::ChannelClosed,
+                                                len,
+                                            );
+                                            return Ok(());
+                                        }
+                                        counters.record_success(len);
+                                    } else {
+                                        counters.record_drop(
+                                            crate::events::DropReason::InvalidFraming,
+                                            data.len(),
+                                        );
+                                    }
+                                }
                                 InboundFrame::Body(pooled_buf, _fin) => {
                                     // Body frames are unexpected for CONNECT-IP per RFC 9484;
-                                    // IP payloads should arrive as DATAGRAM frames.
+                                    // IP payloads should arrive as DATAGRAM frames. Drop immediately.
                                     warn!(
                                         peer = %peer,
                                         len = pooled_buf.len(),
                                         "received unexpected Body frame on CONNECT-IP stream"
                                     );
-                                    pooled_buf.as_ref()
-                                }
-                            };
-
-                            if let Some(payload) = decode_datagram(data) {
-                                let len = payload.len();
-                                if packet_tx.send(payload.to_vec()).await.is_err() {
                                     counters.record_drop(
-                                        crate::events::DropReason::ChannelClosed,
-                                        len,
+                                        crate::events::DropReason::InvalidFraming,
+                                        pooled_buf.len(),
                                     );
-                                    return Ok(());
                                 }
-                                counters.record_success(len);
-                            } else {
-                                counters.record_drop(
-                                    crate::events::DropReason::InvalidFraming,
-                                    data.len(),
-                                );
                             }
                         }
                         None => {
@@ -760,6 +825,66 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    // ========== CONNECT-IP Header Validation Tests ==========
+
+    #[test]
+    fn validate_connect_ip_headers_accepts_valid() {
+        let headers = vec![
+            Header::new(b":method", b"CONNECT"),
+            Header::new(b":protocol", b"connect-ip"),
+            Header::new(b"capsule-protocol", b"?1"),
+        ];
+        assert!(validate_connect_ip_headers(&headers).is_ok());
+    }
+
+    #[test]
+    fn validate_connect_ip_headers_rejects_wrong_method() {
+        let headers = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":protocol", b"connect-ip"),
+            Header::new(b"capsule-protocol", b"?1"),
+        ];
+        assert_eq!(
+            validate_connect_ip_headers(&headers),
+            Err("invalid :method, expected CONNECT")
+        );
+    }
+
+    #[test]
+    fn validate_connect_ip_headers_rejects_missing_protocol() {
+        let headers = vec![
+            Header::new(b":method", b"CONNECT"),
+            Header::new(b"capsule-protocol", b"?1"),
+        ];
+        assert_eq!(
+            validate_connect_ip_headers(&headers),
+            Err("invalid :protocol, expected connect-ip")
+        );
+    }
+
+    #[test]
+    fn validate_connect_ip_headers_rejects_wrong_capsule() {
+        let headers = vec![
+            Header::new(b":method", b"CONNECT"),
+            Header::new(b":protocol", b"connect-ip"),
+            Header::new(b"capsule-protocol", b"?0"),
+        ];
+        assert_eq!(
+            validate_connect_ip_headers(&headers),
+            Err("invalid capsule-protocol, expected ?1")
+        );
+    }
+
+    #[test]
+    fn validate_connect_ip_headers_case_insensitive_capsule() {
+        let headers = vec![
+            Header::new(b":method", b"CONNECT"),
+            Header::new(b":protocol", b"connect-ip"),
+            Header::new(b"Capsule-Protocol", b"?1"),
+        ];
+        assert!(validate_connect_ip_headers(&headers).is_ok());
+    }
+
     // ========== DialError Display Tests ==========
 
     #[test]
@@ -770,6 +895,14 @@ mod tests {
 
         let err = DialError::Rejected(401);
         assert!(err.to_string().contains("401"));
+
+        let err = DialError::Socket("address in use".to_string());
+        assert!(err.to_string().contains("socket"));
+        assert!(err.to_string().contains("address in use"));
+
+        let err = DialError::Timeout(Duration::from_secs(30));
+        assert!(err.to_string().contains("timed out"));
+        assert!(err.to_string().contains("30"));
     }
 
     // ========== ListenerError Display Tests ==========
