@@ -570,8 +570,11 @@ pub async fn spawn_h3_listener(
 
                             // Spawn per-connection handler
                             tokio::spawn(async move {
-                                // State for auth/flow handshake (Headers always arrives before NewFlow per HTTP/3)
+                                // State for auth/flow handshake. For CONNECT-IP, NewFlow typically
+                                // arrives BEFORE Headers (per tokio-quiche semantics), so we must
+                                // handle both orderings.
                                 let mut pending_auth: Option<String> = None;
+                                let mut pending_flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
                                 let mut response_sender: Option<OutboundFrameSender> = None;
 
                                 while let Some(event) = controller.event_receiver_mut().recv().await {
@@ -584,8 +587,30 @@ pub async fn spawn_h3_listener(
 
                                             match extract_and_validate_auth(&incoming_headers.headers, &secrets_snapshot) {
                                                 Ok(peer_id) => {
+                                                    // If NewFlow already arrived, establish connection now
+                                                    if let Some((send, recv, flow_id)) = pending_flow.take() {
+                                                        let mut sender = incoming_headers.send;
+                                                        if send_response_headers(&mut sender, b"200").await.is_err() {
+                                                            warn!(%remote_addr, "failed to send 200 response");
+                                                            break;
+                                                        }
+                                                        let conn = H3Connection {
+                                                            peer_id: peer_id.clone(),
+                                                            remote_addr,
+                                                            datagram_tx: send,
+                                                            datagram_rx: recv,
+                                                            flow_id,
+                                                            quic_conn,
+                                                        };
+                                                        debug!(peer_id, %remote_addr, "H3 connection established");
+                                                        if conn_tx.send(conn).is_err() {
+                                                            debug!("connection channel closed");
+                                                        }
+                                                        return;
+                                                    }
+                                                    // Otherwise wait for NewFlow
                                                     pending_auth = Some(peer_id);
-                                                    debug!(%remote_addr, "CONNECT-IP auth accepted");
+                                                    debug!(%remote_addr, "CONNECT-IP auth accepted, waiting for flow");
                                                 }
                                                 Err(reason) => {
                                                     warn!(%remote_addr, %reason, "CONNECT-IP auth rejected");
@@ -600,14 +625,13 @@ pub async fn spawn_h3_listener(
                                         }
                                         ServerH3Event::Core(H3Event::NewFlow { flow_id, send, recv }) => {
                                             if let Some(peer_id) = pending_auth.take() {
-                                                // Send 200 OK response before establishing connection
+                                                // Headers already arrived and auth passed - establish connection
                                                 if let Some(ref mut sender) = response_sender.take() {
                                                     if send_response_headers(sender, b"200").await.is_err() {
                                                         warn!(%remote_addr, "failed to send 200 response");
                                                         break;
                                                     }
                                                 } else {
-                                                    // This should not happen - auth headers must arrive before we can send 200
                                                     warn!(%remote_addr, "NewFlow received but no response sender available");
                                                     break;
                                                 }
@@ -624,9 +648,11 @@ pub async fn spawn_h3_listener(
                                                 if conn_tx.send(conn).is_err() {
                                                     debug!("connection channel closed");
                                                 }
-                                                return; // Exit handler after sending connection
+                                                return;
                                             }
-                                            // NewFlow without prior auth - protocol violation, ignore
+                                            // NewFlow arrived before Headers (common for CONNECT-IP) - store and wait
+                                            pending_flow = Some((send, recv, flow_id));
+                                            debug!(%remote_addr, "DATAGRAM flow ready, waiting for auth");
                                         }
                                         ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => break,
                                         ServerH3Event::Core(H3Event::ConnectionError(e)) => {
