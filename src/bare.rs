@@ -532,4 +532,54 @@ mod tests {
             result
         );
     }
+
+    /// Verifies RX output can be wired directly to TX input for packet forwarding.
+    #[tokio::test]
+    async fn udp_loopback_rx_to_tx_round_trip() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let rx_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx_socket.local_addr().unwrap();
+
+        let tx_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        tx_socket.connect(dest).await.unwrap();
+
+        let (events_tx, _) = mpsc::unbounded_channel();
+
+        // Spawn TX first to get its packet_tx channel
+        let (packet_tx, tx_handle) = spawn_udp_tx(
+            BareUdpTx { socket: tx_socket },
+            events_tx.clone(),
+            Duration::from_secs(60),
+        );
+
+        // Spawn RX with TX's packet channel as output (direct wiring, no forwarder)
+        let allowed = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
+        let (_cmd_tx, rx_handle) = spawn_udp_rx(
+            BareUdpRx {
+                socket: rx_socket,
+                mtu: 64,
+            },
+            allowed,
+            packet_tx,
+            events_tx,
+            Duration::from_secs(60),
+        );
+
+        // Send packet to RX, expect it at external receiver via TX
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&[1, 2, 3], rx_addr).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv_from(&mut buf))
+                .await
+                .expect("timeout")
+                .expect("recv");
+        assert_eq!(&buf[..len], &[1, 2, 3]);
+
+        rx_handle.abort();
+        tx_handle.abort();
+    }
 }
