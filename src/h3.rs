@@ -60,6 +60,18 @@ fn extract_and_validate_auth(
     validate_connect_auth(auth_header.as_deref(), peer_iter)
 }
 
+/// Checks if an HTTP status code is in the 2xx (Successful) range.
+fn is_2xx_status(status: &[u8]) -> bool {
+    status.len() == 3 && status[0] == b'2'
+}
+
+/// Validates that headers contain `capsule-protocol: ?1` per RFC 9484.
+fn has_capsule_protocol(headers: &[Header]) -> bool {
+    headers
+        .iter()
+        .any(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol") && h.value() == b"?1")
+}
+
 /// Sends HTTP/3 response headers via the OutboundFrameSender.
 ///
 /// Per RFC 9297 Section 2.1, the `capsule-protocol` header MUST only be included
@@ -69,7 +81,7 @@ async fn send_response_headers(
     sender: &mut OutboundFrameSender,
     status: &[u8],
 ) -> Result<(), &'static str> {
-    let headers = if status == b"200" {
+    let headers = if is_2xx_status(status) {
         vec![
             Header::new(b":status", status),
             Header::new(b"capsule-protocol", b"?1"),
@@ -409,13 +421,9 @@ pub async fn dial_h3<P: RouteProbe>(
                         .find(|h| h.name() == b":status")
                         .map(|h| h.value());
                     match status {
-                        Some(b"200") => {
+                        Some(s) if is_2xx_status(s) => {
                             // Validate capsule-protocol header per RFC 9484
-                            let has_capsule = incoming.headers.iter().any(|h| {
-                                h.name().eq_ignore_ascii_case(b"capsule-protocol")
-                                    && h.value() == b"?1"
-                            });
-                            if !has_capsule {
+                            if !has_capsule_protocol(&incoming.headers) {
                                 warn!(%remote_addr, "server response missing capsule-protocol: ?1");
                                 return Err(DialError::Handshake(
                                     "server response missing capsule-protocol: ?1".to_string(),
@@ -995,46 +1003,59 @@ mod tests {
         }
     }
 
-    // ========== Capsule-Protocol Response Validation Tests ==========
+    // ========== Status and Capsule-Protocol Helper Tests ==========
 
     #[test]
-    fn capsule_protocol_response_validation_logic() {
-        // Valid: has capsule-protocol: ?1
+    fn is_2xx_status_accepts_successful_codes() {
+        assert!(is_2xx_status(b"200"));
+        assert!(is_2xx_status(b"201"));
+        assert!(is_2xx_status(b"204"));
+        assert!(is_2xx_status(b"299"));
+    }
+
+    #[test]
+    fn is_2xx_status_rejects_non_successful_codes() {
+        assert!(!is_2xx_status(b"100"));
+        assert!(!is_2xx_status(b"301"));
+        assert!(!is_2xx_status(b"400"));
+        assert!(!is_2xx_status(b"401"));
+        assert!(!is_2xx_status(b"500"));
+        // Edge cases
+        assert!(!is_2xx_status(b"20")); // Too short
+        assert!(!is_2xx_status(b"2000")); // Too long
+    }
+
+    #[test]
+    fn has_capsule_protocol_accepts_valid_header() {
         let headers = vec![
             Header::new(b":status", b"200"),
             Header::new(b"capsule-protocol", b"?1"),
         ];
-        let has_capsule = headers
-            .iter()
-            .any(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol") && h.value() == b"?1");
-        assert!(has_capsule);
+        assert!(has_capsule_protocol(&headers));
+    }
 
-        // Invalid: missing capsule-protocol
+    #[test]
+    fn has_capsule_protocol_rejects_missing_header() {
         let headers = vec![Header::new(b":status", b"200")];
-        let has_capsule = headers
-            .iter()
-            .any(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol") && h.value() == b"?1");
-        assert!(!has_capsule);
+        assert!(!has_capsule_protocol(&headers));
+    }
 
-        // Invalid: wrong value
+    #[test]
+    fn has_capsule_protocol_rejects_wrong_value() {
         let headers = vec![
             Header::new(b":status", b"200"),
             Header::new(b"capsule-protocol", b"?0"),
         ];
-        let has_capsule = headers
-            .iter()
-            .any(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol") && h.value() == b"?1");
-        assert!(!has_capsule);
+        assert!(!has_capsule_protocol(&headers));
+    }
 
-        // Valid: case-insensitive header name
+    #[test]
+    fn has_capsule_protocol_case_insensitive() {
         let headers = vec![
             Header::new(b":status", b"200"),
             Header::new(b"Capsule-Protocol", b"?1"),
         ];
-        let has_capsule = headers
-            .iter()
-            .any(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol") && h.value() == b"?1");
-        assert!(has_capsule);
+        assert!(has_capsule_protocol(&headers));
     }
 
     // ========== Listener Lifecycle Tests ==========
