@@ -575,84 +575,27 @@ pub async fn spawn_h3_listener(
                                 // handle both orderings.
                                 let mut pending_auth: Option<String> = None;
                                 let mut pending_flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
-                                let mut response_sender: Option<OutboundFrameSender> = None;
+                                let mut pending_sender: Option<OutboundFrameSender> = None;
+                                let mut quic_conn = Some(quic_conn);
 
                                 while let Some(event) = controller.event_receiver_mut().recv().await {
                                     match event {
-                                        // ServerH3Event::Headers wraps H3Event::IncomingHeaders with
-                                        // additional server metadata (priority, early-data).
                                         ServerH3Event::Headers { incoming_headers, .. } => {
-                                            // Save response sender for later use
-                                            response_sender = Some(incoming_headers.send.clone());
-
                                             match extract_and_validate_auth(&incoming_headers.headers, &secrets_snapshot) {
                                                 Ok(peer_id) => {
-                                                    // If NewFlow already arrived, establish connection now
-                                                    if let Some((send, recv, flow_id)) = pending_flow.take() {
-                                                        let mut sender = incoming_headers.send;
-                                                        if send_response_headers(&mut sender, b"200").await.is_err() {
-                                                            warn!(%remote_addr, "failed to send 200 response");
-                                                            break;
-                                                        }
-                                                        let conn = H3Connection {
-                                                            peer_id: peer_id.clone(),
-                                                            remote_addr,
-                                                            datagram_tx: send,
-                                                            datagram_rx: recv,
-                                                            flow_id,
-                                                            quic_conn,
-                                                        };
-                                                        debug!(peer_id, %remote_addr, "H3 connection established");
-                                                        if conn_tx.send(conn).is_err() {
-                                                            debug!("connection channel closed");
-                                                        }
-                                                        return;
-                                                    }
-                                                    // Otherwise wait for NewFlow
                                                     pending_auth = Some(peer_id);
-                                                    debug!(%remote_addr, "CONNECT-IP auth accepted, waiting for flow");
+                                                    pending_sender = Some(incoming_headers.send);
                                                 }
                                                 Err(reason) => {
                                                     warn!(%remote_addr, %reason, "CONNECT-IP auth rejected");
-                                                    // Send 401 Unauthorized response
                                                     let mut sender = incoming_headers.send;
-                                                    if send_response_headers(&mut sender, b"401").await.is_err() {
-                                                        warn!(%remote_addr, "failed to send 401 response");
-                                                    }
+                                                    let _ = send_response_headers(&mut sender, b"401").await;
                                                     break;
                                                 }
                                             }
                                         }
                                         ServerH3Event::Core(H3Event::NewFlow { flow_id, send, recv }) => {
-                                            if let Some(peer_id) = pending_auth.take() {
-                                                // Headers already arrived and auth passed - establish connection
-                                                if let Some(ref mut sender) = response_sender.take() {
-                                                    if send_response_headers(sender, b"200").await.is_err() {
-                                                        warn!(%remote_addr, "failed to send 200 response");
-                                                        break;
-                                                    }
-                                                } else {
-                                                    warn!(%remote_addr, "NewFlow received but no response sender available");
-                                                    break;
-                                                }
-
-                                                let conn = H3Connection {
-                                                    peer_id: peer_id.clone(),
-                                                    remote_addr,
-                                                    datagram_tx: send,
-                                                    datagram_rx: recv,
-                                                    flow_id,
-                                                    quic_conn,
-                                                };
-                                                debug!(peer_id, %remote_addr, "H3 connection established");
-                                                if conn_tx.send(conn).is_err() {
-                                                    debug!("connection channel closed");
-                                                }
-                                                return;
-                                            }
-                                            // NewFlow arrived before Headers (common for CONNECT-IP) - store and wait
                                             pending_flow = Some((send, recv, flow_id));
-                                            debug!(%remote_addr, "DATAGRAM flow ready, waiting for auth");
                                         }
                                         ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => break,
                                         ServerH3Event::Core(H3Event::ConnectionError(e)) => {
@@ -660,6 +603,27 @@ pub async fn spawn_h3_listener(
                                             break;
                                         }
                                         _ => continue,
+                                    }
+
+                                    // Check if all pieces ready to establish connection
+                                    if let (Some(peer_id), Some((dgram_tx, dgram_rx, flow_id)), Some(mut sender)) =
+                                        (pending_auth.take(), pending_flow.take(), pending_sender.take())
+                                    {
+                                        if send_response_headers(&mut sender, b"200").await.is_err() {
+                                            warn!(%remote_addr, "failed to send 200 response");
+                                            break;
+                                        }
+                                        let conn = H3Connection {
+                                            peer_id: peer_id.clone(),
+                                            remote_addr,
+                                            datagram_tx: dgram_tx,
+                                            datagram_rx: dgram_rx,
+                                            flow_id,
+                                            quic_conn: quic_conn.take().expect("finish only once"),
+                                        };
+                                        debug!(peer_id, %remote_addr, "H3 connection established");
+                                        let _ = conn_tx.send(conn);
+                                        return;
                                     }
                                 }
                             });
