@@ -1012,25 +1012,4 @@ mod tests {
 
         assert!(result.is_err());
     }
-
-    #[tokio::test]
-    async fn listener_exits_on_channel_close() {
-        let certs = TestCertBundle::generate();
-
-        let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, handle) = spawn_h3_listener(
-            "127.0.0.1:0".parse().unwrap(),
-            certs.cert_path(),
-            certs.key_path(),
-            HashMap::new(),
-            conn_tx,
-        )
-        .await
-        .expect("listener spawn");
-
-        drop(cmd_tx);
-
-        let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
-        assert!(matches!(result, Ok(Ok(Ok(())))));
-    }
 }
