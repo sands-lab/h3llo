@@ -75,6 +75,80 @@ async fn send_response_headers(
         .map_err(|_| "failed to send response headers")
 }
 
+/// Handles a single inbound H3 CONNECT-IP connection handshake.
+///
+/// Waits for both auth (Headers) and flow (NewFlow) events in either order,
+/// then sends 200 OK and emits the established connection.
+async fn handle_h3_connection(
+    mut controller: tokio_quiche::http3::driver::ServerH3Controller,
+    quic_conn: QuicConnection,
+    remote_addr: SocketAddr,
+    secrets: HashMap<String, String>,
+    conn_tx: mpsc::UnboundedSender<H3Connection>,
+) {
+    // State for auth/flow handshake. For CONNECT-IP, NewFlow typically
+    // arrives BEFORE Headers (per tokio-quiche semantics).
+    let mut pending_auth: Option<String> = None;
+    let mut pending_flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
+    let mut pending_sender: Option<OutboundFrameSender> = None;
+    let mut quic_conn = Some(quic_conn);
+
+    while let Some(event) = controller.event_receiver_mut().recv().await {
+        match event {
+            ServerH3Event::Headers {
+                incoming_headers, ..
+            } => match extract_and_validate_auth(&incoming_headers.headers, &secrets) {
+                Ok(peer_id) => {
+                    pending_auth = Some(peer_id);
+                    pending_sender = Some(incoming_headers.send);
+                }
+                Err(reason) => {
+                    warn!(%remote_addr, %reason, "CONNECT-IP auth rejected");
+                    let mut sender = incoming_headers.send;
+                    let _ = send_response_headers(&mut sender, b"401").await;
+                    return;
+                }
+            },
+            ServerH3Event::Core(H3Event::NewFlow {
+                flow_id,
+                send,
+                recv,
+            }) => {
+                pending_flow = Some((send, recv, flow_id));
+            }
+            ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => return,
+            ServerH3Event::Core(H3Event::ConnectionError(e)) => {
+                warn!(%remote_addr, error = ?e, "H3 connection error");
+                return;
+            }
+            _ => continue,
+        }
+
+        // Check if all pieces ready to establish connection
+        if let (Some(peer_id), Some((dgram_tx, dgram_rx, flow_id)), Some(mut sender)) = (
+            pending_auth.take(),
+            pending_flow.take(),
+            pending_sender.take(),
+        ) {
+            if send_response_headers(&mut sender, b"200").await.is_err() {
+                warn!(%remote_addr, "failed to send 200 response");
+                return;
+            }
+            let conn = H3Connection {
+                peer_id: peer_id.clone(),
+                remote_addr,
+                datagram_tx: dgram_tx,
+                datagram_rx: dgram_rx,
+                flow_id,
+                quic_conn: quic_conn.take().expect("finish only once"),
+            };
+            debug!(peer_id, %remote_addr, "H3 connection established");
+            let _ = conn_tx.send(conn);
+            return;
+        }
+    }
+}
+
 // ========== Datagram Encoding ==========
 
 /// Prepends Context ID (0x00) to a payload for CONNECT-IP datagram encoding.
@@ -557,76 +631,18 @@ pub async fn spawn_h3_listener(
                 conn_result = accept_stream.next() => {
                     match conn_result {
                         Some(Ok(initial_conn)) => {
-                            let (driver, mut controller) =
+                            let (driver, controller) =
                                 ServerH3Driver::new(Http3Settings::default());
                             let quic_conn = initial_conn.start(driver);
-
                             let remote_addr = quic_conn.peer_addr();
 
-                            let conn_tx = conn_tx.clone();
-                            // Clone snapshot for this connection's handler.
-                            // Actor owns peer_secrets; handlers get immutable snapshots.
-                            let secrets_snapshot = peer_secrets.clone();
-
-                            // Spawn per-connection handler
-                            tokio::spawn(async move {
-                                // State for auth/flow handshake. For CONNECT-IP, NewFlow typically
-                                // arrives BEFORE Headers (per tokio-quiche semantics), so we must
-                                // handle both orderings.
-                                let mut pending_auth: Option<String> = None;
-                                let mut pending_flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
-                                let mut pending_sender: Option<OutboundFrameSender> = None;
-                                let mut quic_conn = Some(quic_conn);
-
-                                while let Some(event) = controller.event_receiver_mut().recv().await {
-                                    match event {
-                                        ServerH3Event::Headers { incoming_headers, .. } => {
-                                            match extract_and_validate_auth(&incoming_headers.headers, &secrets_snapshot) {
-                                                Ok(peer_id) => {
-                                                    pending_auth = Some(peer_id);
-                                                    pending_sender = Some(incoming_headers.send);
-                                                }
-                                                Err(reason) => {
-                                                    warn!(%remote_addr, %reason, "CONNECT-IP auth rejected");
-                                                    let mut sender = incoming_headers.send;
-                                                    let _ = send_response_headers(&mut sender, b"401").await;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        ServerH3Event::Core(H3Event::NewFlow { flow_id, send, recv }) => {
-                                            pending_flow = Some((send, recv, flow_id));
-                                        }
-                                        ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => break,
-                                        ServerH3Event::Core(H3Event::ConnectionError(e)) => {
-                                            warn!(%remote_addr, error = ?e, "H3 connection error");
-                                            break;
-                                        }
-                                        _ => continue,
-                                    }
-
-                                    // Check if all pieces ready to establish connection
-                                    if let (Some(peer_id), Some((dgram_tx, dgram_rx, flow_id)), Some(mut sender)) =
-                                        (pending_auth.take(), pending_flow.take(), pending_sender.take())
-                                    {
-                                        if send_response_headers(&mut sender, b"200").await.is_err() {
-                                            warn!(%remote_addr, "failed to send 200 response");
-                                            break;
-                                        }
-                                        let conn = H3Connection {
-                                            peer_id: peer_id.clone(),
-                                            remote_addr,
-                                            datagram_tx: dgram_tx,
-                                            datagram_rx: dgram_rx,
-                                            flow_id,
-                                            quic_conn: quic_conn.take().expect("finish only once"),
-                                        };
-                                        debug!(peer_id, %remote_addr, "H3 connection established");
-                                        let _ = conn_tx.send(conn);
-                                        return;
-                                    }
-                                }
-                            });
+                            tokio::spawn(handle_h3_connection(
+                                controller,
+                                quic_conn,
+                                remote_addr,
+                                peer_secrets.clone(),
+                                conn_tx.clone(),
+                            ));
                         }
                         Some(Err(e)) => {
                             warn!(error = %e, "accept error");
