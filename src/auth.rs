@@ -146,4 +146,26 @@ mod tests {
         let result = validate_connect_auth(Some("Basic !!!invalid!!!"), [("p", "s")]);
         assert_eq!(result, Err("invalid base64"));
     }
+
+    #[test]
+    fn handles_colon_in_password() {
+        let header = generate_basic_auth("user", "pass:with:colons");
+        assert!(validate_basic_auth(&header, "user", "pass:with:colons"));
+    }
+
+    #[test]
+    fn validate_connect_auth_accepts_second_peer() {
+        let header = generate_basic_auth("peer-b", "secret-b");
+        let secrets = [("peer-a", "secret-a"), ("peer-b", "secret-b")];
+        let result = validate_connect_auth(Some(&header), secrets);
+        assert_eq!(result, Ok("peer-b".to_string()));
+    }
+
+    #[test]
+    fn validate_connect_auth_wrong_secret() {
+        let header = generate_basic_auth("peer-a", "wrong-secret");
+        let secrets = [("peer-a", "secret-a")];
+        let result = validate_connect_auth(Some(&header), secrets);
+        assert_eq!(result, Err("unknown peer or invalid secret"));
+    }
 }

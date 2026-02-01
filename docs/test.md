@@ -225,7 +225,11 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 ## Current Tests
 
 - Linux CI: `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, Docker integration tests.
-- Unit: `src/config.rs` tests for defaults, admin/listener coupling, peer transport exclusivity, BareUDP endpoint requirement, and allowed IP presence.
+- Unit: `src/config.rs` tests for defaults, admin/listener coupling, peer transport exclusivity.
+- Unit: `src/h3.rs` tests for datagram encoding, error display, CONNECT-IP header validation, and listener spawn/shutdown.
+- Unit: `src/auth.rs` tests for Basic Auth generation and validation.
+- Unit: `src/dns.rs` real-network DNS resolver tests.
+- Unit: `src/bare.rs` real-network BareUDP tests.
 - Docker E2E: `tests/e2e/bareudp.rs` multi-node BareUDP connectivity, source IP filtering, and MTU boundary checks via testcontainers-rs.
 - Docker Integration: `tests/integration/native/dns.rs` DNS resolver integration tests against CoreDNS container.
 - Docker Integration: `tests/integration/native/tun.rs` TUN device creation and addressing via Container Test Pattern.

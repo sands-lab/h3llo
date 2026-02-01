@@ -917,4 +917,104 @@ mod tests {
         assert!(err.to_string().contains("tls"));
         assert!(err.to_string().contains("cert expired"));
     }
+
+    // ========== Test Utilities ==========
+
+    /// Test certificate bundle with temporary files.
+    struct TestCertBundle {
+        cert_file: tempfile::NamedTempFile,
+        key_file: tempfile::NamedTempFile,
+    }
+
+    impl TestCertBundle {
+        /// Generates a self-signed certificate for localhost using rcgen.
+        fn generate() -> Self {
+            use rcgen::{generate_simple_self_signed, CertifiedKey};
+            use std::io::Write;
+
+            let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+            let CertifiedKey { cert, key_pair } =
+                generate_simple_self_signed(subject_alt_names).expect("cert generation");
+
+            let mut cert_file = tempfile::NamedTempFile::new().expect("create cert temp file");
+            cert_file
+                .write_all(cert.pem().as_bytes())
+                .expect("write cert");
+
+            let mut key_file = tempfile::NamedTempFile::new().expect("create key temp file");
+            key_file
+                .write_all(key_pair.serialize_pem().as_bytes())
+                .expect("write key");
+
+            Self {
+                cert_file,
+                key_file,
+            }
+        }
+
+        fn cert_path(&self) -> &std::path::Path {
+            self.cert_file.path()
+        }
+
+        fn key_path(&self) -> &std::path::Path {
+            self.key_file.path()
+        }
+    }
+
+    // ========== Listener Lifecycle Tests ==========
+
+    #[tokio::test]
+    async fn listener_spawns_and_accepts_commands() {
+        let certs = TestCertBundle::generate();
+
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let peer_secrets = HashMap::from([("test-peer".to_string(), "test-secret".to_string())]);
+        let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
+
+        let (cmd_tx, handle) = spawn_h3_listener(
+            listen_addr,
+            certs.cert_path(),
+            certs.key_path(),
+            peer_secrets,
+            conn_tx,
+        )
+        .await
+        .expect("listener spawn");
+
+        // Verify command channel is functional
+        assert!(cmd_tx
+            .send(H3ListenerCommand::UpdatePeerSecrets(HashMap::new()))
+            .is_ok());
+
+        // Clean shutdown
+        drop(cmd_tx);
+        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "listener should shut down cleanly"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_rejects_invalid_cert_path() {
+        // Use tempdir to generate platform-agnostic missing paths
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let missing_cert = temp_dir.path().join("missing-cert.pem");
+        let missing_key = temp_dir.path().join("missing-key.pem");
+
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let peer_secrets = HashMap::new();
+        let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
+
+        let result = spawn_h3_listener(
+            listen_addr,
+            &missing_cert,
+            &missing_key,
+            peer_secrets,
+            conn_tx,
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
 }
