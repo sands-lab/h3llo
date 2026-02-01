@@ -61,14 +61,22 @@ fn extract_and_validate_auth(
 }
 
 /// Sends HTTP/3 response headers via the OutboundFrameSender.
+///
+/// Per RFC 9297 Section 2.1, the `capsule-protocol` header MUST only be included
+/// on 2xx (Successful) responses. Error responses (400, 401, etc.) MUST NOT
+/// include this header to avoid protocol fingerprinting.
 async fn send_response_headers(
     sender: &mut OutboundFrameSender,
     status: &[u8],
 ) -> Result<(), &'static str> {
-    let headers = vec![
-        Header::new(b":status", status),
-        Header::new(b"capsule-protocol", b"?1"),
-    ];
+    let headers = if status == b"200" {
+        vec![
+            Header::new(b":status", status),
+            Header::new(b"capsule-protocol", b"?1"),
+        ]
+    } else {
+        vec![Header::new(b":status", status)]
+    };
     sender
         .send(OutboundFrame::Headers(headers, None))
         .await
@@ -118,9 +126,10 @@ fn validate_connect_ip_headers(headers: &[Header]) -> Result<(), &'static str> {
 
 /// Handles a single inbound H3 CONNECT-IP connection handshake.
 ///
-/// Waits for both auth (Headers) and flow (NewFlow) events in either order,
-/// then sends 200 OK and emits the established connection. Times out after
-/// [`H3_HANDSHAKE_TIMEOUT`] to prevent resource exhaustion from stalled clients.
+/// Waits for exactly one Headers event and one NewFlow event (in either order),
+/// then sends 200 OK and emits the established connection. Rejects duplicate
+/// Headers or NewFlow events by closing the connection immediately. Times out
+/// after [`H3_HANDSHAKE_TIMEOUT`] to prevent resource exhaustion from stalled clients.
 async fn handle_h3_connection(
     mut controller: tokio_quiche::http3::driver::ServerH3Controller,
     quic_conn: QuicConnection,
@@ -129,8 +138,9 @@ async fn handle_h3_connection(
     conn_tx: mpsc::UnboundedSender<H3Connection>,
 ) {
     let handshake = async {
-        // State for auth/flow handshake. For CONNECT-IP, NewFlow typically
-        // arrives BEFORE Headers (per tokio-quiche semantics).
+        // State for auth/flow handshake. Each handshake expects exactly one
+        // Headers event and one NewFlow event. Duplicates are detected via
+        // Option presence and cause immediate connection rejection.
         let mut pending_auth: Option<String> = None;
         let mut pending_flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
         let mut pending_sender: Option<OutboundFrameSender> = None;
@@ -141,6 +151,12 @@ async fn handle_h3_connection(
                 ServerH3Event::Headers {
                     incoming_headers, ..
                 } => {
+                    // Reject duplicate Headers event - use Option presence check
+                    if pending_auth.is_some() || pending_sender.is_some() {
+                        warn!(%remote_addr, "duplicate Headers event, rejecting connection");
+                        return;
+                    }
+
                     // Validate CONNECT-IP protocol headers per RFC 9484
                     if let Err(reason) = validate_connect_ip_headers(&incoming_headers.headers) {
                         warn!(%remote_addr, %reason, "CONNECT-IP protocol validation failed");
@@ -167,6 +183,12 @@ async fn handle_h3_connection(
                     send,
                     recv,
                 }) => {
+                    // Reject duplicate NewFlow event - use Option presence check
+                    if pending_flow.is_some() {
+                        warn!(%remote_addr, "duplicate NewFlow event, rejecting connection");
+                        return;
+                    }
+
                     pending_flow = Some((send, recv, flow_id));
                 }
                 ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => return,
@@ -388,6 +410,18 @@ pub async fn dial_h3<P: RouteProbe>(
                         .map(|h| h.value());
                     match status {
                         Some(b"200") => {
+                            // Validate capsule-protocol header per RFC 9484
+                            let has_capsule = incoming.headers.iter().any(|h| {
+                                h.name().eq_ignore_ascii_case(b"capsule-protocol")
+                                    && h.value() == b"?1"
+                            });
+                            if !has_capsule {
+                                warn!(%remote_addr, "server response missing capsule-protocol: ?1");
+                                return Err(DialError::Handshake(
+                                    "server response missing capsule-protocol: ?1".to_string(),
+                                ));
+                            }
+
                             debug!(%remote_addr, "CONNECT-IP accepted");
                             status_validated = true;
                             // If NewFlow already arrived, we can exit
@@ -959,6 +993,48 @@ mod tests {
         fn key_path(&self) -> &std::path::Path {
             self.key_file.path()
         }
+    }
+
+    // ========== Capsule-Protocol Response Validation Tests ==========
+
+    #[test]
+    fn capsule_protocol_response_validation_logic() {
+        // Valid: has capsule-protocol: ?1
+        let headers = vec![
+            Header::new(b":status", b"200"),
+            Header::new(b"capsule-protocol", b"?1"),
+        ];
+        let has_capsule = headers
+            .iter()
+            .any(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol") && h.value() == b"?1");
+        assert!(has_capsule);
+
+        // Invalid: missing capsule-protocol
+        let headers = vec![Header::new(b":status", b"200")];
+        let has_capsule = headers
+            .iter()
+            .any(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol") && h.value() == b"?1");
+        assert!(!has_capsule);
+
+        // Invalid: wrong value
+        let headers = vec![
+            Header::new(b":status", b"200"),
+            Header::new(b"capsule-protocol", b"?0"),
+        ];
+        let has_capsule = headers
+            .iter()
+            .any(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol") && h.value() == b"?1");
+        assert!(!has_capsule);
+
+        // Valid: case-insensitive header name
+        let headers = vec![
+            Header::new(b":status", b"200"),
+            Header::new(b"Capsule-Protocol", b"?1"),
+        ];
+        let has_capsule = headers
+            .iter()
+            .any(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol") && h.value() == b"?1");
+        assert!(has_capsule);
     }
 
     // ========== Listener Lifecycle Tests ==========
