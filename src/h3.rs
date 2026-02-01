@@ -28,16 +28,18 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_quiche::buf_factory::BufFactory;
 use tokio_quiche::http3::driver::{
-    ClientH3Event, H3Event, InboundFrame, InboundFrameStream, NewClientRequest, OutboundFrame,
-    OutboundFrameSender, ServerH3Driver, ServerH3Event,
+    ClientH3Driver, ClientH3Event, H3Event, InboundFrame, InboundFrameStream, NewClientRequest,
+    OutboundFrame, OutboundFrameSender, ServerH3Driver, ServerH3Event,
 };
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::quiche::h3::{Header, NameValue};
-use tokio_quiche::settings::{CertificateKind, ConnectionParams, TlsCertificatePaths};
+use tokio_quiche::settings::{
+    CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
+};
 use tokio_quiche::{listen, QuicConnection};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// Context ID for IP payloads per RFC 9484 (always 0 for CONNECT-IP).
 const CONTEXT_ID_IP: u8 = 0x00;
@@ -206,12 +208,28 @@ async fn handle_h3_connection(
                 _ => continue,
             }
 
-            // Check if all pieces ready to establish connection
-            if let (Some(peer_id), Some((dgram_tx, dgram_rx, flow_id)), Some(mut sender)) = (
-                pending_auth.take(),
-                pending_flow.take(),
-                pending_sender.take(),
+            // Check if all pieces ready to establish connection.
+            // Must check references first, because take() in pattern matching
+            // would consume values even if the whole pattern doesn't match.
+            if matches!(
+                (&pending_auth, &pending_flow, &pending_sender, &quic_conn),
+                (Some(_), Some(_), Some(_), Some(_))
             ) {
+                let (
+                    Some(peer_id),
+                    Some((dgram_tx, dgram_rx, flow_id)),
+                    Some(mut sender),
+                    Some(quic),
+                ) = (
+                    pending_auth.take(),
+                    pending_flow.take(),
+                    pending_sender.take(),
+                    quic_conn.take(),
+                )
+                else {
+                    error!(%remote_addr, "internal error: handshake state inconsistent");
+                    return;
+                };
                 if send_response_headers(&mut sender, b"200").await.is_err() {
                     warn!(%remote_addr, "failed to send 200 response");
                     return;
@@ -223,7 +241,7 @@ async fn handle_h3_connection(
                     datagram_tx: dgram_tx,
                     datagram_rx: dgram_rx,
                     flow_id,
-                    quic_conn: quic_conn.take().expect("finish only once"),
+                    quic_conn: quic,
                 };
                 if conn_tx.send(conn).is_err() {
                     debug!(%remote_addr, "connection channel closed");
@@ -341,10 +359,16 @@ pub struct H3Connection {
 /// * `bindif` - Optional interface name to bind the socket.
 /// * `tun_if` - Optional TUN interface name to exclude from probing.
 /// * `probe` - Route probe implementation for interface selection.
+/// * `insecure_skip_verify` - Skip TLS certificate verification (for testing only).
 ///
 /// # Errors
 ///
 /// Returns `DialError` if connection establishment fails.
+///
+/// # Security Warning
+///
+/// Setting `insecure_skip_verify` to `true` disables TLS certificate verification,
+/// making the connection vulnerable to MITM attacks. Only use for testing.
 #[allow(clippy::too_many_arguments)]
 pub async fn dial_h3<P: RouteProbe>(
     remote_addr: SocketAddr,
@@ -356,6 +380,7 @@ pub async fn dial_h3<P: RouteProbe>(
     bindif: Option<&str>,
     tun_if: Option<&str>,
     probe: &P,
+    insecure_skip_verify: bool,
 ) -> Result<H3Connection, DialError> {
     debug!(%remote_addr, %server_name, %local_id, "dialing H3 endpoint");
 
@@ -370,10 +395,30 @@ pub async fn dial_h3<P: RouteProbe>(
         warn!("ca_cert_path is configured but not yet implemented; using system roots");
     }
 
-    // Establish QUIC connection with H3 driver (DATAGRAM enabled by default)
-    let (quic_conn, mut controller) = tokio_quiche::quic::connect(socket, Some(server_name))
-        .await
-        .map_err(|e| DialError::Handshake(format!("QUIC connect failed: {}", e)))?;
+    // Configure QUIC settings
+    let mut quic_settings = QuicSettings::default();
+    quic_settings.max_idle_timeout = Some(H3_HANDSHAKE_TIMEOUT);
+    // Only disable verification when explicitly requested (testing only)
+    if !insecure_skip_verify {
+        quic_settings.verify_peer = true;
+    }
+
+    let params = ConnectionParams::new_client(quic_settings, None, Hooks::default());
+
+    // Create H3 driver and controller
+    let (h3_driver, mut controller) = ClientH3Driver::new(Http3Settings::default());
+
+    // Establish QUIC connection with H3 driver
+    let quic_conn = tokio_quiche::quic::connect_with_config(
+        socket
+            .try_into()
+            .map_err(|e: std::io::Error| DialError::Socket(e.to_string()))?,
+        Some(server_name),
+        &params,
+        h3_driver,
+    )
+    .await
+    .map_err(|e| DialError::Handshake(format!("QUIC connect failed: {}", e)))?;
 
     // Build auth header
     let auth_header = generate_basic_auth(local_id, peer_secret);
@@ -687,9 +732,9 @@ pub async fn spawn_h3_listener(
     conn_tx: mpsc::UnboundedSender<H3Connection>,
 ) -> Result<
     (
-        SocketAddr,
         mpsc::UnboundedSender<H3ListenerCommand>,
         JoinHandle<ActorExitResult>,
+        SocketAddr,
     ),
     ListenerError,
 > {
@@ -787,7 +832,7 @@ pub async fn spawn_h3_listener(
         }
     });
 
-    Ok((bound_addr, cmd_tx, handle))
+    Ok((cmd_tx, handle, bound_addr))
 }
 
 #[cfg(test)]
@@ -1071,7 +1116,7 @@ mod tests {
         let peer_secrets = HashMap::from([("test-peer".to_string(), "test-secret".to_string())]);
         let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
 
-        let (_bound_addr, cmd_tx, handle) = spawn_h3_listener(
+        let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(
             listen_addr,
             certs.cert_path(),
             certs.key_path(),
@@ -1120,12 +1165,10 @@ mod tests {
 
     // ========== Client-Server Integration Tests ==========
     //
-    // These tests require real network QUIC handshakes. They are marked as
-    // #[ignore] because they timeout in CI environments without proper network
-    // setup. Run with: cargo test --lib -- --ignored
+    // These tests perform real QUIC/H3 handshakes over loopback. They use
+    // self-signed certificates with `insecure_skip_verify=true` for testing.
 
     #[tokio::test]
-    #[ignore = "requires real network QUIC handshake"]
     async fn handshake_success() {
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1136,7 +1179,7 @@ mod tests {
 
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
-        let (bound_addr, cmd_tx, _listener_handle) = spawn_h3_listener(
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listen_addr,
             certs.cert_path(),
             certs.key_path(),
@@ -1160,6 +1203,7 @@ mod tests {
             None,
             None,
             &probe,
+            true, // insecure_skip_verify for testing
         )
         .await;
 
@@ -1183,7 +1227,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires real network QUIC handshake"]
     async fn handshake_rejects_wrong_secret() {
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1192,7 +1235,7 @@ mod tests {
             HashMap::from([("test-client".to_string(), "correct-secret".to_string())]);
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
-        let (bound_addr, cmd_tx, _listener_handle) = spawn_h3_listener(
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listen_addr,
             certs.cert_path(),
             certs.key_path(),
@@ -1215,6 +1258,7 @@ mod tests {
             None,
             None,
             &probe,
+            true, // insecure_skip_verify for testing
         )
         .await;
 
@@ -1235,7 +1279,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires real network QUIC handshake"]
     async fn handshake_rejects_unknown_peer() {
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1244,7 +1287,7 @@ mod tests {
         let peer_secrets = HashMap::from([("known-peer".to_string(), "secret".to_string())]);
         let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
 
-        let (bound_addr, cmd_tx, _listener_handle) = spawn_h3_listener(
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listen_addr,
             certs.cert_path(),
             certs.key_path(),
@@ -1267,6 +1310,7 @@ mod tests {
             None,
             None,
             &probe,
+            true, // insecure_skip_verify for testing
         )
         .await;
 
@@ -1279,7 +1323,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires real network QUIC handshake"]
     async fn datagram_roundtrip() {
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
@@ -1293,7 +1336,7 @@ mod tests {
 
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
-        let (bound_addr, cmd_tx, _listener_handle) = spawn_h3_listener(
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listen_addr,
             certs.cert_path(),
             certs.key_path(),
@@ -1316,6 +1359,7 @@ mod tests {
             None,
             None,
             &probe,
+            true, // insecure_skip_verify for testing
         )
         .await
         .expect("dial failed");
@@ -1366,7 +1410,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires real network QUIC handshake"]
     async fn datagram_bidirectional() {
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
@@ -1380,7 +1423,7 @@ mod tests {
 
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
-        let (bound_addr, cmd_tx, _listener_handle) = spawn_h3_listener(
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listen_addr,
             certs.cert_path(),
             certs.key_path(),
@@ -1403,6 +1446,7 @@ mod tests {
             None,
             None,
             &probe,
+            true, // insecure_skip_verify for testing
         )
         .await
         .expect("dial failed");
@@ -1475,7 +1519,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires real network QUIC handshake"]
     async fn connection_graceful_shutdown() {
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1486,7 +1529,7 @@ mod tests {
 
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
-        let (bound_addr, cmd_tx, listener_handle) = spawn_h3_listener(
+        let (cmd_tx, listener_handle, bound_addr) = spawn_h3_listener(
             listen_addr,
             certs.cert_path(),
             certs.key_path(),
@@ -1509,6 +1552,7 @@ mod tests {
             None,
             None,
             &probe,
+            true, // insecure_skip_verify for testing
         )
         .await
         .expect("dial failed");
