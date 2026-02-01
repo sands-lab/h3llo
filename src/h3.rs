@@ -997,14 +997,19 @@ mod tests {
 
     #[tokio::test]
     async fn listener_rejects_invalid_cert_path() {
+        // Use tempdir to generate platform-agnostic missing paths
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let missing_cert = temp_dir.path().join("missing-cert.pem");
+        let missing_key = temp_dir.path().join("missing-key.pem");
+
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let peer_secrets = HashMap::new();
         let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
 
         let result = spawn_h3_listener(
             listen_addr,
-            std::path::Path::new("/nonexistent/cert.pem"),
-            std::path::Path::new("/nonexistent/key.pem"),
+            &missing_cert,
+            &missing_key,
             peer_secrets,
             conn_tx,
         )
