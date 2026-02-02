@@ -173,46 +173,45 @@ pub async fn select_bind_interface<P: RouteProbe>(
     preferred_if: Option<&str>,
     probe: &P,
 ) -> Option<String> {
-    match probe.probe_interfaces(&target.to_string(), tun_if).await {
-        Ok(interfaces) => {
-            if interfaces.is_empty() {
-                warn!(target = %target, "no interface found, socket will remain unbound");
-                return None;
-            }
-
-            let mut candidates = if let Some(preferred) = preferred_if {
-                let filtered = filter_preferred_interfaces(
-                    interfaces.clone(),
-                    Some(vec![preferred.to_string()]),
-                );
-                if filtered.is_empty() {
-                    warn!(
-                        interface = %preferred,
-                        "preferred interface not found, falling back to probed"
-                    );
-                    interfaces
-                } else {
-                    filtered
-                }
-            } else {
-                interfaces
-            };
-
-            let chosen = candidates.remove(0);
-            if !candidates.is_empty() {
-                warn!(
-                    chosen = %chosen,
-                    alternatives = ?candidates,
-                    "multiple interfaces found, using first"
-                );
-            }
-            Some(chosen)
-        }
+    let interfaces = match probe.probe_interfaces(&target.to_string(), tun_if).await {
+        Ok(ifaces) => ifaces,
         Err(err) => {
             warn!(error = %err, "route probe failed, socket will remain unbound");
-            None
+            return None;
         }
+    };
+
+    if interfaces.is_empty() {
+        warn!(target = %target, "no interface found, socket will remain unbound");
+        return None;
     }
+
+    let mut candidates = match preferred_if {
+        Some(preferred) => {
+            let filtered =
+                filter_preferred_interfaces(interfaces.clone(), Some(vec![preferred.to_string()]));
+            if filtered.is_empty() {
+                warn!(
+                    interface = %preferred,
+                    "preferred interface not found, falling back to probed"
+                );
+                interfaces
+            } else {
+                filtered
+            }
+        }
+        None => interfaces,
+    };
+
+    let chosen = candidates.remove(0);
+    if !candidates.is_empty() {
+        warn!(
+            chosen = %chosen,
+            alternatives = ?candidates,
+            "multiple interfaces found, using first"
+        );
+    }
+    Some(chosen)
 }
 
 /// Binds `socket` to `interface` for the given `domain` using platform-specific mechanisms.

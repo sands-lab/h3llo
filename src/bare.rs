@@ -127,16 +127,12 @@ pub fn spawn_udp_rx(
                     }
                 }
                 cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(command) => {
-                            match command {
-                                BareUdpRxCommand::UpdateAllowedSources(update) => {
-                                    allowed_sources = update;
-                                }
-                            }
-                        }
-                        None => return Ok(()), // Channel closed, exit gracefully
-                    }
+                    let Some(command) = cmd else {
+                        return Ok(()); // Channel closed, exit gracefully
+                    };
+                    // Single-variant enum: destructure directly
+                    let BareUdpRxCommand::UpdateAllowedSources(update) = command;
+                    allowed_sources = update;
                 }
                 _ = ticker.tick() => {
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
