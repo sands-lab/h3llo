@@ -205,7 +205,14 @@ async fn handle_h3_connection(
                     warn!(%remote_addr, error = ?e, "H3 connection error");
                     return;
                 }
-                _ => continue,
+                other => {
+                    debug!(
+                        %remote_addr,
+                        event = ?other,
+                        "ignoring unhandled H3 server event during handshake"
+                    );
+                    continue;
+                }
             }
 
             // Check if all pieces ready to establish connection.
@@ -510,7 +517,14 @@ pub async fn dial_h3<P: RouteProbe>(
                 ClientH3Event::Core(H3Event::ConnectionShutdown(_)) => {
                     return Err(DialError::Handshake("connection shutdown".to_string()));
                 }
-                _ => continue,
+                other => {
+                    debug!(
+                        %remote_addr,
+                        event = ?other,
+                        "ignoring unhandled H3 client event during handshake"
+                    );
+                    continue;
+                }
             }
         }
 

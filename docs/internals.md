@@ -214,3 +214,10 @@ Warning handling design principles:
 - **Preserved semantic warnings**: `DnsAnswerWarning` is retained for observability purposes—warnings like `NxDomain` are logged to indicate DNS resolution failures. While the current stateless DNS design does not use these warnings for control flow, they provide valuable diagnostic information.
 - **Structured fields**: Warning logs include structured fields (`prefix`, `interface`, `error`, etc.) to enable filtering and analysis in log aggregation systems.
 - **Test assertions**: Tests use `tracing-test` with `#[traced_test]` and `logs_contain()` to verify that expected warnings are logged.
+
+Unhandled event logging policy:
+- **Log at wildcard**: All match statements on event enums (e.g., `ServerH3Event`, `ClientH3Event`, `Event`) must log unhandled variants at `debug!` level instead of silently continuing. This ensures that new event types introduced by library updates (such as `tokio-quiche`) are visible during troubleshooting.
+- **Named binding**: Use `other => { debug!(..., event = ?other, ...); }` instead of `_ => continue`. The named binding enables Debug formatting in the log message.
+- **Structured context**: Include relevant context fields (e.g., `%remote_addr`, `%peer_id`) to aid debugging.
+- **Rationale**: External library enums like `ServerH3Event` and `ClientH3Event` may be `#[non_exhaustive]` or evolve over time. Silent wildcards mask missing handler code that should be added when new variants appear.
+- **Log level choice**: `debug!` is chosen over `warn!` because unhandled events like `IncomingSettings` or `StreamClosed` are expected during normal operation and do not indicate hazardous situations (per standard logging conventions from [docs.rs/log](https://docs.rs/log/latest/log/enum.Level.html)).
