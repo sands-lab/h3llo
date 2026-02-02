@@ -5,7 +5,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use h3llo::config::Config;
-use h3llo::orch::run_bare;
+use h3llo::orch::Orchestrator;
 use std::env;
 use std::fs::File;
 use std::path::PathBuf;
@@ -41,8 +41,16 @@ async fn main() {
         }
     };
 
-    if let Err(err) = run_bare(config).await {
-        error!("bare runtime failed: {err}");
+    let orchestrator = match Orchestrator::new(config).await {
+        Ok(o) => o,
+        Err(err) => {
+            error!("orchestrator initialization failed: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(err) = orchestrator.run().await {
+        error!("orchestrator runtime failed: {err}");
         std::process::exit(1);
     }
 }
