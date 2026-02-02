@@ -582,46 +582,43 @@ pub fn spawn_h3_rx(
         loop {
             tokio::select! {
                 frame = datagram_rx.recv() => {
-                    match frame {
-                        Some(inbound_frame) => {
-                            match &inbound_frame {
-                                InboundFrame::Datagram(pooled_dgram) => {
-                                    let data = pooled_dgram.as_ref();
-                                    if let Some(payload) = decode_datagram(data) {
-                                        let len = payload.len();
-                                        if packet_tx.send(payload.to_vec()).await.is_err() {
-                                            counters.record_drop(
-                                                crate::events::DropReason::ChannelClosed,
-                                                len,
-                                            );
-                                            return Ok(());
-                                        }
-                                        counters.record_success(len);
-                                    } else {
-                                        counters.record_drop(
-                                            crate::events::DropReason::InvalidFraming,
-                                            data.len(),
-                                        );
-                                    }
-                                }
-                                InboundFrame::Body(pooled_buf, _fin) => {
-                                    // Body frames are unexpected for CONNECT-IP per RFC 9484;
-                                    // IP payloads should arrive as DATAGRAM frames. Drop immediately.
-                                    warn!(
-                                        peer = %peer,
-                                        len = pooled_buf.len(),
-                                        "received unexpected Body frame on CONNECT-IP stream"
-                                    );
-                                    counters.record_drop(
-                                        crate::events::DropReason::InvalidFraming,
-                                        pooled_buf.len(),
-                                    );
-                                }
+                    let Some(inbound_frame) = frame else {
+                        debug!(peer = %peer, "datagram stream closed");
+                        return Ok(());
+                    };
+
+                    match inbound_frame {
+                        InboundFrame::Datagram(pooled_dgram) => {
+                            let data = pooled_dgram.as_ref();
+                            let Some(payload) = decode_datagram(data) else {
+                                counters.record_drop(
+                                    crate::events::DropReason::InvalidFraming,
+                                    data.len(),
+                                );
+                                continue;
+                            };
+                            let len = payload.len();
+                            if packet_tx.send(payload.to_vec()).await.is_err() {
+                                counters.record_drop(
+                                    crate::events::DropReason::ChannelClosed,
+                                    len,
+                                );
+                                return Ok(());
                             }
+                            counters.record_success(len);
                         }
-                        None => {
-                            debug!(peer = %peer, "datagram stream closed");
-                            return Ok(());
+                        InboundFrame::Body(pooled_buf, _fin) => {
+                            // Body frames are unexpected for CONNECT-IP per RFC 9484;
+                            // IP payloads should arrive as DATAGRAM frames. Drop immediately.
+                            warn!(
+                                peer = %peer,
+                                len = pooled_buf.len(),
+                                "received unexpected Body frame on CONNECT-IP stream"
+                            );
+                            counters.record_drop(
+                                crate::events::DropReason::InvalidFraming,
+                                pooled_buf.len(),
+                            );
                         }
                     }
                 }
