@@ -1,16 +1,14 @@
-//! DNS resolver coroutine: consumes resolve commands, processes UDP responses, retries on timeout, and emits events.
+//! DNS resolver coroutine: consumes SetHostnames commands, manages IP lifecycle with TTL-based expiration,
+//! and emits IpResolved/IpExpired events.
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_client_udp_socket, RouteProbe};
 use crate::config::{parse_dns_server_uri, LocalDns};
-use crate::events::{
-    DnsAnswer, DnsAnswerRecord, DnsAnswerWarning, DnsEvent, DnsEventDetail, DnsRecordType,
-    DnsTimeout, DnsUnexpected, DnsUnexpectedKind, Event,
-};
+use crate::events::{DnsEvent, DnsEventDetail, DnsIpExpired, DnsIpResolved, Event};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -19,15 +17,72 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
+use tracing::warn;
 
 const DNS_BUFFER_SIZE: usize = 1500;
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Minimum TTL floor to prevent excessive refresh (60 seconds).
+const MIN_TTL_SECS: u32 = 60;
+
 /// Commands accepted by the DNS resolver coroutine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsCommand {
-    /// Resolve the provided hostname by sending A and AAAA queries.
-    Resolve { host: String },
+    /// Register/update the set of hostnames to monitor.
+    ///
+    /// Replaces the previous registration set entirely. The DNS module will:
+    /// - Start tracking new hostnames (issue queries, emit IpResolved)
+    /// - Continue tracking existing hostnames (refresh before TTL expiry)
+    /// - Stop tracking removed hostnames (emit IpExpired for active IPs)
+    SetHostnames { hosts: HashSet<String> },
+}
+
+/// Cached DNS resolution result with expiration tracking.
+#[derive(Debug, Clone)]
+struct CachedRecord {
+    /// Absolute expiration time.
+    expires_at: Instant,
+}
+
+impl CachedRecord {
+    /// Creates a new cached record with TTL floored to MIN_TTL_SECS.
+    fn new(ttl: u32) -> Self {
+        let ttl_secs = ttl.max(MIN_TTL_SECS);
+        let expires_at = Instant::now() + Duration::from_secs(ttl_secs as u64);
+        Self { expires_at }
+    }
+
+    /// Returns true if this record has expired.
+    fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+
+    /// Refreshes the TTL, resetting the expiration time.
+    fn refresh(&mut self, ttl: u32) {
+        let ttl_secs = ttl.max(MIN_TTL_SECS);
+        self.expires_at = Instant::now() + Duration::from_secs(ttl_secs as u64);
+    }
+}
+
+/// Represents DNS record types supported by the resolver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DnsRecordType {
+    /// IPv4 A record.
+    A,
+    /// IPv6 AAAA record.
+    Aaaa,
+    /// Non-A/AAAA record type.
+    Other(u16),
+}
+
+/// Internal representation of a DNS answer record with its TTL.
+/// Used during response processing before caching.
+#[derive(Debug, Clone)]
+struct DnsAnswerRecord {
+    /// Resolved IP address.
+    address: IpAddr,
+    /// Time-to-live in seconds for the record.
+    ttl: u32,
 }
 
 /// Describes resolver initialization failures.
@@ -48,6 +103,7 @@ pub struct DnsResolver {
     bind_interface: Option<String>,
     tun_if: Option<String>,
     timeout: Duration,
+    refresh_interval: Duration,
 }
 
 impl DnsResolver {
@@ -57,12 +113,14 @@ impl DnsResolver {
         bind_interface: Option<String>,
         tun_if: Option<String>,
         timeout: Duration,
+        refresh_interval: Duration,
     ) -> Self {
         Self {
             server,
             bind_interface,
             tun_if,
             timeout,
+            refresh_interval,
         }
     }
 
@@ -78,7 +136,14 @@ impl DnsResolver {
     ) -> Result<Self, ResolveInitError> {
         let server =
             parse_dns_server_uri(&local_dns.server).map_err(ResolveInitError::InvalidServer)?;
-        Ok(Self::new(server, local_dns.bindif.clone(), tun_if, timeout))
+        let refresh_interval = Duration::from_secs(local_dns.refresh);
+        Ok(Self::new(
+            server,
+            local_dns.bindif.clone(),
+            tun_if,
+            timeout,
+            refresh_interval,
+        ))
     }
 
     /// Spawns the DNS resolver coroutine.
@@ -106,7 +171,14 @@ impl DnsResolver {
 
         let socket = self.prepare_socket(&probe).await?;
         let server_str = self.server.to_string();
-        let mut task = ResolverTask::new(self.server, self.timeout, cmd_rx, events_tx, socket);
+        let mut task = ResolverTask::new(
+            self.server,
+            self.timeout,
+            cmd_rx,
+            events_tx,
+            socket,
+            self.refresh_interval,
+        );
 
         let handle = tokio::spawn(async move { task.run(server_str).await });
 
@@ -150,6 +222,12 @@ struct ResolverTask {
     events_tx: mpsc::UnboundedSender<Event>,
     pending: HashMap<u16, PendingRequest>,
     cmd_rx_closed: bool,
+    /// Registered hostnames for lifecycle tracking.
+    registered_hosts: HashSet<String>,
+    /// IP cache: (hostname, IP) -> cached record.
+    cache: HashMap<(String, IpAddr), CachedRecord>,
+    /// Refresh interval from config.
+    refresh_interval: Duration,
 }
 
 impl ResolverTask {
@@ -160,6 +238,7 @@ impl ResolverTask {
         cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
         events_tx: mpsc::UnboundedSender<Event>,
         socket: UdpSocket,
+        refresh_interval: Duration,
     ) -> Self {
         Self {
             server,
@@ -169,6 +248,9 @@ impl ResolverTask {
             events_tx,
             pending: HashMap::new(),
             cmd_rx_closed: false,
+            registered_hosts: HashSet::new(),
+            cache: HashMap::new(),
+            refresh_interval,
         }
     }
 
@@ -176,6 +258,15 @@ impl ResolverTask {
     async fn run(&mut self, server_str: String) -> ActorExitResult {
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
         let mut ticker = time::interval(TICK_INTERVAL);
+
+        // Refresh ticker for periodic DNS refresh
+        let refresh_duration = if self.refresh_interval.is_zero() {
+            Duration::from_secs(3600) // placeholder; branch disabled below
+        } else {
+            self.refresh_interval
+        };
+        let mut refresh_ticker = time::interval(refresh_duration);
+        refresh_ticker.tick().await; // consume immediate first tick
 
         loop {
             tokio::select! {
@@ -193,9 +284,15 @@ impl ResolverTask {
                     }
                 }
                 _ = ticker.tick() => self.handle_tick().await,
+                _ = refresh_ticker.tick(), if !self.refresh_interval.is_zero() => {
+                    self.trigger_refresh().await;
+                }
             }
 
-            if self.cmd_rx_closed && self.pending.is_empty() {
+            // Check for expired IPs on every iteration
+            self.check_expirations().await;
+
+            if self.cmd_rx_closed && self.pending.is_empty() && self.cache.is_empty() {
                 return Ok(());
             }
         }
@@ -204,14 +301,8 @@ impl ResolverTask {
     /// Handles commands from the orchestrator queue.
     async fn handle_command(&mut self, command: Option<DnsCommand>) {
         match command {
-            Some(DnsCommand::Resolve { host }) => {
-                // Fast path: IP literal detection - emit answer immediately without network I/O
-                if let Ok(ip) = host.parse::<IpAddr>() {
-                    self.emit_ip_literal_answer(host, ip).await;
-                } else {
-                    self.issue_query(host.clone(), DnsRecordType::A).await;
-                    self.issue_query(host, DnsRecordType::Aaaa).await;
-                }
+            Some(DnsCommand::SetHostnames { hosts }) => {
+                self.handle_set_hostnames(hosts).await;
             }
             None => {
                 self.cmd_rx_closed = true;
@@ -219,42 +310,104 @@ impl ResolverTask {
         }
     }
 
-    /// Emits a DnsAnswer for an IP literal without network I/O.
-    ///
-    /// This allows IP literals to flow through the same code path as resolved
-    /// hostnames, simplifying the orchestrator's initialization logic.
-    async fn emit_ip_literal_answer(&mut self, host: String, ip: IpAddr) {
-        let record_type = match ip {
-            IpAddr::V4(_) => DnsRecordType::A,
-            IpAddr::V6(_) => DnsRecordType::Aaaa,
-        };
+    /// Handles the SetHostnames command: diff against current state.
+    async fn handle_set_hostnames(&mut self, new_hosts: HashSet<String>) {
+        // Find removed hostnames
+        let removed: Vec<String> = self
+            .registered_hosts
+            .difference(&new_hosts)
+            .cloned()
+            .collect();
 
-        let event = Event::Dns(DnsEvent {
-            server: self.server,
-            detail: DnsEventDetail::Answer(DnsAnswer {
-                host,
-                record_type,
-                records: vec![DnsAnswerRecord {
-                    address: ip,
-                    ttl: u32::MAX, // IP literal never expires
-                }],
-                warnings: vec![],
-            }),
-        });
+        // Find added hostnames
+        let added: Vec<String> = new_hosts
+            .difference(&self.registered_hosts)
+            .cloned()
+            .collect();
 
-        let _ = self.events_tx.send(event);
+        // Update registered set
+        self.registered_hosts = new_hosts;
+
+        // Emit IpExpired for all IPs of removed hostnames
+        for host in removed {
+            self.expire_hostname(&host).await;
+        }
+
+        // Issue queries for added hostnames
+        for host in added {
+            self.resolve_hostname(&host).await;
+        }
     }
 
-    /// Issues a query for `host` and `record_type`, emitting a send-failure event on error.
+    /// Issues DNS queries for a hostname (handling IP literals).
+    async fn resolve_hostname(&mut self, host: &str) {
+        // Fast path: IP literal detection
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            self.handle_ip_literal(host.to_string(), ip).await;
+        } else {
+            self.issue_query(host.to_string(), DnsRecordType::A).await;
+            self.issue_query(host.to_string(), DnsRecordType::Aaaa)
+                .await;
+        }
+    }
+
+    /// Handles IP literal: emit IpResolved immediately, cache with max TTL.
+    async fn handle_ip_literal(&mut self, host: String, ip: IpAddr) {
+        let key = (host.clone(), ip);
+        if self.cache.contains_key(&key) {
+            return; // Already cached
+        }
+
+        // IP literals use max TTL (effectively never expire)
+        self.cache.insert(key, CachedRecord::new(u32::MAX));
+        self.emit_ip_resolved(&host, ip).await;
+    }
+
+    /// Expires all IPs for a hostname and emits IpExpired events.
+    async fn expire_hostname(&mut self, host: &str) {
+        let keys_to_remove: Vec<(String, IpAddr)> = self
+            .cache
+            .keys()
+            .filter(|(h, _)| h == host)
+            .cloned()
+            .collect();
+
+        for (h, ip) in keys_to_remove {
+            self.cache.remove(&(h.clone(), ip));
+            self.emit_ip_expired(&h, ip).await;
+        }
+    }
+
+    /// Triggers refresh for all registered hostnames.
+    async fn trigger_refresh(&mut self) {
+        for host in self.registered_hosts.clone() {
+            // Skip IP literals (never need refresh)
+            if host.parse::<IpAddr>().is_err() {
+                self.issue_query(host.clone(), DnsRecordType::A).await;
+                self.issue_query(host, DnsRecordType::Aaaa).await;
+            }
+        }
+    }
+
+    /// Checks for expired cache entries and emits IpExpired events.
+    async fn check_expirations(&mut self) {
+        let expired: Vec<(String, IpAddr)> = self
+            .cache
+            .iter()
+            .filter(|(_, record)| record.is_expired())
+            .map(|((host, ip), _)| (host.clone(), *ip))
+            .collect();
+
+        for (host, ip) in expired {
+            self.cache.remove(&(host.clone(), ip));
+            self.emit_ip_expired(&host, ip).await;
+        }
+    }
+
+    /// Issues a query for `host` and `record_type`, logging on error.
     async fn issue_query(&mut self, host: String, record_type: DnsRecordType) {
         if let Err(err) = self.send_query(host.clone(), record_type).await {
-            self.emit_unexpected(
-                None,
-                Some(host),
-                Some(record_type),
-                DnsUnexpectedKind::SendFailed(err),
-            )
-            .await;
+            warn!(host = %host, record_type = ?record_type, error = %err, "dns: query send failed");
         }
     }
 
@@ -307,13 +460,7 @@ impl ResolverTask {
         let message = match Message::from_vec(data) {
             Ok(msg) => msg,
             Err(err) => {
-                self.emit_unexpected(
-                    None,
-                    None,
-                    None,
-                    DnsUnexpectedKind::DecodeFailed(err.to_string()),
-                )
-                .await;
+                warn!(error = %err, "dns: packet decode failed");
                 return;
             }
         };
@@ -322,49 +469,41 @@ impl ResolverTask {
         if let Some(request) = self.pending.remove(&id) {
             self.handle_decoded_packet(message, request).await;
         } else {
-            let record_type = message
-                .queries()
-                .first()
-                .map(|q| DnsRecordType::from(q.query_type()));
-            self.emit_unexpected(
-                Some(id),
-                None,
-                record_type,
-                DnsUnexpectedKind::UnknownTransaction,
-            )
-            .await;
+            warn!(id = id, "dns: unknown transaction ID");
         }
     }
 
     /// Handles a parsed DNS packet that matches a pending request.
     async fn handle_decoded_packet(&mut self, message: Message, request: PendingRequest) {
-        let warnings = response_warnings(&message);
+        // Log warnings at origin instead of sending via events
+        log_response_warnings(&message, &request.host);
+
         let records = extract_records(&message, request.record_type);
 
         if message.response_code() == ResponseCode::NoError && records.is_empty() {
             if let Some(unexpected_type) = first_nonmatching_answer(&message, request.record_type) {
-                self.emit_unexpected(
-                    Some(message.id()),
-                    Some(request.host),
-                    Some(request.record_type),
-                    DnsUnexpectedKind::UnexpectedRecordType(unexpected_type),
-                )
-                .await;
+                warn!(
+                    host = %request.host,
+                    expected = ?request.record_type,
+                    got = ?unexpected_type,
+                    "dns: unexpected record type in response"
+                );
                 return;
             }
         }
 
-        let event = Event::Dns(DnsEvent {
-            server: self.server,
-            detail: DnsEventDetail::Answer(DnsAnswer {
-                host: request.host,
-                record_type: request.record_type,
-                records,
-                warnings,
-            }),
-        });
-
-        let _ = self.events_tx.send(event);
+        // Process each record: cache and emit new IPs, refresh existing
+        for record in records {
+            let key = (request.host.clone(), record.address);
+            if let Some(cached) = self.cache.get_mut(&key) {
+                // Existing IP - refresh TTL (no event emitted)
+                cached.refresh(record.ttl);
+            } else {
+                // New IP - cache and emit IpResolved
+                self.cache.insert(key, CachedRecord::new(record.ttl));
+                self.emit_ip_resolved(&request.host, record.address).await;
+            }
+        }
     }
 
     /// Handles timer ticks by retrying timed-out pending queries.
@@ -380,49 +519,35 @@ impl ResolverTask {
 
         for (id, request) in expired {
             self.pending.remove(&id);
-            self.emit_timeout(&request).await;
+            warn!(host = %request.host, record_type = ?request.record_type, "dns: query timed out, retrying");
             if let Err(err) = self
                 .send_query(request.host.clone(), request.record_type)
                 .await
             {
-                self.emit_unexpected(
-                    None,
-                    Some(request.host),
-                    Some(request.record_type),
-                    DnsUnexpectedKind::SendFailed(err),
-                )
-                .await;
+                warn!(host = %request.host, error = %err, "dns: retry send failed");
             }
         }
     }
 
-    /// Emits an unexpected event.
-    async fn emit_unexpected(
-        &mut self,
-        id: Option<u16>,
-        host: Option<String>,
-        record_type: Option<DnsRecordType>,
-        warning: DnsUnexpectedKind,
-    ) {
+    /// Emits an IpResolved event.
+    async fn emit_ip_resolved(&self, host: &str, address: IpAddr) {
         let event = Event::Dns(DnsEvent {
             server: self.server,
-            detail: DnsEventDetail::Unexpected(DnsUnexpected {
-                id,
-                host,
-                record_type,
-                warning,
+            detail: DnsEventDetail::IpResolved(DnsIpResolved {
+                host: host.to_string(),
+                address,
             }),
         });
         let _ = self.events_tx.send(event);
     }
 
-    /// Emits a timeout event.
-    async fn emit_timeout(&mut self, request: &PendingRequest) {
+    /// Emits an IpExpired event.
+    async fn emit_ip_expired(&self, host: &str, address: IpAddr) {
         let event = Event::Dns(DnsEvent {
             server: self.server,
-            detail: DnsEventDetail::Timeout(DnsTimeout {
-                host: request.host.clone(),
-                record_type: request.record_type,
+            detail: DnsEventDetail::IpExpired(DnsIpExpired {
+                host: host.to_string(),
+                address,
             }),
         });
         let _ = self.events_tx.send(event);
@@ -484,25 +609,28 @@ fn first_nonmatching_answer(message: &Message, expected: DnsRecordType) -> Optio
     None
 }
 
-/// Collects warnings from the DNS response code and flags.
-fn response_warnings(message: &Message) -> Vec<DnsAnswerWarning> {
-    let mut warnings = Vec::new();
+/// Logs DNS response warnings at origin (not sent as events).
+fn log_response_warnings(message: &Message, host: &str) {
     match message.response_code() {
         ResponseCode::NoError => {}
-        ResponseCode::NXDomain => warnings.push(DnsAnswerWarning::NxDomain),
-        ResponseCode::Refused => warnings.push(DnsAnswerWarning::Refused),
-        other => warnings.push(DnsAnswerWarning::ResponseCode(format!("{other:?}"))),
+        ResponseCode::NXDomain => {
+            warn!(host = %host, "dns: NXDOMAIN response");
+        }
+        ResponseCode::Refused => {
+            warn!(host = %host, "dns: query refused");
+        }
+        other => {
+            warn!(host = %host, code = ?other, "dns: unexpected response code");
+        }
     }
 
     if message.truncated() {
-        warnings.push(DnsAnswerWarning::Truncated);
+        warn!(host = %host, "dns: response truncated");
     }
 
     if !message.recursion_available() {
-        warnings.push(DnsAnswerWarning::RecursionUnavailable);
+        warn!(host = %host, "dns: recursion unavailable");
     }
-
-    warnings
 }
 
 /// Converts Hickory's IPv4 RDATA to `Ipv4Addr`.
@@ -530,11 +658,9 @@ impl From<RecordType> for DnsRecordType {
 mod tests {
     use super::*;
     use crate::bind::test_support::FakeRouteProbe;
-    use hickory_proto::rr::rdata::{A, AAAA, TXT};
+    use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::Record;
-    use std::collections::HashMap;
     use std::net::Ipv4Addr;
-    use std::net::Ipv6Addr;
 
     /// Starts a resolver coroutine wired to the provided server socket.
     async fn start_resolver(
@@ -546,7 +672,13 @@ mod tests {
         JoinHandle<ActorExitResult>,
     ) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let resolver = DnsResolver::new(server, bindif, None, Duration::from_millis(50));
+        let resolver = DnsResolver::new(
+            server,
+            bindif,
+            None,
+            Duration::from_millis(50),
+            Duration::ZERO,
+        );
         let probe = FakeRouteProbe::noop();
         let (cmd_tx, handle) = resolver
             .spawn(probe, event_tx)
@@ -588,17 +720,17 @@ mod tests {
         }
     }
 
+    // ========== IpResolved Tests ==========
+
     #[tokio::test]
-    async fn emits_answers_with_warnings() {
+    async fn emits_ip_resolved_for_new_ip() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
 
-        cmd_tx
-            .send(DnsCommand::Resolve {
-                host: "example.com".to_string(),
-            })
-            .unwrap();
+        let mut hosts = HashSet::new();
+        hosts.insert("example.com".to_string());
+        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
         let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
@@ -607,100 +739,104 @@ mod tests {
         let response = build_response(
             request.id(),
             query.clone(),
-            ResponseCode::NXDomain,
+            ResponseCode::NoError,
             vec![Record::from_rdata(
                 query.name().clone(),
-                60,
-                RData::A(A(Ipv4Addr::new(1, 1, 1, 1))),
+                300,
+                RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
             )],
         );
         socket.send_to(&response, peer).await.unwrap();
 
-        let (len2, peer2) = socket.recv_from(&mut buf).await.unwrap();
-        let request2 = Message::from_vec(&buf[..len2]).unwrap();
-        let query2 = request2.queries().first().cloned().unwrap();
-        let response2 = build_response(
-            request2.id(),
-            query2.clone(),
+        let detail = next_relevant_detail(&mut events_rx).await;
+        match detail {
+            DnsEventDetail::IpResolved(resolved) => {
+                assert_eq!(resolved.host, "example.com");
+                assert_eq!(resolved.address, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+            }
+            _ => panic!("expected IpResolved event"),
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn does_not_emit_duplicate_ip_on_refresh() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+
+        let mut hosts = HashSet::new();
+        hosts.insert("example.com".to_string());
+        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+
+        // First resolution
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+        let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+        let request = Message::from_vec(&buf[..len]).unwrap();
+        let query = request.queries().first().cloned().unwrap();
+        let response = build_response(
+            request.id(),
+            query.clone(),
             ResponseCode::NoError,
             vec![Record::from_rdata(
-                query2.name().clone(),
-                60,
-                RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
+                query.name().clone(),
+                300,
+                RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
             )],
+        );
+        socket.send_to(&response, peer).await.unwrap();
+
+        // Wait for first IpResolved
+        let _ = next_relevant_detail(&mut events_rx).await;
+
+        // Consume AAAA query
+        let (len2, peer2) = socket.recv_from(&mut buf).await.unwrap();
+        let request2 = Message::from_vec(&buf[..len2]).unwrap();
+        let response2 = build_response(
+            request2.id(),
+            request2.queries()[0].clone(),
+            ResponseCode::NoError,
+            vec![],
         );
         socket.send_to(&response2, peer2).await.unwrap();
 
-        let detail = next_relevant_detail(&mut events_rx).await;
-        match detail {
-            DnsEventDetail::Answer(answer) => {
-                assert_eq!(answer.host, "example.com");
-                assert_eq!(answer.record_type, DnsRecordType::A);
-                assert!(answer.warnings.contains(&DnsAnswerWarning::NxDomain));
-                assert_eq!(answer.records.len(), 1);
-                assert_eq!(
-                    answer.records[0].address,
-                    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))
-                );
-                assert_eq!(answer.records[0].ttl, 60);
+        // Re-register same hosts (simulating refresh via new SetHostnames with same content)
+        // This should not re-query since hosts haven't changed
+        let mut hosts2 = HashSet::new();
+        hosts2.insert("example.com".to_string());
+        cmd_tx
+            .send(DnsCommand::SetHostnames { hosts: hosts2 })
+            .unwrap();
+
+        // Should not receive another IpResolved (no new hostnames added)
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                // Expected - no event
             }
-            _ => panic!("unexpected event"),
+            event = events_rx.recv() => {
+                // Only IpResolved events should not fire for same IP
+                if let Some(Event::Dns(dns)) = event {
+                    if matches!(dns.detail, DnsEventDetail::IpResolved(_)) {
+                        panic!("should not emit duplicate IpResolved");
+                    }
+                }
+            }
         }
 
         handle.abort();
     }
 
     #[tokio::test]
-    async fn flags_unknown_transaction() {
+    async fn emits_ip_expired_on_hostname_removal() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
 
-        cmd_tx
-            .send(DnsCommand::Resolve {
-                host: "unknown.test".to_string(),
-            })
-            .unwrap();
-
-        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
-        let (_len, peer) = socket.recv_from(&mut buf).await.unwrap();
-
-        let mut message = Message::new();
-        message.set_id(55);
-        message.set_message_type(MessageType::Response);
-        message.set_op_code(OpCode::Query);
-        message.set_response_code(ResponseCode::NoError);
-        message.add_query(record_type_query(
-            Name::from_ascii("example.com").unwrap(),
-            DnsRecordType::A,
-        ));
-
-        let outbound = message.to_vec().unwrap();
-        socket.send_to(&outbound, peer).await.unwrap();
-
-        let detail = next_relevant_detail(&mut events_rx).await;
-        match detail {
-            DnsEventDetail::Unexpected(DnsUnexpected {
-                warning: DnsUnexpectedKind::UnknownTransaction,
-                ..
-            }) => {}
-            _ => panic!("unexpected event"),
-        }
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn deduplicates_answers_and_keeps_some_ttl() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
-
-        cmd_tx
-            .send(DnsCommand::Resolve {
-                host: "ttl.test".to_string(),
-            })
-            .unwrap();
+        // Register and resolve
+        let mut hosts = HashSet::new();
+        hosts.insert("example.com".to_string());
+        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
         let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
@@ -708,153 +844,222 @@ mod tests {
         let query = request.queries().first().cloned().unwrap();
         let response = build_response(
             request.id(),
-            query,
+            query.clone(),
+            ResponseCode::NoError,
+            vec![Record::from_rdata(
+                query.name().clone(),
+                3600,
+                RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+            )],
+        );
+        socket.send_to(&response, peer).await.unwrap();
+
+        // Wait for IpResolved
+        let _ = next_relevant_detail(&mut events_rx).await;
+
+        // Consume AAAA query
+        let (len2, peer2) = socket.recv_from(&mut buf).await.unwrap();
+        let request2 = Message::from_vec(&buf[..len2]).unwrap();
+        let response2 = build_response(
+            request2.id(),
+            request2.queries()[0].clone(),
+            ResponseCode::NoError,
+            vec![],
+        );
+        socket.send_to(&response2, peer2).await.unwrap();
+
+        // Unregister by sending empty hosts
+        cmd_tx
+            .send(DnsCommand::SetHostnames {
+                hosts: HashSet::new(),
+            })
+            .unwrap();
+
+        // Should receive IpExpired
+        let detail = next_relevant_detail(&mut events_rx).await;
+        match detail {
+            DnsEventDetail::IpExpired(expired) => {
+                assert_eq!(expired.host, "example.com");
+                assert_eq!(expired.address, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+            }
+            _ => panic!("expected IpExpired event"),
+        }
+
+        handle.abort();
+    }
+
+    // ========== IP Literal Tests ==========
+
+    #[tokio::test]
+    async fn ip_literal_emits_immediate_ip_resolved() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+
+        // Register IP literal
+        let mut hosts = HashSet::new();
+        hosts.insert("192.168.1.100".to_string());
+        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+
+        // Should receive immediate IpResolved (no network query)
+        let detail = next_relevant_detail(&mut events_rx).await;
+        match detail {
+            DnsEventDetail::IpResolved(resolved) => {
+                assert_eq!(resolved.host, "192.168.1.100");
+                assert_eq!(resolved.address.to_string(), "192.168.1.100");
+            }
+            _ => panic!("expected IpResolved event"),
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ipv6_literal_emits_immediate_ip_resolved() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+
+        // Register IPv6 literal
+        let mut hosts = HashSet::new();
+        hosts.insert("2001:db8::1".to_string());
+        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+
+        // Should receive immediate IpResolved
+        let detail = next_relevant_detail(&mut events_rx).await;
+        match detail {
+            DnsEventDetail::IpResolved(resolved) => {
+                assert_eq!(resolved.host, "2001:db8::1");
+                assert!(resolved.address.is_ipv6());
+            }
+            _ => panic!("expected IpResolved event"),
+        }
+
+        handle.abort();
+    }
+
+    // ========== Deduplication Tests ==========
+
+    #[tokio::test]
+    async fn emits_multiple_ips_for_same_hostname() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+
+        let mut hosts = HashSet::new();
+        hosts.insert("multi.example.com".to_string());
+        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+        let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+        let request = Message::from_vec(&buf[..len]).unwrap();
+        let query = request.queries().first().cloned().unwrap();
+        let response = build_response(
+            request.id(),
+            query.clone(),
             ResponseCode::NoError,
             vec![
                 Record::from_rdata(
-                    Name::from_ascii("ttl.test").unwrap(),
+                    query.name().clone(),
                     120,
                     RData::A(A(Ipv4Addr::new(10, 0, 0, 1))),
                 ),
                 Record::from_rdata(
-                    Name::from_ascii("ttl.test").unwrap(),
-                    30,
+                    query.name().clone(),
+                    120,
                     RData::A(A(Ipv4Addr::new(10, 0, 0, 2))),
-                ),
-                Record::from_rdata(
-                    Name::from_ascii("ttl.test").unwrap(),
-                    90,
-                    RData::A(A(Ipv4Addr::new(10, 0, 0, 1))),
                 ),
             ],
         );
         socket.send_to(&response, peer).await.unwrap();
 
-        let detail = next_relevant_detail(&mut events_rx).await;
-        match detail {
-            DnsEventDetail::Answer(answer) => {
-                assert_eq!(answer.host, "ttl.test");
-                assert_eq!(answer.record_type, DnsRecordType::A);
-                let mut map = HashMap::new();
-                for rec in answer.records {
-                    map.insert(rec.address, rec.ttl);
-                }
-                assert_eq!(map.len(), 2);
-                assert!(
-                    matches!(
-                        map.get(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-                        Some(120) | Some(90)
-                    ),
-                    "ttl should be taken from one of the duplicated records"
-                );
-                assert_eq!(map.get(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))), Some(&30));
-            }
-            _ => panic!("unexpected event"),
+        // Should receive two IpResolved events
+        let detail1 = next_relevant_detail(&mut events_rx).await;
+        let detail2 = next_relevant_detail(&mut events_rx).await;
+
+        let mut ips = HashSet::new();
+        if let DnsEventDetail::IpResolved(r) = detail1 {
+            ips.insert(r.address);
+        }
+        if let DnsEventDetail::IpResolved(r) = detail2 {
+            ips.insert(r.address);
         }
 
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+
         handle.abort();
+    }
+
+    // ========== Actor Lifecycle Tests ==========
+
+    #[tokio::test]
+    async fn spawn_returns_working_cmd_tx() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+
+        let resolver = DnsResolver::new(
+            server_addr,
+            None,
+            None,
+            Duration::from_millis(50),
+            Duration::ZERO,
+        );
+        let probe = FakeRouteProbe::noop();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _handle) = resolver
+            .spawn(probe, event_tx)
+            .await
+            .expect("resolver spawn");
+
+        // Verify cmd_tx is functional
+        let mut hosts = HashSet::new();
+        hosts.insert("test.example".to_string());
+        assert!(cmd_tx.send(DnsCommand::SetHostnames { hosts }).is_ok());
     }
 
     #[tokio::test]
-    async fn flags_decode_failures() {
+    async fn actor_exits_when_sender_dropped() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
 
-        cmd_tx
-            .send(DnsCommand::Resolve {
-                host: "decode.test".to_string(),
-            })
-            .unwrap();
+        let resolver = DnsResolver::new(
+            server_addr,
+            None,
+            None,
+            Duration::from_millis(50),
+            Duration::ZERO,
+        );
+        let probe = FakeRouteProbe::noop();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, join_handle) = resolver
+            .spawn(probe, event_tx)
+            .await
+            .expect("resolver spawn");
 
-        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
-        let (_len, peer) = socket.recv_from(&mut buf).await.unwrap();
+        // Drop sender to signal shutdown
+        drop(cmd_tx);
 
-        socket.send_to(b"not-dns", peer).await.unwrap();
-
-        let detail = next_relevant_detail(&mut events_rx).await;
-        match detail {
-            DnsEventDetail::Unexpected(DnsUnexpected {
-                warning: DnsUnexpectedKind::DecodeFailed(_),
-                ..
-            }) => {}
-            _ => panic!("unexpected event"),
-        }
-
-        handle.abort();
+        // Actor should exit gracefully (check both timeout and join result)
+        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "actor should shut down cleanly after sender dropped, got {:?}",
+            result
+        );
     }
 
-    #[tokio::test]
-    async fn flags_unexpected_record_type() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
-
-        cmd_tx
-            .send(DnsCommand::Resolve {
-                host: "txt.example".to_string(),
-            })
-            .unwrap();
-
-        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
-        let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
-        let request = Message::from_vec(&buf[..len]).unwrap();
-        let query = request.queries().first().cloned().unwrap();
-        let response = build_response(
-            request.id(),
-            query,
-            ResponseCode::NoError,
-            vec![Record::from_rdata(
-                Name::from_ascii("txt.example").unwrap(),
-                60,
-                RData::TXT(TXT::new(vec!["hello".to_string()])),
-            )],
-        );
-        socket.send_to(&response, peer).await.unwrap();
-
-        let (len2, peer2) = socket.recv_from(&mut buf).await.unwrap();
-        let request2 = Message::from_vec(&buf[..len2]).unwrap();
-        let query2 = request2.queries().first().cloned().unwrap();
-        let response2 = build_response(
-            request2.id(),
-            query2.clone(),
-            ResponseCode::NoError,
-            vec![Record::from_rdata(
-                query2.name().clone(),
-                60,
-                RData::AAAA(AAAA(Ipv6Addr::LOCALHOST)),
-            )],
-        );
-        socket.send_to(&response2, peer2).await.unwrap();
-
-        let detail = next_relevant_detail(&mut events_rx).await;
-        match detail {
-            DnsEventDetail::Unexpected(DnsUnexpected {
-                warning: DnsUnexpectedKind::UnexpectedRecordType(DnsRecordType::Other(16)),
-                host,
-                record_type,
-                ..
-            }) => {
-                assert_eq!(host.as_deref(), Some("txt.example"));
-                assert_eq!(record_type, Some(DnsRecordType::A));
-            }
-            _ => panic!("unexpected event"),
-        }
-
-        handle.abort();
-    }
+    // ========== Timeout Retry Tests ==========
 
     #[tokio::test]
     async fn retries_with_new_id_on_timeout() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+        let (cmd_tx, _events_rx, handle) = start_resolver(server_addr, None).await;
 
-        cmd_tx
-            .send(DnsCommand::Resolve {
-                host: "timeout.example".to_string(),
-            })
-            .unwrap();
+        let mut hosts = HashSet::new();
+        hosts.insert("timeout.example".to_string());
+        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
         let mut first_ids: HashMap<DnsRecordType, u16> = HashMap::new();
@@ -865,21 +1070,8 @@ mod tests {
             first_ids.insert(DnsRecordType::from(query.query_type()), message.id());
         }
 
-        let detail1 = next_relevant_detail(&mut events_rx).await;
-        match detail1 {
-            DnsEventDetail::Timeout(timeout) => {
-                assert_eq!(timeout.host, "timeout.example");
-            }
-            _ => panic!("expected timeout event"),
-        }
-
-        let detail2 = next_relevant_detail(&mut events_rx).await;
-        match detail2 {
-            DnsEventDetail::Timeout(timeout) => {
-                assert_eq!(timeout.host, "timeout.example");
-            }
-            _ => panic!("expected timeout event"),
-        }
+        // Wait for timeout and retry
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut retry_ids: HashMap<DnsRecordType, u16> = HashMap::new();
         for _ in 0..2 {
@@ -899,112 +1091,5 @@ mod tests {
         );
 
         handle.abort();
-    }
-
-    // ========== IP Literal Tests ==========
-
-    #[tokio::test]
-    async fn emits_immediate_answer_for_ipv4_literal() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
-
-        cmd_tx
-            .send(DnsCommand::Resolve {
-                host: "192.168.1.100".to_string(),
-            })
-            .unwrap();
-
-        let detail = next_relevant_detail(&mut events_rx).await;
-        match detail {
-            DnsEventDetail::Answer(answer) => {
-                assert_eq!(answer.host, "192.168.1.100");
-                assert_eq!(answer.record_type, DnsRecordType::A);
-                assert_eq!(answer.records.len(), 1);
-                assert_eq!(
-                    answer.records[0].address,
-                    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))
-                );
-                assert_eq!(answer.records[0].ttl, u32::MAX);
-            }
-            _ => panic!("expected Answer event for IP literal"),
-        }
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn emits_immediate_answer_for_ipv6_literal() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
-
-        cmd_tx
-            .send(DnsCommand::Resolve {
-                host: "2001:db8::1".to_string(),
-            })
-            .unwrap();
-
-        let detail = next_relevant_detail(&mut events_rx).await;
-        match detail {
-            DnsEventDetail::Answer(answer) => {
-                assert_eq!(answer.host, "2001:db8::1");
-                assert_eq!(answer.record_type, DnsRecordType::Aaaa);
-                assert_eq!(answer.records.len(), 1);
-                assert!(answer.records[0].address.is_ipv6());
-                assert_eq!(answer.records[0].ttl, u32::MAX);
-            }
-            _ => panic!("expected Answer event for IPv6 literal"),
-        }
-
-        handle.abort();
-    }
-
-    // ========== Actor Lifecycle Tests ==========
-
-    #[tokio::test]
-    async fn spawn_returns_working_cmd_tx() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = socket.local_addr().unwrap();
-
-        let resolver = DnsResolver::new(server_addr, None, None, Duration::from_millis(50));
-        let probe = FakeRouteProbe::noop();
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, _handle) = resolver
-            .spawn(probe, event_tx)
-            .await
-            .expect("resolver spawn");
-
-        // Verify cmd_tx is functional
-        assert!(cmd_tx
-            .send(DnsCommand::Resolve {
-                host: "test.example".to_string()
-            })
-            .is_ok());
-    }
-
-    #[tokio::test]
-    async fn actor_exits_when_sender_dropped() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = socket.local_addr().unwrap();
-
-        let resolver = DnsResolver::new(server_addr, None, None, Duration::from_millis(50));
-        let probe = FakeRouteProbe::noop();
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, join_handle) = resolver
-            .spawn(probe, event_tx)
-            .await
-            .expect("resolver spawn");
-
-        // Drop sender to signal shutdown
-        drop(cmd_tx);
-
-        // Actor should exit gracefully (check both timeout and join result)
-        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
-        assert!(
-            matches!(result, Ok(Ok(Ok(())))),
-            "actor should shut down cleanly after sender dropped, got {:?}",
-            result
-        );
     }
 }
