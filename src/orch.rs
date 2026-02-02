@@ -1,16 +1,20 @@
-//! BareUDP-only runtime orchestration.
+//! Runtime orchestration for BareUDP and HTTP/3 transports.
 
 use crate::actor::{ActorError, ActorExitResult, ActorKind};
 use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareUdpTx};
 use crate::bind::DefaultRouteProbe;
-use crate::config::{parse_udp_uri, Config, Peer};
+use crate::config::{parse_h3_uri, parse_udp_uri, Config, Peer};
 use crate::dns::{DnsCommand, DnsResolver};
 use crate::events::{DnsEventDetail, Event, TransportEvent};
+use crate::h3::{
+    dial_h3, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3Connection, H3ListenerCommand,
+};
 use crate::route::{sync_tun_routes, RouteManagerHandle};
 use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -24,12 +28,22 @@ const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct BoundId(u64);
 
+/// Identifies the transport protocol for a bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportType {
+    BareUdp,
+    Http3,
+}
+
 /// A single active connection bound to a peer.
 #[derive(Debug)]
 struct BoundState {
     /// Unique identifier for tracking.
     #[allow(dead_code)]
     id: BoundId,
+    /// Transport kind for this bound.
+    #[allow(dead_code)]
+    transport: TransportType,
     /// Destination socket address.
     dest: SocketAddr,
     /// TX channel for sending packets.
@@ -76,15 +90,34 @@ pub enum OrchestratorError {
     /// BareUDP configuration is missing.
     #[error("bare runtime requires local.bare.listen to be set")]
     MissingBareListen,
+    /// HTTP/3 configuration is missing.
+    #[error("h3 runtime requires local.h3.listen to be set")]
+    MissingH3Listen,
     /// BareUDP listen URI failed validation.
     #[error("invalid bare listen uri: {0}")]
     InvalidBareListen(String),
+    /// HTTP/3 listen URI failed validation.
+    #[error("invalid h3 listen uri: {0}")]
+    InvalidH3Listen(String),
     /// BareUDP peer endpoint failed validation.
     #[error("peer '{peer_id}' bare.endpoint invalid: {reason}")]
     InvalidPeerEndpoint { peer_id: String, reason: String },
+    /// HTTP/3 peer endpoint failed validation.
+    #[error("peer '{peer_id}' h3.endpoints[{index}] invalid: {reason}")]
+    InvalidH3Endpoint {
+        peer_id: String,
+        index: usize,
+        reason: String,
+    },
     /// BareUDP listen host could not be resolved.
     #[error("failed to resolve bare listen host '{host}': {reason}")]
     ListenResolveFailed { host: String, reason: String },
+    /// HTTP/3 listener failed to start.
+    #[error("h3 listener failed: {0}")]
+    H3Listener(String),
+    /// HTTP/3 dial failed.
+    #[error("h3 dial to '{peer_id}' failed: {reason}")]
+    H3Dial { peer_id: String, reason: String },
     /// DNS resolver failed to initialize.
     #[error("dns resolver failed to initialize: {0}")]
     DnsInit(String),
@@ -108,11 +141,11 @@ pub enum OrchestratorError {
     TaskJoin(String),
 }
 
-/// BareUDP runtime orchestrator.
+/// Runtime orchestrator for BareUDP and HTTP/3 transports.
 ///
 /// Manages child actors with selective supervision:
-/// - Critical actors (TUN, BareUDP-Rx): failure causes immediate exit
-/// - Peer actors (BareUDP-Tx, H3): failure logged (reconnection deferred to future iteration)
+/// - Critical actors (TUN, BareUDP-Rx, H3-Listener): failure causes immediate exit
+/// - Peer actors (BareUDP-Tx, H3-Tx/Rx): failure logged (reconnection deferred to future iteration)
 pub struct Orchestrator {
     events_rx: mpsc::UnboundedReceiver<Event>,
     events_tx: mpsc::UnboundedSender<Event>,
@@ -121,6 +154,7 @@ pub struct Orchestrator {
     dns_refresh: Duration,
 
     // Runtime state
+    local_id: String,
     tun_if: String,
     #[allow(dead_code)]
     mtu: usize,
@@ -130,6 +164,13 @@ pub struct Orchestrator {
     bound_counter: u64,
     tun_cmd_tx: mpsc::UnboundedSender<TunRxCommand>,
     bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
+    /// H3 listener command sender (if listening).
+    #[allow(dead_code)]
+    h3_listener_cmd_tx: Option<mpsc::UnboundedSender<H3ListenerCommand>>,
+    /// H3 connection receiver for inbound connections.
+    h3_conn_rx: Option<mpsc::UnboundedReceiver<H3Connection>>,
+    /// Packet sender to TUN TX (for H3 RX actors).
+    tun_packet_tx: mpsc::Sender<Vec<u8>>,
 
     /// DNS resolver command sender for refresh commands.
     dns_cmd_tx: mpsc::UnboundedSender<DnsCommand>,
@@ -167,49 +208,34 @@ impl Orchestrator {
 
     /// Creates a new orchestrator from configuration.
     ///
-    /// Initializes TUN interface, BareUDP sockets, routing table, and spawns
-    /// child actors. Listen hostname is resolved synchronously; peer hostnames
-    /// are resolved asynchronously via the event loop.
+    /// Initializes TUN interface, transport listeners (BareUDP and/or H3),
+    /// routing table, and spawns child actors. Listen hostnames are resolved
+    /// synchronously; peer hostnames are resolved asynchronously via the event loop.
     ///
     /// # Errors
     ///
     /// Returns `OrchestratorError` when initialization fails.
     pub async fn new(config: Config) -> Result<Self, OrchestratorError> {
-        let local_bare = config
-            .local
-            .bare
-            .as_ref()
-            .ok_or(OrchestratorError::MissingBareListen)?;
-        let listen_endpoint =
-            parse_udp_uri(&local_bare.listen).map_err(OrchestratorError::InvalidBareListen)?;
-
+        let local_id = config.local.id.clone();
         let tun_if = config.local.tun.ifname.clone();
         let mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
         let tun_addrs = tun_prefixes(&config.local.tun.addrs)?;
 
-        // Resolve listen address synchronously (blocking for hostname)
-        let listen_addr = resolve_listen_addr(&listen_endpoint)?;
+        // At least one transport must be configured
+        let has_bare = config.local.bare.is_some();
+        let has_h3 = config.local.h3.is_some();
+        if !has_bare && !has_h3 {
+            return Err(OrchestratorError::MissingBareListen);
+        }
 
         // Setup TUN
         let (tun_reader, tun_writer) = tun::from_config(&config.local.tun)
             .await
             .map_err(|err| OrchestratorError::Tun(err.to_string()))?;
 
-        // Setup BareUDP RX
-        let bare_rx = BareUdpRx::from_config(listen_addr, mtu)
-            .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
-
         // Control plane: unbounded to prevent deadlocks from actor cycles.
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-
-        // Initialize unified peer state from config (enabled BareUDP peers only)
-        let peers: HashMap<String, PeerEntry> = config
-            .peers
-            .iter()
-            .filter(|p| p.enabled && p.bare.is_some())
-            .map(|p| (p.id.clone(), PeerEntry::new(p.clone())))
-            .collect();
 
         let mut join_set = JoinSet::new();
 
@@ -219,22 +245,72 @@ impl Orchestrator {
         // Spawn TUN actors - actors create their own command channels
         let (tun_cmd_tx, tun_rx_handle) =
             tun::spawn_tun_rx(tun_reader, routing, events_tx.clone(), METRICS_INTERVAL);
-        // TUN-Tx actor creates its own packet channel; returns sender for BareUDP-Rx to use
+        // TUN-Tx actor creates its own packet channel; returns sender for transports to use
         let (tun_packet_tx, tun_tx_handle) =
             tun::spawn_tun_tx(tun_writer, events_tx.clone(), METRICS_INTERVAL);
 
-        // BareUDP RX forwards received packets to TUN TX's packet channel
-        let (bare_rx_cmd_tx, bare_rx_handle) = spawn_udp_rx(
-            bare_rx,
-            std::collections::HashSet::new(),
-            tun_packet_tx,
-            events_tx.clone(),
-            METRICS_INTERVAL,
-        );
-
         join_set.spawn(tun_rx_handle);
         join_set.spawn(tun_tx_handle);
-        join_set.spawn(bare_rx_handle);
+
+        // Initialize BareUDP listener if configured
+        let bare_rx_cmd_tx = if let Some(local_bare) = config.local.bare.as_ref() {
+            let listen_endpoint =
+                parse_udp_uri(&local_bare.listen).map_err(OrchestratorError::InvalidBareListen)?;
+            let listen_addr = resolve_listen_addr(&listen_endpoint)?;
+
+            let bare_rx = BareUdpRx::from_config(listen_addr, mtu)
+                .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
+
+            let (cmd_tx, bare_rx_handle) = spawn_udp_rx(
+                bare_rx,
+                std::collections::HashSet::new(),
+                tun_packet_tx.clone(),
+                events_tx.clone(),
+                METRICS_INTERVAL,
+            );
+
+            join_set.spawn(bare_rx_handle);
+            Some(cmd_tx)
+        } else {
+            None
+        };
+
+        // Initialize H3 listener if configured
+        let (h3_listener_cmd_tx, h3_conn_rx) = if let Some(h3_cfg) = config.local.h3.as_ref() {
+            let listen_endpoint =
+                parse_h3_uri(&h3_cfg.listen).map_err(OrchestratorError::InvalidH3Listen)?;
+            let listen_addr = resolve_h3_listen_addr(&listen_endpoint)?;
+
+            let cert_path = Path::new(&h3_cfg.cert);
+            let key_path = Path::new(&h3_cfg.key);
+
+            // Build peer secrets map for authentication
+            let peer_secrets: HashMap<String, String> = config
+                .peers
+                .iter()
+                .filter(|p| p.enabled && p.h3.is_some())
+                .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().secret.clone()))
+                .collect();
+
+            let (conn_tx, conn_rx) = mpsc::unbounded_channel();
+            let (cmd_tx, listener_handle, _bound_addr) =
+                spawn_h3_listener(listen_addr, cert_path, key_path, peer_secrets, conn_tx)
+                    .await
+                    .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
+
+            join_set.spawn(listener_handle);
+            (Some(cmd_tx), Some(conn_rx))
+        } else {
+            (None, None)
+        };
+
+        // Initialize unified peer state from config (enabled peers with any transport)
+        let peers: HashMap<String, PeerEntry> = config
+            .peers
+            .iter()
+            .filter(|p| p.enabled && (p.bare.is_some() || p.h3.is_some()))
+            .map(|p| (p.id.clone(), PeerEntry::new(p.clone())))
+            .collect();
 
         let dns_refresh = Duration::from_secs(config.local.dns.refresh);
 
@@ -256,11 +332,9 @@ impl Orchestrator {
 
         join_set.spawn(handle);
 
-        if peers
-            .values()
-            .all(|e| !e.config.enabled || e.config.bare.is_none())
-        {
-            warn!("no active BareUDP peers; traffic will be dropped");
+        let has_active_peers = peers.values().any(|e| e.config.enabled);
+        if !has_active_peers {
+            warn!("no active peers; traffic will be dropped");
         }
 
         Ok(Self {
@@ -268,12 +342,16 @@ impl Orchestrator {
             events_tx,
             join_set,
             dns_refresh,
+            local_id,
             tun_if,
             mtu,
             peers,
             bound_counter: 0,
             tun_cmd_tx,
-            bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
+            bare_rx_cmd_tx,
+            h3_listener_cmd_tx,
+            h3_conn_rx,
+            tun_packet_tx,
             dns_cmd_tx,
             manage_routes,
             tun_addrs,
@@ -303,6 +381,14 @@ impl Orchestrator {
                 }
                 _ = dns_ticker.tick(), if !self.dns_refresh.is_zero() => {
                     self.refresh_dns().await;
+                }
+                Some(conn) = async {
+                    match self.h3_conn_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.handle_h3_inbound(conn).await;
                 }
                 result = self.join_set.join_next() => {
                     match result {
@@ -452,48 +538,110 @@ impl Orchestrator {
             if !entry.config.enabled {
                 continue;
             }
-            let Some(bare) = entry.config.bare.as_ref() else {
-                continue;
-            };
-            let Ok(endpoint) = parse_udp_uri(&bare.endpoint) else {
-                // Invalid endpoints were validated at startup; skip silently
-                continue;
-            };
 
-            // Check if this peer's hostname matches the DNS answer
-            if endpoint.host != answer.host {
-                continue;
+            // Handle BareUDP endpoints
+            if let Some(bare) = entry.config.bare.as_ref() {
+                let Ok(endpoint) = parse_udp_uri(&bare.endpoint) else {
+                    continue;
+                };
+
+                if endpoint.host == answer.host {
+                    for record in &answer.records {
+                        let destination = SocketAddr::new(record.address, endpoint.port);
+                        let entry = self.peers.get(&peer_id).unwrap();
+                        if entry.has_bound_for_ip(destination.ip()) {
+                            continue;
+                        }
+
+                        let bindif = entry.config.bare.as_ref().and_then(|b| b.bindif.as_deref());
+                        if let Some((packet_tx, tx_handle)) = spawn_bare_tx(
+                            &peer_id,
+                            destination,
+                            bindif,
+                            &self.tun_if,
+                            self.events_tx.clone(),
+                        )
+                        .await
+                        {
+                            let bound_id = self.next_bound_id();
+                            let entry = self.peers.get_mut(&peer_id).unwrap();
+                            entry.bounds.push(BoundState {
+                                id: bound_id,
+                                transport: TransportType::BareUdp,
+                                dest: destination,
+                                tx: packet_tx,
+                            });
+                            self.join_set.spawn(tx_handle);
+                            any_spawned = true;
+                        }
+                    }
+                }
             }
 
-            // Spawn TX actors for all resolved IPs
-            for record in &answer.records {
-                let destination = SocketAddr::new(record.address, endpoint.port);
-
-                // Check if already have a bound for this IP
+            // Handle H3 endpoints - collect dial targets first to avoid borrow conflicts
+            let h3_dial_targets: Vec<(SocketAddr, String, String, String, Option<String>, bool)> = {
                 let entry = self.peers.get(&peer_id).unwrap();
-                if entry.has_bound_for_ip(destination.ip()) {
+                let Some(h3) = entry.config.h3.as_ref() else {
                     continue;
-                }
+                };
 
-                // Spawn new bound
-                let bindif = entry.config.bare.as_ref().and_then(|b| b.bindif.as_deref());
-                if let Some((packet_tx, tx_handle)) = spawn_bare_tx(
-                    &peer_id,
-                    destination,
-                    bindif,
-                    &self.tun_if,
-                    self.events_tx.clone(),
-                )
-                .await
+                let mut targets = Vec::new();
+                for endpoint_uri in &h3.endpoints {
+                    let Ok(endpoint) = parse_h3_uri(endpoint_uri) else {
+                        continue;
+                    };
+
+                    // Strip IPv6 brackets for comparison
+                    let host = endpoint.host.trim_start_matches('[').trim_end_matches(']');
+
+                    if host != answer.host {
+                        continue;
+                    }
+
+                    for record in &answer.records {
+                        let destination = SocketAddr::new(record.address, endpoint.port);
+                        if entry.has_bound_for_ip(destination.ip()) {
+                            continue;
+                        }
+
+                        targets.push((
+                            destination,
+                            endpoint.host.clone(),
+                            endpoint.path.clone(),
+                            h3.secret.clone(),
+                            h3.ca.clone(),
+                            h3.insecure,
+                        ));
+                    }
+                }
+                targets
+            };
+
+            // Now dial H3 peers
+            for (destination, server_name, path, secret, ca_path, insecure) in h3_dial_targets {
+                if let Some((packet_tx, handles)) = self
+                    .spawn_h3_peer(
+                        &peer_id,
+                        destination,
+                        &server_name,
+                        &path,
+                        &secret,
+                        ca_path.as_deref(),
+                        insecure,
+                    )
+                    .await
                 {
                     let bound_id = self.next_bound_id();
                     let entry = self.peers.get_mut(&peer_id).unwrap();
                     entry.bounds.push(BoundState {
                         id: bound_id,
+                        transport: TransportType::Http3,
                         dest: destination,
                         tx: packet_tx,
                     });
-                    self.join_set.spawn(tx_handle);
+                    for handle in handles {
+                        self.join_set.spawn(handle);
+                    }
                     any_spawned = true;
                 }
             }
@@ -533,6 +681,138 @@ impl Orchestrator {
             }
         }
     }
+
+    /// Handles an inbound H3 connection from the listener.
+    ///
+    /// Spawns RX/TX actors for the authenticated peer and adds to routing.
+    async fn handle_h3_inbound(&mut self, conn: H3Connection) {
+        let peer_id = &conn.peer_id;
+        let remote_addr = conn.remote_addr;
+
+        // Check if peer is configured
+        if !self.peers.contains_key(peer_id) {
+            warn!(peer = %peer_id, addr = %remote_addr, "H3 inbound connection from unknown peer");
+            return;
+        }
+
+        // Check if already have a bound for this IP
+        let entry = self.peers.get(peer_id).unwrap();
+        if entry.has_bound_for_ip(remote_addr.ip()) {
+            debug!(peer = %peer_id, addr = %remote_addr, "H3 inbound: already have bound for this IP");
+            return;
+        }
+
+        debug!(peer = %peer_id, addr = %remote_addr, "H3 inbound connection accepted");
+
+        // Spawn RX/TX actors
+        let rx_handle = spawn_h3_rx(
+            peer_id.to_string(),
+            conn.datagram_rx,
+            self.tun_packet_tx.clone(),
+            self.events_tx.clone(),
+            METRICS_INTERVAL,
+        );
+
+        let (packet_tx, tx_handle) = spawn_h3_tx(
+            peer_id.to_string(),
+            conn.datagram_tx,
+            conn.flow_id,
+            self.events_tx.clone(),
+            METRICS_INTERVAL,
+        );
+
+        let bound_id = self.next_bound_id();
+        let entry = self.peers.get_mut(peer_id).unwrap();
+        entry.bounds.push(BoundState {
+            id: bound_id,
+            transport: TransportType::Http3,
+            dest: remote_addr,
+            tx: packet_tx,
+        });
+
+        self.join_set.spawn(rx_handle);
+        self.join_set.spawn(tx_handle);
+
+        // Update routing table
+        let peer_configs = self.peer_configs();
+        let peer_txs = self.peer_txs();
+        if let Ok(routing) = RoutingTable::from_peers(&peer_configs, &peer_txs) {
+            if let Err(e) = self
+                .tun_cmd_tx
+                .send(TunRxCommand::UpdateRouting { routing })
+            {
+                warn!(error = %e, "failed to send routing update command");
+            }
+        }
+
+        // Sync system routes if enabled
+        if self.manage_routes {
+            match collect_allowed_ips(&peer_configs) {
+                Ok(allowed) => {
+                    sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await;
+                }
+                Err(err) => warn!("route sync skipped: {err}"),
+            }
+        }
+    }
+
+    /// Spawns H3 TX/RX actors for a peer connection.
+    ///
+    /// Returns the packet sender and task handles, or None if dialing fails.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_h3_peer(
+        &self,
+        peer_id: &str,
+        dest: SocketAddr,
+        server_name: &str,
+        path: &str,
+        secret: &str,
+        ca_path: Option<&str>,
+        insecure: bool,
+    ) -> Option<(mpsc::Sender<Vec<u8>>, Vec<JoinHandle<ActorExitResult>>)> {
+        let probe = DefaultRouteProbe;
+        let conn = match dial_h3(
+            dest,
+            server_name,
+            path,
+            &self.local_id,
+            peer_id,
+            secret,
+            ca_path.map(Path::new),
+            None, // bindif - TODO: support H3 bindifs
+            Some(&self.tun_if),
+            &probe,
+            insecure,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(peer = %peer_id, addr = %dest, error = %e, "H3 dial failed");
+                return None;
+            }
+        };
+
+        debug!(peer = %peer_id, addr = %dest, "H3 connection established");
+
+        let rx_handle = spawn_h3_rx(
+            peer_id.to_string(),
+            conn.datagram_rx,
+            self.tun_packet_tx.clone(),
+            self.events_tx.clone(),
+            METRICS_INTERVAL,
+        );
+
+        let (packet_tx, tx_handle) = spawn_h3_tx(
+            peer_id.to_string(),
+            conn.datagram_tx,
+            conn.flow_id,
+            self.events_tx.clone(),
+            METRICS_INTERVAL,
+        );
+
+        Some((packet_tx, vec![rx_handle, tx_handle]))
+    }
 }
 
 /// Runs the BareUDP-only runtime until a task exits or shutdown signal.
@@ -546,7 +826,7 @@ pub async fn run_bare(config: Config) -> Result<(), OrchestratorError> {
     Orchestrator::new(config).await?.run().await
 }
 
-/// Resolves listen address, using synchronous DNS lookup for hostnames.
+/// Resolves BareUDP listen address, using synchronous DNS lookup for hostnames.
 fn resolve_listen_addr(
     listen: &crate::config::UdpEndpoint,
 ) -> Result<SocketAddr, OrchestratorError> {
@@ -574,6 +854,43 @@ fn resolve_listen_addr(
     if addrs.len() > 1 {
         warn!(
             "bare listen resolved multiple addresses for {}; using {}",
+            listen.host, addrs[0]
+        );
+    }
+    Ok(addrs[0])
+}
+
+/// Resolves H3 listen address, using synchronous DNS lookup for hostnames.
+fn resolve_h3_listen_addr(
+    listen: &crate::config::H3Endpoint,
+) -> Result<SocketAddr, OrchestratorError> {
+    // Handle IPv6 bracket notation (e.g., "[::1]" -> "::1")
+    let host = listen.host.trim_start_matches('[').trim_end_matches(']');
+
+    if let Some(ip) = parse_ip_literal(host) {
+        return Ok(SocketAddr::new(ip, listen.port));
+    }
+
+    // Synchronous DNS lookup for listen hostname
+    use std::net::ToSocketAddrs;
+    let addr_str = format!("{}:{}", host, listen.port);
+    let addrs: Vec<_> = addr_str
+        .to_socket_addrs()
+        .map_err(|err| OrchestratorError::ListenResolveFailed {
+            host: listen.host.clone(),
+            reason: err.to_string(),
+        })?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(OrchestratorError::ListenResolveFailed {
+            host: listen.host.clone(),
+            reason: "no resolved addresses".to_string(),
+        });
+    }
+    if addrs.len() > 1 {
+        warn!(
+            "h3 listen resolved multiple addresses for {}; using {}",
             listen.host, addrs[0]
         );
     }
@@ -655,6 +972,8 @@ fn parse_ip_literal(host: &str) -> Option<IpAddr> {
 
 /// Sends DNS resolve commands for all unique peer endpoint hostnames.
 ///
+/// Handles both BareUDP and H3 endpoints.
+///
 /// # Arguments
 ///
 /// * `peers` - Slice of peer configurations to process
@@ -662,8 +981,8 @@ fn parse_ip_literal(host: &str) -> Option<IpAddr> {
 ///
 /// # Errors
 ///
-/// Returns `OrchestratorError::InvalidPeerEndpoint` if any enabled peer
-/// has an invalid BareUDP endpoint URI.
+/// Returns `OrchestratorError::InvalidPeerEndpoint` or `OrchestratorError::InvalidH3Endpoint`
+/// if any enabled peer has an invalid endpoint URI.
 fn send_resolve_commands(
     peers: &[Peer],
     dns_cmd_tx: &mpsc::UnboundedSender<DnsCommand>,
@@ -674,23 +993,48 @@ fn send_resolve_commands(
         if !peer.enabled {
             continue;
         }
-        let bare = match peer.bare.as_ref() {
-            Some(b) => b,
-            None => continue,
-        };
-        let endpoint = parse_udp_uri(&bare.endpoint).map_err(|err| {
-            OrchestratorError::InvalidPeerEndpoint {
-                peer_id: peer.id.clone(),
-                reason: err,
-            }
-        })?;
 
-        // Send resolve command only once per hostname (deduplication)
-        if seen_hosts.insert(endpoint.host.clone()) {
-            if let Err(e) = dns_cmd_tx.send(DnsCommand::Resolve {
-                host: endpoint.host.clone(),
-            }) {
-                warn!(host = %endpoint.host, error = %e, "dns: resolver channel closed");
+        // Handle BareUDP endpoints
+        if let Some(bare) = peer.bare.as_ref() {
+            let endpoint = parse_udp_uri(&bare.endpoint).map_err(|err| {
+                OrchestratorError::InvalidPeerEndpoint {
+                    peer_id: peer.id.clone(),
+                    reason: err,
+                }
+            })?;
+
+            if seen_hosts.insert(endpoint.host.clone()) {
+                if let Err(e) = dns_cmd_tx.send(DnsCommand::Resolve {
+                    host: endpoint.host.clone(),
+                }) {
+                    warn!(host = %endpoint.host, error = %e, "dns: resolver channel closed");
+                }
+            }
+        }
+
+        // Handle H3 endpoints
+        if let Some(h3) = peer.h3.as_ref() {
+            for (idx, endpoint_uri) in h3.endpoints.iter().enumerate() {
+                let endpoint = parse_h3_uri(endpoint_uri).map_err(|err| {
+                    OrchestratorError::InvalidH3Endpoint {
+                        peer_id: peer.id.clone(),
+                        index: idx,
+                        reason: err,
+                    }
+                })?;
+
+                // Strip IPv6 brackets for DNS resolution
+                let host = endpoint
+                    .host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_string();
+
+                if seen_hosts.insert(host.clone()) {
+                    if let Err(e) = dns_cmd_tx.send(DnsCommand::Resolve { host: host.clone() }) {
+                        warn!(host = %host, error = %e, "dns: resolver channel closed");
+                    }
+                }
             }
         }
     }
@@ -758,6 +1102,7 @@ mod test_support {
                 self.bound_counter += 1;
                 entry.bounds.push(BoundState {
                     id: BoundId(self.bound_counter),
+                    transport: TransportType::BareUdp,
                     dest,
                     tx,
                 });
@@ -774,18 +1119,23 @@ mod test_support {
             let (tun_cmd_tx, tun_cmd_rx) = mpsc::unbounded_channel();
             let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel();
             let (dns_cmd_tx, dns_cmd_rx) = mpsc::unbounded_channel();
+            let (tun_packet_tx, _tun_packet_rx) = mpsc::channel(1);
 
             let orch = Orchestrator {
                 events_rx,
                 events_tx: events_tx.clone(),
                 join_set: JoinSet::new(),
                 dns_refresh: self.dns_refresh,
+                local_id: "test-local".to_string(),
                 tun_if: self.tun_if,
                 mtu: self.mtu,
                 peers: self.peers,
                 bound_counter: self.bound_counter,
                 tun_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
+                h3_listener_cmd_tx: None,
+                h3_conn_rx: None,
+                tun_packet_tx,
                 dns_cmd_tx,
                 manage_routes: self.manage_routes,
                 tun_addrs: self.tun_addrs,
@@ -835,6 +1185,7 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         entry.bounds.push(BoundState {
             id: BoundId(1),
+            transport: TransportType::BareUdp,
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx: tx1,
         });
@@ -847,6 +1198,7 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         entry.bounds.push(BoundState {
             id: BoundId(2),
+            transport: TransportType::BareUdp,
             dest: "5.6.7.8:5353".parse().unwrap(),
             tx: tx2,
         });

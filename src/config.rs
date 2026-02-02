@@ -443,6 +443,17 @@ pub struct UdpEndpoint {
     pub port: u16,
 }
 
+/// Represents an HTTP/3 endpoint parsed from an `https://` URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H3Endpoint {
+    /// Host portion of the URI (domain or IP literal).
+    pub host: String,
+    /// Port number of the endpoint (defaults to 443 if not specified).
+    pub port: u16,
+    /// Path portion of the URI.
+    pub path: String,
+}
+
 /// Parses a UDP DNS server URI (e.g., `udp://1.1.1.1:53`) into a socket address, enforcing IP literals.
 pub fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
     let url = Url::parse(raw).map_err(|e| e.to_string())?;
@@ -470,6 +481,49 @@ pub fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
     }
 
     Ok(SocketAddr::new(ip, port))
+}
+
+/// Parses an HTTP/3 URI (e.g., `https://host:443/path`) into host, port, and path components.
+///
+/// # Arguments
+///
+/// * `raw` - The URI string to parse.
+///
+/// # Returns
+///
+/// Returns an `H3Endpoint` with the parsed components. Port defaults to 443 if not specified.
+///
+/// # Errors
+///
+/// Returns an error if the URI is invalid, uses a non-https scheme, or is missing a host.
+pub fn parse_h3_uri(raw: &str) -> Result<H3Endpoint, String> {
+    let url = Url::parse(raw).map_err(|e| e.to_string())?;
+
+    if url.scheme() != "https" {
+        return Err("scheme must be https".to_string());
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("userinfo is not supported".to_string());
+    }
+
+    let host = url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| "host is required".to_string())?;
+
+    let port = url.port().unwrap_or(443);
+    let path = url.path().to_string();
+
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("query and fragment are not supported".to_string());
+    }
+
+    Ok(H3Endpoint {
+        host: host.to_string(),
+        port,
+        path,
+    })
 }
 
 /// Parses a UDP URI (e.g., `udp://host:6635`) into host and port components.
@@ -920,5 +974,61 @@ peers:
         let endpoint = parse_udp_uri("udp://example.com:6635").expect("udp uri should parse");
         assert_eq!(endpoint.host, "example.com");
         assert_eq!(endpoint.port, 6635);
+    }
+
+    // ========== parse_h3_uri tests ==========
+
+    #[test]
+    fn parse_h3_uri_accepts_full_uri() {
+        let endpoint = parse_h3_uri("https://example.com:8443/path").expect("should parse");
+        assert_eq!(endpoint.host, "example.com");
+        assert_eq!(endpoint.port, 8443);
+        assert_eq!(endpoint.path, "/path");
+    }
+
+    #[test]
+    fn parse_h3_uri_defaults_port_443() {
+        let endpoint = parse_h3_uri("https://example.com/path").expect("should parse");
+        assert_eq!(endpoint.port, 443);
+    }
+
+    #[test]
+    fn parse_h3_uri_rejects_http() {
+        let result = parse_h3_uri("http://example.com/path");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("https"));
+    }
+
+    #[test]
+    fn parse_h3_uri_rejects_invalid_uri() {
+        let result = parse_h3_uri("not-a-valid-uri");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_h3_uri_rejects_userinfo() {
+        let result = parse_h3_uri("https://user:pass@example.com/path");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("userinfo"));
+    }
+
+    #[test]
+    fn parse_h3_uri_rejects_query() {
+        let result = parse_h3_uri("https://example.com/path?query=1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("query"));
+    }
+
+    #[test]
+    fn parse_h3_uri_accepts_ipv6_host() {
+        let endpoint = parse_h3_uri("https://[::1]:8443/path").expect("should parse");
+        assert_eq!(endpoint.host, "[::1]");
+        assert_eq!(endpoint.port, 8443);
+    }
+
+    #[test]
+    fn parse_h3_uri_accepts_root_path() {
+        let endpoint = parse_h3_uri("https://example.com/").expect("should parse");
+        assert_eq!(endpoint.path, "/");
     }
 }
