@@ -59,6 +59,7 @@ path = "src/main.rs"
 [[test]]
 name = "integration"
 path = "tests/integration/main.rs"
+required-features = ["test-utils"]
 
 [[test]]
 name = "e2e"

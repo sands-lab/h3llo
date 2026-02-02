@@ -529,29 +529,12 @@ impl From<RecordType> for DnsRecordType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bind::RouteProbeError;
+    use crate::bind::test_support::FakeRouteProbe;
     use hickory_proto::rr::rdata::{A, AAAA, TXT};
     use hickory_proto::rr::Record;
     use std::collections::HashMap;
     use std::net::Ipv4Addr;
     use std::net::Ipv6Addr;
-
-    /// Route probe stub for DNS tests.
-    #[derive(Clone)]
-    struct FakeRouteProbe {
-        result: Result<Vec<String>, RouteProbeError>,
-    }
-
-    impl RouteProbe for FakeRouteProbe {
-        /// Returns the configured probe result.
-        async fn probe_interfaces(
-            &self,
-            _target: &str,
-            _tun_if: Option<&str>,
-        ) -> Result<Vec<String>, RouteProbeError> {
-            self.result.clone()
-        }
-    }
 
     /// Starts a resolver coroutine wired to the provided server socket.
     async fn start_resolver(
@@ -564,9 +547,7 @@ mod tests {
     ) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let resolver = DnsResolver::new(server, bindif, None, Duration::from_millis(50));
-        let probe = FakeRouteProbe {
-            result: Ok(Vec::new()),
-        };
+        let probe = FakeRouteProbe::noop();
         let (cmd_tx, handle) = resolver
             .spawn(probe, event_tx)
             .await
@@ -987,9 +968,7 @@ mod tests {
         let server_addr = socket.local_addr().unwrap();
 
         let resolver = DnsResolver::new(server_addr, None, None, Duration::from_millis(50));
-        let probe = FakeRouteProbe {
-            result: Ok(Vec::new()),
-        };
+        let probe = FakeRouteProbe::noop();
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, _handle) = resolver
             .spawn(probe, event_tx)
@@ -1010,9 +989,7 @@ mod tests {
         let server_addr = socket.local_addr().unwrap();
 
         let resolver = DnsResolver::new(server_addr, None, None, Duration::from_millis(50));
-        let probe = FakeRouteProbe {
-            result: Ok(Vec::new()),
-        };
+        let probe = FakeRouteProbe::noop();
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, join_handle) = resolver
             .spawn(probe, event_tx)

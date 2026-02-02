@@ -560,15 +560,57 @@ fn ifindex_to_name(ifindex: u32) -> io::Result<String> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tracing_test::traced_test;
+// ============================================================================
+// Test utilities (feature-gated)
+// ============================================================================
+
+/// Route probe test doubles for testing.
+///
+/// Available when compiled with `--features test-utils` or in test builds.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
+    use super::{RouteProbe, RouteProbeError};
 
     /// Test double that returns a fixed probe result.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use h3llo::test_utils::FakeRouteProbe;
+    ///
+    /// // Returns empty interfaces (most common case)
+    /// let probe = FakeRouteProbe::noop();
+    ///
+    /// // Returns specific interfaces
+    /// let probe = FakeRouteProbe::ok(vec!["eth0".to_string()]);
+    ///
+    /// // Returns an error
+    /// let probe = FakeRouteProbe::error(RouteProbeError::Probe("test error".into()));
+    /// ```
     #[derive(Clone)]
-    struct FakeRouteProbe {
+    pub struct FakeRouteProbe {
         result: Result<Vec<String>, RouteProbeError>,
+    }
+
+    impl FakeRouteProbe {
+        /// Creates a probe returning the given interfaces.
+        pub fn ok(interfaces: Vec<String>) -> Self {
+            Self {
+                result: Ok(interfaces),
+            }
+        }
+
+        /// Creates a probe returning empty interfaces (no-op behavior).
+        ///
+        /// This is the most common case for tests that don't need interface binding.
+        pub fn noop() -> Self {
+            Self::ok(Vec::new())
+        }
+
+        /// Creates a probe returning the given error.
+        pub fn error(err: RouteProbeError) -> Self {
+            Self { result: Err(err) }
+        }
     }
 
     impl RouteProbe for FakeRouteProbe {
@@ -580,6 +622,13 @@ mod tests {
             self.result.clone()
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_support::FakeRouteProbe;
+    use tracing_test::traced_test;
 
     #[test]
     fn filters_interfaces_by_preference() {
@@ -599,9 +648,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn select_bind_interface_logs_warning_on_empty_results() {
-        let probe = FakeRouteProbe {
-            result: Ok(Vec::new()),
-        };
+        let probe = FakeRouteProbe::noop();
         let iface =
             select_bind_interface(IpAddr::V4("1.1.1.1".parse().unwrap()), None, None, &probe).await;
         assert!(iface.is_none());
@@ -612,9 +659,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn select_bind_interface_logs_warning_on_missing_preference() {
-        let probe = FakeRouteProbe {
-            result: Ok(vec!["eth0".to_string(), "eth1".to_string()]),
-        };
+        let probe = FakeRouteProbe::ok(vec!["eth0".to_string(), "eth1".to_string()]);
         let iface = select_bind_interface(
             IpAddr::V4("8.8.4.4".parse().unwrap()),
             None,
@@ -631,9 +676,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn select_bind_interface_logs_warning_on_ambiguity() {
-        let probe = FakeRouteProbe {
-            result: Ok(vec!["eth0".to_string(), "eth1".to_string()]),
-        };
+        let probe = FakeRouteProbe::ok(vec!["eth0".to_string(), "eth1".to_string()]);
         let iface =
             select_bind_interface(IpAddr::V4("8.8.8.8".parse().unwrap()), None, None, &probe).await;
         assert_eq!(iface.as_deref(), Some("eth0"));
@@ -644,9 +687,7 @@ mod tests {
     #[traced_test]
     #[tokio::test]
     async fn select_bind_interface_logs_warning_on_probe_error() {
-        let probe = FakeRouteProbe {
-            result: Err(RouteProbeError::Probe("boom".into())),
-        };
+        let probe = FakeRouteProbe::error(RouteProbeError::Probe("boom".into()));
         let iface =
             select_bind_interface(IpAddr::V4("9.9.9.9".parse().unwrap()), None, None, &probe).await;
         assert!(iface.is_none());
@@ -764,9 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn make_client_udp_socket_skips_probe_for_localhost() {
-        let probe = FakeRouteProbe {
-            result: Err(RouteProbeError::Probe("should not be called".into())),
-        };
+        let probe = FakeRouteProbe::error(RouteProbeError::Probe("should not be called".into()));
 
         let result = make_client_udp_socket(
             SocketAddr::from(([127, 0, 0, 1], 12345)),
@@ -788,7 +827,7 @@ mod tests {
 
     #[tokio::test]
     async fn make_client_udp_socket_creates_connected_socket() {
-        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let probe = FakeRouteProbe::noop();
         let result = make_client_udp_socket(
             SocketAddr::from(([127, 0, 0, 1], 54321)),
             None,
@@ -808,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn make_client_udp_socket_ipv4_creates_ipv4_socket() {
-        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let probe = FakeRouteProbe::noop();
         let result =
             make_client_udp_socket(SocketAddr::from(([127, 0, 0, 1], 53)), None, None, &probe)
                 .await;
@@ -819,7 +858,7 @@ mod tests {
 
     #[tokio::test]
     async fn make_client_udp_socket_ipv6_creates_ipv6_socket() {
-        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let probe = FakeRouteProbe::noop();
         let result = make_client_udp_socket(
             SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 53)),
             None,

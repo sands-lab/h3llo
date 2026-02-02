@@ -15,27 +15,13 @@ const RESOLVER_TIMEOUT: Duration = Duration::from_secs(5);
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 use h3llo::actor::ActorExitResult;
-use h3llo::bind::{RouteProbe, RouteProbeError};
 use h3llo::dns::{DnsCommand, DnsResolver};
 use h3llo::events::{DnsAnswer, DnsAnswerWarning, DnsEventDetail, DnsRecordType, Event};
+use h3llo::test_utils::FakeRouteProbe;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::mpsc;
-
-/// NoopProbe returns empty interfaces -- DNS tests don't need interface binding.
-#[derive(Clone)]
-struct NoopProbe;
-
-impl RouteProbe for NoopProbe {
-    async fn probe_interfaces(
-        &self,
-        _target: &str,
-        _tun_if: Option<&str>,
-    ) -> Result<Vec<String>, RouteProbeError> {
-        Ok(Vec::new())
-    }
-}
 
 /// CoreDNS Corefile using the `file` plugin for deterministic zone resolution.
 const COREFILE: &str = r#"test.h3llo:53 {
@@ -104,7 +90,7 @@ async fn spawn_resolver(
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let resolver = DnsResolver::new(server, None, None, timeout);
     let (cmd_tx, handle) = resolver
-        .spawn(NoopProbe, event_tx)
+        .spawn(FakeRouteProbe::noop(), event_tx)
         .await
         .expect("resolver spawn failed");
     (cmd_tx, event_rx, handle)

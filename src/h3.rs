@@ -850,26 +850,7 @@ pub async fn spawn_h3_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bind::RouteProbeError;
-
-    // ========== Test Doubles ==========
-
-    /// Test double that returns a fixed probe result.
-    /// For H3 loopback tests, use `FakeRouteProbe { result: Ok(vec![]) }`.
-    #[derive(Clone)]
-    struct FakeRouteProbe {
-        result: Result<Vec<String>, RouteProbeError>,
-    }
-
-    impl RouteProbe for FakeRouteProbe {
-        async fn probe_interfaces(
-            &self,
-            _target: &str,
-            _tun_if: Option<&str>,
-        ) -> Result<Vec<String>, RouteProbeError> {
-            self.result.clone()
-        }
-    }
+    use crate::bind::test_support::FakeRouteProbe;
 
     // ========== Auth Helper Tests ==========
 
@@ -1204,7 +1185,7 @@ mod tests {
         // Give listener time to bind
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let probe = FakeRouteProbe::noop();
         let client_result = dial_h3(
             bound_addr,
             "localhost",
@@ -1260,7 +1241,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let probe = FakeRouteProbe::noop();
         let result = dial_h3(
             bound_addr,
             "localhost",
@@ -1313,7 +1294,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let probe = FakeRouteProbe::noop();
         let result = dial_h3(
             bound_addr,
             "localhost",
@@ -1363,7 +1344,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let probe = FakeRouteProbe::noop();
         let client_conn = dial_h3(
             bound_addr,
             "localhost",
@@ -1451,7 +1432,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let probe = FakeRouteProbe::noop();
         let client_conn = dial_h3(
             bound_addr,
             "localhost",
@@ -1558,7 +1539,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let probe = FakeRouteProbe { result: Ok(vec![]) };
+        let probe = FakeRouteProbe::noop();
         let _client_conn = dial_h3(
             bound_addr,
             "localhost",
