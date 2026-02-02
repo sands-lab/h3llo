@@ -776,6 +776,7 @@ impl Orchestrator {
             server_name,
             path,
             &self.local_id,
+            peer_id,
             secret,
             ca_path.map(Path::new),
             None, // bindif - TODO: support H3 bindifs

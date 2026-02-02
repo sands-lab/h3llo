@@ -154,23 +154,28 @@ async fn test_two_node_h3_tunnel() {
     let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), "node-b-h3");
 
     // Create config files
+    // Note: local_id must match the peer_id configured on the remote node
+    // (i.e., node-a's local_id = node-b's peer_id for node-a)
+    // The secret must match cross-wise: Node_A.peers[B].secret == Node_B.peers[A].secret
+    // This is because client sends peers[target].secret, server validates with peers[client].secret
+    let shared_secret = "shared-tunnel-secret";
     let node_a_config = h3_node_config(
-        "node-a-h3-local",
+        "node-a-h3",
         "10.0.0.1",
         "node-b-h3",
         "https://node-b-h3.h3llo-test-net:443/",
-        "node-b-h3-secret-token",
+        shared_secret,
         "10.0.0.2/32",
         "/certs/cert.pem",
         "/certs/key.pem",
     );
 
     let node_b_config = h3_node_config(
-        "node-b-h3-local",
+        "node-b-h3",
         "10.0.0.2",
         "node-a-h3",
         "https://node-a-h3.h3llo-test-net:443/",
-        "node-a-h3-secret-token",
+        shared_secret,
         "10.0.0.1/32",
         "/certs/cert.pem",
         "/certs/key.pem",

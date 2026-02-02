@@ -375,6 +375,7 @@ pub async fn dial_h3<P: RouteProbe>(
     server_name: &str,
     path: &str,
     local_id: &str,
+    peer_id: &str,
     peer_secret: &str,
     ca_cert_path: Option<&Path>,
     bindif: Option<&str>,
@@ -382,7 +383,7 @@ pub async fn dial_h3<P: RouteProbe>(
     probe: &P,
     insecure_skip_verify: bool,
 ) -> Result<H3Connection, DialError> {
-    debug!(%remote_addr, %server_name, %local_id, "dialing H3 endpoint");
+    debug!(%remote_addr, %server_name, %local_id, %peer_id, "dialing H3 endpoint");
 
     // Create connected socket with route probing
     let socket = make_client_udp_socket(remote_addr, tun_if, bindif, probe)
@@ -528,7 +529,7 @@ pub async fn dial_h3<P: RouteProbe>(
     let (datagram_tx, datagram_rx, flow_id) = handshake_result;
 
     Ok(H3Connection {
-        peer_id: local_id.to_string(),
+        peer_id: peer_id.to_string(),
         remote_addr,
         datagram_tx,
         datagram_rx,
@@ -1198,6 +1199,7 @@ mod tests {
             "localhost",
             "/.well-known/masque/udp/*/*/",
             peer_id,
+            peer_id,
             secret,
             None,
             None,
@@ -1253,6 +1255,7 @@ mod tests {
             "localhost",
             "/.well-known/masque/udp/*/*/",
             "test-client",
+            "test-client",
             "wrong-secret",
             None,
             None,
@@ -1305,6 +1308,7 @@ mod tests {
             "localhost",
             "/.well-known/masque/udp/*/*/",
             "unknown-peer",
+            "unknown-peer",
             "any-secret",
             None,
             None,
@@ -1353,6 +1357,7 @@ mod tests {
             bound_addr,
             "localhost",
             "/.well-known/masque/udp/*/*/",
+            peer_id,
             peer_id,
             secret,
             None,
@@ -1440,6 +1445,7 @@ mod tests {
             bound_addr,
             "localhost",
             "/.well-known/masque/udp/*/*/",
+            peer_id,
             peer_id,
             secret,
             None,
@@ -1546,6 +1552,7 @@ mod tests {
             bound_addr,
             "localhost",
             "/.well-known/masque/udp/*/*/",
+            peer_id,
             peer_id,
             secret,
             None,
