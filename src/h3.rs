@@ -13,7 +13,8 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_basic_auth, validate_connect_auth};
-use crate::bind::{make_client_udp_socket, RouteProbe};
+use crate::bind::{make_client_udp_socket, resolve_listen_addr, RouteProbe};
+use crate::config::{parse_h3_uri, LocalH3, Peer};
 use crate::events::{Direction, Event, TransportEvent, TransportKind};
 use crate::metrics::TransportCounters;
 use crate::PACKET_QUEUE_DEPTH;
@@ -21,7 +22,7 @@ use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -327,6 +328,134 @@ pub enum ListenerError {
     /// TLS setup failed.
     #[error("tls failed: {0}")]
     Tls(String),
+    /// Listen URI parsing failed.
+    #[error("invalid listen uri: {0}")]
+    InvalidUri(String),
+    /// Address resolution failed.
+    #[error("address resolution failed for '{host}': {reason}")]
+    ResolveFailed {
+        /// Hostname that failed to resolve.
+        host: String,
+        /// Reason for resolution failure.
+        reason: String,
+    },
+    /// Certificate or key path is missing.
+    #[error("cert and key paths are required when listen is configured")]
+    MissingCredentials,
+}
+
+// ========== H3 Listener Config ==========
+
+/// Pre-validated configuration for H3 listener spawning.
+///
+/// Created via [`H3ListenerConfig::from_config`] which performs URI parsing, address resolution,
+/// and peer secrets extraction. Follows the DNS resolver pattern where config
+/// parsing is encapsulated within the module.
+#[derive(Debug)]
+pub struct H3ListenerConfig {
+    /// Resolved listen socket address.
+    pub listen_addr: SocketAddr,
+    /// Path to TLS certificate file.
+    pub cert_path: PathBuf,
+    /// Path to TLS private key file.
+    pub key_path: PathBuf,
+    /// Peer ID to secret mapping for authentication.
+    pub peer_secrets: HashMap<String, String>,
+}
+
+impl H3ListenerConfig {
+    /// Builds listener configuration from local H3 config and peer list.
+    ///
+    /// Performs URI parsing, address resolution, and peer secrets extraction.
+    /// Returns `None` if no listener is configured (dial-only mode).
+    ///
+    /// # Arguments
+    ///
+    /// * `local_h3` - Local H3 configuration with optional listen URI, cert, and key paths.
+    /// * `peers` - Peer configurations for extracting H3-enabled peer secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ListenerError`] if URI parsing, resolution, or credential validation fails.
+    pub fn from_config(local_h3: &LocalH3, peers: &[Peer]) -> Result<Option<Self>, ListenerError> {
+        // Check if listener is configured
+        let listen_uri = match local_h3.listen.as_ref().filter(|l| !l.trim().is_empty()) {
+            Some(uri) => uri,
+            None => return Ok(None), // Dial-only mode
+        };
+
+        // Parse URI
+        let endpoint = parse_h3_uri(listen_uri).map_err(ListenerError::InvalidUri)?;
+
+        // Resolve address
+        let listen_addr = resolve_listen_addr(&endpoint.host, endpoint.port).map_err(|reason| {
+            ListenerError::ResolveFailed {
+                host: endpoint.host.clone(),
+                reason,
+            }
+        })?;
+
+        // Validate credentials are present
+        let cert_path = local_h3
+            .cert
+            .as_ref()
+            .filter(|c| !c.trim().is_empty())
+            .map(PathBuf::from)
+            .ok_or(ListenerError::MissingCredentials)?;
+
+        let key_path = local_h3
+            .key
+            .as_ref()
+            .filter(|k| !k.trim().is_empty())
+            .map(PathBuf::from)
+            .ok_or(ListenerError::MissingCredentials)?;
+
+        // Build peer secrets map for authentication
+        let peer_secrets: HashMap<String, String> = peers
+            .iter()
+            .filter(|p| p.enabled && p.h3.is_some())
+            .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().secret.clone()))
+            .collect();
+
+        Ok(Some(Self {
+            listen_addr,
+            cert_path,
+            key_path,
+            peer_secrets,
+        }))
+    }
+
+    /// Spawns the H3 listener actor with pre-validated configuration.
+    ///
+    /// Consumes self and delegates to [`spawn_h3_listener`] with extracted fields.
+    ///
+    /// # Arguments
+    ///
+    /// * `conn_tx` - Channel sender for notifying orchestrator of new connections.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ListenerError`] if socket binding or TLS setup fails.
+    pub async fn spawn(
+        self,
+        conn_tx: mpsc::UnboundedSender<H3Connection>,
+    ) -> Result<
+        (
+            mpsc::UnboundedSender<H3ListenerCommand>,
+            JoinHandle<ActorExitResult>,
+            SocketAddr,
+        ),
+        ListenerError,
+    > {
+        spawn_h3_listener(
+            self.listen_addr,
+            &self.cert_path,
+            &self.key_path,
+            self.peer_secrets,
+            conn_tx,
+        )
+        .await
+    }
 }
 
 // ========== Connection Handle ==========
@@ -1019,6 +1148,180 @@ mod tests {
         let err = ListenerError::Tls("cert expired".to_string());
         assert!(err.to_string().contains("tls"));
         assert!(err.to_string().contains("cert expired"));
+
+        let err = ListenerError::InvalidUri("bad uri".to_string());
+        assert!(err.to_string().contains("invalid listen uri"));
+        assert!(err.to_string().contains("bad uri"));
+
+        let err = ListenerError::ResolveFailed {
+            host: "example.com".to_string(),
+            reason: "dns timeout".to_string(),
+        };
+        assert!(err.to_string().contains("example.com"));
+        assert!(err.to_string().contains("dns timeout"));
+
+        let err = ListenerError::MissingCredentials;
+        assert!(err.to_string().contains("cert and key"));
+    }
+
+    // ========== H3ListenerConfig Tests ==========
+
+    #[test]
+    fn h3_listener_config_returns_none_when_listen_empty() {
+        use crate::config::LocalH3;
+
+        let h3_cfg = LocalH3 {
+            listen: None,
+            cert: Some("cert.pem".to_string()),
+            key: Some("key.pem".to_string()),
+            admin: None,
+        };
+
+        let result = H3ListenerConfig::from_config(&h3_cfg, &[]);
+        assert!(
+            result.unwrap().is_none(),
+            "should return None for dial-only mode"
+        );
+    }
+
+    #[test]
+    fn h3_listener_config_returns_none_when_listen_whitespace() {
+        use crate::config::LocalH3;
+
+        let h3_cfg = LocalH3 {
+            listen: Some("   ".to_string()),
+            cert: Some("cert.pem".to_string()),
+            key: Some("key.pem".to_string()),
+            admin: None,
+        };
+
+        let result = H3ListenerConfig::from_config(&h3_cfg, &[]);
+        assert!(
+            result.unwrap().is_none(),
+            "should return None for whitespace-only listen"
+        );
+    }
+
+    #[test]
+    fn h3_listener_config_fails_missing_cert() {
+        use crate::config::LocalH3;
+
+        let h3_cfg = LocalH3 {
+            listen: Some("https://127.0.0.1:4433/".to_string()),
+            cert: None,
+            key: Some("key.pem".to_string()),
+            admin: None,
+        };
+
+        let result = H3ListenerConfig::from_config(&h3_cfg, &[]);
+        assert!(matches!(result, Err(ListenerError::MissingCredentials)));
+    }
+
+    #[test]
+    fn h3_listener_config_fails_missing_key() {
+        use crate::config::LocalH3;
+
+        let h3_cfg = LocalH3 {
+            listen: Some("https://127.0.0.1:4433/".to_string()),
+            cert: Some("cert.pem".to_string()),
+            key: None,
+            admin: None,
+        };
+
+        let result = H3ListenerConfig::from_config(&h3_cfg, &[]);
+        assert!(matches!(result, Err(ListenerError::MissingCredentials)));
+    }
+
+    #[test]
+    fn h3_listener_config_parses_valid_config() {
+        use crate::config::{LocalH3, Peer, PeerH3, PeerTun};
+
+        let h3_cfg = LocalH3 {
+            listen: Some("https://127.0.0.1:4433/".to_string()),
+            cert: Some("cert.pem".to_string()),
+            key: Some("key.pem".to_string()),
+            admin: None,
+        };
+
+        let peers = vec![
+            Peer {
+                id: "peer1".to_string(),
+                enabled: true,
+                h3: Some(PeerH3 {
+                    endpoints: vec!["https://peer1.example.com:4433/".to_string()],
+                    secret: "secret1".to_string(),
+                    ca: None,
+                    insecure: false,
+                    bindif: None,
+                }),
+                bare: None,
+                tun: PeerTun {
+                    allowed_ips: vec!["10.0.0.0/24".to_string()],
+                },
+            },
+            Peer {
+                id: "peer2".to_string(),
+                enabled: false, // disabled, should not be included
+                h3: Some(PeerH3 {
+                    endpoints: vec!["https://peer2.example.com:4433/".to_string()],
+                    secret: "secret2".to_string(),
+                    ca: None,
+                    insecure: false,
+                    bindif: None,
+                }),
+                bare: None,
+                tun: PeerTun {
+                    allowed_ips: vec!["10.0.1.0/24".to_string()],
+                },
+            },
+        ];
+
+        let result = H3ListenerConfig::from_config(&h3_cfg, &peers)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.listen_addr, "127.0.0.1:4433".parse().unwrap());
+        assert_eq!(result.cert_path, PathBuf::from("cert.pem"));
+        assert_eq!(result.key_path, PathBuf::from("key.pem"));
+        assert_eq!(result.peer_secrets.len(), 1);
+        assert_eq!(
+            result.peer_secrets.get("peer1"),
+            Some(&"secret1".to_string())
+        );
+    }
+
+    #[test]
+    fn h3_listener_config_fails_invalid_uri() {
+        use crate::config::LocalH3;
+
+        let h3_cfg = LocalH3 {
+            listen: Some("not-a-valid-uri".to_string()),
+            cert: Some("cert.pem".to_string()),
+            key: Some("key.pem".to_string()),
+            admin: None,
+        };
+
+        let result = H3ListenerConfig::from_config(&h3_cfg, &[]);
+        assert!(matches!(result, Err(ListenerError::InvalidUri(_))));
+    }
+
+    #[test]
+    fn h3_listener_config_parses_ipv6_address() {
+        use crate::config::LocalH3;
+
+        let h3_cfg = LocalH3 {
+            listen: Some("https://[::1]:4433/".to_string()),
+            cert: Some("cert.pem".to_string()),
+            key: Some("key.pem".to_string()),
+            admin: None,
+        };
+
+        let result = H3ListenerConfig::from_config(&h3_cfg, &[])
+            .unwrap()
+            .unwrap();
+
+        assert!(result.listen_addr.ip().is_ipv6());
+        assert_eq!(result.listen_addr.port(), 4433);
     }
 
     // ========== Test Utilities ==========

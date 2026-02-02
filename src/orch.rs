@@ -2,12 +2,12 @@
 
 use crate::actor::{ActorError, ActorExitResult, ActorKind};
 use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareUdpTx};
-use crate::bind::DefaultRouteProbe;
+use crate::bind::{resolve_listen_addr, DefaultRouteProbe};
 use crate::config::{parse_h3_uri, parse_udp_uri, Config, Peer};
 use crate::dns::{DnsCommand, DnsResolver};
 use crate::events::{DnsEventDetail, DnsIpExpired, DnsIpResolved, Event, TransportEvent};
 use crate::h3::{
-    dial_h3, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3Connection, H3ListenerCommand,
+    dial_h3, spawn_h3_rx, spawn_h3_tx, H3Connection, H3ListenerCommand, H3ListenerConfig,
 };
 use crate::route::{sync_tun_routes, RouteManagerHandle};
 use crate::tun::{self, RoutingTable, TunRxCommand};
@@ -293,7 +293,11 @@ impl Orchestrator {
         let bare_rx_cmd_tx = if let Some(local_bare) = config.local.bare.as_ref() {
             let listen_endpoint =
                 parse_udp_uri(&local_bare.listen).map_err(OrchestratorError::InvalidBareListen)?;
-            let listen_addr = resolve_listen_addr(&listen_endpoint.host, listen_endpoint.port)?;
+            let listen_addr = resolve_listen_addr(&listen_endpoint.host, listen_endpoint.port)
+                .map_err(|reason| OrchestratorError::ListenResolveFailed {
+                    host: listen_endpoint.host.clone(),
+                    reason,
+                })?;
 
             let bare_rx = BareUdpRx::from_config(listen_addr, mtu)
                 .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
@@ -313,40 +317,24 @@ impl Orchestrator {
         };
 
         // Initialize H3 listener if configured with listen address
-        let h3_cfg = config.local.h3.as_ref();
-        let listen_uri = h3_cfg
-            .and_then(|h3| h3.listen.as_ref())
-            .filter(|l| !l.trim().is_empty());
-
-        let (h3_listener_cmd_tx, h3_conn_rx) = match (h3_cfg, listen_uri) {
-            (Some(h3_cfg), Some(listen_uri)) => {
-                let listen_endpoint =
-                    parse_h3_uri(listen_uri).map_err(OrchestratorError::InvalidH3Listen)?;
-                let listen_addr = resolve_listen_addr(&listen_endpoint.host, listen_endpoint.port)?;
-
-                // SAFETY: cert and key are validated to be Some when listen is set
-                let cert_path = Path::new(h3_cfg.cert.as_ref().expect("validated"));
-                let key_path = Path::new(h3_cfg.key.as_ref().expect("validated"));
-
-                // Build peer secrets map for authentication
-                let peer_secrets: HashMap<String, String> = config
-                    .peers
-                    .iter()
-                    .filter(|p| p.enabled && p.h3.is_some())
-                    .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().secret.clone()))
-                    .collect();
-
-                let (conn_tx, conn_rx) = mpsc::unbounded_channel();
-                let (cmd_tx, listener_handle, _bound_addr) =
-                    spawn_h3_listener(listen_addr, cert_path, key_path, peer_secrets, conn_tx)
+        let (h3_listener_cmd_tx, h3_conn_rx) = if let Some(h3_cfg) = config.local.h3.as_ref() {
+            match H3ListenerConfig::from_config(h3_cfg, &config.peers)
+                .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?
+            {
+                Some(listener_config) => {
+                    let (conn_tx, conn_rx) = mpsc::unbounded_channel();
+                    let (cmd_tx, listener_handle, _bound_addr) = listener_config
+                        .spawn(conn_tx)
                         .await
                         .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
 
-                join_set.spawn(listener_handle);
-                (Some(cmd_tx), Some(conn_rx))
+                    join_set.spawn(listener_handle);
+                    (Some(cmd_tx), Some(conn_rx))
+                }
+                None => (None, None), // Dial-only mode
             }
-            // Dial-only mode or no H3 configured: no listener, but can dial H3 peers
-            _ => (None, None),
+        } else {
+            (None, None)
         };
 
         // Initialize unified peer state from config (enabled peers with any transport)
@@ -788,45 +776,6 @@ impl Orchestrator {
 
         Some((packet_tx, vec![rx_handle, tx_handle]))
     }
-}
-
-/// Resolves a listen address from host and port, using synchronous DNS lookup for hostnames.
-///
-/// Handles IPv6 bracket notation (e.g., "[::1]" -> "::1") for compatibility with
-/// both UDP and H3 endpoint formats.
-fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, OrchestratorError> {
-    // Strip IPv6 bracket notation (safe no-op for non-bracketed hosts)
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-
-    // Fast path: IP literal
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
-    }
-
-    // Synchronous DNS lookup for hostname
-    use std::net::ToSocketAddrs;
-    let addr_str = format!("{}:{}", host, port);
-    let addrs: Vec<_> = addr_str
-        .to_socket_addrs()
-        .map_err(|err| OrchestratorError::ListenResolveFailed {
-            host: host.to_string(),
-            reason: err.to_string(),
-        })?
-        .collect();
-
-    if addrs.is_empty() {
-        return Err(OrchestratorError::ListenResolveFailed {
-            host: host.to_string(),
-            reason: "no resolved addresses".to_string(),
-        });
-    }
-    if addrs.len() > 1 {
-        warn!(
-            "listen resolved multiple addresses for {}; using {}",
-            host, addrs[0]
-        );
-    }
-    Ok(addrs[0])
 }
 
 /// Spawns a BareUDP TX actor for a peer destination.

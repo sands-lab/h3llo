@@ -6,7 +6,7 @@ use tracing::warn;
 
 use std::collections::HashSet;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use tokio::net::UdpSocket;
 
 #[cfg(target_os = "windows")]
@@ -29,6 +29,45 @@ pub enum UdpError {
     /// Socket creation, binding, or conversion failed.
     #[error("udp socket setup failed: {0}")]
     Socket(String),
+}
+
+/// Resolves a listen address from host and port.
+///
+/// Handles IPv6 bracket notation and performs synchronous DNS lookup for hostnames.
+/// Used by both BareUDP and H3 listener initialization.
+///
+/// # Arguments
+///
+/// * `host` - Hostname or IP literal (may include IPv6 brackets)
+/// * `port` - Port number
+///
+/// # Returns
+///
+/// The resolved socket address on success.
+///
+/// # Errors
+///
+/// Returns error string if resolution fails or no addresses are found.
+pub fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    // Strip IPv6 bracket notation (safe no-op for non-bracketed hosts)
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+
+    // Fast path: IP literal
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+
+    // Synchronous DNS lookup for hostname
+    let addr_str = format!("{}:{}", host, port);
+    let addrs: Vec<_> = addr_str
+        .to_socket_addrs()
+        .map_err(|err| format!("resolution failed: {}", err))?
+        .collect();
+
+    addrs
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no resolved addresses".to_string())
 }
 
 /// Creates a raw UDP socket with explicit domain and optional bind address.
@@ -701,6 +740,41 @@ mod tests {
             err.to_string(),
             "udp socket setup failed: connection refused"
         );
+    }
+
+    // ========== resolve_listen_addr Tests ==========
+
+    #[test]
+    fn resolve_listen_addr_handles_ipv4_literal() {
+        let result = resolve_listen_addr("127.0.0.1", 5353).expect("should resolve");
+        assert_eq!(
+            result.ip(),
+            IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        );
+        assert_eq!(result.port(), 5353);
+    }
+
+    #[test]
+    fn resolve_listen_addr_handles_ipv6_literal() {
+        let result = resolve_listen_addr("::1", 5353).expect("should resolve");
+        assert!(result.ip().is_ipv6());
+        assert_eq!(result.port(), 5353);
+    }
+
+    #[test]
+    fn resolve_listen_addr_strips_ipv6_brackets() {
+        let result = resolve_listen_addr("[::1]", 443).expect("should resolve");
+        assert!(result.ip().is_ipv6());
+        assert_eq!(result.port(), 443);
+    }
+
+    #[test]
+    fn resolve_listen_addr_resolves_localhost() {
+        // localhost should resolve to an IP address
+        let result = resolve_listen_addr("localhost", 8080);
+        assert!(result.is_ok(), "localhost should resolve");
+        let addr = result.unwrap();
+        assert_eq!(addr.port(), 8080);
     }
 
     /// Prefers longest-prefix matches and deduplicates interface indexes.
