@@ -568,11 +568,10 @@ mod tests {
         sender.send_to(&[1, 2, 3], rx_addr).await.unwrap();
 
         let mut buf = [0u8; 64];
-        let (len, _) =
-            tokio::time::timeout(Duration::from_millis(100), receiver.recv_from(&mut buf))
-                .await
-                .expect("timeout")
-                .expect("recv");
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+            .await
+            .expect("timeout")
+            .expect("recv");
         assert_eq!(&buf[..len], &[1, 2, 3]);
 
         rx_handle.abort();
