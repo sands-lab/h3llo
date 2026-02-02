@@ -80,10 +80,6 @@ cargo test --test e2e -- --ignored --nocapture
 
 # Run integration tests (DNS + TUN container tests, requires Docker)
 cargo test --test integration -- --ignored --nocapture
-
-# Build container test binaries first (required for TUN/route tests)
-cargo test --test integration-container-tun --no-run
-cargo test --test integration-container-route --no-run
 ```
 
 ### Side-Effect Classification
@@ -121,8 +117,8 @@ The `tests/integration/native/common/` module provides utilities shared across C
 
 - `ensure_image_exists(image, tag)` - Check for Docker image before test
 - `get_container_exit_code(container_id)` - Retrieve container exit code via docker inspect
-- `find_test_binary(binary_name)` - Locate compiled test binaries in target directory
 - `TEST_IMAGE`, `TEST_TAG` - Default image constants ("h3llo", "test")
+- `CONTAINER_TUN_BINARY`, `CONTAINER_ROUTE_BINARY` - Container paths for embedded test binaries
 
 ### E2E Test Scenarios (`tests/e2e/bareudp.rs`)
 
@@ -151,13 +147,13 @@ or port conflicts.
 When tests with real side effects are needed:
 1. Write test as standalone binary in `tests/integration/container/`
 2. Add `[[test]]` entry with `harness = false` in Cargo.toml
-3. Native orchestrator in `tests/integration/native/` copies binary into Docker
-4. Uses testcontainers `with_copy_to` for binary injection
+3. Test binaries are built into the Docker `test` image during `docker build`
+4. Native orchestrator in `tests/integration/native/` runs the pre-built binary
 5. Uses `WaitFor::Exit` to wait for container exit and verify exit code
 
 #### Static Binary Injection
 
-Container test binaries are built with `--target x86_64-unknown-linux-musl` to produce
+Container test binaries are built inside Docker with `--target x86_64-unknown-linux-musl` to produce
 fully static executables. Static musl binaries run on any Linux distribution without
 runtime library dependencies, eliminating GLIBC version compatibility concerns.
 
@@ -181,8 +177,8 @@ Data-path test uses a userspace ICMP echo responder:
 5. Successful ping confirms bidirectional TUN send/receive works
 
 ```bash
-# Build the container binary
-cargo test --test integration-container-tun --no-run
+# Build test image with embedded binaries
+docker build --target test -t h3llo:test .
 
 # Run TUN integration tests
 cargo test --test integration -- tun --ignored --nocapture
@@ -202,8 +198,8 @@ Scenarios:
 - **default_split**: Verifies `0.0.0.0/0` is split into `0.0.0.0/1` + `128.0.0.0/1`
 
 ```bash
-# Build the container binary
-cargo test --test integration-container-route --no-run
+# Build test image with embedded binaries
+docker build --target test -t h3llo:test .
 
 # Run route integration tests
 cargo test --test integration -- route --ignored --nocapture
