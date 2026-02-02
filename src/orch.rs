@@ -926,10 +926,7 @@ fn collect_hostnames(peers: &[Peer]) -> Result<HashSet<String>, OrchestratorErro
                     reason: err,
                 }
             })?;
-            // Skip IP literals - they don't need DNS resolution
-            if endpoint.host.parse::<std::net::IpAddr>().is_err() {
-                hosts.insert(endpoint.host);
-            }
+            hosts.insert(endpoint.host);
         }
 
         // Handle H3 endpoints
@@ -949,10 +946,7 @@ fn collect_hostnames(peers: &[Peer]) -> Result<HashSet<String>, OrchestratorErro
                     .trim_start_matches('[')
                     .trim_end_matches(']')
                     .to_string();
-                // Skip IP literals - they don't need DNS resolution
-                if host.parse::<std::net::IpAddr>().is_err() {
-                    hosts.insert(host);
-                }
+                hosts.insert(host);
             }
         }
     }
@@ -1584,10 +1578,13 @@ mod tests {
     }
 
     #[test]
-    fn collect_hostnames_skips_ip_literals() {
+    fn collect_hostnames_includes_ip_literals() {
         let peer = bare_peer("peer1", &["10.0.0.0/24"]); // Uses 127.0.0.1
 
         let result = collect_hostnames(&[peer]).unwrap();
-        assert!(result.is_empty(), "IP literals should not be collected");
+        assert!(
+            result.contains("127.0.0.1"),
+            "IP literals should be collected for DNS module to handle"
+        );
     }
 }
