@@ -187,6 +187,43 @@ impl Orchestrator {
         self.peers.values().flat_map(|e| e.active_ips()).collect()
     }
 
+    /// Updates all dependent subsystems after bounds topology changes.
+    ///
+    /// Performs the three-update sequence:
+    /// 1. BareRx allowed sources (in-memory filter)
+    /// 2. TUN routing table (internal forwarding)
+    /// 3. System routes (if `local.table` is enabled)
+    ///
+    /// Called after any bound is added or removed.
+    async fn on_bounds_changed(&self) {
+        // 1. Update allowed sources (fast, in-memory filter)
+        if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
+            if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAllowedSources(self.active_ips())) {
+                warn!(error = %e, "failed to send allowed sources update command");
+            }
+        }
+
+        // 2. Update internal routing table
+        let peer_configs = self.peer_configs();
+        let peer_txs = self.peer_txs();
+        if let Ok(routing) = RoutingTable::from_peers(&peer_configs, &peer_txs) {
+            if let Err(e) = self
+                .tun_cmd_tx
+                .send(TunRxCommand::UpdateRouting { routing })
+            {
+                warn!(error = %e, "failed to send routing update command");
+            }
+        }
+
+        // 3. Sync system routes if enabled
+        if self.manage_routes {
+            match collect_allowed_ips(&peer_configs) {
+                Ok(allowed) => sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await,
+                Err(err) => warn!("route sync skipped: {err}"),
+            }
+        }
+    }
+
     /// Returns map of peer ID to preferred TX channel (for routing table).
     fn peer_txs(&self) -> HashMap<String, mpsc::Sender<Vec<u8>>> {
         self.peers
@@ -256,7 +293,7 @@ impl Orchestrator {
         let bare_rx_cmd_tx = if let Some(local_bare) = config.local.bare.as_ref() {
             let listen_endpoint =
                 parse_udp_uri(&local_bare.listen).map_err(OrchestratorError::InvalidBareListen)?;
-            let listen_addr = resolve_listen_addr(&listen_endpoint)?;
+            let listen_addr = resolve_listen_addr(&listen_endpoint.host, listen_endpoint.port)?;
 
             let bare_rx = BareUdpRx::from_config(listen_addr, mtu)
                 .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
@@ -279,7 +316,7 @@ impl Orchestrator {
         let (h3_listener_cmd_tx, h3_conn_rx) = if let Some(h3_cfg) = config.local.h3.as_ref() {
             let listen_endpoint =
                 parse_h3_uri(&h3_cfg.listen).map_err(OrchestratorError::InvalidH3Listen)?;
-            let listen_addr = resolve_h3_listen_addr(&listen_endpoint)?;
+            let listen_addr = resolve_listen_addr(&listen_endpoint.host, listen_endpoint.port)?;
 
             let cert_path = Path::new(&h3_cfg.cert);
             let key_path = Path::new(&h3_cfg.key);
@@ -649,36 +686,7 @@ impl Orchestrator {
 
         // Only update routing/filters if we actually spawned something
         if any_spawned {
-            // 1. Update allowed sources (fast, in-memory filter)
-            if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
-                if let Err(e) =
-                    cmd_tx.send(BareUdpRxCommand::UpdateAllowedSources(self.active_ips()))
-                {
-                    warn!(error = %e, "failed to send allowed sources update command");
-                }
-            }
-
-            // 2. Update internal routing table
-            let peer_configs = self.peer_configs();
-            let peer_txs = self.peer_txs();
-            if let Ok(routing) = RoutingTable::from_peers(&peer_configs, &peer_txs) {
-                if let Err(e) = self
-                    .tun_cmd_tx
-                    .send(TunRxCommand::UpdateRouting { routing })
-                {
-                    warn!(error = %e, "failed to send routing update command");
-                }
-            }
-
-            // 3. Sync system routes if enabled
-            if self.manage_routes {
-                match collect_allowed_ips(&peer_configs) {
-                    Ok(allowed) => {
-                        sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await
-                    }
-                    Err(err) => warn!("route sync skipped: {err}"),
-                }
-            }
+            self.on_bounds_changed().await;
         }
     }
 
@@ -733,27 +741,7 @@ impl Orchestrator {
         self.join_set.spawn(rx_handle);
         self.join_set.spawn(tx_handle);
 
-        // Update routing table
-        let peer_configs = self.peer_configs();
-        let peer_txs = self.peer_txs();
-        if let Ok(routing) = RoutingTable::from_peers(&peer_configs, &peer_txs) {
-            if let Err(e) = self
-                .tun_cmd_tx
-                .send(TunRxCommand::UpdateRouting { routing })
-            {
-                warn!(error = %e, "failed to send routing update command");
-            }
-        }
-
-        // Sync system routes if enabled
-        if self.manage_routes {
-            match collect_allowed_ips(&peer_configs) {
-                Ok(allowed) => {
-                    sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await;
-                }
-                Err(err) => warn!("route sync skipped: {err}"),
-            }
-        }
+        self.on_bounds_changed().await;
     }
 
     /// Spawns H3 TX/RX actors for a peer connection.
@@ -826,72 +814,40 @@ pub async fn run_bare(config: Config) -> Result<(), OrchestratorError> {
     Orchestrator::new(config).await?.run().await
 }
 
-/// Resolves BareUDP listen address, using synchronous DNS lookup for hostnames.
-fn resolve_listen_addr(
-    listen: &crate::config::UdpEndpoint,
-) -> Result<SocketAddr, OrchestratorError> {
-    if let Some(ip) = parse_ip_literal(&listen.host) {
-        return Ok(SocketAddr::new(ip, listen.port));
+/// Resolves a listen address from host and port, using synchronous DNS lookup for hostnames.
+///
+/// Handles IPv6 bracket notation (e.g., "[::1]" -> "::1") for compatibility with
+/// both UDP and H3 endpoint formats.
+fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, OrchestratorError> {
+    // Strip IPv6 bracket notation (safe no-op for non-bracketed hosts)
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+
+    // Fast path: IP literal
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
     }
 
-    // Synchronous DNS lookup for listen hostname
+    // Synchronous DNS lookup for hostname
     use std::net::ToSocketAddrs;
-    let addr_str = format!("{}:{}", listen.host, listen.port);
+    let addr_str = format!("{}:{}", host, port);
     let addrs: Vec<_> = addr_str
         .to_socket_addrs()
         .map_err(|err| OrchestratorError::ListenResolveFailed {
-            host: listen.host.clone(),
+            host: host.to_string(),
             reason: err.to_string(),
         })?
         .collect();
 
     if addrs.is_empty() {
         return Err(OrchestratorError::ListenResolveFailed {
-            host: listen.host.clone(),
+            host: host.to_string(),
             reason: "no resolved addresses".to_string(),
         });
     }
     if addrs.len() > 1 {
         warn!(
-            "bare listen resolved multiple addresses for {}; using {}",
-            listen.host, addrs[0]
-        );
-    }
-    Ok(addrs[0])
-}
-
-/// Resolves H3 listen address, using synchronous DNS lookup for hostnames.
-fn resolve_h3_listen_addr(
-    listen: &crate::config::H3Endpoint,
-) -> Result<SocketAddr, OrchestratorError> {
-    // Handle IPv6 bracket notation (e.g., "[::1]" -> "::1")
-    let host = listen.host.trim_start_matches('[').trim_end_matches(']');
-
-    if let Some(ip) = parse_ip_literal(host) {
-        return Ok(SocketAddr::new(ip, listen.port));
-    }
-
-    // Synchronous DNS lookup for listen hostname
-    use std::net::ToSocketAddrs;
-    let addr_str = format!("{}:{}", host, listen.port);
-    let addrs: Vec<_> = addr_str
-        .to_socket_addrs()
-        .map_err(|err| OrchestratorError::ListenResolveFailed {
-            host: listen.host.clone(),
-            reason: err.to_string(),
-        })?
-        .collect();
-
-    if addrs.is_empty() {
-        return Err(OrchestratorError::ListenResolveFailed {
-            host: listen.host.clone(),
-            reason: "no resolved addresses".to_string(),
-        });
-    }
-    if addrs.len() > 1 {
-        warn!(
-            "h3 listen resolved multiple addresses for {}; using {}",
-            listen.host, addrs[0]
+            "listen resolved multiple addresses for {}; using {}",
+            host, addrs[0]
         );
     }
     Ok(addrs[0])
@@ -964,10 +920,6 @@ fn tun_prefixes(addrs: &[String]) -> Result<Vec<IpNet>, OrchestratorError> {
         prefixes.push(net);
     }
     Ok(prefixes)
-}
-
-fn parse_ip_literal(host: &str) -> Option<IpAddr> {
-    host.parse::<IpAddr>().ok()
 }
 
 /// Sends DNS resolve commands for all unique peer endpoint hostnames.
@@ -1274,32 +1226,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_ip_literal_parses_ipv4() {
-        let ip = parse_ip_literal("192.168.1.1");
-        assert!(ip.is_some());
-        assert_eq!(ip.unwrap().to_string(), "192.168.1.1");
-    }
-
-    #[test]
-    fn parse_ip_literal_parses_ipv6() {
-        let ip = parse_ip_literal("::1");
-        assert!(ip.is_some());
-        assert!(ip.unwrap().is_ipv6());
-    }
-
-    #[test]
-    fn parse_ip_literal_returns_none_for_hostname() {
-        let ip = parse_ip_literal("example.com");
-        assert!(ip.is_none());
-    }
-
-    #[test]
-    fn parse_ip_literal_returns_none_for_empty() {
-        let ip = parse_ip_literal("");
-        assert!(ip.is_none());
-    }
-
     // ========== collect_allowed_ips tests ==========
 
     #[test]
@@ -1448,13 +1374,8 @@ mod tests {
     // ========== resolve_listen_addr tests ==========
 
     #[test]
-    fn resolve_listen_addr_with_ipv4_literal() {
-        use crate::config::UdpEndpoint;
-        let endpoint = UdpEndpoint {
-            host: "127.0.0.1".to_string(),
-            port: 5353,
-        };
-        let result = resolve_listen_addr(&endpoint).expect("should resolve");
+    fn resolve_listen_addr_handles_ipv4_literal() {
+        let result = resolve_listen_addr("127.0.0.1", 5353).expect("should resolve");
         assert_eq!(
             result.ip(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
@@ -1463,15 +1384,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_listen_addr_with_ipv6_literal() {
-        use crate::config::UdpEndpoint;
-        let endpoint = UdpEndpoint {
-            host: "::1".to_string(),
-            port: 5353,
-        };
-        let result = resolve_listen_addr(&endpoint).expect("should resolve");
+    fn resolve_listen_addr_handles_ipv6_literal() {
+        let result = resolve_listen_addr("::1", 5353).expect("should resolve");
         assert!(result.ip().is_ipv6());
         assert_eq!(result.port(), 5353);
+    }
+
+    #[test]
+    fn resolve_listen_addr_strips_ipv6_brackets() {
+        let result = resolve_listen_addr("[::1]", 443).expect("should resolve");
+        assert!(result.ip().is_ipv6());
+        assert_eq!(result.port(), 443);
     }
 
     // ========== Event handling tests ==========
