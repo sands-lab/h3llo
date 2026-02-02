@@ -803,17 +803,6 @@ impl Orchestrator {
     }
 }
 
-/// Runs the BareUDP-only runtime until a task exits or shutdown signal.
-///
-/// This is a convenience function that creates an `Orchestrator` and runs it.
-///
-/// # Errors
-///
-/// Returns `OrchestratorError` when initialization fails or a runtime task exits unexpectedly.
-pub async fn run_bare(config: Config) -> Result<(), OrchestratorError> {
-    Orchestrator::new(config).await?.run().await
-}
-
 /// Resolves a listen address from host and port, using synchronous DNS lookup for hostnames.
 ///
 /// Handles IPv6 bracket notation (e.g., "[::1]" -> "::1") for compatibility with
