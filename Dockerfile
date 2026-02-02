@@ -48,11 +48,19 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies (cached as long as recipe.json unchanged)
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
-# Build application
+# Build application and test binaries
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY tests ./tests
 RUN cargo build --release --target x86_64-unknown-linux-musl --bin h3llo && \
+    cargo test --test integration-container-tun --release --target x86_64-unknown-linux-musl --no-run && \
+    cargo test --test integration-container-route --release --target x86_64-unknown-linux-musl --no-run && \
     strip /app/target/x86_64-unknown-linux-musl/release/h3llo
+# Copy test binaries to known location (they have hash suffixes in deps/)
+RUN mkdir -p /app/test-binaries && \
+    find /app/target/x86_64-unknown-linux-musl/release/deps -name 'integration_container_tun-*' -type f ! -name '*.d' -exec cp {} /app/test-binaries/integration-container-tun \; && \
+    find /app/target/x86_64-unknown-linux-musl/release/deps -name 'integration_container_route-*' -type f ! -name '*.d' -exec cp {} /app/test-binaries/integration-container-route \; && \
+    strip /app/test-binaries/*
 
 # Stage 4: Runtime - Minimal Alpine production image
 FROM alpine:3.21 AS runtime
@@ -66,3 +74,6 @@ CMD ["-c", "/etc/h3llo/config.yaml"]
 # Stage 5: Test - Adds diagnostic tools for integration tests
 FROM runtime AS test
 RUN apk add --no-cache iproute2 iputils-ping
+# Include pre-built test binaries for Container Test Pattern
+COPY --from=builder /app/test-binaries/integration-container-tun /usr/local/bin/
+COPY --from=builder /app/test-binaries/integration-container-route /usr/local/bin/
