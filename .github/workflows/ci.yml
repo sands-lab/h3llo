@@ -69,6 +69,6 @@ jobs:
           AR_x86_64_unknown_linux_musl: x86_64-unknown-linux-musl-ar
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-unknown-linux-musl-gcc
       - name: Run integration tests
-        run: cargo test --test integration -- --ignored --nocapture
+        run: cargo test --test integration --features test-utils -- --ignored --nocapture
       - name: Run E2E tests
         run: cargo test --test e2e -- --ignored --nocapture
