@@ -22,10 +22,13 @@ pub mod tun;
 
 /// Test utilities module exposed via the `test-utils` feature.
 ///
-/// Provides in-memory TUN implementations for integration testing without
-/// elevated privileges or real network devices.
+/// Provides test doubles for integration testing without elevated privileges
+/// or real network devices:
+/// - In-memory TUN implementations (`MemoryTun*`)
+/// - Route probe test doubles (`FakeRouteProbe`)
 #[cfg(feature = "test-utils")]
 pub mod test_utils {
+    pub use crate::bind::test_support::FakeRouteProbe;
     pub use crate::tun::test_support::{
         memory_tun, memory_tun_with_errors, MemoryTunRx, MemoryTunTx,
     };

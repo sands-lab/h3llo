@@ -48,11 +48,16 @@ The `test-utils` feature exposes internal testing utilities for integration test
 // [dev-dependencies]
 // h3llo = { path = ".", features = ["test-utils"] }
 
-use h3llo::test_utils::{memory_tun, MemoryTunRx, MemoryTunTx};
+use h3llo::test_utils::{memory_tun, MemoryTunRx, MemoryTunTx, FakeRouteProbe};
 
 let (rx, tx, inject_tx, output_rx) = memory_tun("test0", 1500);
 // inject_tx: send packets into TUN RX (simulates incoming)
 // output_rx: receive packets from TUN TX (captures outgoing)
+
+// Route probe test doubles:
+let probe = FakeRouteProbe::noop();      // Returns empty interfaces (most common)
+let probe = FakeRouteProbe::ok(vec!["eth0".to_string()]); // Returns specific interfaces
+let probe = FakeRouteProbe::error(RouteProbeError::Probe("boom".into())); // Returns error
 ```
 
 ## Docker Integration Tests (testcontainers-rs)
