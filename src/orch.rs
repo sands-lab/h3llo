@@ -5,7 +5,7 @@ use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareU
 use crate::bind::DefaultRouteProbe;
 use crate::config::{parse_h3_uri, parse_udp_uri, Config, Peer};
 use crate::dns::{DnsCommand, DnsResolver};
-use crate::events::{DnsEventDetail, Event, TransportEvent};
+use crate::events::{DnsEventDetail, DnsIpExpired, DnsIpResolved, Event, TransportEvent};
 use crate::h3::{
     dial_h3, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3Connection, H3ListenerCommand,
 };
@@ -13,6 +13,7 @@ use crate::route::{sync_tun_routes, RouteManagerHandle};
 use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
@@ -151,8 +152,6 @@ pub struct Orchestrator {
     events_tx: mpsc::UnboundedSender<Event>,
     join_set: JoinSet<Result<ActorExitResult, tokio::task::JoinError>>,
 
-    dns_refresh: Duration,
-
     // Runtime state
     local_id: String,
     tun_if: String,
@@ -172,7 +171,8 @@ pub struct Orchestrator {
     /// Packet sender to TUN TX (for H3 RX actors).
     tun_packet_tx: mpsc::Sender<Vec<u8>>,
 
-    /// DNS resolver command sender for refresh commands.
+    /// DNS resolver command sender for SetHostnames (used for future reconfiguration).
+    #[allow(dead_code)]
     dns_cmd_tx: mpsc::UnboundedSender<DnsCommand>,
 
     /// Whether to manage system routes (`local.table`).
@@ -357,8 +357,6 @@ impl Orchestrator {
             .map(|p| (p.id.clone(), PeerEntry::new(p.clone())))
             .collect();
 
-        let dns_refresh = Duration::from_secs(config.local.dns.refresh);
-
         // Spawn DNS resolver - actor creates its own command channel
         let resolver =
             DnsResolver::from_config(&config.local.dns, Some(tun_if.clone()), DNS_QUERY_TIMEOUT)
@@ -370,10 +368,13 @@ impl Orchestrator {
             .await
             .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
-        // Send initial resolve commands for all peer endpoints.
-        // IP literals are detected by resolver and emit immediate DnsAnswer events.
+        // Send all hostnames to DNS module in one shot.
+        // IP literals are handled by the DNS module directly (immediate IpResolved event).
         let peer_configs: Vec<Peer> = peers.values().map(|e| e.config.clone()).collect();
-        send_resolve_commands(&peer_configs, &dns_cmd_tx)?;
+        let hostnames = collect_hostnames(&peer_configs)?;
+        if let Err(e) = dns_cmd_tx.send(DnsCommand::SetHostnames { hosts: hostnames }) {
+            warn!(error = %e, "dns: failed to send initial hostnames");
+        }
 
         join_set.spawn(handle);
 
@@ -386,7 +387,6 @@ impl Orchestrator {
             events_rx,
             events_tx,
             join_set,
-            dns_refresh,
             local_id,
             tun_if,
             mtu,
@@ -412,20 +412,10 @@ impl Orchestrator {
     ///
     /// Returns `OrchestratorError` when a child task exits unexpectedly.
     pub async fn run(mut self) -> Result<(), OrchestratorError> {
-        let mut dns_ticker = tokio::time::interval(if self.dns_refresh.is_zero() {
-            Duration::from_secs(3600) // placeholder; branch disabled below
-        } else {
-            self.dns_refresh
-        });
-        dns_ticker.tick().await; // consume the immediate first tick
-
         loop {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {
                     self.handle_event(event).await;
-                }
-                _ = dns_ticker.tick(), if !self.dns_refresh.is_zero() => {
-                    self.refresh_dns().await;
                 }
                 Some(conn) = async {
                     match self.h3_conn_rx.as_mut() {
@@ -493,26 +483,14 @@ impl Orchestrator {
     /// Handles an event from a child actor.
     async fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Dns(dns_event) => {
-                if let DnsEventDetail::Answer(answer) = dns_event.detail {
-                    // Log DNS warnings
-                    for warning in &answer.warnings {
-                        warn!("dns warning for {}: {:?}", answer.host, warning);
-                    }
-
-                    // Process answer by iterating all peers with matching hostname.
-                    // Empty answers (e.g., AAAA when no IPv6) are ignored; subsequent
-                    // A record answers will still be processed.
-                    if !answer.records.is_empty() {
-                        self.handle_dns_answer(&answer).await;
-                    }
-                } else {
-                    debug!(
-                        "dns event from {}: {:?}",
-                        dns_event.server, dns_event.detail
-                    );
+            Event::Dns(dns_event) => match dns_event.detail {
+                DnsEventDetail::IpResolved(resolved) => {
+                    self.handle_ip_resolved(resolved).await;
                 }
-            }
+                DnsEventDetail::IpExpired(expired) => {
+                    self.handle_ip_expired(expired).await;
+                }
+            },
             Event::Transport(TransportEvent::Metrics(metrics)) => {
                 let labels = &metrics.labels;
                 let stats = &metrics.stats;
@@ -555,24 +533,11 @@ impl Orchestrator {
         }
     }
 
-    /// Sends DNS resolve commands for all peer endpoints (periodic refresh).
+    /// Handles a new IP resolution event.
     ///
-    /// Existing TX actors for unchanged IPs are deduplicated by
-    /// `PeerEntry::has_bound_for_ip`. IP literals flow through DNS resolver
-    /// (emits immediate answer).
-    async fn refresh_dns(&mut self) {
-        let peer_configs = self.peer_configs();
-        if let Err(err) = send_resolve_commands(&peer_configs, &self.dns_cmd_tx) {
-            warn!("dns refresh: unexpected error: {}", err);
-        }
-    }
-
-    /// Handles a DNS answer by iterating all peers to create TX paths.
-    ///
-    /// This reactive approach eliminates the need for `pending_dns` state:
-    /// on each answer, we iterate peers and spawn TX actors for those
-    /// whose endpoint hostname matches the resolved host.
-    async fn handle_dns_answer(&mut self, answer: &crate::events::DnsAnswer) {
+    /// Iterates all peers to find those with matching endpoint hostname,
+    /// then spawns TX actors for the resolved IP.
+    async fn handle_ip_resolved(&mut self, resolved: DnsIpResolved) {
         let mut any_spawned = false;
 
         // Collect peer IDs to process (to avoid borrow conflicts)
@@ -590,35 +555,33 @@ impl Orchestrator {
                     continue;
                 };
 
-                if endpoint.host == answer.host {
-                    for record in &answer.records {
-                        let destination = SocketAddr::new(record.address, endpoint.port);
-                        let entry = self.peers.get(&peer_id).unwrap();
-                        if entry.has_bound_for_ip(destination.ip()) {
-                            continue;
-                        }
+                if endpoint.host == resolved.host {
+                    let destination = SocketAddr::new(resolved.address, endpoint.port);
+                    let entry = self.peers.get(&peer_id).unwrap();
+                    if entry.has_bound_for_ip(destination.ip()) {
+                        continue;
+                    }
 
-                        let bindif = entry.config.bare.as_ref().and_then(|b| b.bindif.as_deref());
-                        if let Some((packet_tx, tx_handle)) = spawn_bare_tx(
-                            &peer_id,
-                            destination,
-                            bindif,
-                            &self.tun_if,
-                            self.events_tx.clone(),
-                        )
-                        .await
-                        {
-                            let bound_id = self.next_bound_id();
-                            let entry = self.peers.get_mut(&peer_id).unwrap();
-                            entry.bounds.push(BoundState {
-                                id: bound_id,
-                                transport: TransportType::BareUdp,
-                                dest: destination,
-                                tx: packet_tx,
-                            });
-                            self.join_set.spawn(tx_handle);
-                            any_spawned = true;
-                        }
+                    let bindif = entry.config.bare.as_ref().and_then(|b| b.bindif.as_deref());
+                    if let Some((packet_tx, tx_handle)) = spawn_bare_tx(
+                        &peer_id,
+                        destination,
+                        bindif,
+                        &self.tun_if,
+                        self.events_tx.clone(),
+                    )
+                    .await
+                    {
+                        let bound_id = self.next_bound_id();
+                        let entry = self.peers.get_mut(&peer_id).unwrap();
+                        entry.bounds.push(BoundState {
+                            id: bound_id,
+                            transport: TransportType::BareUdp,
+                            dest: destination,
+                            tx: packet_tx,
+                        });
+                        self.join_set.spawn(tx_handle);
+                        any_spawned = true;
                     }
                 }
             }
@@ -639,25 +602,23 @@ impl Orchestrator {
                     // Strip IPv6 brackets for comparison
                     let host = endpoint.host.trim_start_matches('[').trim_end_matches(']');
 
-                    if host != answer.host {
+                    if host != resolved.host {
                         continue;
                     }
 
-                    for record in &answer.records {
-                        let destination = SocketAddr::new(record.address, endpoint.port);
-                        if entry.has_bound_for_ip(destination.ip()) {
-                            continue;
-                        }
-
-                        targets.push((
-                            destination,
-                            endpoint.host.clone(),
-                            endpoint.path.clone(),
-                            h3.secret.clone(),
-                            h3.ca.clone(),
-                            h3.insecure,
-                        ));
+                    let destination = SocketAddr::new(resolved.address, endpoint.port);
+                    if entry.has_bound_for_ip(destination.ip()) {
+                        continue;
                     }
+
+                    targets.push((
+                        destination,
+                        endpoint.host.clone(),
+                        endpoint.path.clone(),
+                        h3.secret.clone(),
+                        h3.ca.clone(),
+                        h3.insecure,
+                    ));
                 }
                 targets
             };
@@ -694,6 +655,24 @@ impl Orchestrator {
 
         // Only update routing/filters if we actually spawned something
         if any_spawned {
+            self.on_bounds_changed().await;
+        }
+    }
+
+    /// Handles IP expiration event - removes bounds for expired IP.
+    async fn handle_ip_expired(&mut self, expired: DnsIpExpired) {
+        let mut any_removed = false;
+
+        for entry in self.peers.values_mut() {
+            let before = entry.bounds.len();
+            entry.bounds.retain(|b| b.dest.ip() != expired.address);
+            if entry.bounds.len() < before {
+                any_removed = true;
+            }
+        }
+
+        if any_removed {
+            debug!(host = %expired.host, ip = %expired.address, "bound removed due to IP expiration");
             self.on_bounds_changed().await;
         }
     }
@@ -919,24 +898,20 @@ fn tun_prefixes(addrs: &[String]) -> Result<Vec<IpNet>, OrchestratorError> {
     Ok(prefixes)
 }
 
-/// Sends DNS resolve commands for all unique peer endpoint hostnames.
+/// Collects all unique hostnames from peer configurations.
 ///
 /// Handles both BareUDP and H3 endpoints.
 ///
 /// # Arguments
 ///
 /// * `peers` - Slice of peer configurations to process
-/// * `dns_cmd_tx` - Channel to send DNS resolve commands
 ///
 /// # Errors
 ///
 /// Returns `OrchestratorError::InvalidPeerEndpoint` or `OrchestratorError::InvalidH3Endpoint`
 /// if any enabled peer has an invalid endpoint URI.
-fn send_resolve_commands(
-    peers: &[Peer],
-    dns_cmd_tx: &mpsc::UnboundedSender<DnsCommand>,
-) -> Result<(), OrchestratorError> {
-    let mut seen_hosts = std::collections::HashSet::new();
+fn collect_hostnames(peers: &[Peer]) -> Result<HashSet<String>, OrchestratorError> {
+    let mut hosts = HashSet::new();
 
     for peer in peers {
         if !peer.enabled {
@@ -951,14 +926,7 @@ fn send_resolve_commands(
                     reason: err,
                 }
             })?;
-
-            if seen_hosts.insert(endpoint.host.clone()) {
-                if let Err(e) = dns_cmd_tx.send(DnsCommand::Resolve {
-                    host: endpoint.host.clone(),
-                }) {
-                    warn!(host = %endpoint.host, error = %e, "dns: resolver channel closed");
-                }
-            }
+            hosts.insert(endpoint.host);
         }
 
         // Handle H3 endpoints
@@ -978,17 +946,12 @@ fn send_resolve_commands(
                     .trim_start_matches('[')
                     .trim_end_matches(']')
                     .to_string();
-
-                if seen_hosts.insert(host.clone()) {
-                    if let Err(e) = dns_cmd_tx.send(DnsCommand::Resolve { host: host.clone() }) {
-                        warn!(host = %host, error = %e, "dns: resolver channel closed");
-                    }
-                }
+                hosts.insert(host);
             }
         }
     }
 
-    Ok(())
+    Ok(hosts)
 }
 
 #[cfg(test)]
@@ -1004,7 +967,6 @@ mod test_support {
         mtu: usize,
         peers: HashMap<String, PeerEntry>,
         bound_counter: u64,
-        dns_refresh: Duration,
         manage_routes: bool,
         tun_addrs: Vec<IpNet>,
     }
@@ -1016,7 +978,6 @@ mod test_support {
                 mtu: 1400,
                 peers: HashMap::new(),
                 bound_counter: 0,
-                dns_refresh: Duration::ZERO,
                 manage_routes: false,
                 tun_addrs: Vec::new(),
             }
@@ -1024,8 +985,8 @@ mod test_support {
     }
 
     /// Test handles for verifying commands sent by the orchestrator.
+    #[allow(dead_code)]
     pub struct TestHandles {
-        #[allow(dead_code)]
         pub events_tx: mpsc::UnboundedSender<Event>,
         pub tun_cmd_rx: mpsc::UnboundedReceiver<TunRxCommand>,
         pub bare_rx_cmd_rx: mpsc::UnboundedReceiver<BareUdpRxCommand>,
@@ -1074,7 +1035,6 @@ mod test_support {
                 events_rx,
                 events_tx: events_tx.clone(),
                 join_set: JoinSet::new(),
-                dns_refresh: self.dns_refresh,
                 local_id: "test-local".to_string(),
                 tun_if: self.tun_if,
                 mtu: self.mtu,
@@ -1109,8 +1069,8 @@ mod tests {
     use super::*;
     use crate::config::{PeerBare, PeerTun};
     use crate::events::{
-        Direction, DnsAnswer, DnsAnswerRecord, DnsEvent, DnsEventDetail, DnsRecordType,
-        TransportEvent, TransportKind, TransportLabels, TransportMetrics, TransportStats,
+        Direction, DnsEvent, DnsEventDetail, DnsIpExpired, DnsIpResolved, TransportEvent,
+        TransportKind, TransportLabels, TransportMetrics, TransportStats,
     };
 
     // ========== PeerEntry unit tests ==========
@@ -1442,28 +1402,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_event_ignores_dns_answer_for_unknown_host() {
-        // Peer configured for known.example.com, but we send answer for unknown host
+    async fn handle_ip_resolved_ignores_unknown_host() {
+        // Peer configured for known.example.com, but we send IpResolved for unknown host
         let peer = bare_peer_at_host("peer1", "known.example.com", 5353, &["10.0.0.0/24"]);
 
         let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer])
             .build();
 
-        // Answer for a host that doesn't match any peer
-        let answer = Event::Dns(DnsEvent {
+        // IpResolved for a host that doesn't match any peer
+        let event = Event::Dns(DnsEvent {
             server: "127.0.0.1:53".parse().unwrap(),
-            detail: DnsEventDetail::Answer(DnsAnswer {
+            detail: DnsEventDetail::IpResolved(DnsIpResolved {
                 host: "unknown.example.com".to_string(),
-                record_type: DnsRecordType::A,
-                records: vec![DnsAnswerRecord {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
-                    ttl: 60,
-                }],
-                warnings: vec![],
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
             }),
         });
-        orch.handle_event(answer).await;
+        orch.handle_event(event).await;
 
         // No bounds created (hostname doesn't match)
         assert!(orch.peers.get("peer1").unwrap().bounds.is_empty());
@@ -1473,33 +1428,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_dns_answer_with_empty_records_no_op() {
-        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
-        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
-            .with_peers(vec![peer])
-            .build();
-
-        // DNS answer with empty records should be ignored (no processing)
-        let answer = Event::Dns(DnsEvent {
-            server: "127.0.0.1:53".parse().unwrap(),
-            detail: DnsEventDetail::Answer(DnsAnswer {
-                host: "example.com".to_string(),
-                record_type: DnsRecordType::Aaaa,
-                records: vec![],
-                warnings: vec![],
-            }),
-        });
-        orch.handle_event(answer).await;
-
-        // No bounds created (empty records)
-        assert!(orch.peers.get("peer1").unwrap().bounds.is_empty());
-        // No commands sent
-        assert!(handles.tun_cmd_rx.try_recv().is_err());
-        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn handle_dns_answer_iterates_all_matching_peers() {
+    async fn handle_ip_resolved_iterates_all_matching_peers() {
         let peer1 = bare_peer_at_host("peer1", "shared.example.com", 5353, &["10.0.0.0/24"]);
         let peer2 = bare_peer_at_host("peer2", "shared.example.com", 5354, &["172.16.0.0/16"]);
 
@@ -1507,17 +1436,12 @@ mod tests {
             .with_peers(vec![peer1, peer2])
             .build();
 
-        let answer = DnsAnswer {
+        let resolved = DnsIpResolved {
             host: "shared.example.com".to_string(),
-            record_type: DnsRecordType::A,
-            records: vec![DnsAnswerRecord {
-                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
-                ttl: 60,
-            }],
-            warnings: vec![],
+            address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
         };
 
-        orch.handle_dns_answer(&answer).await;
+        orch.handle_ip_resolved(resolved).await;
 
         // Both peers should be processed (iteration covers all matching)
         // Note: actual socket binding may fail in test environment,
@@ -1525,24 +1449,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_dns_answer_ignores_non_matching_hostnames() {
+    async fn handle_ip_resolved_ignores_non_matching_hostnames() {
         let peer = bare_peer_at_host("peer1", "different.example.com", 5353, &["10.0.0.0/24"]);
 
         let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer])
             .build();
 
-        let answer = DnsAnswer {
+        let resolved = DnsIpResolved {
             host: "other.example.com".to_string(),
-            record_type: DnsRecordType::A,
-            records: vec![DnsAnswerRecord {
-                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
-                ttl: 60,
-            }],
-            warnings: vec![],
+            address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
         };
 
-        orch.handle_dns_answer(&answer).await;
+        orch.handle_ip_resolved(resolved).await;
 
         // No commands should be sent (no peers matched)
         assert!(handles.tun_cmd_rx.try_recv().is_err());
@@ -1550,7 +1469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_dns_answer_skips_disabled_peers() {
+    async fn handle_ip_resolved_skips_disabled_peers() {
         let mut peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
         peer.enabled = false;
 
@@ -1558,55 +1477,69 @@ mod tests {
             .with_peers(vec![peer])
             .build();
 
-        let answer = DnsAnswer {
+        let resolved = DnsIpResolved {
             host: "example.com".to_string(),
-            record_type: DnsRecordType::A,
-            records: vec![DnsAnswerRecord {
-                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
-                ttl: 60,
-            }],
-            warnings: vec![],
+            address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
         };
 
-        orch.handle_dns_answer(&answer).await;
+        orch.handle_ip_resolved(resolved).await;
 
         // No commands should be sent (peer disabled)
         assert!(handles.tun_cmd_rx.try_recv().is_err());
     }
 
-    // ========== send_resolve_commands helper function tests ==========
+    #[tokio::test]
+    async fn handle_ip_expired_removes_bound() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_tx("peer1", "1.2.3.4:5353".parse().unwrap(), tx)
+            .build();
+
+        // Verify bound exists before expiration
+        assert_eq!(orch.peers.get("peer1").unwrap().bounds.len(), 1);
+
+        let expired = DnsIpExpired {
+            host: "example.com".to_string(),
+            address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+        };
+
+        orch.handle_ip_expired(expired).await;
+
+        // Bound should be removed
+        assert!(orch.peers.get("peer1").unwrap().bounds.is_empty());
+    }
+
+    // ========== collect_hostnames helper function tests ==========
 
     #[test]
-    fn send_resolve_commands_deduplicates_hostnames() {
+    fn collect_hostnames_deduplicates() {
         let peers = vec![
             bare_peer_at_host("peer1", "shared.example.com", 5353, &["10.0.0.0/24"]),
             bare_peer_at_host("peer2", "shared.example.com", 5354, &["172.16.0.0/16"]),
         ];
 
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-        let result = send_resolve_commands(&peers, &cmd_tx);
-        assert!(result.is_ok());
+        let peer_configs: Vec<_> = peers.iter().map(|p| p.clone()).collect();
+        let result = collect_hostnames(&peer_configs).unwrap();
 
-        // Only ONE DNS command sent (hostname deduplicated)
-        let cmd = cmd_rx.try_recv().expect("should receive command");
-        assert!(matches!(cmd, DnsCommand::Resolve { host } if host == "shared.example.com"));
-        assert!(cmd_rx.try_recv().is_err(), "should be no more commands");
+        // Deduplicated to single hostname
+        assert_eq!(result.len(), 1);
+        assert!(result.contains("shared.example.com"));
     }
 
     #[test]
-    fn send_resolve_commands_skips_disabled_peers() {
+    fn collect_hostnames_skips_disabled_peers() {
         let mut peer = bare_peer_at_host("disabled", "example.com", 5353, &["10.0.0.0/24"]);
         peer.enabled = false;
 
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-        let result = send_resolve_commands(&[peer], &cmd_tx);
-        assert!(result.is_ok());
-
-        assert!(cmd_rx.try_recv().is_err(), "no commands should be sent");
+        let result = collect_hostnames(&[peer]).unwrap();
+        assert!(result.is_empty(), "no hostnames should be collected");
     }
 
     #[test]
-    fn send_resolve_commands_skips_non_bare_peers() {
+    fn collect_hostnames_skips_non_bare_peers() {
         let peer = Peer {
             id: "h3only".to_string(),
             enabled: true,
@@ -1617,15 +1550,12 @@ mod tests {
             },
         };
 
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-        let result = send_resolve_commands(&[peer], &cmd_tx);
-        assert!(result.is_ok());
-
-        assert!(cmd_rx.try_recv().is_err(), "no commands should be sent");
+        let result = collect_hostnames(&[peer]).unwrap();
+        assert!(result.is_empty(), "no hostnames should be collected");
     }
 
     #[test]
-    fn send_resolve_commands_returns_error_for_invalid_endpoint() {
+    fn collect_hostnames_returns_error_for_invalid_endpoint() {
         let peer = Peer {
             id: "badpeer".to_string(),
             enabled: true,
@@ -1639,8 +1569,7 @@ mod tests {
             },
         };
 
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
-        let result = send_resolve_commands(&[peer], &cmd_tx);
+        let result = collect_hostnames(&[peer]);
 
         assert!(matches!(
             result,
@@ -1648,59 +1577,14 @@ mod tests {
         ));
     }
 
-    // ========== refresh_dns integration tests ==========
+    #[test]
+    fn collect_hostnames_includes_ip_literals() {
+        let peer = bare_peer("peer1", &["10.0.0.0/24"]); // Uses 127.0.0.1
 
-    #[tokio::test]
-    async fn refresh_dns_sends_commands_for_shared_hostname() {
-        let peer1 = Peer {
-            id: "peer1".to_string(),
-            enabled: true,
-            h3: None,
-            bare: Some(PeerBare {
-                endpoint: "udp://example.com:5353".to_string(),
-                bindif: None,
-            }),
-            tun: PeerTun {
-                allowed_ips: vec!["10.0.0.0/24".to_string()],
-            },
-        };
-        let peer2 = Peer {
-            id: "peer2".to_string(),
-            enabled: true,
-            h3: None,
-            bare: Some(PeerBare {
-                endpoint: "udp://example.com:5354".to_string(),
-                bindif: None,
-            }),
-            tun: PeerTun {
-                allowed_ips: vec!["172.16.0.0/16".to_string()],
-            },
-        };
-
-        let (mut orch, handles) = TestableOrchestratorBuilder::default()
-            .with_peers(vec![peer1, peer2])
-            .build();
-
-        orch.refresh_dns().await;
-        let mut dns_cmd_rx = handles.dns_cmd_rx;
-
-        // Verify only ONE DNS command sent (hostname deduplicated)
-        let cmd = dns_cmd_rx.try_recv().expect("should receive command");
-        assert!(matches!(cmd, DnsCommand::Resolve { host } if host == "example.com"));
-        assert!(dns_cmd_rx.try_recv().is_err(), "should be no more commands");
-    }
-
-    #[tokio::test]
-    async fn refresh_dns_handles_closed_channel_gracefully() {
-        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
-
-        let (mut orch, handles) = TestableOrchestratorBuilder::default()
-            .with_peers(vec![peer])
-            .build();
-
-        drop(handles.dns_cmd_rx); // Close receiver
-
-        // Should not panic, just log warning
-        orch.refresh_dns().await;
+        let result = collect_hostnames(&[peer]).unwrap();
+        assert!(
+            result.contains("127.0.0.1"),
+            "IP literals should be collected for DNS module to handle"
+        );
     }
 }

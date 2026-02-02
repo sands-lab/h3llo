@@ -148,93 +148,26 @@ pub struct DnsEvent {
 /// Enumerates DNS outcomes emitted by the resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsEventDetail {
-    /// Answer or status for a pending query.
-    Answer(DnsAnswer),
-    /// Query timed out and was retransmitted.
-    Timeout(DnsTimeout),
-    /// Packet failed validation or did not match pending queries.
-    Unexpected(DnsUnexpected),
+    /// A new IP address was resolved for a hostname.
+    IpResolved(DnsIpResolved),
+    /// An IP address has expired and should no longer be used.
+    IpExpired(DnsIpExpired),
 }
 
-/// Describes a DNS answer and any attached warnings.
+/// Notification that a new IP was resolved for a hostname.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsAnswer {
-    /// Queried hostname.
+pub struct DnsIpResolved {
+    /// The hostname that was resolved.
     pub host: String,
-    /// Record type of the query.
-    pub record_type: DnsRecordType,
-    /// Resolved answer records with TTL (order not guaranteed).
-    pub records: Vec<DnsAnswerRecord>,
-    /// Warnings derived from the DNS response.
-    pub warnings: Vec<DnsAnswerWarning>,
-}
-
-/// Represents a DNS answer record with its TTL.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsAnswerRecord {
-    /// Resolved IP address.
+    /// The resolved IP address.
     pub address: IpAddr,
-    /// Time-to-live in seconds for the record.
-    pub ttl: u32,
 }
 
-/// Warnings extracted from a DNS answer.
+/// Notification that an IP has expired for a hostname.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DnsAnswerWarning {
-    /// DNS server reported NXDOMAIN.
-    NxDomain,
-    /// Response was truncated.
-    Truncated,
-    /// Server refused recursive resolution or recursion was unavailable.
-    RecursionUnavailable,
-    /// Server refused to answer.
-    Refused,
-    /// Unexpected response code.
-    ResponseCode(String),
-}
-
-/// Notes that a query timed out and was retried.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsTimeout {
-    /// Hostname whose query timed out.
+pub struct DnsIpExpired {
+    /// The hostname whose IP expired.
     pub host: String,
-    /// Record type of the timed-out query.
-    pub record_type: DnsRecordType,
-}
-
-/// Records unexpected DNS responses or decoding failures.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsUnexpected {
-    /// Transaction ID present in the packet (if parsed).
-    pub id: Option<u16>,
-    /// Hostname associated with the packet, when known.
-    pub host: Option<String>,
-    /// Record type associated with the packet, when known.
-    pub record_type: Option<DnsRecordType>,
-    /// Reason for flagging the packet.
-    pub warning: DnsUnexpectedKind,
-}
-
-/// Reasons for unexpected DNS traffic.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DnsUnexpectedKind {
-    /// Packet referenced a transaction ID that is not pending.
-    UnknownTransaction,
-    /// Packet could not be decoded.
-    DecodeFailed(String),
-    /// Packet answered with a non-A/AAAA record type.
-    UnexpectedRecordType(DnsRecordType),
-    /// Sending the query failed.
-    SendFailed(String),
-}
-
-/// Represents DNS record types supported by the resolver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DnsRecordType {
-    /// IPv4 A record.
-    A,
-    /// IPv6 AAAA record.
-    Aaaa,
-    /// Non-A/AAAA record type.
-    Other(u16),
+    /// The expired IP address.
+    pub address: IpAddr,
 }

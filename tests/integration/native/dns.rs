@@ -6,9 +6,10 @@
 //! Each test creates its own temporary directory and CoreDNS container,
 //! making parallel execution safe (`cargo test` default behavior).
 //!
-//! Run with: `cargo test --test integration -- --ignored --nocapture`
+//! Run with: `cargo test --test integration --features test-utils -- --ignored --nocapture`
 
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 const RESOLVER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -16,7 +17,7 @@ const COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 use h3llo::actor::ActorExitResult;
 use h3llo::dns::{DnsCommand, DnsResolver};
-use h3llo::events::{DnsAnswer, DnsAnswerWarning, DnsEventDetail, DnsRecordType, Event};
+use h3llo::events::{DnsEventDetail, DnsIpResolved, Event};
 use h3llo::test_utils::FakeRouteProbe;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -79,6 +80,8 @@ async fn start_coredns() -> (ContainerAsync<GenericImage>, tempfile::TempDir, u1
 }
 
 /// Spawns a DnsResolver targeting the given server address.
+///
+/// Uses zero refresh interval so tests don't get automatic re-queries.
 async fn spawn_resolver(
     server: SocketAddr,
     timeout: Duration,
@@ -88,7 +91,8 @@ async fn spawn_resolver(
     tokio::task::JoinHandle<ActorExitResult>,
 ) {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let resolver = DnsResolver::new(server, None, None, timeout);
+    // refresh_interval = ZERO disables automatic refresh
+    let resolver = DnsResolver::new(server, None, None, timeout, Duration::ZERO);
     let (cmd_tx, handle) = resolver
         .spawn(FakeRouteProbe::noop(), event_tx)
         .await
@@ -96,45 +100,33 @@ async fn spawn_resolver(
     (cmd_tx, event_rx, handle)
 }
 
-/// Collects DNS answer events until we have one for each expected record type, skipping non-answer events.
-async fn collect_answers(
+/// Collects IpResolved events until timeout or expected count reached.
+async fn collect_ip_resolved(
     rx: &mut mpsc::UnboundedReceiver<Event>,
     timeout: Duration,
-) -> Vec<(DnsRecordType, DnsAnswer)> {
-    let mut answers = Vec::new();
+    expected_count: usize,
+) -> Vec<DnsIpResolved> {
+    let mut resolved = Vec::new();
     let deadline = tokio::time::Instant::now() + timeout;
 
-    // DnsResolver issues both A and AAAA queries per Resolve command.
-    while answers.len() < 2 {
+    while resolved.len() < expected_count {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(Event::Dns(ev))) => match ev.detail {
-                DnsEventDetail::Answer(answer) => {
-                    answers.push((answer.record_type, answer));
+            Ok(Some(Event::Dns(ev))) => {
+                if let DnsEventDetail::IpResolved(ip) = ev.detail {
+                    resolved.push(ip);
                 }
-                _ => continue,
-            },
+            }
             Ok(Some(_)) => continue,
             Ok(None) => break,
             Err(_) => break,
         }
     }
-    answers
+    resolved
 }
 
-/// Extracts the next DNS event detail from the receiver, skipping bind warnings.
-async fn next_dns_detail(
-    rx: &mut mpsc::UnboundedReceiver<Event>,
-    timeout: Duration,
-) -> DnsEventDetail {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(Event::Dns(ev))) => return ev.detail,
-            Ok(Some(_)) => continue,
-            Ok(None) => panic!("channel closed unexpectedly"),
-            Err(_) => panic!("timed out waiting for DNS event"),
-        }
-    }
+/// Helper to create a HashSet from a slice of strings.
+fn hosts(names: &[&str]) -> HashSet<String> {
+    names.iter().map(|s| s.to_string()).collect()
 }
 
 #[tokio::test]
@@ -145,28 +137,27 @@ async fn dns_resolve_single_a_record() {
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
-        .send(DnsCommand::Resolve {
-            host: "single.test.h3llo".to_string(),
+        .send(DnsCommand::SetHostnames {
+            hosts: hosts(&["single.test.h3llo"]),
         })
         .unwrap();
 
-    let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
+    // single.test.h3llo has one A record (10.0.0.1), no AAAA
+    // Expect at least 1 IpResolved event
+    let resolved = collect_ip_resolved(&mut event_rx, COLLECT_TIMEOUT, 1).await;
 
-    // Find the A record answer
-    let a_answer = answers
-        .iter()
-        .find(|(rt, _)| *rt == DnsRecordType::A)
-        .map(|(_, a)| a)
-        .expect("expected A record answer");
-
-    assert_eq!(a_answer.host, "single.test.h3llo");
     assert!(
-        a_answer
-            .records
-            .iter()
-            .any(|r| r.address.to_string() == "10.0.0.1"),
-        "expected 10.0.0.1 in A records: {:?}",
-        a_answer.records
+        !resolved.is_empty(),
+        "expected at least one IpResolved event"
+    );
+
+    let has_expected_ip = resolved
+        .iter()
+        .any(|r| r.host == "single.test.h3llo" && r.address.to_string() == "10.0.0.1");
+    assert!(
+        has_expected_ip,
+        "expected 10.0.0.1 for single.test.h3llo: {:?}",
+        resolved
     );
 
     handle.abort();
@@ -180,48 +171,28 @@ async fn dns_resolve_multiple_records() {
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
-        .send(DnsCommand::Resolve {
-            host: "multi.test.h3llo".to_string(),
+        .send(DnsCommand::SetHostnames {
+            hosts: hosts(&["multi.test.h3llo"]),
         })
         .unwrap();
 
-    let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
+    // multi.test.h3llo has: 10.0.0.2, 10.0.0.3 (A), and 2001:db8::2 (AAAA)
+    // Expect 3 IpResolved events
+    let resolved = collect_ip_resolved(&mut event_rx, COLLECT_TIMEOUT, 3).await;
 
-    // Check A records contain 10.0.0.2 and 10.0.0.3
-    let a_answer = answers
-        .iter()
-        .find(|(rt, _)| *rt == DnsRecordType::A)
-        .map(|(_, a)| a)
-        .expect("expected A record answer");
+    let addrs: Vec<IpAddr> = resolved.iter().map(|r| r.address).collect();
 
-    let a_addrs: Vec<String> = a_answer
-        .records
-        .iter()
-        .map(|r| r.address.to_string())
-        .collect();
     assert!(
-        a_addrs.contains(&"10.0.0.2".to_string()),
-        "missing 10.0.0.2: {a_addrs:?}"
+        addrs.contains(&"10.0.0.2".parse().unwrap()),
+        "missing 10.0.0.2: {addrs:?}"
     );
     assert!(
-        a_addrs.contains(&"10.0.0.3".to_string()),
-        "missing 10.0.0.3: {a_addrs:?}"
+        addrs.contains(&"10.0.0.3".parse().unwrap()),
+        "missing 10.0.0.3: {addrs:?}"
     );
-
-    // Check AAAA records contain 2001:db8::2
-    let aaaa_answer = answers
-        .iter()
-        .find(|(rt, _)| *rt == DnsRecordType::Aaaa)
-        .map(|(_, a)| a)
-        .expect("expected AAAA record answer");
-
     assert!(
-        aaaa_answer
-            .records
-            .iter()
-            .any(|r| r.address.to_string() == "2001:db8::2"),
-        "expected 2001:db8::2 in AAAA records: {:?}",
-        aaaa_answer.records
+        addrs.contains(&"2001:db8::2".parse().unwrap()),
+        "missing 2001:db8::2: {addrs:?}"
     );
 
     handle.abort();
@@ -235,69 +206,46 @@ async fn dns_resolve_aaaa_only() {
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
-        .send(DnsCommand::Resolve {
-            host: "ipv6only.test.h3llo".to_string(),
+        .send(DnsCommand::SetHostnames {
+            hosts: hosts(&["ipv6only.test.h3llo"]),
         })
         .unwrap();
 
-    let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
+    // ipv6only.test.h3llo has only AAAA record: 2001:db8::1
+    let resolved = collect_ip_resolved(&mut event_rx, COLLECT_TIMEOUT, 1).await;
 
-    // AAAA answer should contain 2001:db8::1
-    let aaaa_answer = answers
+    let has_expected_ip = resolved
         .iter()
-        .find(|(rt, _)| *rt == DnsRecordType::Aaaa)
-        .map(|(_, a)| a)
-        .expect("expected AAAA record answer");
-
+        .any(|r| r.host == "ipv6only.test.h3llo" && r.address.to_string() == "2001:db8::1");
     assert!(
-        aaaa_answer
-            .records
-            .iter()
-            .any(|r| r.address.to_string() == "2001:db8::1"),
-        "expected 2001:db8::1 in AAAA records: {:?}",
-        aaaa_answer.records
+        has_expected_ip,
+        "expected 2001:db8::1 for ipv6only.test.h3llo: {:?}",
+        resolved
     );
-
-    // A answer should have no records (no A record for ipv6only)
-    let a_answer = answers
-        .iter()
-        .find(|(rt, _)| *rt == DnsRecordType::A)
-        .map(|(_, a)| a);
-
-    if let Some(a) = a_answer {
-        assert!(
-            a.records.is_empty(),
-            "expected no A records for ipv6only: {:?}",
-            a.records
-        );
-    }
 
     handle.abort();
 }
 
 #[tokio::test]
 #[ignore]
-async fn dns_resolve_nxdomain() {
+async fn dns_resolve_nxdomain_emits_no_events() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
-        .send(DnsCommand::Resolve {
-            host: "nonexistent.test.h3llo".to_string(),
+        .send(DnsCommand::SetHostnames {
+            hosts: hosts(&["nonexistent.test.h3llo"]),
         })
         .unwrap();
 
-    let answers = collect_answers(&mut event_rx, COLLECT_TIMEOUT).await;
+    // NXDOMAIN should not emit IpResolved events (warning is logged at origin)
+    let resolved = collect_ip_resolved(&mut event_rx, Duration::from_secs(3), 1).await;
 
-    // At least one answer should have NxDomain warning
-    let has_nxdomain = answers
-        .iter()
-        .any(|(_, answer)| answer.warnings.contains(&DnsAnswerWarning::NxDomain));
     assert!(
-        has_nxdomain,
-        "expected NxDomain warning in answers: {:?}",
-        answers
+        resolved.is_empty(),
+        "expected no IpResolved events for NXDOMAIN, got: {:?}",
+        resolved
     );
 
     handle.abort();
@@ -305,26 +253,34 @@ async fn dns_resolve_nxdomain() {
 
 #[tokio::test]
 #[ignore]
-async fn dns_resolve_timeout() {
-    // RFC 5737 TEST-NET-1: guaranteed unroutable in well-configured networks,
-    // causing the resolver to timeout rather than receive a response.
-    let server: SocketAddr = "192.0.2.1:53".parse().unwrap();
-    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, Duration::from_secs(2)).await;
+async fn dns_resolve_multiple_hostnames() {
+    let (_container, _dir, port) = start_coredns().await;
+    let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
+    // Register multiple hostnames at once
     cmd_tx
-        .send(DnsCommand::Resolve {
-            host: "anything.example.com".to_string(),
+        .send(DnsCommand::SetHostnames {
+            hosts: hosts(&["single.test.h3llo", "ipv6only.test.h3llo"]),
         })
         .unwrap();
 
-    // Should receive a Timeout event
-    let detail = next_dns_detail(&mut event_rx, COLLECT_TIMEOUT).await;
-    match detail {
-        DnsEventDetail::Timeout(timeout) => {
-            assert_eq!(timeout.host, "anything.example.com");
-        }
-        other => panic!("expected Timeout, got: {:?}", other),
-    }
+    // Expect: single (1 A) + ipv6only (1 AAAA) = 2 IPs
+    let resolved = collect_ip_resolved(&mut event_rx, COLLECT_TIMEOUT, 2).await;
+
+    let single_resolved = resolved
+        .iter()
+        .any(|r| r.host == "single.test.h3llo" && r.address.to_string() == "10.0.0.1");
+    let ipv6only_resolved = resolved
+        .iter()
+        .any(|r| r.host == "ipv6only.test.h3llo" && r.address.to_string() == "2001:db8::1");
+
+    assert!(single_resolved, "missing single.test.h3llo: {:?}", resolved);
+    assert!(
+        ipv6only_resolved,
+        "missing ipv6only.test.h3llo: {:?}",
+        resolved
+    );
 
     handle.abort();
 }
