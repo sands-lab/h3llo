@@ -1,6 +1,8 @@
 # h3llo: HTTP/3-based Low-latency Overlay
 
+[![CI](https://github.com/Tonny-Gu/h3llo/actions/workflows/ci.yml/badge.svg)](https://github.com/Tonny-Gu/h3llo/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/Tonny-Gu/h3llo/graph/badge.svg?token=B06V3MZ768)](https://codecov.io/gh/Tonny-Gu/h3llo)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 h3llo is a lightweight overlay network that rides on standard HTTP/3 (MASQUE/CONNECT-IP, [RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484)) with an optional BareUDP fast path. It aims for WireGuard-like latency, flexible topologies, and zero-downtime reconfiguration.
 
