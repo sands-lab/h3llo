@@ -42,12 +42,15 @@ pub struct Local {
 /// HTTP/3 settings for the local node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalH3 {
-    /// HTTP/3 listen address (scheme/host/port/path); required when HTTP/3 is configured.
-    pub listen: String,
-    /// Certificate path for QUIC/TLS; required when HTTP/3 is configured.
-    pub cert: String,
-    /// Private key path for QUIC/TLS; required when HTTP/3 is configured.
-    pub key: String,
+    /// HTTP/3 listen address (scheme/host/port/path); optional (dial-only when absent).
+    #[serde(default)]
+    pub listen: Option<String>,
+    /// Certificate path for QUIC/TLS; required when `listen` is set.
+    #[serde(default)]
+    pub cert: Option<String>,
+    /// Private key path for QUIC/TLS; required when `listen` is set.
+    #[serde(default)]
+    pub key: Option<String>,
     /// Optional control-plane credentials scoped to HTTP/3.
     pub admin: Option<LocalAdmin>,
 }
@@ -125,8 +128,8 @@ pub struct PeerH3 {
     /// Whether to skip TLS validation (default: false).
     #[serde(default)]
     pub insecure: bool,
-    /// Optional list of interfaces to bind HTTP/3 dialers; must not be empty when set.
-    pub bindifs: Option<Vec<String>>,
+    /// Optional interface to bind HTTP/3 dialers.
+    pub bindif: Option<String>,
 }
 
 /// BareUDP options per peer.
@@ -183,15 +186,9 @@ pub enum ValidationError {
     /// `local.id` is missing or too short.
     #[error("local.id must be at least 6 characters")]
     LocalIdTooShort,
-    /// `local.h3.listen` is missing when HTTP/3 is configured.
-    #[error("local.h3.listen must be set when local.h3 is configured")]
-    LocalH3MissingListen,
-    /// `local.h3.cert` is missing when HTTP/3 is configured.
-    #[error("local.h3.cert must be set when local.h3 is configured")]
-    LocalH3MissingCert,
-    /// `local.h3.key` is missing when HTTP/3 is configured.
-    #[error("local.h3.key must be set when local.h3 is configured")]
-    LocalH3MissingKey,
+    /// `local.h3.cert` and `local.h3.key` are required when `local.h3.listen` is set.
+    #[error("local.h3.cert and local.h3.key must be set when local.h3.listen is configured")]
+    LocalH3CredentialsMissing,
     /// `local.h3.admin` is present but too short.
     #[error(
         "local.h3.admin.name and local.h3.admin.pass must be longer than 8 characters when set"
@@ -222,9 +219,6 @@ pub enum ValidationError {
     /// Peer secret missing or too short.
     #[error("peer '{peer_id}' requires h3.secret longer than 8 characters when h3 is configured")]
     PeerSecretTooShort { peer_id: String },
-    /// Peer bindifs present but empty.
-    #[error("peer '{peer_id}' requires h3.bindifs to include at least one interface when set")]
-    PeerH3BindifsEmpty { peer_id: String },
     /// Peer transport fields conflict.
     #[error("peer '{peer_id}' must configure exactly one of h3 or bare")]
     PeerTransportConflict { peer_id: String },
@@ -272,22 +266,30 @@ impl Config {
             errors.push(ValidationError::LocalIdTooShort);
         }
 
-        let h3 = self.local.h3.as_ref();
-        let has_h3_listener = h3.map(|h3| !h3.listen.trim().is_empty()).unwrap_or(false);
+        // H3 listener validation: cert/key required only when listen is set
+        let has_h3_listener = self
+            .local
+            .h3
+            .as_ref()
+            .and_then(|h3| h3.listen.as_ref())
+            .map(|l| !l.trim().is_empty())
+            .unwrap_or(false);
 
-        if let Some(h3) = h3 {
-            if !has_h3_listener {
-                errors.push(ValidationError::LocalH3MissingListen);
-            }
-
-            let has_cert = !h3.cert.trim().is_empty();
-            if !has_cert {
-                errors.push(ValidationError::LocalH3MissingCert);
-            }
-
-            let has_key = !h3.key.trim().is_empty();
-            if !has_key {
-                errors.push(ValidationError::LocalH3MissingKey);
+        if let Some(h3) = self.local.h3.as_ref() {
+            if has_h3_listener {
+                let has_cert = h3
+                    .cert
+                    .as_ref()
+                    .map(|c| !c.trim().is_empty())
+                    .unwrap_or(false);
+                let has_key = h3
+                    .key
+                    .as_ref()
+                    .map(|k| !k.trim().is_empty())
+                    .unwrap_or(false);
+                if !has_cert || !has_key {
+                    errors.push(ValidationError::LocalH3CredentialsMissing);
+                }
             }
 
             if let Some(admin) = &h3.admin {
@@ -342,13 +344,7 @@ impl Config {
                         peer_id: peer.id.clone(),
                     });
                 }
-                if let Some(bindifs) = h3.bindifs.as_ref() {
-                    if bindifs.is_empty() {
-                        errors.push(ValidationError::PeerH3BindifsEmpty {
-                            peer_id: peer.id.clone(),
-                        });
-                    }
-                }
+                // bindif is now Option<String>; no empty-list validation needed
             }
 
             match (&peer.h3, &peer.bare) {
@@ -589,9 +585,9 @@ mod tests {
                     bindif: None,
                 },
                 h3: Some(LocalH3 {
-                    listen: "https://[::]:443/path".to_string(),
-                    cert: "./cert.pem".to_string(),
-                    key: "./key.pem".to_string(),
+                    listen: Some("https://[::]:443/path".to_string()),
+                    cert: Some("./cert.pem".to_string()),
+                    key: Some("./key.pem".to_string()),
                     admin: Some(LocalAdmin {
                         name: "admin-username".to_string(),
                         pass: "admin-password".to_string(),
@@ -612,7 +608,7 @@ mod tests {
                     endpoints: vec!["https://peer.example.com:443/path".to_string()],
                     ca: None,
                     insecure: false,
-                    bindifs: None,
+                    bindif: None,
                 }),
                 bare: None,
                 tun: PeerTun {
@@ -644,7 +640,7 @@ mod tests {
     fn rejects_missing_admin_listener() {
         let mut config = sample_h3_config();
         if let Some(h3) = config.local.h3.as_mut() {
-            h3.listen.clear();
+            h3.listen = None;
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
@@ -654,22 +650,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_required_local_h3_fields() {
+    fn rejects_h3_listener_without_credentials() {
         let mut config = sample_h3_config();
         config.local.h3 = Some(LocalH3 {
-            listen: String::new(),
-            cert: String::new(),
-            key: String::new(),
+            listen: Some("https://[::]:443/".to_string()),
+            cert: None,
+            key: None,
             admin: None,
         });
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.contains(&ValidationError::LocalH3MissingListen)
-                    && errs.contains(&ValidationError::LocalH3MissingCert)
-                    && errs.contains(&ValidationError::LocalH3MissingKey)
+                if errs.contains(&ValidationError::LocalH3CredentialsMissing)
         ));
+    }
+
+    #[test]
+    fn rejects_h3_listener_with_partial_credentials() {
+        let mut config = sample_h3_config();
+        config.local.h3 = Some(LocalH3 {
+            listen: Some("https://[::]:443/".to_string()),
+            cert: Some("./cert.pem".to_string()),
+            key: None, // missing key
+            admin: None,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.contains(&ValidationError::LocalH3CredentialsMissing)
+        ));
+    }
+
+    #[test]
+    fn accepts_h3_without_listener_dial_only() {
+        let mut config = sample_h3_config();
+        config.local.h3 = Some(LocalH3 {
+            listen: None,
+            cert: None,
+            key: None,
+            admin: None,
+        });
+        let result = config.validate();
+        assert!(result.is_ok(), "dial-only H3 config should be valid");
     }
 
     #[test]
@@ -874,7 +898,7 @@ peers:
         assert!(cfg.peers[0].h3.is_some());
         if let Some(h3) = cfg.peers[0].h3.as_ref() {
             assert!(h3.endpoints.is_empty());
-            assert!(h3.bindifs.is_none());
+            assert!(h3.bindif.is_none());
         } else {
             panic!("peer h3 should be present");
         }
@@ -898,9 +922,7 @@ peers:
       - https://peer.example.com/path
       - https://peer.example.com/path
       - https://peer2.example.com/path
-    bindifs:
-      - eth0
-      - eth0
+    bindif: eth0
   tun:
     allowedIPs:
       - 192.168.180.2/32
@@ -916,26 +938,16 @@ peers:
                 "https://peer2.example.com/path".to_string()
             ]
         );
-        assert_eq!(
-            h3.bindifs,
-            Some(vec!["eth0".to_string(), "eth0".to_string()])
-        );
+        assert_eq!(h3.bindif, Some("eth0".to_string()));
     }
 
     #[test]
-    fn rejects_empty_bindifs_when_set() {
+    fn accepts_peer_h3_with_bindif() {
         let mut config = sample_h3_config();
         if let Some(h3) = config.peers[0].h3.as_mut() {
-            h3.bindifs = Some(Vec::new());
+            h3.bindif = Some("eth0".to_string());
         }
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Validation(ValidationErrors(ref errs))
-                if errs
-                    .iter()
-                    .any(|e| matches!(e, ValidationError::PeerH3BindifsEmpty { .. }))
-        ));
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -1030,5 +1042,60 @@ peers:
     fn parse_h3_uri_accepts_root_path() {
         let endpoint = parse_h3_uri("https://example.com/").expect("should parse");
         assert_eq!(endpoint.path, "/");
+    }
+
+    #[test]
+    fn parse_dial_only_h3_config() {
+        let yaml = r#"
+local:
+  id: dial-only-node
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1
+peers:
+- id: remote-peer
+  h3:
+    secret: remote-peer-secret
+    endpoints:
+      - https://peer.example.com:443/path
+  tun:
+    allowedIPs:
+      - 192.168.180.2/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert!(cfg.local.h3.is_some());
+        let h3 = cfg.local.h3.as_ref().unwrap();
+        assert!(h3.listen.is_none());
+        assert!(h3.cert.is_none());
+        assert!(h3.key.is_none());
+    }
+
+    #[test]
+    fn parse_h3_with_singular_bindif() {
+        let yaml = r#"
+local:
+  id: example-node-1
+  h3:
+    listen: https://[::]:443/path
+    cert: ./cert.pem
+    key: ./key.pem
+  tun:
+    addrs:
+      - 192.168.180.1
+peers:
+- id: example-node-2
+  h3:
+    secret: example-node-2-secret
+    endpoints:
+      - https://peer.example.com:443/path
+    bindif: eth0
+  tun:
+    allowedIPs:
+      - 192.168.180.2/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
+        assert_eq!(h3.bindif, Some("eth0".to_string()));
     }
 }

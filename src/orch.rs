@@ -312,33 +312,50 @@ impl Orchestrator {
             None
         };
 
-        // Initialize H3 listener if configured
-        let (h3_listener_cmd_tx, h3_conn_rx) = if let Some(h3_cfg) = config.local.h3.as_ref() {
-            let listen_endpoint =
-                parse_h3_uri(&h3_cfg.listen).map_err(OrchestratorError::InvalidH3Listen)?;
-            let listen_addr = resolve_listen_addr(&listen_endpoint.host, listen_endpoint.port)?;
+        // Initialize H3 listener if configured with listen address
+        let (h3_listener_cmd_tx, h3_conn_rx) = match config.local.h3.as_ref() {
+            Some(h3_cfg) => {
+                // Only start listener if listen address is configured
+                match h3_cfg.listen.as_ref().filter(|l| !l.trim().is_empty()) {
+                    Some(listen_uri) => {
+                        let listen_endpoint =
+                            parse_h3_uri(listen_uri).map_err(OrchestratorError::InvalidH3Listen)?;
+                        let listen_addr =
+                            resolve_listen_addr(&listen_endpoint.host, listen_endpoint.port)?;
 
-            let cert_path = Path::new(&h3_cfg.cert);
-            let key_path = Path::new(&h3_cfg.key);
+                        // cert and key are validated to be Some when listen is set
+                        let cert_path = Path::new(h3_cfg.cert.as_ref().expect("validated"));
+                        let key_path = Path::new(h3_cfg.key.as_ref().expect("validated"));
 
-            // Build peer secrets map for authentication
-            let peer_secrets: HashMap<String, String> = config
-                .peers
-                .iter()
-                .filter(|p| p.enabled && p.h3.is_some())
-                .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().secret.clone()))
-                .collect();
+                        // Build peer secrets map for authentication
+                        let peer_secrets: HashMap<String, String> = config
+                            .peers
+                            .iter()
+                            .filter(|p| p.enabled && p.h3.is_some())
+                            .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().secret.clone()))
+                            .collect();
 
-            let (conn_tx, conn_rx) = mpsc::unbounded_channel();
-            let (cmd_tx, listener_handle, _bound_addr) =
-                spawn_h3_listener(listen_addr, cert_path, key_path, peer_secrets, conn_tx)
-                    .await
-                    .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
+                        let (conn_tx, conn_rx) = mpsc::unbounded_channel();
+                        let (cmd_tx, listener_handle, _bound_addr) = spawn_h3_listener(
+                            listen_addr,
+                            cert_path,
+                            key_path,
+                            peer_secrets,
+                            conn_tx,
+                        )
+                        .await
+                        .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
 
-            join_set.spawn(listener_handle);
-            (Some(cmd_tx), Some(conn_rx))
-        } else {
-            (None, None)
+                        join_set.spawn(listener_handle);
+                        (Some(cmd_tx), Some(conn_rx))
+                    }
+                    None => {
+                        // Dial-only mode: no listener, but can dial H3 peers
+                        (None, None)
+                    }
+                }
+            }
+            None => (None, None),
         };
 
         // Initialize unified peer state from config (enabled peers with any transport)

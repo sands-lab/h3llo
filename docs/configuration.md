@@ -10,10 +10,10 @@ local:
     server: udp://1.1.1.1:53 # optional, default: udp://1.1.1.1:53
     refresh: 60 # optional, default: 60 (seconds; 0 disables; minimum 1s, recommended 30s+)
     bindif: eth0 # optional, default: auto-detect; warn and fallback to unbound on failure
-  h3: # optional; when present, all fields below are required unless noted
-    listen: https://[::]:443/path # required when local.h3 is set
-    cert: ./cert.pem # required when local.h3 is set
-    key: ./key.pem # required when local.h3 is set
+  h3: # optional; enables HTTP/3 transport
+    listen: https://[::]:443/path # optional; omit for dial-only H3 mode
+    cert: ./cert.pem # required when local.h3.listen is set
+    key: ./key.pem # required when local.h3.listen is set
     admin: # optional; enables control-plane API when set (requires both name and pass, each longer than 8 characters)
       name: admin-username
       pass: admin-password
@@ -33,8 +33,7 @@ peers: # optional, default: []
       - https://node1.example.com:443/path # optional; deduped; order does not imply priority
     ca: ./ca.pem # optional
     insecure: false # optional, default: false
-    bindifs:
-      - eth0 # optional; omit to auto-detect at most one interface; when set, list must not be empty
+    bindif: eth0 # optional; omit to auto-detect
   bare: # optional, conflicts with peers.h3
     endpoint: udp://node1.example.com:6635 # required when peers.bare is set
     bindif: eth0 # optional; auto-detect when absent; warn and fallback to unbound on failure
@@ -47,7 +46,8 @@ peers: # optional, default: []
 
 - `local.id`: Unique node identifier validated by peers; must be globally unique; use a string of at least 6 characters.
 - `peers` (default `[]`): Optional peer list; omit entirely when running standalone.
-- `local.h3` / `local.bare` (optional): Omit to disable the corresponding listener. When `local.h3` is present, `local.h3.listen`, `local.h3.cert`, and `local.h3.key` are required and must be non-empty. When `local.bare` is present, `local.bare.listen` is required.
+- `local.h3` (optional): Enables HTTP/3 transport. When `local.h3.listen` is set, `cert` and `key` are required. When `listen` is omitted, the node operates in dial-only mode (can connect to peers but not accept inbound connections).
+- `local.bare` (optional): When present, `local.bare.listen` is required.
 - `local.table` (default `true`): Update the system routing table to steer matching traffic into the h3llo TUN. When `false`, h3llo does not touch system routes; the OS still installs host routes (`/32` or `/128`) for `local.tun.addrs`.
 - `local.h3.admin.name` / `local.h3.admin.pass` (optional; both longer than 8 characters): Control-plane Basic Auth credentials bound to HTTP/3. Enable GET/POST APIs only when both are set; authentication matrix is described in `docs/protocol.md`.
 - `local.dns.server` (default `udp://1.1.1.1:53`): DNS server address as a UDP URI with an IP literal and port; outbound binding/recursive-routing guards are detailed in `docs/internals.md`.
@@ -64,7 +64,7 @@ peers: # optional, default: []
 - `peers[].h3.secret`: Remote peer authentication secret; required (and must be longer than 8 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. HTTP Basic Auth for CONNECT uses `username = remote local.id` and `password = peers[username].h3.secret` on the server side; clients send `password = peers[target].h3.secret`.
 - `peers[].enabled` (default `true`): Whether this peer entry is active.
 - `peers[].h3.endpoints` (optional, deduped): List of HTTP/3 dialing addresses (scheme/host/port/path); omit or leave empty to wait for inbound HTTP/3 from the peer. Mutually exclusive with peers[].bare; dialing/multipath details are in `docs/internals.md`.
-- `peers[].h3.bindifs` (optional): Interface list for HTTP/3 dialers. When omitted, auto-detects at most one interface; when set, the list must include at least one interface. Probe/bind fallbacks and recursive-routing warnings are described in `docs/internals.md`.
+- `peers[].h3.bindif` (optional): Interface for HTTP/3 dialer. When omitted, auto-detects at most one interface. Probe/bind fallbacks and recursive-routing warnings are described in `docs/internals.md`.
 - `peers[].h3.ca`: Custom CA bundle path for validating the peer’s certificate (useful for self-signed certs); otherwise the system trust store is used.
 - `peers[].h3.insecure` (default `false`): Skip TLS certificate validation (not recommended; prefer `ca`).
 - `peers[].bare.endpoint`: BareUDP dialing address; mutually exclusive with peers[].h3. DNS handling, source-IP filtering, and multi-answer behavior are detailed in `docs/protocol.md`.
