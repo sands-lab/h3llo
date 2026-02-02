@@ -38,6 +38,30 @@ Actor design principles:
   The orchestrator continues running on graceful exits but terminates on actor errors or task panics.
 - **Graceful shutdown**: when all senders to an actor's command channel are dropped, `recv()` returns `None`. The actor detects this and exits its event loop gracefully.
 
+#### Actor Initialization Pattern (make + spawn)
+
+Each actor follows a consistent two-function initialization pattern:
+
+1. **`make_*`** - Creates actor state from configuration:
+   - Takes configuration parameters (structured config or resolved types)
+   - Performs synchronous or fallible I/O (socket binding, parsing)
+   - Returns `Result<ActorState, Error>`
+   - Example: `make_bare_rx(listen: SocketAddr, mtu: usize) -> Result<BareUdpRx, UdpError>`
+
+2. **`spawn_*`** - Spawns the actor task:
+   - Takes the state struct and dependencies (events_tx, etc.)
+   - Creates channels internally (actor owns receiver)
+   - Spawns `tokio::spawn` task
+   - Returns `(Sender, JoinHandle)`
+   - Example: `spawn_udp_rx(rx: BareUdpRx, ...) -> (UnboundedSender<Cmd>, JoinHandle)`
+
+Both `make` and `spawn` are **bare functions** (not associated methods or impl methods). This design:
+- Follows [Alice Ryhl's Tokio actor pattern](https://ryhl.io/blog/actors-with-tokio/) recommendation for fewer lifetime issues
+- Keeps initialization logic in the actor module, not scattered in orchestrator
+- Makes the separation between fallible setup (`make`) and task spawning (`spawn`) explicit
+
+The orchestrator calls `make` then `spawn` sequentially, never performs actor-specific socket/device initialization.
+
 #### Channel Capacity Policy
 
 Actors use two channel categories with different capacity policies:

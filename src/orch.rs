@@ -1,7 +1,7 @@
 //! Runtime orchestration for BareUDP and HTTP/3 transports.
 
 use crate::actor::{ActorError, ActorExitResult, ActorKind};
-use crate::bare::{spawn_udp_rx, spawn_udp_tx, BareUdpRx, BareUdpRxCommand, BareUdpTx};
+use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUdpRxCommand};
 use crate::bind::DefaultRouteProbe;
 use crate::config::{parse_h3_uri, parse_udp_uri, Config, Peer};
 use crate::dns::{DnsCommand, DnsResolver};
@@ -295,7 +295,7 @@ impl Orchestrator {
                 parse_udp_uri(&local_bare.listen).map_err(OrchestratorError::InvalidBareListen)?;
             let listen_addr = resolve_listen_addr(&listen_endpoint.host, listen_endpoint.port)?;
 
-            let bare_rx = BareUdpRx::from_config(listen_addr, mtu)
+            let bare_rx = make_bare_rx(listen_addr, mtu)
                 .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
 
             let (cmd_tx, bare_rx_handle) = spawn_udp_rx(
@@ -563,26 +563,28 @@ impl Orchestrator {
                     }
 
                     let bindif = entry.config.bare.as_ref().and_then(|b| b.bindif.as_deref());
-                    if let Some((packet_tx, tx_handle)) = spawn_bare_tx(
-                        &peer_id,
-                        destination,
-                        bindif,
-                        &self.tun_if,
-                        self.events_tx.clone(),
-                    )
-                    .await
-                    {
-                        let bound_id = self.next_bound_id();
-                        let entry = self.peers.get_mut(&peer_id).unwrap();
-                        entry.bounds.push(BoundState {
-                            id: bound_id,
-                            transport: TransportType::BareUdp,
-                            dest: destination,
-                            tx: packet_tx,
-                        });
-                        self.join_set.spawn(tx_handle);
-                        any_spawned = true;
-                    }
+                    let probe = DefaultRouteProbe;
+                    let tx_socket =
+                        match make_bare_tx(destination, bindif, Some(&self.tun_if), &probe).await {
+                            Ok(s) => s,
+                            Err(err) => {
+                                warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
+                                continue;
+                            }
+                        };
+                    let (packet_tx, tx_handle) =
+                        spawn_udp_tx(tx_socket, self.events_tx.clone(), METRICS_INTERVAL);
+
+                    let bound_id = self.next_bound_id();
+                    let entry = self.peers.get_mut(&peer_id).unwrap();
+                    entry.bounds.push(BoundState {
+                        id: bound_id,
+                        transport: TransportType::BareUdp,
+                        dest: destination,
+                        tx: packet_tx,
+                    });
+                    self.join_set.spawn(tx_handle);
+                    any_spawned = true;
                 }
             }
 
@@ -827,31 +829,6 @@ fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, Orchestrator
         );
     }
     Ok(addrs[0])
-}
-
-/// Spawns a BareUDP TX actor for a peer destination.
-///
-/// Returns the packet sender and task handle, or None if socket setup fails.
-async fn spawn_bare_tx(
-    peer_id: &str,
-    destination: SocketAddr,
-    bindif: Option<&str>,
-    tun_if: &str,
-    events_tx: mpsc::UnboundedSender<Event>,
-) -> Option<(mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>)> {
-    let probe = DefaultRouteProbe;
-    let tx_socket = match BareUdpTx::from_config(destination, bindif, Some(tun_if), &probe).await {
-        Ok(result) => result,
-        Err(err) => {
-            warn!("bare peer '{}' socket setup failed: {err}", peer_id);
-            return None;
-        }
-    };
-
-    // BareUDP TX actor creates its own packet channel; returns sender
-    let (packet_tx, tx_handle) = spawn_udp_tx(tx_socket, events_tx, METRICS_INTERVAL);
-
-    Some((packet_tx, tx_handle))
 }
 
 /// Performs system route synchronization, logging warnings on failure.
