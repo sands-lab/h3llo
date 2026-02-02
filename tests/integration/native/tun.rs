@@ -1,13 +1,13 @@
 //! TUN integration test orchestrator.
 //!
-//! Copies the `integration-container-tun` binary into a privileged Docker
-//! container and waits for it to exit with code 0.
+//! Runs the `integration-container-tun` binary (pre-built inside Docker image)
+//! in a privileged container and waits for it to exit with code 0.
 //!
 //! Implements the Container Test Pattern documented in `docs/test.md`.
 //!
 //! Run with:
 //! ```bash
-//! cargo test --test integration-container-tun --no-run  # build container binary
+//! docker build --target test -t h3llo:test .  # build image with embedded binaries
 //! cargo test --test integration -- tun --ignored --nocapture
 //! ```
 
@@ -17,18 +17,15 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use super::common::{
-    ensure_image_exists, find_test_binary, get_container_exit_code, TEST_IMAGE, TEST_TAG,
+    ensure_image_exists, get_container_exit_code, CONTAINER_TUN_BINARY, TEST_IMAGE, TEST_TAG,
 };
-
-const BINARY_NAME: &str = "integration-container-tun";
-const CONTAINER_BINARY_PATH: &str = "/usr/local/bin/integration-container-tun";
 
 /// Runs the TUN integration test binary inside a privileged Docker container.
 ///
 /// The container binary exercises `h3llo::tun::from_config()` with real TUN
 /// devices, verifying device creation, multi-address assignment, and MTU.
 #[tokio::test]
-#[ignore = "requires Docker, pre-built image, and pre-compiled container binary"]
+#[ignore = "requires Docker and pre-built test image with embedded binaries"]
 async fn tun_container_integration() {
     if !ensure_image_exists(TEST_IMAGE, TEST_TAG) {
         panic!(
@@ -37,15 +34,12 @@ async fn tun_container_integration() {
         );
     }
 
-    let binary_path = find_test_binary(BINARY_NAME);
-    eprintln!("Using test binary: {}", binary_path.display());
+    eprintln!("Using embedded test binary: {CONTAINER_TUN_BINARY}");
 
-    // Wait for container to exit without checking exit code - allows us to get logs first
     let container = GenericImage::new(TEST_IMAGE, TEST_TAG)
-        .with_entrypoint(CONTAINER_BINARY_PATH)
+        .with_entrypoint(CONTAINER_TUN_BINARY)
         .with_wait_for(WaitFor::Exit(ExitWaitStrategy::new()))
         .with_privileged(true)
-        .with_copy_to(CONTAINER_BINARY_PATH, binary_path)
         .start()
         .await
         .expect("container should start");

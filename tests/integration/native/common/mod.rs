@@ -2,7 +2,6 @@
 //!
 //! Provides common helper functions for Container Test Pattern tests.
 
-use std::path::PathBuf;
 use std::process::Command;
 
 /// Default test image name.
@@ -10,6 +9,12 @@ pub const TEST_IMAGE: &str = "h3llo";
 
 /// Default test image tag.
 pub const TEST_TAG: &str = "test";
+
+/// Container path for TUN test binary.
+pub const CONTAINER_TUN_BINARY: &str = "/usr/local/bin/integration-container-tun";
+
+/// Container path for route test binary.
+pub const CONTAINER_ROUTE_BINARY: &str = "/usr/local/bin/integration-container-route";
 
 /// Checks if a Docker image exists locally.
 ///
@@ -52,53 +57,4 @@ pub fn get_container_exit_code(container_id: &str) -> Option<i64> {
     } else {
         None
     }
-}
-
-/// Locates a compiled test binary in the target directory.
-///
-/// `cargo test --no-run` places binaries in `target/{profile}/deps/` with
-/// underscores replacing hyphens and a hash suffix. For musl cross-compilation,
-/// binaries are in `target/x86_64-unknown-linux-musl/{profile}/deps/`.
-///
-/// # Arguments
-///
-/// * `binary_name` - The binary name with hyphens (e.g., "integration-container-tun")
-///
-/// # Panics
-///
-/// Panics if the binary cannot be found.
-pub fn find_test_binary(binary_name: &str) -> PathBuf {
-    let target_dir =
-        PathBuf::from(std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string()));
-
-    let deps_prefix = binary_name.replace('-', "_");
-
-    // Search musl target directory first, then fall back to default
-    let search_bases = [
-        target_dir.join("x86_64-unknown-linux-musl"),
-        target_dir.clone(),
-    ];
-
-    for base in search_bases {
-        for profile in ["debug", "release"] {
-            let deps_dir = base.join(profile).join("deps");
-            if let Ok(entries) = std::fs::read_dir(&deps_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if name_str.starts_with(&deps_prefix)
-                        && !name_str.ends_with(".d")
-                        && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
-                    {
-                        return entry.path();
-                    }
-                }
-            }
-        }
-    }
-
-    panic!(
-        "Cannot find test binary '{binary_name}'. Build it first with:\n  \
-         cargo test --test {binary_name} --target x86_64-unknown-linux-musl --no-run"
-    );
 }
