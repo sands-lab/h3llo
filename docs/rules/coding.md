@@ -9,6 +9,10 @@
     - 【应当】在能简化正确性/降低锁竞争时，优先消息传递（如 MPSC）而非共享可变状态加锁。
 - Idiomatic / Modern Rust
     - 【应当】使用惯用 Rust：?、所有权/借用、清晰的错误类型与边界；在合适场景使用 async、impl Trait 等提升表达力。
+- 控制流与嵌套
+    - 【应当】使用 `let-else` 和 early return 减少嵌套深度，例如 `let Some(x) = expr else { continue; };` 优于 `match expr { Some(x) => ..., None => continue }`。
+    - 【应当】对单变体枚举直接使用 `let Pattern = value;` 解构，避免不必要的 `match`。
+    - 参考示例：`src/auth.rs:44-55` 展示了连续多个 let-else guard 的惯用写法。
 - 性能（性能敏感路径）
     - 【应当】尽量减少拷贝，复用 buffer 或采用零拷贝策略。
     - 【应当】优先静态分发，避免不必要的运行期多态，便于内联与优化。

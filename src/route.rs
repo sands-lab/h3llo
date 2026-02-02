@@ -137,15 +137,12 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
     // - For non-TUN routes:
     //   * record as potential conflicts (prefix -> first seen ifindex).
     for route in &routes {
-        let net = match ipnet_from_route(route) {
-            Some(net) => net,
-            None => {
-                warn!(
-                    reason = "unsupported address family or invalid prefix",
-                    "route skipped: unsupported"
-                );
-                continue;
-            }
+        let Some(net) = ipnet_from_route(route) else {
+            warn!(
+                reason = "unsupported address family or invalid prefix",
+                "route skipped: unsupported"
+            );
+            continue;
         };
 
         match route.if_index() {

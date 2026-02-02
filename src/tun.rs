@@ -422,20 +422,14 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             let packet = buf[..len].to_vec();
 
                             // Inline routing dispatch
-                            let dest = match extract_dst_ip(&packet) {
-                                Some(ip) => ip,
-                                None => {
-                                    counters.record_drop(DropReason::InvalidIpVersion, len);
-                                    continue;
-                                }
+                            let Some(dest) = extract_dst_ip(&packet) else {
+                                counters.record_drop(DropReason::InvalidIpVersion, len);
+                                continue;
                             };
 
-                            let route = match routing.lookup(dest) {
-                                Some(route) => route,
-                                None => {
-                                    counters.record_drop(DropReason::NoRoute, len);
-                                    continue;
-                                }
+                            let Some(route) = routing.lookup(dest) else {
+                                counters.record_drop(DropReason::NoRoute, len);
+                                continue;
                             };
 
                             // Send directly via embedded TX channel
@@ -452,16 +446,12 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                     }
                 }
                 cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(command) => {
-                            match command {
-                                TunRxCommand::UpdateRouting { routing: new_routing } => {
-                                    routing = new_routing;
-                                }
-                            }
-                        }
-                        None => return Ok(()), // Channel closed, exit gracefully
-                    }
+                    let Some(command) = cmd else {
+                        return Ok(()); // Channel closed, exit gracefully
+                    };
+                    // Single-variant enum: destructure directly
+                    let TunRxCommand::UpdateRouting { routing: new_routing } = command;
+                    routing = new_routing;
                 }
                 _ = ticker.tick() => {
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
