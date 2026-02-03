@@ -691,17 +691,17 @@ impl Orchestrator {
     ///
     /// Spawns RX/TX actors for the authenticated peer and adds to routing.
     async fn handle_h3_inbound(&mut self, conn: H3Connection) {
-        let peer_id = &conn.peer_id;
+        let peer_id = conn.peer_id.clone();
         let remote_addr = conn.remote_addr;
 
         // Check if peer is configured
-        if !self.peers.contains_key(peer_id) {
+        if !self.peers.contains_key(&peer_id) {
             warn!(peer = %peer_id, addr = %remote_addr, "H3 inbound connection from unknown peer");
             return;
         }
 
         // Check if already have a bound for this IP
-        let entry = self.peers.get(peer_id).unwrap();
+        let entry = self.peers.get(&peer_id).unwrap();
         if entry.has_bound_for_ip(remote_addr.ip()) {
             debug!(peer = %peer_id, addr = %remote_addr, "H3 inbound: already have bound for this IP");
             return;
@@ -725,7 +725,7 @@ impl Orchestrator {
             spawn_h3_tx(tx_state, self.events_tx.clone(), METRICS_INTERVAL);
 
         let bound_id = self.next_bound_id();
-        let entry = self.peers.get_mut(peer_id).unwrap();
+        let entry = self.peers.get_mut(&peer_id).unwrap();
         entry.bounds.push(BoundState {
             id: bound_id,
             transport: TransportType::Http3,
