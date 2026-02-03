@@ -3,7 +3,7 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_client_udp_socket, RouteProbe};
-use crate::config::{parse_dns_server_uri, LocalDns};
+use crate::config::LocalDns;
 use crate::events::{DnsEvent, DnsEventDetail, DnsIpExpired, DnsIpResolved, Event};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
@@ -88,9 +88,7 @@ struct DnsAnswerRecord {
 /// Describes resolver initialization failures.
 #[derive(Debug, Error)]
 pub enum ResolveInitError {
-    /// DNS server URI could not be parsed.
-    #[error("invalid dns server: {0}")]
-    InvalidServer(String),
+    // Note: InvalidServer variant removed - parsing now happens during config deserialization.
     /// DNS socket could not be prepared.
     #[error("dns resolver failed to initialize: {0}")]
     Socket(String),
@@ -121,7 +119,6 @@ pub struct DnsActor {
 ///
 /// # Errors
 ///
-/// Returns `ResolveInitError::InvalidServer` when the DNS server URI is malformed.
 /// Returns `ResolveInitError::Socket` when socket creation, binding, or connect fails.
 pub async fn make_dns<P: RouteProbe>(
     local_dns: &LocalDns,
@@ -129,8 +126,8 @@ pub async fn make_dns<P: RouteProbe>(
     timeout: Duration,
     probe: &P,
 ) -> Result<DnsActor, ResolveInitError> {
-    let server =
-        parse_dns_server_uri(&local_dns.server).map_err(ResolveInitError::InvalidServer)?;
+    // server is pre-parsed as SocketAddr during config deserialization
+    let server = local_dns.server;
     let refresh_interval = Duration::from_secs(local_dns.refresh);
 
     let socket = make_client_udp_socket(server, tun_if, local_dns.bindif.as_deref(), probe)
@@ -693,9 +690,9 @@ mod tests {
     ) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-        // Build LocalDns config for make_dns (needs udp:// scheme)
+        // Build LocalDns config for make_dns (server is now pre-parsed SocketAddr)
         let local_dns = LocalDns {
-            server: format!("udp://{}", server),
+            server,
             bindif: None,
             refresh: 0, // ZERO disables automatic refresh
         };
@@ -1020,7 +1017,7 @@ mod tests {
         let server_addr = socket.local_addr().unwrap();
 
         let local_dns = LocalDns {
-            server: format!("udp://{}", server_addr),
+            server: server_addr,
             bindif: None,
             refresh: 0,
         };
@@ -1045,7 +1042,7 @@ mod tests {
         let server_addr = socket.local_addr().unwrap();
 
         let local_dns = LocalDns {
-            server: format!("udp://{}", server_addr),
+            server: server_addr,
             bindif: None,
             refresh: 0,
         };

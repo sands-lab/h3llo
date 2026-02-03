@@ -51,10 +51,9 @@ pub trait TunTx: Send + 'static {
 ///
 /// # Errors
 ///
-/// Returns `TunError::InvalidAddress` when an address cannot be parsed.
 /// Returns `TunError::DeviceBuild` when device creation or address assignment fails.
 pub async fn make_tun(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), TunError> {
-    let (v4_addrs, v6_addrs) = parse_addrs(&local_tun.addrs)?;
+    let (v4_addrs, v6_addrs) = split_addrs_by_version(&local_tun.addrs);
 
     let mut builder = DeviceBuilder::new()
         .name(local_tun.ifname.as_str())
@@ -147,9 +146,7 @@ impl TunTx for TunWriter {
 /// Describes TUN errors for creation and operation.
 #[derive(Debug, Error)]
 pub enum TunError {
-    /// A configured address could not be parsed.
-    #[error("invalid TUN address '{addr}': {error}")]
-    InvalidAddress { addr: String, error: String },
+    // Note: InvalidAddress variant removed - parsing now happens during config deserialization.
     /// Device creation or address assignment failed.
     #[error("failed to build TUN device: {0}")]
     DeviceBuild(String),
@@ -239,7 +236,7 @@ impl RoutingTable {
     ///
     /// # Errors
     ///
-    /// Returns `RoutingError` when a prefix is invalid or conflicts with an existing peer.
+    /// Returns `RoutingError::ConflictingPrefix` when a prefix conflicts with an existing peer.
     pub fn from_peers(
         peers: &[Peer],
         peer_txs: &HashMap<String, mpsc::Sender<Vec<u8>>>,
@@ -255,17 +252,10 @@ impl RoutingTable {
                 continue;
             };
 
-            for cidr in &peer.tun.allowed_ips {
-                let net: IpNet =
-                    cidr.parse::<IpNet>()
-                        .map_err(|err| RoutingError::InvalidAllowedIp {
-                            peer_id: peer.id.clone(),
-                            cidr: cidr.clone(),
-                            error: err.to_string(),
-                        })?;
-
+            // allowed_ips is pre-parsed as Vec<IpNet> during config deserialization
+            for net in &peer.tun.allowed_ips {
                 table.insert(
-                    net,
+                    *net,
                     RouteEntry {
                         peer_id: peer.id.clone(),
                         tx: tx.clone(),
@@ -336,16 +326,7 @@ pub enum TunRxCommand {
 /// Routing table construction or lookup error.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RoutingError {
-    /// Allowed IP entry cannot be parsed.
-    #[error("peer '{peer_id}' has invalid allowedIPs entry '{cidr}': {error}")]
-    InvalidAllowedIp {
-        /// Identifier of the owning peer.
-        peer_id: String,
-        /// Raw CIDR string that failed to parse.
-        cidr: String,
-        /// Parsing failure detail.
-        error: String,
-    },
+    // Note: InvalidAllowedIp variant removed - parsing now happens during config deserialization.
     /// Two peers claim the same prefix.
     #[error("prefix {prefix} already assigned to peer '{existing_peer_id}', cannot assign to '{new_peer_id}'")]
     ConflictingPrefix {
@@ -358,35 +339,23 @@ pub enum RoutingError {
     },
 }
 
-// Parses raw address strings and groups them by IP version.
-fn parse_addrs(raw_addrs: &[String]) -> Result<(Vec<Ipv4Net>, Vec<Ipv6Net>), TunError> {
+/// Groups pre-parsed IP addresses by version, converting to host-prefix networks.
+fn split_addrs_by_version(addrs: &[IpAddr]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
-    for addr in raw_addrs {
-        match addr.parse::<IpAddr>() {
-            Ok(IpAddr::V4(ip)) => {
-                let net = Ipv4Net::new(ip, 32).map_err(|e| TunError::InvalidAddress {
-                    addr: addr.clone(),
-                    error: e.to_string(),
-                })?;
-                v4.push(net);
+    for addr in addrs {
+        match addr {
+            IpAddr::V4(ip) => {
+                // SAFETY: /32 prefix is always valid for IPv4
+                v4.push(Ipv4Net::new(*ip, 32).unwrap());
             }
-            Ok(IpAddr::V6(ip)) => {
-                let net = Ipv6Net::new(ip, 128).map_err(|e| TunError::InvalidAddress {
-                    addr: addr.clone(),
-                    error: e.to_string(),
-                })?;
-                v6.push(net);
+            IpAddr::V6(ip) => {
+                // SAFETY: /128 prefix is always valid for IPv6
+                v6.push(Ipv6Net::new(*ip, 128).unwrap());
             }
-            Err(e) => {
-                return Err(TunError::InvalidAddress {
-                    addr: addr.clone(),
-                    error: e.to_string(),
-                })
-            }
-        };
+        }
     }
-    Ok((v4, v6))
+    (v4, v6)
 }
 
 /// Spawns the TUN read loop.
@@ -689,9 +658,12 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
-    async fn parses_addresses_and_normalizes_to_host_prefix() {
-        let addrs = vec!["192.168.1.1".to_string(), "2001:db8::1".to_string()];
-        let (v4, v6) = parse_addrs(&addrs).unwrap();
+    async fn splits_addresses_and_normalizes_to_host_prefix() {
+        let addrs: Vec<IpAddr> = vec![
+            "192.168.1.1".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+        ];
+        let (v4, v6) = split_addrs_by_version(&addrs);
         assert_eq!(v4.len(), 1);
         assert_eq!(v4[0].addr(), Ipv4Addr::new(192, 168, 1, 1));
         assert_eq!(v4[0].prefix_len(), 32);
@@ -861,7 +833,7 @@ mod tests {
                 bindif: None,
             }),
             tun: PeerTun {
-                allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
+                allowed_ips: allowed.iter().map(|s| s.parse().unwrap()).collect(),
             },
         }
     }
@@ -953,7 +925,7 @@ mod tests {
             h3: None,
             bare: None,
             tun: PeerTun {
-                allowed_ips: vec!["192.0.2.0/24".to_string()],
+                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
             },
         };
         let mut peer_txs = HashMap::new();
@@ -975,7 +947,7 @@ mod tests {
             h3: None,
             bare: None,
             tun: PeerTun {
-                allowed_ips: vec!["192.0.2.0/24".to_string()],
+                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
             },
         };
         let mut new_peer_txs = HashMap::new();
