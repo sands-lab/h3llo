@@ -602,7 +602,7 @@ impl Orchestrator {
                     };
 
                     // Strip IPv6 brackets for comparison
-                    let host = endpoint.host.trim_start_matches('[').trim_end_matches(']');
+                    let host = strip_ipv6_brackets(&endpoint.host);
 
                     if host != resolved.host {
                         continue;
@@ -792,13 +792,17 @@ impl Orchestrator {
     }
 }
 
+fn strip_ipv6_brackets(host: &str) -> &str {
+    host.trim_start_matches('[').trim_end_matches(']')
+}
+
 /// Resolves a listen address from host and port, using synchronous DNS lookup for hostnames.
 ///
 /// Handles IPv6 bracket notation (e.g., "[::1]" -> "::1") for compatibility with
 /// both UDP and H3 endpoint formats.
 fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, OrchestratorError> {
     // Strip IPv6 bracket notation (safe no-op for non-bracketed hosts)
-    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = strip_ipv6_brackets(host);
 
     // Fast path: IP literal
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -844,35 +848,33 @@ async fn sync_system_routes(tun_if: &str, tun_addrs: &[IpNet], allowed: &[IpNet]
 }
 
 fn collect_allowed_ips(peers: &[Peer]) -> Result<Vec<IpNet>, OrchestratorError> {
-    let mut allowed = Vec::new();
-    for peer in peers {
-        for cidr in &peer.tun.allowed_ips {
-            let net = cidr
-                .parse::<IpNet>()
-                .map_err(|err| OrchestratorError::Routing(err.to_string()))?;
-            allowed.push(net);
-        }
-    }
-    Ok(allowed)
+    peers
+        .iter()
+        .flat_map(|peer| peer.tun.allowed_ips.iter())
+        .map(|cidr| {
+            cidr.parse::<IpNet>()
+                .map_err(|err| OrchestratorError::Routing(err.to_string()))
+        })
+        .collect()
 }
 
 fn tun_prefixes(addrs: &[String]) -> Result<Vec<IpNet>, OrchestratorError> {
-    let mut prefixes = Vec::new();
-    for addr in addrs {
-        let ip = addr
-            .parse::<IpAddr>()
-            .map_err(|err| OrchestratorError::Routing(err.to_string()))?;
-        let net = match ip {
-            IpAddr::V4(ip) => IpNet::new(ip.into(), 32).map_err(|e| {
-                OrchestratorError::Routing(format!("invalid IPv4 TUN addr {addr}: {e}"))
-            })?,
-            IpAddr::V6(ip) => IpNet::new(ip.into(), 128).map_err(|e| {
-                OrchestratorError::Routing(format!("invalid IPv6 TUN addr {addr}: {e}"))
-            })?,
-        };
-        prefixes.push(net);
-    }
-    Ok(prefixes)
+    addrs
+        .iter()
+        .map(|addr| {
+            let ip = addr
+                .parse::<IpAddr>()
+                .map_err(|err| OrchestratorError::Routing(err.to_string()))?;
+            match ip {
+                IpAddr::V4(ip) => IpNet::new(ip.into(), 32).map_err(|e| {
+                    OrchestratorError::Routing(format!("invalid IPv4 TUN addr {addr}: {e}"))
+                }),
+                IpAddr::V6(ip) => IpNet::new(ip.into(), 128).map_err(|e| {
+                    OrchestratorError::Routing(format!("invalid IPv6 TUN addr {addr}: {e}"))
+                }),
+            }
+        })
+        .collect()
 }
 
 /// Collects all unique hostnames from peer configurations.
@@ -918,12 +920,7 @@ fn collect_hostnames(peers: &[Peer]) -> Result<HashSet<String>, OrchestratorErro
                 })?;
 
                 // Strip IPv6 brackets for DNS resolution
-                let host = endpoint
-                    .host
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .to_string();
-                hosts.insert(host);
+                hosts.insert(strip_ipv6_brackets(&endpoint.host).to_string());
             }
         }
     }
