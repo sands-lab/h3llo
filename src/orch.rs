@@ -3,7 +3,7 @@
 use crate::actor::{ActorError, ActorExitResult, ActorKind};
 use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUdpRxCommand};
 use crate::bind::DefaultRouteProbe;
-use crate::config::{parse_h3_uri, parse_udp_uri, Config, Peer};
+use crate::config::{Config, Peer};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
     ConnectionDirection, DnsEventDetail, DnsIpExpired, DnsIpResolved, Event, H3ConnectedEvent,
@@ -92,28 +92,6 @@ impl PeerEntry {
 /// Errors returned by the orchestrator.
 #[derive(Debug, Error)]
 pub enum OrchestratorError {
-    /// BareUDP configuration is missing.
-    #[error("bare runtime requires local.bare.listen to be set")]
-    MissingBareListen,
-    /// HTTP/3 configuration is missing.
-    #[error("h3 runtime requires local.h3.listen to be set")]
-    MissingH3Listen,
-    /// BareUDP listen URI failed validation.
-    #[error("invalid bare listen uri: {0}")]
-    InvalidBareListen(String),
-    /// HTTP/3 listen URI failed validation.
-    #[error("invalid h3 listen uri: {0}")]
-    InvalidH3Listen(String),
-    /// BareUDP peer endpoint failed validation.
-    #[error("peer '{peer_id}' bare.endpoint invalid: {reason}")]
-    InvalidPeerEndpoint { peer_id: String, reason: String },
-    /// HTTP/3 peer endpoint failed validation.
-    #[error("peer '{peer_id}' h3.endpoints[{index}] invalid: {reason}")]
-    InvalidH3Endpoint {
-        peer_id: String,
-        index: usize,
-        reason: String,
-    },
     /// BareUDP listen host could not be resolved.
     #[error("failed to resolve bare listen host '{host}': {reason}")]
     ListenResolveFailed { host: String, reason: String },
@@ -261,12 +239,7 @@ impl Orchestrator {
         let manage_routes = config.local.table;
         let tun_addrs = tun_prefixes(&config.local.tun.addrs)?;
 
-        // At least one transport must be configured
-        let has_bare = config.local.bare.is_some();
-        let has_h3 = config.local.h3.is_some();
-        if !has_bare && !has_h3 {
-            return Err(OrchestratorError::MissingBareListen);
-        }
+        // Note: NoTransportConfigured validation moved to Config::validate()
 
         // Setup TUN
         let (tun_reader, tun_writer) = tun::make_tun(&config.local.tun)
@@ -292,10 +265,9 @@ impl Orchestrator {
         join_set.spawn(tun_tx_handle);
 
         // Initialize BareUDP listener if configured
-        let bare_rx_cmd_tx = if let Some(local_bare) = config.local.bare.as_ref() {
-            let listen_endpoint =
-                parse_udp_uri(&local_bare.listen).map_err(OrchestratorError::InvalidBareListen)?;
-            let listen_addr = resolve_listen_addr(&listen_endpoint.host, listen_endpoint.port)?;
+        let bare_rx_cmd_tx = if let Some(ref local_bare) = config.local.bare {
+            // Endpoint already parsed during config deserialization
+            let listen_addr = resolve_listen_addr(&local_bare.listen.host, local_bare.listen.port)?;
 
             let bare_rx = make_bare_rx(listen_addr, mtu)
                 .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
@@ -316,15 +288,12 @@ impl Orchestrator {
 
         // Initialize H3 listener if configured with listen address
         let h3_cfg = config.local.h3.as_ref();
-        let listen_uri = h3_cfg
-            .and_then(|h3| h3.listen.as_ref())
-            .filter(|l| !l.trim().is_empty());
+        let listen_endpoint = h3_cfg.and_then(|h3| h3.listen.as_ref());
 
-        let h3_listener_cmd_tx = match (h3_cfg, listen_uri) {
-            (Some(h3_cfg), Some(listen_uri)) => {
-                let listen_endpoint =
-                    parse_h3_uri(listen_uri).map_err(OrchestratorError::InvalidH3Listen)?;
-                let listen_addr = resolve_listen_addr(&listen_endpoint.host, listen_endpoint.port)?;
+        let h3_listener_cmd_tx = match (h3_cfg, listen_endpoint) {
+            (Some(h3_cfg), Some(listen_ep)) => {
+                // Endpoint already parsed during config deserialization
+                let listen_addr = resolve_listen_addr(&listen_ep.host, listen_ep.port)?;
 
                 // SAFETY: cert and key are validated to be Some when listen is set
                 let cert_path = Path::new(h3_cfg.cert.as_ref().expect("validated"));
@@ -378,7 +347,7 @@ impl Orchestrator {
         // Send all hostnames to DNS module in one shot.
         // IP literals are handled by the DNS module directly (immediate IpResolved event).
         let peer_configs: Vec<Peer> = peers.values().map(|e| e.config.clone()).collect();
-        let hostnames = collect_hostnames(&peer_configs)?;
+        let hostnames = collect_hostnames(&peer_configs);
         if let Err(e) = dns_cmd_tx.send(DnsCommand::SetHostnames { hosts: hostnames }) {
             warn!(error = %e, "dns: failed to send initial hostnames");
         }
@@ -538,9 +507,7 @@ impl Orchestrator {
 
             // Handle BareUDP endpoints
             if let Some(bare) = entry.config.bare.as_ref() {
-                let Ok(endpoint) = parse_udp_uri(&bare.endpoint) else {
-                    continue;
-                };
+                let endpoint = &bare.endpoint;
 
                 if endpoint.host == resolved.host {
                     let destination = SocketAddr::new(resolved.address, endpoint.port);
@@ -583,11 +550,8 @@ impl Orchestrator {
                 };
 
                 let mut targets = Vec::new();
-                for endpoint_uri in &h3.endpoints {
-                    let Ok(endpoint) = parse_h3_uri(endpoint_uri) else {
-                        continue;
-                    };
-
+                for endpoint in &h3.endpoints {
+                    // Endpoints already parsed during config deserialization
                     // Strip IPv6 brackets for comparison
                     let host = strip_ipv6_brackets(&endpoint.host);
 
@@ -845,17 +809,9 @@ fn tun_prefixes(addrs: &[String]) -> Result<Vec<IpNet>, OrchestratorError> {
 
 /// Collects all unique hostnames from peer configurations.
 ///
-/// Handles both BareUDP and H3 endpoints.
-///
-/// # Arguments
-///
-/// * `peers` - Slice of peer configurations to process
-///
-/// # Errors
-///
-/// Returns `OrchestratorError::InvalidPeerEndpoint` or `OrchestratorError::InvalidH3Endpoint`
-/// if any enabled peer has an invalid endpoint URI.
-fn collect_hostnames(peers: &[Peer]) -> Result<HashSet<String>, OrchestratorError> {
+/// Handles both BareUDP and H3 endpoints. Endpoints are pre-parsed during
+/// config deserialization, so this function cannot fail.
+fn collect_hostnames(peers: &[Peer]) -> HashSet<String> {
     let mut hosts = HashSet::new();
 
     for peer in peers {
@@ -865,33 +821,19 @@ fn collect_hostnames(peers: &[Peer]) -> Result<HashSet<String>, OrchestratorErro
 
         // Handle BareUDP endpoints
         if let Some(bare) = peer.bare.as_ref() {
-            let endpoint = parse_udp_uri(&bare.endpoint).map_err(|err| {
-                OrchestratorError::InvalidPeerEndpoint {
-                    peer_id: peer.id.clone(),
-                    reason: err,
-                }
-            })?;
-            hosts.insert(endpoint.host);
+            hosts.insert(bare.endpoint.host.clone());
         }
 
         // Handle H3 endpoints
         if let Some(h3) = peer.h3.as_ref() {
-            for (idx, endpoint_uri) in h3.endpoints.iter().enumerate() {
-                let endpoint = parse_h3_uri(endpoint_uri).map_err(|err| {
-                    OrchestratorError::InvalidH3Endpoint {
-                        peer_id: peer.id.clone(),
-                        index: idx,
-                        reason: err,
-                    }
-                })?;
-
+            for endpoint in &h3.endpoints {
                 // Strip IPv6 brackets for DNS resolution
                 hosts.insert(strip_ipv6_brackets(&endpoint.host).to_string());
             }
         }
     }
 
-    Ok(hosts)
+    hosts
 }
 
 #[cfg(test)]
@@ -1058,12 +1000,16 @@ mod tests {
 
     /// Helper to create test peers with BareUDP configuration.
     fn bare_peer(id: &str, allowed: &[&str]) -> Peer {
+        use crate::config::UdpEndpoint;
         Peer {
             id: id.to_string(),
             enabled: true,
             h3: None,
             bare: Some(PeerBare {
-                endpoint: "udp://127.0.0.1:5353".to_string(),
+                endpoint: UdpEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: 5353,
+                },
                 bindif: None,
             }),
             tun: PeerTun {
@@ -1074,12 +1020,16 @@ mod tests {
 
     /// Helper to create test peers with BareUDP configuration at a specific hostname.
     fn bare_peer_at_host(id: &str, hostname: &str, port: u16, allowed: &[&str]) -> Peer {
+        use crate::config::UdpEndpoint;
         Peer {
             id: id.to_string(),
             enabled: true,
             h3: None,
             bare: Some(PeerBare {
-                endpoint: format!("udp://{}:{}", hostname, port),
+                endpoint: UdpEndpoint {
+                    host: hostname.to_string(),
+                    port,
+                },
                 bindif: None,
             }),
             tun: PeerTun {
@@ -1195,30 +1145,14 @@ mod tests {
 
     // ========== OrchestratorError tests ==========
 
-    #[test]
-    fn orchestrator_error_missing_bare_listen() {
-        let error = OrchestratorError::MissingBareListen;
-        assert!(error.to_string().contains("local.bare.listen"));
-    }
+    // Note: orchestrator_error_missing_bare_listen test removed - this error
+    // variant was removed; validation moved to Config::validate()
 
-    #[test]
-    fn orchestrator_error_invalid_bare_listen() {
-        let error = OrchestratorError::InvalidBareListen("bad uri".to_string());
-        let msg = error.to_string();
-        assert!(msg.contains("invalid bare listen"));
-        assert!(msg.contains("bad uri"));
-    }
+    // Note: orchestrator_error_invalid_bare_listen test removed - URI parsing
+    // now happens during config deserialization
 
-    #[test]
-    fn orchestrator_error_invalid_peer_endpoint() {
-        let error = OrchestratorError::InvalidPeerEndpoint {
-            peer_id: "test-peer".to_string(),
-            reason: "bad uri".to_string(),
-        };
-        let msg = error.to_string();
-        assert!(msg.contains("test-peer"));
-        assert!(msg.contains("bad uri"));
-    }
+    // Note: orchestrator_error_invalid_peer_endpoint test removed - URI parsing
+    // now happens during config deserialization
 
     #[test]
     fn orchestrator_error_listen_resolve_failed() {
@@ -1461,7 +1395,7 @@ mod tests {
         ];
 
         let peer_configs: Vec<_> = peers.iter().map(|p| p.clone()).collect();
-        let result = collect_hostnames(&peer_configs).unwrap();
+        let result = collect_hostnames(&peer_configs);
 
         // Deduplicated to single hostname
         assert_eq!(result.len(), 1);
@@ -1473,7 +1407,7 @@ mod tests {
         let mut peer = bare_peer_at_host("disabled", "example.com", 5353, &["10.0.0.0/24"]);
         peer.enabled = false;
 
-        let result = collect_hostnames(&[peer]).unwrap();
+        let result = collect_hostnames(&[peer]);
         assert!(result.is_empty(), "no hostnames should be collected");
     }
 
@@ -1489,38 +1423,19 @@ mod tests {
             },
         };
 
-        let result = collect_hostnames(&[peer]).unwrap();
+        let result = collect_hostnames(&[peer]);
         assert!(result.is_empty(), "no hostnames should be collected");
     }
 
-    #[test]
-    fn collect_hostnames_returns_error_for_invalid_endpoint() {
-        let peer = Peer {
-            id: "badpeer".to_string(),
-            enabled: true,
-            h3: None,
-            bare: Some(PeerBare {
-                endpoint: "not-a-valid-uri".to_string(),
-                bindif: None,
-            }),
-            tun: PeerTun {
-                allowed_ips: vec!["10.0.0.0/24".to_string()],
-            },
-        };
-
-        let result = collect_hostnames(&[peer]);
-
-        assert!(matches!(
-            result,
-            Err(OrchestratorError::InvalidPeerEndpoint { peer_id, .. }) if peer_id == "badpeer"
-        ));
-    }
+    // Note: collect_hostnames_returns_error_for_invalid_endpoint test removed -
+    // invalid endpoint URIs now fail at config deserialization time, and
+    // collect_hostnames is now infallible.
 
     #[test]
     fn collect_hostnames_includes_ip_literals() {
         let peer = bare_peer("peer1", &["10.0.0.0/24"]); // Uses 127.0.0.1
 
-        let result = collect_hostnames(&[peer]).unwrap();
+        let result = collect_hostnames(&[peer]);
         assert!(
             result.contains("127.0.0.1"),
             "IP literals should be collected for DNS module to handle"
@@ -1531,12 +1446,16 @@ mod tests {
 
     /// Helper to create test peers with H3 configuration at a specific host.
     fn h3_peer_at_host(id: &str, host: &str, port: u16, allowed: &[&str]) -> Peer {
-        use crate::config::PeerH3;
+        use crate::config::{H3Endpoint, PeerH3};
         Peer {
             id: id.to_string(),
             enabled: true,
             h3: Some(PeerH3 {
-                endpoints: vec![format!("https://{}:{}/", host, port)],
+                endpoints: vec![H3Endpoint {
+                    host: host.to_string(),
+                    port,
+                    path: "/".to_string(),
+                }],
                 secret: "test-secret-12345".to_string(),
                 ca: None,
                 insecure: true,
