@@ -29,16 +29,19 @@ pub struct BareUdpRx {
     mtu: usize,
 }
 
-impl BareUdpRx {
-    /// Builds a BareUDP RX socket from a resolved listen address.
-    ///
-    /// # Errors
-    ///
-    /// Returns `UdpError::Socket` when socket binding fails.
-    pub fn from_config(listen: SocketAddr, mtu: usize) -> Result<Self, UdpError> {
-        let socket = make_server_udp_socket(listen)?;
-        Ok(Self { socket, mtu })
-    }
+/// Creates a BareUDP RX actor state from resolved listen address.
+///
+/// # Arguments
+///
+/// * `listen` - Resolved socket address to bind.
+/// * `mtu` - MTU for buffer sizing.
+///
+/// # Errors
+///
+/// Returns `UdpError::Socket` when socket binding fails.
+pub fn make_bare_rx(listen: SocketAddr, mtu: usize) -> Result<BareUdpRx, UdpError> {
+    let socket = make_server_udp_socket(listen)?;
+    Ok(BareUdpRx { socket, mtu })
 }
 
 /// Provides send-only access to a BareUDP socket.
@@ -47,23 +50,28 @@ pub struct BareUdpTx {
     socket: UdpSocket,
 }
 
-impl BareUdpTx {
-    /// Builds a BareUDP TX socket from a resolved destination address.
-    ///
-    /// Returns a connected socket, allowing use of `send()` instead of `send_to()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `UdpError::Socket` when socket creation, binding, or connect fails.
-    pub async fn from_config<P: RouteProbe>(
-        destination: SocketAddr,
-        bindif: Option<&str>,
-        tun_if: Option<&str>,
-        probe: &P,
-    ) -> Result<Self, UdpError> {
-        let socket = make_client_udp_socket(destination, tun_if, bindif, probe).await?;
-        Ok(Self { socket })
-    }
+/// Creates a BareUDP TX actor state from resolved destination.
+///
+/// Returns a connected socket, allowing use of `send()` instead of `send_to()`.
+///
+/// # Arguments
+///
+/// * `destination` - Resolved destination socket address.
+/// * `bindif` - Optional interface name to bind.
+/// * `tun_if` - Optional TUN interface name to exclude from routing.
+/// * `probe` - Route probe for interface selection.
+///
+/// # Errors
+///
+/// Returns `UdpError::Socket` when socket creation, binding, or connect fails.
+pub async fn make_bare_tx<P: RouteProbe>(
+    destination: SocketAddr,
+    bindif: Option<&str>,
+    tun_if: Option<&str>,
+    probe: &P,
+) -> Result<BareUdpTx, UdpError> {
+    let socket = make_client_udp_socket(destination, tun_if, bindif, probe).await?;
+    Ok(BareUdpTx { socket })
 }
 
 /// Spawns the BareUDP receive loop.
@@ -210,6 +218,32 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::time::Duration;
+
+    // ========== make_bare_rx Tests ==========
+
+    #[tokio::test]
+    async fn make_bare_rx_creates_valid_state() {
+        let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let result = make_bare_rx(listen, 1500);
+        assert!(result.is_ok());
+        let rx = result.unwrap();
+        assert_eq!(rx.mtu, 1500);
+    }
+
+    // ========== make_bare_tx Tests ==========
+
+    #[tokio::test]
+    async fn make_bare_tx_creates_connected_socket() {
+        use crate::bind::test_support::FakeRouteProbe;
+
+        // Create a destination to connect to
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let probe = FakeRouteProbe::noop();
+        let result = make_bare_tx(dest, None, None, &probe).await;
+        assert!(result.is_ok());
+    }
 
     #[tokio::test]
     async fn udp_rx_filters_disallowed_sources() {
