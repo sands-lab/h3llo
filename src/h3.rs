@@ -713,8 +713,10 @@ pub struct H3Listener {
     socket: std::net::UdpSocket,
     /// Actual bound address (may differ from requested if port was 0).
     bound_addr: SocketAddr,
-    /// Server connection parameters with TLS config.
-    conn_params: ConnectionParams,
+    /// Path to TLS certificate (owned).
+    cert_path: String,
+    /// Path to TLS private key (owned).
+    key_path: String,
 }
 
 /// Commands accepted by the H3 listener actor.
@@ -728,7 +730,7 @@ pub enum H3ListenerCommand {
 
 /// Creates H3 listener state from configuration.
 ///
-/// Performs all fallible I/O: socket binding, path validation, TLS config.
+/// Performs all fallible I/O: socket binding, path validation.
 /// Does NOT spawn any tasks.
 ///
 /// # Arguments
@@ -753,31 +755,23 @@ pub fn make_h3_listener(
         .local_addr()
         .map_err(|e| ListenerError::Bind(format!("failed to get local addr: {}", e)))?;
 
-    // Convert Path to &str for TlsCertificatePaths
+    // Validate and convert paths to owned strings
     let cert_str = cert_path
         .to_str()
-        .ok_or_else(|| ListenerError::Tls("invalid cert path encoding".to_string()))?;
+        .ok_or_else(|| ListenerError::Tls("invalid cert path encoding".to_string()))?
+        .to_string();
     let key_str = key_path
         .to_str()
-        .ok_or_else(|| ListenerError::Tls("invalid key path encoding".to_string()))?;
-
-    // Configure TLS with certificate paths
-    // Note: TlsCertificatePaths borrows strings; ConnectionParams consumes them immediately.
-    let tls_config = TlsCertificatePaths {
-        cert: cert_str,
-        private_key: key_str,
-        kind: CertificateKind::X509,
-    };
-
-    let conn_params =
-        ConnectionParams::new_server(Default::default(), tls_config, Default::default());
+        .ok_or_else(|| ListenerError::Tls("invalid key path encoding".to_string()))?
+        .to_string();
 
     debug!(%listen_addr, %bound_addr, "H3 listener state created");
 
     Ok(H3Listener {
         socket,
         bound_addr,
-        conn_params,
+        cert_path: cert_str,
+        key_path: key_str,
     })
 }
 
@@ -805,10 +799,21 @@ pub fn spawn_h3_listener(
     let H3Listener {
         socket,
         bound_addr,
-        conn_params,
+        cert_path,
+        key_path,
     } = listener;
 
     debug!(%bound_addr, "spawning H3 listener actor");
+
+    // Configure TLS with certificate paths
+    let tls_config = TlsCertificatePaths {
+        cert: &cert_path,
+        private_key: &key_path,
+        kind: CertificateKind::X509,
+    };
+
+    let conn_params =
+        ConnectionParams::new_server(Default::default(), tls_config, Default::default());
 
     // Create tokio-quiche listener (infallible after socket is bound)
     let mut listeners = listen(
