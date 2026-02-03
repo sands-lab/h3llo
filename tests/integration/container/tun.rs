@@ -88,16 +88,27 @@ async fn check_device_creation() -> Result<(), String> {
     Ok(())
 }
 
-/// Verifies multiple IPv4 and IPv6 addresses are assigned correctly.
+/// Checks whether IPv6 is supported by looking for /proc/sys/net/ipv6.
+fn has_ipv6_support() -> bool {
+    std::path::Path::new("/proc/sys/net/ipv6").exists()
+}
+
+/// Verifies multiple IPv4 (and IPv6 if available) addresses are assigned correctly.
 async fn check_multi_address() -> Result<(), String> {
+    let ipv6_available = has_ipv6_support();
+    if !ipv6_available {
+        eprintln!("  note: IPv6 not available, testing IPv4 only");
+    }
+
+    let mut addrs = vec!["10.99.1.1".to_string(), "10.99.1.2".to_string()];
+    if ipv6_available {
+        addrs.push("fd99::1".to_string());
+        addrs.push("fd99::2".to_string());
+    }
+
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun1".to_string(),
-        addrs: vec![
-            "10.99.1.1".to_string(),
-            "10.99.1.2".to_string(),
-            "fd99::1".to_string(),
-            "fd99::2".to_string(),
-        ],
+        addrs: addrs.clone(),
         mtu: 1500,
     };
 
@@ -113,7 +124,7 @@ async fn check_multi_address() -> Result<(), String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     eprintln!("  ip addr show itun1:\n{stdout}");
 
-    for expected in &["10.99.1.1", "10.99.1.2", "fd99::1", "fd99::2"] {
+    for expected in &addrs {
         if !stdout.contains(expected) {
             return Err(format!("multi_address: missing address {expected}"));
         }
