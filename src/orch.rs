@@ -197,10 +197,8 @@ impl Orchestrator {
 
         // 3. Sync system routes if enabled
         if self.manage_routes {
-            match collect_allowed_ips(&peer_configs) {
-                Ok(allowed) => sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await,
-                Err(err) => warn!("route sync skipped: {err}"),
-            }
+            let allowed = collect_allowed_ips(&peer_configs);
+            sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await;
         }
     }
 
@@ -237,7 +235,7 @@ impl Orchestrator {
         let tun_if = config.local.tun.ifname.clone();
         let mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
-        let tun_addrs = tun_prefixes(&config.local.tun.addrs)?;
+        let tun_addrs = tun_prefixes(&config.local.tun.addrs);
 
         // Note: NoTransportConfigured validation moved to Config::validate()
 
@@ -777,32 +775,21 @@ async fn sync_system_routes(tun_if: &str, tun_addrs: &[IpNet], allowed: &[IpNet]
     }
 }
 
-fn collect_allowed_ips(peers: &[Peer]) -> Result<Vec<IpNet>, OrchestratorError> {
+fn collect_allowed_ips(peers: &[Peer]) -> Vec<IpNet> {
     peers
         .iter()
-        .flat_map(|peer| peer.tun.allowed_ips.iter())
-        .map(|cidr| {
-            cidr.parse::<IpNet>()
-                .map_err(|err| OrchestratorError::Routing(err.to_string()))
-        })
+        .flat_map(|peer| peer.tun.allowed_ips.iter().copied())
         .collect()
 }
 
-fn tun_prefixes(addrs: &[String]) -> Result<Vec<IpNet>, OrchestratorError> {
+fn tun_prefixes(addrs: &[IpAddr]) -> Vec<IpNet> {
     addrs
         .iter()
-        .map(|addr| {
-            let ip = addr
-                .parse::<IpAddr>()
-                .map_err(|err| OrchestratorError::Routing(err.to_string()))?;
-            match ip {
-                IpAddr::V4(ip) => IpNet::new(ip.into(), 32).map_err(|e| {
-                    OrchestratorError::Routing(format!("invalid IPv4 TUN addr {addr}: {e}"))
-                }),
-                IpAddr::V6(ip) => IpNet::new(ip.into(), 128).map_err(|e| {
-                    OrchestratorError::Routing(format!("invalid IPv6 TUN addr {addr}: {e}"))
-                }),
-            }
+        .map(|ip| match ip {
+            // SAFETY: /32 is always valid for IPv4 (max prefix length)
+            IpAddr::V4(v4) => IpNet::new((*v4).into(), 32).unwrap(),
+            // SAFETY: /128 is always valid for IPv6 (max prefix length)
+            IpAddr::V6(v6) => IpNet::new((*v6).into(), 128).unwrap(),
         })
         .collect()
 }
@@ -964,7 +951,7 @@ mod tests {
             h3: None,
             bare: None,
             tun: PeerTun {
-                allowed_ips: vec!["10.0.0.0/24".to_string()],
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
             },
         };
         let mut entry = PeerEntry::new(config);
@@ -1013,7 +1000,7 @@ mod tests {
                 bindif: None,
             }),
             tun: PeerTun {
-                allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
+                allowed_ips: allowed.iter().map(|s| s.parse().unwrap()).collect(),
             },
         }
     }
@@ -1033,7 +1020,7 @@ mod tests {
                 bindif: None,
             }),
             tun: PeerTun {
-                allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
+                allowed_ips: allowed.iter().map(|s| s.parse().unwrap()).collect(),
             },
         }
     }
@@ -1075,62 +1062,57 @@ mod tests {
     // ========== collect_allowed_ips tests ==========
 
     #[test]
-    fn collect_allowed_ips_parses_valid_cidrs() {
+    fn collect_allowed_ips_collects_valid_cidrs() {
         let peers = vec![
             bare_peer("peer1", &["10.0.0.0/24", "192.168.1.0/24"]),
             bare_peer("peer2", &["172.16.0.0/16"]),
         ];
-        let result = collect_allowed_ips(&peers).expect("should parse");
+        let result = collect_allowed_ips(&peers);
         assert_eq!(result.len(), 3);
         assert!(result.contains(&"10.0.0.0/24".parse().unwrap()));
         assert!(result.contains(&"192.168.1.0/24".parse().unwrap()));
         assert!(result.contains(&"172.16.0.0/16".parse().unwrap()));
     }
 
-    #[test]
-    fn collect_allowed_ips_rejects_invalid_cidr() {
-        let peers = vec![bare_peer("peer1", &["not-a-cidr"])];
-        let result = collect_allowed_ips(&peers);
-        assert!(result.is_err());
-    }
+    // Note: collect_allowed_ips_rejects_invalid_cidr test removed - CIDR parsing
+    // now happens during config deserialization
 
     #[test]
     fn collect_allowed_ips_handles_empty_peers() {
         let peers: Vec<Peer> = vec![];
-        let result = collect_allowed_ips(&peers).expect("should parse");
+        let result = collect_allowed_ips(&peers);
         assert!(result.is_empty());
     }
 
     // ========== tun_prefixes tests ==========
 
     #[test]
-    fn tun_prefixes_parses_ipv4_addresses() {
-        let addrs = vec!["192.168.1.1".to_string(), "10.0.0.1".to_string()];
-        let result = tun_prefixes(&addrs).expect("should parse");
+    fn tun_prefixes_converts_ipv4_addresses() {
+        let addrs: Vec<IpAddr> = vec!["192.168.1.1".parse().unwrap(), "10.0.0.1".parse().unwrap()];
+        let result = tun_prefixes(&addrs);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].prefix_len(), 32);
         assert_eq!(result[1].prefix_len(), 32);
     }
 
     #[test]
-    fn tun_prefixes_parses_ipv6_addresses() {
-        let addrs = vec!["2001:db8::1".to_string()];
-        let result = tun_prefixes(&addrs).expect("should parse");
+    fn tun_prefixes_converts_ipv6_addresses() {
+        let addrs: Vec<IpAddr> = vec!["2001:db8::1".parse().unwrap()];
+        let result = tun_prefixes(&addrs);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].prefix_len(), 128);
     }
 
-    #[test]
-    fn tun_prefixes_rejects_invalid_address() {
-        let addrs = vec!["not-an-ip".to_string()];
-        let result = tun_prefixes(&addrs);
-        assert!(result.is_err());
-    }
+    // Note: tun_prefixes_rejects_invalid_address test removed - IP address parsing
+    // now happens during config deserialization
 
     #[test]
     fn tun_prefixes_handles_mixed_families() {
-        let addrs = vec!["192.168.1.1".to_string(), "2001:db8::1".to_string()];
-        let result = tun_prefixes(&addrs).expect("should parse");
+        let addrs: Vec<IpAddr> = vec![
+            "192.168.1.1".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+        ];
+        let result = tun_prefixes(&addrs);
         assert_eq!(result.len(), 2);
         assert!(result[0].addr().is_ipv4());
         assert!(result[1].addr().is_ipv6());
@@ -1138,8 +1120,8 @@ mod tests {
 
     #[test]
     fn tun_prefixes_handles_empty_addrs() {
-        let addrs: Vec<String> = vec![];
-        let result = tun_prefixes(&addrs).expect("should parse");
+        let addrs: Vec<IpAddr> = vec![];
+        let result = tun_prefixes(&addrs);
         assert!(result.is_empty());
     }
 
@@ -1463,7 +1445,7 @@ mod tests {
             }),
             bare: None,
             tun: PeerTun {
-                allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
+                allowed_ips: allowed.iter().map(|s| s.parse().unwrap()).collect(),
             },
         }
     }
