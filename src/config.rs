@@ -1,5 +1,5 @@
 use ipnet::IpNet;
-use serde::de::Deserializer;
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
@@ -44,7 +44,7 @@ pub struct Local {
 pub struct LocalH3 {
     /// HTTP/3 listen address (scheme/host/port/path); optional (dial-only when absent).
     #[serde(default)]
-    pub listen: Option<String>,
+    pub listen: Option<H3Endpoint>,
     /// Certificate path for QUIC/TLS; required when `listen` is set.
     #[serde(default)]
     pub cert: Option<String>,
@@ -68,7 +68,7 @@ pub struct LocalAdmin {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalBare {
     /// BareUDP listen address (required when BareUDP is configured).
-    pub listen: String,
+    pub listen: UdpEndpoint,
 }
 
 /// DNS resolver settings for the local node.
@@ -119,8 +119,8 @@ pub struct Peer {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerH3 {
     /// Optional dialing endpoints (scheme/host/port/path); omit or leave empty for listen-only posture.
-    #[serde(default, deserialize_with = "deserialize_endpoints")]
-    pub endpoints: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_h3_endpoints")]
+    pub endpoints: Vec<H3Endpoint>,
     /// Remote peer secret (> 8 characters) required whenever HTTP/3 is configured, including listen-only peers.
     pub secret: String,
     /// Optional custom CA bundle.
@@ -136,7 +136,7 @@ pub struct PeerH3 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerBare {
     /// BareUDP dialing endpoint (required when BareUDP is configured).
-    pub endpoint: String,
+    pub endpoint: UdpEndpoint,
     /// Optional interface binding for BareUDP dialing.
     pub bindif: Option<String>,
 }
@@ -207,12 +207,9 @@ pub enum ValidationError {
     /// A local TUN address is invalid.
     #[error("local.tun.addrs entry '{addr}' is invalid: {error}")]
     InvalidLocalTunAddr { addr: String, error: String },
-    /// `local.bare.listen` is missing when BareUDP is configured.
-    #[error("local.bare.listen must be set when local.bare is configured")]
-    LocalBareMissingListen,
-    /// `local.bare.listen` is not a valid UDP URI.
-    #[error("local.bare.listen must be a udp:// URI with host and port: {reason}")]
-    LocalBareListenInvalid { reason: String },
+    /// No transport configured (neither H3 nor BareUDP).
+    #[error("at least one transport must be configured (local.h3 or local.bare)")]
+    NoTransportConfigured,
     /// Peer identifier is missing or too short.
     #[error("peer id '{peer_id}' must be at least 6 characters")]
     PeerIdTooShort { peer_id: String },
@@ -222,12 +219,6 @@ pub enum ValidationError {
     /// Peer transport fields conflict.
     #[error("peer '{peer_id}' must configure exactly one of h3 or bare")]
     PeerTransportConflict { peer_id: String },
-    /// BareUDP endpoint missing when BareUDP is configured.
-    #[error("peer '{peer_id}' requires bare.endpoint when bare is configured")]
-    PeerBareMissingEndpoint { peer_id: String },
-    /// BareUDP endpoint is not a valid UDP URI.
-    #[error("peer '{peer_id}' bare.endpoint must be a udp:// URI with host and port: {reason}")]
-    PeerBareEndpointInvalid { peer_id: String, reason: String },
     /// Allowed IP list missing.
     #[error("peer '{peer_id}' must include at least one allowedIPs entry")]
     PeerMissingAllowedIps { peer_id: String },
@@ -266,14 +257,18 @@ impl Config {
             errors.push(ValidationError::LocalIdTooShort);
         }
 
+        // At least one transport must be configured
+        if self.local.h3.is_none() && self.local.bare.is_none() {
+            errors.push(ValidationError::NoTransportConfigured);
+        }
+
         // H3 listener validation: cert/key required only when listen is set
         let has_h3_listener = self
             .local
             .h3
             .as_ref()
             .and_then(|h3| h3.listen.as_ref())
-            .map(|l| !l.trim().is_empty())
-            .unwrap_or(false);
+            .is_some();
 
         if let Some(h3) = self.local.h3.as_ref() {
             if has_h3_listener {
@@ -302,14 +297,7 @@ impl Config {
             }
         }
 
-        if let Some(bare) = self.local.bare.as_ref() {
-            let has_bare_listener = !bare.listen.trim().is_empty();
-            if !has_bare_listener {
-                errors.push(ValidationError::LocalBareMissingListen);
-            } else if let Err(reason) = parse_udp_uri(&bare.listen) {
-                errors.push(ValidationError::LocalBareListenInvalid { reason });
-            }
-        }
+        // Note: local.bare.listen URI validation now happens during deserialization
 
         if self.local.tun.addrs.is_empty() {
             errors.push(ValidationError::MissingLocalTunAddrs);
@@ -353,19 +341,8 @@ impl Config {
                         peer_id: peer.id.clone(),
                     })
                 }
-                (Some(_), None) => {}
-                (None, Some(bare)) => {
-                    if bare.endpoint.trim().is_empty() {
-                        errors.push(ValidationError::PeerBareMissingEndpoint {
-                            peer_id: peer.id.clone(),
-                        });
-                    } else if let Err(reason) = parse_udp_uri(&bare.endpoint) {
-                        errors.push(ValidationError::PeerBareEndpointInvalid {
-                            peer_id: peer.id.clone(),
-                            reason,
-                        });
-                    }
-                }
+                // Note: peer endpoint URI validation now happens during deserialization
+                (Some(_), None) | (None, Some(_)) => {}
             }
 
             if peer.tun.allowed_ips.is_empty() {
@@ -439,6 +416,25 @@ pub struct UdpEndpoint {
     pub port: u16,
 }
 
+impl<'de> Deserialize<'de> for UdpEndpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        parse_udp_uri(&s).map_err(de::Error::custom)
+    }
+}
+
+impl Serialize for UdpEndpoint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("udp://{}:{}", self.host, self.port))
+    }
+}
+
 /// Represents an HTTP/3 endpoint parsed from an `https://` URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct H3Endpoint {
@@ -448,6 +444,30 @@ pub struct H3Endpoint {
     pub port: u16,
     /// Path portion of the URI.
     pub path: String,
+}
+
+impl<'de> Deserialize<'de> for H3Endpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        parse_h3_uri(&s).map_err(de::Error::custom)
+    }
+}
+
+impl Serialize for H3Endpoint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let uri = if self.port == 443 {
+            format!("https://{}{}", self.host, self.path)
+        } else {
+            format!("https://{}:{}{}", self.host, self.port, self.path)
+        };
+        serializer.serialize_str(&uri)
+    }
 }
 
 /// Parses a UDP DNS server URI (e.g., `udp://1.1.1.1:53`) into a socket address, enforcing IP literals.
@@ -555,16 +575,21 @@ pub fn parse_udp_uri(raw: &str) -> Result<UdpEndpoint, String> {
     })
 }
 
-fn deserialize_endpoints<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+fn deserialize_h3_endpoints<'de, D>(deserializer: D) -> Result<Vec<H3Endpoint>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let endpoints: Vec<String> = Vec::deserialize(deserializer)?;
+    let raw_endpoints: Vec<String> = Vec::deserialize(deserializer)?;
     let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
-    for ep in endpoints {
-        if seen.insert(ep.clone()) {
-            deduped.push(ep);
+    let mut deduped = Vec::with_capacity(raw_endpoints.len());
+
+    for (idx, raw) in raw_endpoints.into_iter().enumerate() {
+        let endpoint = parse_h3_uri(&raw)
+            .map_err(|e| de::Error::custom(format!("endpoints[{}]: {}", idx, e)))?;
+        // Deduplicate by canonical string representation
+        let canonical = format!("{}:{}:{}", endpoint.host, endpoint.port, endpoint.path);
+        if seen.insert(canonical) {
+            deduped.push(endpoint);
         }
     }
     Ok(deduped)
@@ -585,7 +610,11 @@ mod tests {
                     bindif: None,
                 },
                 h3: Some(LocalH3 {
-                    listen: Some("https://[::]:443/path".to_string()),
+                    listen: Some(H3Endpoint {
+                        host: "[::]".to_string(),
+                        port: 443,
+                        path: "/path".to_string(),
+                    }),
                     cert: Some("./cert.pem".to_string()),
                     key: Some("./key.pem".to_string()),
                     admin: Some(LocalAdmin {
@@ -605,7 +634,11 @@ mod tests {
                 enabled: true,
                 h3: Some(PeerH3 {
                     secret: "example-node-2-secret".to_string(),
-                    endpoints: vec!["https://peer.example.com:443/path".to_string()],
+                    endpoints: vec![H3Endpoint {
+                        host: "peer.example.com".to_string(),
+                        port: 443,
+                        path: "/path".to_string(),
+                    }],
                     ca: None,
                     insecure: false,
                     bindif: None,
@@ -653,7 +686,11 @@ mod tests {
     fn rejects_h3_listener_without_credentials() {
         let mut config = sample_h3_config();
         config.local.h3 = Some(LocalH3 {
-            listen: Some("https://[::]:443/".to_string()),
+            listen: Some(H3Endpoint {
+                host: "[::]".to_string(),
+                port: 443,
+                path: "/".to_string(),
+            }),
             cert: None,
             key: None,
             admin: None,
@@ -670,7 +707,11 @@ mod tests {
     fn rejects_h3_listener_with_partial_credentials() {
         let mut config = sample_h3_config();
         config.local.h3 = Some(LocalH3 {
-            listen: Some("https://[::]:443/".to_string()),
+            listen: Some(H3Endpoint {
+                host: "[::]".to_string(),
+                port: 443,
+                path: "/".to_string(),
+            }),
             cert: Some("./cert.pem".to_string()),
             key: None, // missing key
             admin: None,
@@ -712,39 +753,20 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rejects_missing_local_bare_listener() {
-        let mut config = sample_h3_config();
-        config.local.h3 = None;
-        config.local.bare = Some(LocalBare {
-            listen: String::new(),
-        });
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.contains(&ValidationError::LocalBareMissingListen)
-        ));
-    }
+    // Note: rejects_missing_local_bare_listener test removed - LocalBare.listen is now
+    // UdpEndpoint type which requires a valid URI at deserialization time.
 
-    #[test]
-    fn rejects_invalid_local_bare_listen_uri() {
-        let mut config = sample_h3_config();
-        config.local.h3 = None;
-        config.local.bare = Some(LocalBare {
-            listen: "udp://example.com:6635/path".to_string(),
-        });
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::LocalBareListenInvalid { .. }))
-        ));
-    }
+    // Note: rejects_invalid_local_bare_listen_uri test removed - URI validation now
+    // happens during deserialization (see rejects_invalid_endpoint_uri_at_parse_time).
 
     #[test]
     fn rejects_peer_transport_conflict() {
         let mut config = sample_h3_config();
         config.peers[0].bare = Some(PeerBare {
-            endpoint: "udp://peer.example.com:6635".to_string(),
+            endpoint: UdpEndpoint {
+                host: "peer.example.com".to_string(),
+                port: 6635,
+            },
             bindif: None,
         });
         let err = config.validate().unwrap_err();
@@ -754,35 +776,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rejects_missing_bare_endpoint() {
-        let mut config = sample_h3_config();
-        config.peers[0].h3 = None;
-        config.peers[0].bare = Some(PeerBare {
-            endpoint: String::new(),
-            bindif: None,
-        });
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerBareMissingEndpoint { .. }))
-        ));
-    }
+    // Note: rejects_missing_bare_endpoint test removed - PeerBare.endpoint is now
+    // UdpEndpoint type which requires a valid URI at deserialization time.
 
-    #[test]
-    fn rejects_invalid_bare_endpoint_uri() {
-        let mut config = sample_h3_config();
-        config.peers[0].h3 = None;
-        config.peers[0].bare = Some(PeerBare {
-            endpoint: "udp://peer.example.com:6635/path".to_string(),
-            bindif: None,
-        });
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerBareEndpointInvalid { .. }))
-        ));
-    }
+    // Note: rejects_invalid_bare_endpoint_uri test removed - URI validation now
+    // happens during deserialization (see rejects_invalid_endpoint_uri_at_parse_time).
 
     #[test]
     fn rejects_missing_peer_secret() {
@@ -909,6 +907,7 @@ peers:
         let yaml = r#"
 local:
   id: example-node-1
+  h3: {}
   dns:
     server: udp://8.8.8.8:53
   tun:
@@ -931,13 +930,11 @@ peers:
         assert_eq!(cfg.local.dns.server, "udp://8.8.8.8:53");
         assert_eq!(cfg.local.dns.refresh, 60);
         let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
-        assert_eq!(
-            h3.endpoints,
-            vec![
-                "https://peer.example.com/path".to_string(),
-                "https://peer2.example.com/path".to_string()
-            ]
-        );
+        assert_eq!(h3.endpoints.len(), 2);
+        assert_eq!(h3.endpoints[0].host, "peer.example.com");
+        assert_eq!(h3.endpoints[0].port, 443);
+        assert_eq!(h3.endpoints[0].path, "/path");
+        assert_eq!(h3.endpoints[1].host, "peer2.example.com");
         assert_eq!(h3.bindif, Some("eth0".to_string()));
     }
 
@@ -1097,5 +1094,99 @@ peers:
         let cfg = Config::load_from_str(yaml).expect("config should load");
         let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
         assert_eq!(h3.bindif, Some("eth0".to_string()));
+    }
+
+    // ========== Endpoint deserialization tests ==========
+
+    #[test]
+    fn udp_endpoint_deserializes_from_string() {
+        let yaml = r#""udp://example.com:6635""#;
+        let endpoint: UdpEndpoint = serde_yaml::from_str(yaml).expect("should deserialize");
+        assert_eq!(endpoint.host, "example.com");
+        assert_eq!(endpoint.port, 6635);
+    }
+
+    #[test]
+    fn udp_endpoint_rejects_invalid_scheme() {
+        let yaml = r#""tcp://example.com:6635""#;
+        let result: Result<UdpEndpoint, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn udp_endpoint_serializes_to_uri() {
+        let endpoint = UdpEndpoint {
+            host: "example.com".to_string(),
+            port: 6635,
+        };
+        let yaml = serde_yaml::to_string(&endpoint).expect("should serialize");
+        assert!(yaml.contains("udp://example.com:6635"));
+    }
+
+    #[test]
+    fn h3_endpoint_deserializes_from_string() {
+        let yaml = r#""https://example.com:8443/path""#;
+        let endpoint: H3Endpoint = serde_yaml::from_str(yaml).expect("should deserialize");
+        assert_eq!(endpoint.host, "example.com");
+        assert_eq!(endpoint.port, 8443);
+        assert_eq!(endpoint.path, "/path");
+    }
+
+    #[test]
+    fn h3_endpoint_defaults_port_443() {
+        let yaml = r#""https://example.com/path""#;
+        let endpoint: H3Endpoint = serde_yaml::from_str(yaml).expect("should deserialize");
+        assert_eq!(endpoint.port, 443);
+    }
+
+    #[test]
+    fn h3_endpoint_rejects_http_scheme() {
+        let yaml = r#""http://example.com/path""#;
+        let result: Result<H3Endpoint, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn h3_endpoint_serializes_omits_default_port() {
+        let endpoint = H3Endpoint {
+            host: "example.com".to_string(),
+            port: 443,
+            path: "/path".to_string(),
+        };
+        let yaml = serde_yaml::to_string(&endpoint).expect("should serialize");
+        assert!(yaml.contains("https://example.com/path"));
+        assert!(!yaml.contains(":443"));
+    }
+
+    #[test]
+    fn config_rejects_invalid_endpoint_uri_at_parse_time() {
+        let yaml = r#"
+local:
+  id: example-node-1
+  bare:
+    listen: not-a-valid-uri
+  tun:
+    addrs:
+      - 192.168.180.1
+"#;
+        let result = Config::load_from_str(yaml);
+        assert!(matches!(result, Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn rejects_no_transport_configured() {
+        let yaml = r#"
+local:
+  id: example-node-1
+  tun:
+    addrs:
+      - 192.168.180.1
+"#;
+        let result = Config::load_from_str(yaml);
+        assert!(matches!(
+            result,
+            Err(ConfigError::Validation(ValidationErrors(ref errs)))
+                if errs.contains(&ValidationError::NoTransportConfigured)
+        ));
     }
 }

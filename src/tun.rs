@@ -846,7 +846,7 @@ mod tests {
     // Routing table tests (migrated from routing.rs)
     // ========================================================================
 
-    use crate::config::{PeerBare, PeerTun};
+    use crate::config::{PeerBare, PeerTun, UdpEndpoint};
 
     fn bare_peer(id: &str, enabled: bool, allowed: &[&str]) -> Peer {
         Peer {
@@ -854,7 +854,10 @@ mod tests {
             enabled,
             h3: None,
             bare: Some(PeerBare {
-                endpoint: "udp://127.0.0.1:5353".to_string(),
+                endpoint: UdpEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: 5353,
+                },
                 bindif: None,
             }),
             tun: PeerTun {
