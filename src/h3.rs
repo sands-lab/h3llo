@@ -704,6 +704,19 @@ pub fn spawn_h3_tx(
 
 // ========== Listener ==========
 
+/// State for the HTTP/3 listener actor.
+///
+/// Created via `make_h3_listener`, spawned via `spawn_h3_listener`.
+/// Follows the Actor Initialization Pattern documented in `docs/internals.md`.
+pub struct H3Listener {
+    /// Bound UDP socket for QUIC.
+    socket: std::net::UdpSocket,
+    /// Actual bound address (may differ from requested if port was 0).
+    bound_addr: SocketAddr,
+    /// Server connection parameters with TLS config.
+    conn_params: ConnectionParams,
+}
+
 /// Commands accepted by the H3 listener actor.
 ///
 /// Note: No Shutdown command - shutdown via channel close (consistent with other actors).
@@ -713,54 +726,29 @@ pub enum H3ListenerCommand {
     UpdatePeerSecrets(HashMap<String, String>),
 }
 
-/// Spawns the H3 listener actor for accepting inbound CONNECT-IP connections.
+/// Creates H3 listener state from configuration.
 ///
-/// Uses direct select loop pattern matching BareUDP: handles commands and
-/// accept stream in a single select without intermediate message types.
-/// Actor owns peer_secrets directly; updates arrive via UpdatePeerSecrets command.
+/// Performs all fallible I/O: socket binding, path validation, TLS config.
+/// Does NOT spawn any tasks.
 ///
 /// # Arguments
 ///
 /// * `listen_addr` - Address to listen on.
 /// * `cert_path` - Path to TLS certificate.
 /// * `key_path` - Path to TLS private key.
-/// * `peer_secrets` - Map of peer ID to expected secret for authentication.
-/// * `conn_tx` - Unbounded channel for emitting established connections.
-///
-/// # Returns
-///
-/// Returns the actual bound address, the command sender, and join handle.
-/// When `listen_addr` uses port 0, the returned address contains the assigned port.
-/// Shutdown by dropping cmd_tx (no explicit Shutdown command).
 ///
 /// # Errors
 ///
-/// Returns `ListenerError` if listener setup fails.
-pub async fn spawn_h3_listener(
+/// Returns `ListenerError` if socket binding fails or paths are invalid.
+pub fn make_h3_listener(
     listen_addr: SocketAddr,
     cert_path: &Path,
     key_path: &Path,
-    mut peer_secrets: HashMap<String, String>,
-    conn_tx: mpsc::UnboundedSender<H3Connection>,
-) -> Result<
-    (
-        mpsc::UnboundedSender<H3ListenerCommand>,
-        JoinHandle<ActorExitResult>,
-        SocketAddr,
-    ),
-    ListenerError,
-> {
-    // Create command channel (actor owns receiver directly - direct select pattern)
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<H3ListenerCommand>();
-
-    debug!(%listen_addr, "starting H3 listener");
-
-    // Server socket binds directly to listen address (no route probing needed).
-    // Use std socket for better compatibility with tokio-quiche.
+) -> Result<H3Listener, ListenerError> {
+    // Bind socket
     let socket =
         std::net::UdpSocket::bind(listen_addr).map_err(|e| ListenerError::Bind(e.to_string()))?;
 
-    // Get actual bound address (may differ from listen_addr if port was 0)
     let bound_addr = socket
         .local_addr()
         .map_err(|e| ListenerError::Bind(format!("failed to get local addr: {}", e)))?;
@@ -774,43 +762,75 @@ pub async fn spawn_h3_listener(
         .ok_or_else(|| ListenerError::Tls("invalid key path encoding".to_string()))?;
 
     // Configure TLS with certificate paths
+    // Note: TlsCertificatePaths borrows strings; ConnectionParams consumes them immediately.
     let tls_config = TlsCertificatePaths {
         cert: cert_str,
         private_key: key_str,
         kind: CertificateKind::X509,
     };
 
-    // Create connection parameters for server
-    let conn_params = ConnectionParams::new_server(
-        Default::default(), // QuicSettings with enable_dgram=true by default
-        tls_config,
-        Default::default(), // Hooks
-    );
+    let conn_params =
+        ConnectionParams::new_server(Default::default(), tls_config, Default::default());
 
-    // Create tokio-quiche listener
+    debug!(%listen_addr, %bound_addr, "H3 listener state created");
+
+    Ok(H3Listener {
+        socket,
+        bound_addr,
+        conn_params,
+    })
+}
+
+/// Spawns the H3 listener actor from prepared state.
+///
+/// Creates command channel internally (actor owns receiver).
+/// Returns command sender, join handle, and bound address.
+///
+/// # Arguments
+///
+/// * `listener` - H3 listener state from `make_h3_listener`.
+/// * `peer_secrets` - Map of peer ID to expected secret for authentication.
+/// * `conn_tx` - Unbounded channel for emitting established connections.
+pub fn spawn_h3_listener(
+    listener: H3Listener,
+    mut peer_secrets: HashMap<String, String>,
+    conn_tx: mpsc::UnboundedSender<H3Connection>,
+) -> (
+    mpsc::UnboundedSender<H3ListenerCommand>,
+    JoinHandle<ActorExitResult>,
+    SocketAddr,
+) {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<H3ListenerCommand>();
+
+    let H3Listener {
+        socket,
+        bound_addr,
+        conn_params,
+    } = listener;
+
+    debug!(%bound_addr, "spawning H3 listener actor");
+
+    // Create tokio-quiche listener (infallible after socket is bound)
     let mut listeners = listen(
         vec![socket],
         conn_params,
         SimpleConnectionIdGenerator,
         DefaultMetrics,
     )
-    .map_err(|e| ListenerError::Bind(format!("listen failed: {}", e)))?;
+    .expect("listen on already-bound socket should not fail");
 
     let mut accept_stream = listeners.remove(0);
 
     let handle = tokio::spawn(async move {
-        // Actor owns peer_secrets directly (Option 2A: message passing pattern)
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(H3ListenerCommand::UpdatePeerSecrets(update)) => {
-                            // Direct assignment - actor owns the state
                             peer_secrets = update;
                             debug!("updated peer secrets");
                         }
                         None => {
-                            // Command channel closed - shutdown
                             return Ok(());
                         }
                     }
@@ -835,7 +855,6 @@ pub async fn spawn_h3_listener(
                             warn!(error = %e, "accept error");
                         }
                         None => {
-                            // Accept stream ended
                             return Ok(());
                         }
                     }
@@ -844,7 +863,7 @@ pub async fn spawn_h3_listener(
         }
     });
 
-    Ok((cmd_tx, handle, bound_addr))
+    (cmd_tx, handle, bound_addr)
 }
 
 #[cfg(test)]
@@ -1099,6 +1118,58 @@ mod tests {
         assert!(has_capsule_protocol(&headers));
     }
 
+    // ========== make_h3_listener Tests ==========
+
+    #[test]
+    fn make_h3_listener_binds_socket() {
+        let certs = TestCertBundle::generate();
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let result = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path());
+
+        assert!(result.is_ok());
+        let listener = result.unwrap();
+        assert_ne!(listener.bound_addr.port(), 0, "should bind to actual port");
+    }
+
+    #[test]
+    fn make_h3_listener_rejects_privileged_port() {
+        let certs = TestCertBundle::generate();
+        // Port 1 requires root
+        let listen_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let result = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path());
+
+        // Should fail on non-root systems
+        if !nix::unistd::geteuid().is_root() {
+            assert!(matches!(result, Err(ListenerError::Bind(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_h3_listener_from_state_graceful_shutdown() {
+        let certs = TestCertBundle::generate();
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+            .expect("make_h3_listener");
+
+        let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, handle, bound_addr) = spawn_h3_listener(listener, HashMap::new(), conn_tx);
+
+        // Verify bound address is valid
+        assert_ne!(bound_addr.port(), 0);
+
+        // Drop command sender to trigger shutdown
+        drop(cmd_tx);
+
+        let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "listener should shutdown gracefully"
+        );
+    }
+
     // ========== Listener Lifecycle Tests ==========
 
     #[tokio::test]
@@ -1109,15 +1180,9 @@ mod tests {
         let peer_secrets = HashMap::from([("test-peer".to_string(), "test-secret".to_string())]);
         let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
 
-        let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(
-            listen_addr,
-            certs.cert_path(),
-            certs.key_path(),
-            peer_secrets,
-            conn_tx,
-        )
-        .await
-        .expect("listener spawn");
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+            .expect("make_h3_listener");
+        let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(listener, peer_secrets, conn_tx);
 
         // Verify command channel is functional
         assert!(cmd_tx
@@ -1141,17 +1206,8 @@ mod tests {
         let missing_key = temp_dir.path().join("missing-key.pem");
 
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let peer_secrets = HashMap::new();
-        let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
 
-        let result = spawn_h3_listener(
-            listen_addr,
-            &missing_cert,
-            &missing_key,
-            peer_secrets,
-            conn_tx,
-        )
-        .await;
+        let result = make_h3_listener(listen_addr, &missing_cert, &missing_key);
 
         assert!(result.is_err());
     }
@@ -1172,15 +1228,10 @@ mod tests {
 
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
-        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
-            listen_addr,
-            certs.cert_path(),
-            certs.key_path(),
-            peer_secrets,
-            conn_tx,
-        )
-        .await
-        .expect("listener spawn");
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+            .expect("make_h3_listener");
+        let (cmd_tx, _listener_handle, bound_addr) =
+            spawn_h3_listener(listener, peer_secrets, conn_tx);
 
         // Give listener time to bind
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1229,15 +1280,10 @@ mod tests {
             HashMap::from([("test-client".to_string(), "correct-secret".to_string())]);
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
-        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
-            listen_addr,
-            certs.cert_path(),
-            certs.key_path(),
-            peer_secrets,
-            conn_tx,
-        )
-        .await
-        .expect("listener spawn");
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+            .expect("make_h3_listener");
+        let (cmd_tx, _listener_handle, bound_addr) =
+            spawn_h3_listener(listener, peer_secrets, conn_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1282,15 +1328,10 @@ mod tests {
         let peer_secrets = HashMap::from([("known-peer".to_string(), "secret".to_string())]);
         let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
 
-        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
-            listen_addr,
-            certs.cert_path(),
-            certs.key_path(),
-            peer_secrets,
-            conn_tx,
-        )
-        .await
-        .expect("listener spawn");
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+            .expect("make_h3_listener");
+        let (cmd_tx, _listener_handle, bound_addr) =
+            spawn_h3_listener(listener, peer_secrets, conn_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1332,15 +1373,10 @@ mod tests {
 
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
-        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
-            listen_addr,
-            certs.cert_path(),
-            certs.key_path(),
-            peer_secrets,
-            conn_tx,
-        )
-        .await
-        .expect("listener spawn");
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+            .expect("make_h3_listener");
+        let (cmd_tx, _listener_handle, bound_addr) =
+            spawn_h3_listener(listener, peer_secrets, conn_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1420,15 +1456,10 @@ mod tests {
 
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
-        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
-            listen_addr,
-            certs.cert_path(),
-            certs.key_path(),
-            peer_secrets,
-            conn_tx,
-        )
-        .await
-        .expect("listener spawn");
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+            .expect("make_h3_listener");
+        let (cmd_tx, _listener_handle, bound_addr) =
+            spawn_h3_listener(listener, peer_secrets, conn_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1527,15 +1558,10 @@ mod tests {
 
         let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
 
-        let (cmd_tx, listener_handle, bound_addr) = spawn_h3_listener(
-            listen_addr,
-            certs.cert_path(),
-            certs.key_path(),
-            peer_secrets,
-            conn_tx,
-        )
-        .await
-        .expect("listener spawn");
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+            .expect("make_h3_listener");
+        let (cmd_tx, listener_handle, bound_addr) =
+            spawn_h3_listener(listener, peer_secrets, conn_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
