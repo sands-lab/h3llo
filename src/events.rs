@@ -3,8 +3,21 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
+use crate::h3::H3Connection;
+
+/// Indicates connection establishment direction.
+///
+/// Distinct from `Direction` (Rx/Tx) which describes data flow for metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionDirection {
+    /// Connection accepted by listener (server-side).
+    Inbound,
+    /// Connection established by dialer (client-side).
+    Outbound,
+}
+
 /// Carries high-level events emitted by modules to the orchestrator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Event {
     /// Events originating from transports (TUN, BareUDP, HTTP/3).
     Transport(TransportEvent),
@@ -15,34 +28,24 @@ pub enum Event {
 }
 
 /// Describes transport-level events.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum TransportEvent {
     /// Latest cumulative metrics for a transport direction.
     Metrics(TransportMetrics),
-    /// HTTP/3 connection established.
+    /// HTTP/3 connection established, ready for actor spawning.
     H3Connected(H3ConnectedEvent),
-    /// HTTP/3 connection closed.
-    H3Closed(H3ClosedEvent),
 }
 
-/// HTTP/3 connection established event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// HTTP/3 connection established event with full connection object.
+///
+/// Emitted by listener (inbound) and dialer (outbound) when connection is
+/// established and ready for RX/TX actors to be spawned.
+#[derive(Debug)]
 pub struct H3ConnectedEvent {
-    /// Authenticated peer identifier.
-    pub peer_id: String,
-    /// Remote socket address.
-    pub remote_addr: SocketAddr,
-    /// Whether inbound (listener) or outbound (dialer).
-    pub direction: Direction,
-}
-
-/// HTTP/3 connection closed event.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct H3ClosedEvent {
-    /// Peer identifier.
-    pub peer_id: String,
-    /// Reason for closure.
-    pub reason: Option<String>,
+    /// The established connection.
+    pub connection: H3Connection,
+    /// Whether this is an inbound or outbound connection.
+    pub direction: ConnectionDirection,
 }
 
 /// Indicates which transport produced the metrics.

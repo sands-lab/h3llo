@@ -14,7 +14,9 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_basic_auth, validate_connect_auth};
 use crate::bind::{make_client_udp_socket, RouteProbe};
-use crate::events::{Direction, Event, TransportEvent, TransportKind};
+use crate::events::{
+    ConnectionDirection, Direction, Event, H3ConnectedEvent, TransportEvent, TransportKind,
+};
 use crate::metrics::TransportCounters;
 use crate::PACKET_QUEUE_DEPTH;
 use futures_util::sink::SinkExt;
@@ -144,7 +146,7 @@ async fn handle_h3_connection(
     quic_conn: QuicConnection,
     remote_addr: SocketAddr,
     secrets: HashMap<String, String>,
-    conn_tx: mpsc::UnboundedSender<H3Connection>,
+    events_tx: mpsc::UnboundedSender<Event>,
 ) {
     let handshake = async {
         // State for auth/flow handshake. Each handshake expects exactly one
@@ -250,8 +252,12 @@ async fn handle_h3_connection(
                     flow_id,
                     quic_conn: quic,
                 };
-                if conn_tx.send(conn).is_err() {
-                    debug!(%remote_addr, "connection channel closed");
+                let event = Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
+                    connection: conn,
+                    direction: ConnectionDirection::Inbound,
+                }));
+                if events_tx.send(event).is_err() {
+                    debug!(%remote_addr, "events channel closed");
                 }
                 return;
             }
@@ -411,6 +417,16 @@ pub struct H3Connection {
     /// QUIC connection metadata (holds peer_addr, local_addr, etc.).
     #[allow(dead_code)] // May be used for connection management
     pub quic_conn: QuicConnection,
+}
+
+impl std::fmt::Debug for H3Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("H3Connection")
+            .field("peer_id", &self.peer_id)
+            .field("remote_addr", &self.remote_addr)
+            .field("flow_id", &self.flow_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl H3Connection {
@@ -880,11 +896,11 @@ pub fn make_h3_listener(
 ///
 /// * `listener` - H3 listener state from `make_h3_listener`.
 /// * `peer_secrets` - Map of peer ID to expected secret for authentication.
-/// * `conn_tx` - Unbounded channel for emitting established connections.
+/// * `events_tx` - Unbounded channel for emitting events to orchestrator.
 pub fn spawn_h3_listener(
     listener: H3Listener,
     mut peer_secrets: HashMap<String, String>,
-    conn_tx: mpsc::UnboundedSender<H3Connection>,
+    events_tx: mpsc::UnboundedSender<Event>,
 ) -> (
     mpsc::UnboundedSender<H3ListenerCommand>,
     JoinHandle<ActorExitResult>,
@@ -949,7 +965,7 @@ pub fn spawn_h3_listener(
                                 quic_conn,
                                 remote_addr,
                                 peer_secrets.clone(),
-                                conn_tx.clone(),
+                                events_tx.clone(),
                             ));
                         }
                         Some(Err(e)) => {
@@ -1284,8 +1300,8 @@ mod tests {
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
 
-        let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, handle, bound_addr) = spawn_h3_listener(listener, HashMap::new(), conn_tx);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, handle, bound_addr) = spawn_h3_listener(listener, HashMap::new(), events_tx);
 
         // Verify bound address is valid
         assert_ne!(bound_addr.port(), 0);
@@ -1308,11 +1324,11 @@ mod tests {
 
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let peer_secrets = HashMap::from([("test-peer".to_string(), "test-secret".to_string())]);
-        let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
-        let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(listener, peer_secrets, conn_tx);
+        let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(listener, peer_secrets, events_tx);
 
         // Verify command channel is functional
         assert!(cmd_tx
@@ -1335,6 +1351,8 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_success() {
+        use crate::events::{ConnectionDirection, Event, TransportEvent};
+
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -1342,12 +1360,12 @@ mod tests {
         let secret = "test-secret-123";
         let peer_secrets = HashMap::from([(peer_id.to_string(), secret.to_string())]);
 
-        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, conn_tx);
+            spawn_h3_listener(listener, peer_secrets, events_tx);
 
         // Give listener time to bind
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1375,12 +1393,20 @@ mod tests {
         let client_conn = client_result.unwrap();
         assert_eq!(client_conn.peer_id, peer_id);
 
-        // Server should also receive the connection
-        let server_conn = tokio::time::timeout(Duration::from_secs(5), conn_rx.recv())
-            .await
-            .expect("timeout waiting for server connection")
-            .expect("server connection channel closed");
-        assert_eq!(server_conn.peer_id, peer_id);
+        // Server should emit an H3Connected event
+        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events_rx.recv().await {
+                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                    return Some(connected);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timeout waiting for server connection")
+        .expect("no H3Connected event received");
+        assert_eq!(server_event.connection.peer_id, peer_id);
+        assert_eq!(server_event.direction, ConnectionDirection::Inbound);
 
         // Clean shutdown
         drop(cmd_tx);
@@ -1390,6 +1416,8 @@ mod tests {
 
     #[tokio::test]
     async fn h3_connection_into_actors_preserves_peer_id() {
+        use crate::events::{Event, TransportEvent};
+
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -1397,11 +1425,11 @@ mod tests {
         let secret = "split-test-secret";
         let peer_secrets = HashMap::from([(peer_id.to_string(), secret.to_string())]);
 
-        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make listener");
-        let (cmd_tx, _handle, bound_addr) = spawn_h3_listener(listener, peer_secrets, conn_tx);
+        let (cmd_tx, _handle, bound_addr) = spawn_h3_listener(listener, peer_secrets, events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1422,12 +1450,19 @@ mod tests {
             .await
             .expect("dial");
 
-        let server_conn = tokio::time::timeout(Duration::from_secs(5), conn_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("no conn");
+        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events_rx.recv().await {
+                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                    return Some(connected);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timeout")
+        .expect("no conn");
 
-        let (rx, tx) = server_conn.into_actors();
+        let (rx, tx) = server_event.connection.into_actors();
         assert_eq!(rx.peer_id, peer_id);
         assert_eq!(tx.peer_id, peer_id);
 
@@ -1436,17 +1471,19 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_rejects_wrong_secret() {
+        use crate::events::{Event, TransportEvent};
+
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let peer_secrets =
             HashMap::from([("test-client".to_string(), "correct-secret".to_string())]);
-        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, conn_tx);
+            spawn_h3_listener(listener, peer_secrets, events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1471,8 +1508,16 @@ mod tests {
             Ok(_) => panic!("expected dial to fail with wrong secret"),
         }
 
-        // Server should NOT have accepted a connection
-        let server_recv = tokio::time::timeout(Duration::from_millis(500), conn_rx.recv()).await;
+        // Server should NOT have emitted an H3Connected event
+        let server_recv = tokio::time::timeout(Duration::from_millis(500), async {
+            while let Some(event) = events_rx.recv().await {
+                if matches!(event, Event::Transport(TransportEvent::H3Connected(_))) {
+                    return Some(());
+                }
+            }
+            None
+        })
+        .await;
         assert!(
             server_recv.is_err() || server_recv.unwrap().is_none(),
             "server should not accept connection with wrong secret"
@@ -1488,12 +1533,12 @@ mod tests {
 
         // Server only knows "known-peer"
         let peer_secrets = HashMap::from([("known-peer".to_string(), "secret".to_string())]);
-        let (conn_tx, _conn_rx) = mpsc::unbounded_channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, conn_tx);
+            spawn_h3_listener(listener, peer_secrets, events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1522,6 +1567,7 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_roundtrip() {
+        use crate::events::{Event, TransportEvent};
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
 
@@ -1532,12 +1578,12 @@ mod tests {
         let secret = "datagram-secret";
         let peer_secrets = HashMap::from([(peer_id.to_string(), secret.to_string())]);
 
-        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let (listener_events_tx, mut listener_events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, conn_tx);
+            spawn_h3_listener(listener, peer_secrets, listener_events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1558,10 +1604,17 @@ mod tests {
             .await
             .expect("dial failed");
 
-        let server_conn = tokio::time::timeout(Duration::from_secs(5), conn_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("no connection");
+        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = listener_events_rx.recv().await {
+                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                    return Some(connected);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timeout")
+        .expect("no connection");
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let metrics_interval = Duration::from_secs(60);
@@ -1574,7 +1627,7 @@ mod tests {
             spawn_h3_tx(client_tx, events_tx.clone(), metrics_interval);
 
         // Split server connection for RX
-        let (server_rx, _server_tx) = server_conn.into_actors();
+        let (server_rx, _server_tx) = server_event.connection.into_actors();
 
         // Server RX actor
         let (server_packet_tx, mut server_packet_rx) = mpsc::channel(16);
@@ -1601,6 +1654,7 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_bidirectional() {
+        use crate::events::{Event, TransportEvent};
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
 
@@ -1611,12 +1665,12 @@ mod tests {
         let secret = "bidir-secret";
         let peer_secrets = HashMap::from([(peer_id.to_string(), secret.to_string())]);
 
-        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let (listener_events_tx, mut listener_events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, conn_tx);
+            spawn_h3_listener(listener, peer_secrets, listener_events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1637,10 +1691,17 @@ mod tests {
             .await
             .expect("dial failed");
 
-        let server_conn = tokio::time::timeout(Duration::from_secs(5), conn_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("no connection");
+        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = listener_events_rx.recv().await {
+                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                    return Some(connected);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timeout")
+        .expect("no connection");
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let metrics_interval = Duration::from_secs(60);
@@ -1660,7 +1721,7 @@ mod tests {
         );
 
         // Split server connection
-        let (server_rx, server_tx) = server_conn.into_actors();
+        let (server_rx, server_tx) = server_event.connection.into_actors();
 
         // Server TX -> Client RX
         let (server_send_tx, _) = spawn_h3_tx(server_tx, events_tx.clone(), metrics_interval);
@@ -1694,6 +1755,8 @@ mod tests {
 
     #[tokio::test]
     async fn connection_graceful_shutdown() {
+        use crate::events::{Event, TransportEvent};
+
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -1701,12 +1764,12 @@ mod tests {
         let secret = "shutdown-secret";
         let peer_secrets = HashMap::from([(peer_id.to_string(), secret.to_string())]);
 
-        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, conn_tx);
+            spawn_h3_listener(listener, peer_secrets, events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1727,10 +1790,17 @@ mod tests {
             .await
             .expect("dial failed");
 
-        let _server_conn = tokio::time::timeout(Duration::from_secs(5), conn_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("no connection");
+        let _server_event = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events_rx.recv().await {
+                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                    return Some(connected);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timeout")
+        .expect("no connection");
 
         // Graceful shutdown: drop command channel with active connection
         drop(cmd_tx);

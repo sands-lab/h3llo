@@ -5,10 +5,13 @@ use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUd
 use crate::bind::DefaultRouteProbe;
 use crate::config::{parse_h3_uri, parse_udp_uri, Config, Peer};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
-use crate::events::{DnsEventDetail, DnsIpExpired, DnsIpResolved, Event, TransportEvent};
+use crate::events::{
+    ConnectionDirection, DnsEventDetail, DnsIpExpired, DnsIpResolved, Event, H3ConnectedEvent,
+    TransportEvent,
+};
 use crate::h3::{
     dial_h3, make_h3_dialer, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx,
-    H3Connection, H3ListenerCommand,
+    H3ListenerCommand,
 };
 use crate::route::{sync_tun_routes, RouteManagerHandle};
 use crate::tun::{self, RoutingTable, TunRxCommand};
@@ -20,7 +23,7 @@ use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
@@ -167,8 +170,6 @@ pub struct Orchestrator {
     /// H3 listener command sender (if listening).
     #[allow(dead_code)]
     h3_listener_cmd_tx: Option<mpsc::UnboundedSender<H3ListenerCommand>>,
-    /// H3 connection receiver for inbound connections.
-    h3_conn_rx: Option<mpsc::UnboundedReceiver<H3Connection>>,
     /// Packet sender to TUN TX (for H3 RX actors).
     tun_packet_tx: mpsc::Sender<Vec<u8>>,
 
@@ -319,7 +320,7 @@ impl Orchestrator {
             .and_then(|h3| h3.listen.as_ref())
             .filter(|l| !l.trim().is_empty());
 
-        let (h3_listener_cmd_tx, h3_conn_rx) = match (h3_cfg, listen_uri) {
+        let h3_listener_cmd_tx = match (h3_cfg, listen_uri) {
             (Some(h3_cfg), Some(listen_uri)) => {
                 let listen_endpoint =
                     parse_h3_uri(listen_uri).map_err(OrchestratorError::InvalidH3Listen)?;
@@ -337,21 +338,19 @@ impl Orchestrator {
                     .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().secret.clone()))
                     .collect();
 
-                let (conn_tx, conn_rx) = mpsc::unbounded_channel();
-
                 // make: fallible I/O (socket bind, TLS config)
                 let listener = make_h3_listener(listen_addr, cert_path, key_path)
                     .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
 
-                // spawn: infallible task creation
+                // spawn: infallible task creation; listener sends events through events_tx
                 let (cmd_tx, listener_handle, _bound_addr) =
-                    spawn_h3_listener(listener, peer_secrets, conn_tx);
+                    spawn_h3_listener(listener, peer_secrets, events_tx.clone());
 
                 join_set.spawn(listener_handle);
-                (Some(cmd_tx), Some(conn_rx))
+                Some(cmd_tx)
             }
             // Dial-only mode or no H3 configured: no listener, but can dial H3 peers
-            _ => (None, None),
+            _ => None,
         };
 
         // Initialize unified peer state from config (enabled peers with any transport)
@@ -403,7 +402,6 @@ impl Orchestrator {
             tun_cmd_tx,
             bare_rx_cmd_tx,
             h3_listener_cmd_tx,
-            h3_conn_rx,
             tun_packet_tx,
             dns_cmd_tx,
             manage_routes,
@@ -424,14 +422,6 @@ impl Orchestrator {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {
                     self.handle_event(event).await;
-                }
-                Some(conn) = async {
-                    match self.h3_conn_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    self.handle_h3_inbound(conn).await;
                 }
                 result = self.join_set.join_next() => {
                     match result {
@@ -524,16 +514,7 @@ impl Orchestrator {
                 }
             }
             Event::Transport(TransportEvent::H3Connected(event)) => {
-                debug!(
-                    "H3 connection established: peer={} remote={} direction={:?}",
-                    event.peer_id, event.remote_addr, event.direction
-                );
-            }
-            Event::Transport(TransportEvent::H3Closed(event)) => {
-                debug!(
-                    "H3 connection closed: peer={} reason={:?}",
-                    event.peer_id, event.reason
-                );
+                self.handle_h3_connection(event).await;
             }
             Event::Other(msg) => {
                 debug!("other event: {}", msg);
@@ -546,8 +527,6 @@ impl Orchestrator {
     /// Iterates all peers to find those with matching endpoint hostname,
     /// then spawns TX actors for the resolved IP.
     async fn handle_ip_resolved(&mut self, resolved: DnsIpResolved) {
-        let mut any_spawned = false;
-
         // Collect peer IDs to process (to avoid borrow conflicts)
         let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
 
@@ -592,7 +571,7 @@ impl Orchestrator {
                         tx: packet_tx,
                     });
                     self.join_set.spawn(tx_handle);
-                    any_spawned = true;
+                    self.on_bounds_changed().await;
                 }
             }
 
@@ -635,8 +614,9 @@ impl Orchestrator {
 
             // Now dial H3 peers
             for (destination, server_name, path, secret, ca_path, insecure) in h3_dial_targets {
-                if let Some((packet_tx, handles)) = self
-                    .spawn_h3_peer(
+                // Dial and emit event through unified channel
+                if let Some(conn) = self
+                    .dial_h3_peer(
                         &peer_id,
                         destination,
                         &server_name,
@@ -647,25 +627,17 @@ impl Orchestrator {
                     )
                     .await
                 {
-                    let bound_id = self.next_bound_id();
-                    let entry = self.peers.get_mut(&peer_id).unwrap();
-                    entry.bounds.push(BoundState {
-                        id: bound_id,
-                        transport: TransportType::Http3,
-                        dest: destination,
-                        tx: packet_tx,
-                    });
-                    for handle in handles {
-                        self.join_set.spawn(handle);
+                    // Emit event - will be handled by handle_h3_connection
+                    let event = Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
+                        connection: conn,
+                        direction: ConnectionDirection::Outbound,
+                    }));
+                    if self.events_tx.send(event).is_err() {
+                        warn!(peer = %peer_id, "events channel closed during dial");
                     }
-                    any_spawned = true;
+                    // Note: on_bounds_changed called by handle_h3_connection
                 }
             }
-        }
-
-        // Only update routing/filters if we actually spawned something
-        if any_spawned {
-            self.on_bounds_changed().await;
         }
     }
 
@@ -687,27 +659,47 @@ impl Orchestrator {
         }
     }
 
-    /// Handles an inbound H3 connection from the listener.
+    /// Handles an H3 connection event (inbound or outbound).
     ///
-    /// Spawns RX/TX actors for the authenticated peer and adds to routing.
-    async fn handle_h3_inbound(&mut self, conn: H3Connection) {
+    /// Unified handler for both listener and dialer connections.
+    /// Spawns RX/TX actors and updates routing.
+    async fn handle_h3_connection(&mut self, event: H3ConnectedEvent) {
+        let H3ConnectedEvent {
+            connection: conn,
+            direction,
+        } = event;
         let peer_id = conn.peer_id.clone();
         let remote_addr = conn.remote_addr;
 
         // Check if peer is configured
         if !self.peers.contains_key(&peer_id) {
-            warn!(peer = %peer_id, addr = %remote_addr, "H3 inbound connection from unknown peer");
+            warn!(
+                peer = %peer_id,
+                addr = %remote_addr,
+                direction = ?direction,
+                "H3 connection from unknown peer"
+            );
             return;
         }
 
         // Check if already have a bound for this IP
         let entry = self.peers.get(&peer_id).unwrap();
         if entry.has_bound_for_ip(remote_addr.ip()) {
-            debug!(peer = %peer_id, addr = %remote_addr, "H3 inbound: already have bound for this IP");
+            debug!(
+                peer = %peer_id,
+                addr = %remote_addr,
+                direction = ?direction,
+                "H3: already have bound for this IP"
+            );
             return;
         }
 
-        debug!(peer = %peer_id, addr = %remote_addr, "H3 inbound connection accepted");
+        debug!(
+            peer = %peer_id,
+            addr = %remote_addr,
+            direction = ?direction,
+            "H3 connection accepted"
+        );
 
         // Split connection into actor states
         let (rx_state, tx_state) = conn.into_actors();
@@ -739,11 +731,12 @@ impl Orchestrator {
         self.on_bounds_changed().await;
     }
 
-    /// Spawns H3 TX/RX actors for a peer connection.
+    /// Dials an H3 peer and returns the established connection.
     ///
-    /// Returns the packet sender and task handles, or None if dialing fails.
+    /// Returns the connection, or None if dialing fails.
+    /// Actor spawning is handled by the unified `handle_h3_connection`.
     #[allow(clippy::too_many_arguments)]
-    async fn spawn_h3_peer(
+    async fn dial_h3_peer(
         &self,
         peer_id: &str,
         dest: SocketAddr,
@@ -752,7 +745,7 @@ impl Orchestrator {
         secret: &str,
         ca_path: Option<&str>,
         insecure: bool,
-    ) -> Option<(mpsc::Sender<Vec<u8>>, Vec<JoinHandle<ActorExitResult>>)> {
+    ) -> Option<crate::h3::H3Connection> {
         let probe = DefaultRouteProbe;
 
         // make: fallible socket setup
@@ -793,19 +786,7 @@ impl Orchestrator {
 
         debug!(peer = %peer_id, addr = %dest, "H3 connection established");
 
-        let (rx_state, tx_state) = conn.into_actors();
-
-        let rx_handle = spawn_h3_rx(
-            rx_state,
-            self.tun_packet_tx.clone(),
-            self.events_tx.clone(),
-            METRICS_INTERVAL,
-        );
-
-        let (packet_tx, tx_handle) =
-            spawn_h3_tx(tx_state, self.events_tx.clone(), METRICS_INTERVAL);
-
-        Some((packet_tx, vec![rx_handle, tx_handle]))
+        Some(conn)
     }
 }
 
@@ -1034,7 +1015,6 @@ mod test_support {
                 tun_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
                 h3_listener_cmd_tx: None,
-                h3_conn_rx: None,
                 tun_packet_tx,
                 dns_cmd_tx,
                 manage_routes: self.manage_routes,
