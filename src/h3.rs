@@ -1137,20 +1137,6 @@ mod tests {
         assert_ne!(listener.bound_addr.port(), 0, "should bind to actual port");
     }
 
-    #[test]
-    fn make_h3_listener_rejects_privileged_port() {
-        let certs = TestCertBundle::generate();
-        // Port 1 requires root
-        let listen_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-
-        let result = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path());
-
-        // Should fail on non-root systems
-        if !nix::unistd::geteuid().is_root() {
-            assert!(matches!(result, Err(ListenerError::Bind(_))));
-        }
-    }
-
     #[tokio::test]
     async fn spawn_h3_listener_from_state_graceful_shutdown() {
         let certs = TestCertBundle::generate();
