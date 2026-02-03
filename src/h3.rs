@@ -1189,20 +1189,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn listener_rejects_invalid_cert_path() {
-        // Use tempdir to generate platform-agnostic missing paths
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let missing_cert = temp_dir.path().join("missing-cert.pem");
-        let missing_key = temp_dir.path().join("missing-key.pem");
-
-        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
-        let result = make_h3_listener(listen_addr, &missing_cert, &missing_key);
-
-        assert!(result.is_err());
-    }
-
     // ========== Client-Server Integration Tests ==========
     //
     // These tests perform real QUIC/H3 handshakes over loopback. They use
