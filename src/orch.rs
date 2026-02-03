@@ -7,7 +7,8 @@ use crate::config::{parse_h3_uri, parse_udp_uri, Config, Peer};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{DnsEventDetail, DnsIpExpired, DnsIpResolved, Event, TransportEvent};
 use crate::h3::{
-    dial_h3, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3Connection, H3ListenerCommand,
+    dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3Connection,
+    H3ListenerCommand,
 };
 use crate::route::{sync_tun_routes, RouteManagerHandle};
 use crate::tun::{self, RoutingTable, TunRxCommand};
@@ -337,10 +338,14 @@ impl Orchestrator {
                     .collect();
 
                 let (conn_tx, conn_rx) = mpsc::unbounded_channel();
+
+                // make: fallible I/O (socket bind, TLS config)
+                let listener = make_h3_listener(listen_addr, cert_path, key_path)
+                    .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
+
+                // spawn: infallible task creation
                 let (cmd_tx, listener_handle, _bound_addr) =
-                    spawn_h3_listener(listen_addr, cert_path, key_path, peer_secrets, conn_tx)
-                        .await
-                        .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
+                    spawn_h3_listener(listener, peer_secrets, conn_tx);
 
                 join_set.spawn(listener_handle);
                 (Some(cmd_tx), Some(conn_rx))
