@@ -1,6 +1,6 @@
 //! Standalone TUN integration test binary for Docker container execution.
 //!
-//! Exercises `h3llo::tun::from_config()` with real TUN devices requiring
+//! Exercises `h3llo::tun::make_tun()` with real TUN devices requiring
 //! CAP_NET_ADMIN. Designed to run inside a privileged Docker container
 //! via the native orchestrator (`tests/integration/native/tun.rs`).
 //!
@@ -55,7 +55,7 @@ async fn run_checks() -> Result<(), String> {
     Ok(())
 }
 
-/// Verifies TUN device creation via `from_config()` and interface visibility.
+/// Verifies TUN device creation via `make_tun()` and interface visibility.
 async fn check_device_creation() -> Result<(), String> {
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun0".to_string(),
@@ -63,9 +63,9 @@ async fn check_device_creation() -> Result<(), String> {
         mtu: 1400,
     };
 
-    let (_reader, _writer) = h3llo::tun::from_config(&local_tun)
+    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun)
         .await
-        .map_err(|e| format!("device_creation: from_config failed: {e}"))?;
+        .map_err(|e| format!("device_creation: make_tun failed: {e}"))?;
 
     let output = Command::new("ip")
         .args(["link", "show", "itun0"])
@@ -112,9 +112,9 @@ async fn check_multi_address() -> Result<(), String> {
         mtu: 1500,
     };
 
-    let (_reader, _writer) = h3llo::tun::from_config(&local_tun)
+    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun)
         .await
-        .map_err(|e| format!("multi_address: from_config failed: {e}"))?;
+        .map_err(|e| format!("multi_address: make_tun failed: {e}"))?;
 
     let output = Command::new("ip")
         .args(["addr", "show", "itun1"])
@@ -136,7 +136,7 @@ async fn check_multi_address() -> Result<(), String> {
 
 /// Verifies actual data transmission through a TUN device using ICMP echo (ping).
 ///
-/// Creates a TUN device via `from_config()`, disables rp_filter, adds a route for
+/// Creates a TUN device via `make_tun()`, disables rp_filter, adds a route for
 /// a remote IP through the TUN, spawns a userspace ICMP echo responder, and runs
 /// `ping` to verify round-trip data flow through `TunRx::recv()` and `TunTx::send()`.
 async fn check_send_recv() -> Result<(), String> {
@@ -148,9 +148,9 @@ async fn check_send_recv() -> Result<(), String> {
         mtu: 1400,
     };
 
-    let (mut reader, mut writer) = h3llo::tun::from_config(&local_tun)
+    let (mut reader, mut writer) = h3llo::tun::make_tun(&local_tun)
         .await
-        .map_err(|e| format!("send_recv: from_config failed: {e}"))?;
+        .map_err(|e| format!("send_recv: make_tun failed: {e}"))?;
 
     // Disable rp_filter to allow ICMP replies from non-local source.
     // Write directly to /proc/sys since sysctl binary may not be available.
@@ -278,9 +278,9 @@ async fn check_mtu_configuration() -> Result<(), String> {
         mtu: 1280,
     };
 
-    let (_reader, _writer) = h3llo::tun::from_config(&local_tun)
+    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun)
         .await
-        .map_err(|e| format!("mtu_configuration: from_config failed: {e}"))?;
+        .map_err(|e| format!("mtu_configuration: make_tun failed: {e}"))?;
 
     let output = Command::new("ip")
         .args(["link", "show", "itun2"])

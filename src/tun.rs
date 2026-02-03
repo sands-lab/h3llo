@@ -43,8 +43,17 @@ pub trait TunTx: Send + 'static {
     fn send(&mut self, buf: &[u8]) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 }
 
-/// Creates a TUN device from `local_tun` and returns exclusive RX/TX handles.
-pub async fn from_config(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), TunError> {
+/// Creates TUN device state from configuration.
+///
+/// # Arguments
+///
+/// * `local_tun` - TUN configuration including interface name, addresses, and MTU.
+///
+/// # Errors
+///
+/// Returns `TunError::InvalidAddress` when an address cannot be parsed.
+/// Returns `TunError::DeviceBuild` when device creation or address assignment fails.
+pub async fn make_tun(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), TunError> {
     let (v4_addrs, v6_addrs) = parse_addrs(&local_tun.addrs)?;
 
     let mut builder = DeviceBuilder::new()

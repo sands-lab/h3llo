@@ -267,7 +267,7 @@ impl Orchestrator {
         }
 
         // Setup TUN
-        let (tun_reader, tun_writer) = tun::from_config(&config.local.tun)
+        let (tun_reader, tun_writer) = tun::make_tun(&config.local.tun)
             .await
             .map_err(|err| OrchestratorError::Tun(err.to_string()))?;
 

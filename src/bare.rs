@@ -156,7 +156,7 @@ pub fn spawn_udp_rx(
 
 /// Spawns the BareUDP send loop, emitting metrics while forwarding packets.
 ///
-/// The socket must be connected (created via `BareUdpTx::from_config`), allowing
+/// The socket must be connected (created via `make_bare_tx`), allowing
 /// use of `send()` instead of `send_to()`.
 ///
 /// Creates a bounded packet channel internally (actor owns the receiver).
