@@ -293,6 +293,68 @@ pub fn decode_datagram(data: &[u8]) -> Option<&[u8]> {
     Some(&data[1..])
 }
 
+// ========== Dialer ==========
+
+/// Client-side H3 CONNECT-IP dialer state.
+///
+/// Created by `make_h3_dialer`, used by `dial_h3` for connection.
+/// Encapsulates fallible socket setup separate from async handshake.
+#[derive(Debug)]
+pub struct H3Dialer {
+    /// Connected UDP socket.
+    socket: tokio::net::UdpSocket,
+    /// Remote socket address.
+    remote_addr: SocketAddr,
+    /// Server hostname for TLS SNI.
+    server_name: String,
+    /// CONNECT-IP request path.
+    path: String,
+    /// Whether to skip TLS verification (testing only).
+    insecure_skip_verify: bool,
+}
+
+/// Creates H3 dialer state for outbound connection.
+///
+/// Performs all fallible I/O: socket creation, route probing, connect.
+/// Does NOT perform QUIC handshake (that happens in `dial_h3`).
+///
+/// # Arguments
+///
+/// * `remote_addr` - Resolved target socket address.
+/// * `server_name` - Server hostname for TLS SNI.
+/// * `path` - CONNECT-IP request path.
+/// * `bindif` - Optional interface name to bind the socket.
+/// * `tun_if` - Optional TUN interface name to exclude from probing.
+/// * `probe` - Route probe implementation for interface selection.
+/// * `insecure_skip_verify` - Skip TLS certificate verification (testing only).
+///
+/// # Errors
+///
+/// Returns `DialError::Socket` if socket setup fails.
+pub async fn make_h3_dialer<P: RouteProbe>(
+    remote_addr: SocketAddr,
+    server_name: &str,
+    path: &str,
+    bindif: Option<&str>,
+    tun_if: Option<&str>,
+    probe: &P,
+    insecure_skip_verify: bool,
+) -> Result<H3Dialer, DialError> {
+    debug!(%remote_addr, %server_name, "creating H3 dialer socket");
+
+    let socket = make_client_udp_socket(remote_addr, tun_if, bindif, probe)
+        .await
+        .map_err(|e| DialError::Socket(e.to_string()))?;
+
+    Ok(H3Dialer {
+        socket,
+        remote_addr,
+        server_name: server_name.to_string(),
+        path: path.to_string(),
+        insecure_skip_verify,
+    })
+}
+
 // ========== Error Types ==========
 
 /// Dial error for H3 connection establishment.
@@ -351,51 +413,58 @@ pub struct H3Connection {
     pub quic_conn: QuicConnection,
 }
 
+impl H3Connection {
+    /// Splits the connection into separate RX and TX actor states.
+    ///
+    /// Consumes the connection, returning state structs suitable for
+    /// `spawn_h3_rx` and `spawn_h3_tx`.
+    pub fn into_actors(self) -> (H3Rx, H3Tx) {
+        let rx = H3Rx {
+            peer_id: self.peer_id.clone(),
+            datagram_rx: self.datagram_rx,
+        };
+        let tx = H3Tx {
+            peer_id: self.peer_id,
+            datagram_tx: self.datagram_tx,
+            flow_id: self.flow_id,
+        };
+        (rx, tx)
+    }
+}
+
 // ========== Dial Function ==========
 
-/// Establishes an HTTP/3 CONNECT-IP connection to a peer.
+/// Establishes an HTTP/3 CONNECT-IP connection using prepared dialer state.
+///
+/// Performs QUIC handshake and CONNECT-IP protocol negotiation.
 ///
 /// # Arguments
 ///
-/// * `remote_addr` - Resolved target socket address.
-/// * `server_name` - Server hostname for TLS SNI.
-/// * `path` - CONNECT-IP request path.
+/// * `dialer` - Prepared dialer state from `make_h3_dialer`.
 /// * `local_id` - Local node ID (Basic Auth username).
+/// * `peer_id` - Remote peer ID.
 /// * `peer_secret` - Peer's shared secret (Basic Auth password).
 /// * `ca_cert_path` - Optional path to CA certificate for server verification.
-/// * `bindif` - Optional interface name to bind the socket.
-/// * `tun_if` - Optional TUN interface name to exclude from probing.
-/// * `probe` - Route probe implementation for interface selection.
-/// * `insecure_skip_verify` - Skip TLS certificate verification (for testing only).
 ///
 /// # Errors
 ///
 /// Returns `DialError` if connection establishment fails.
-///
-/// # Security Warning
-///
-/// Setting `insecure_skip_verify` to `true` disables TLS certificate verification,
-/// making the connection vulnerable to MITM attacks. Only use for testing.
-#[allow(clippy::too_many_arguments)]
-pub async fn dial_h3<P: RouteProbe>(
-    remote_addr: SocketAddr,
-    server_name: &str,
-    path: &str,
+pub async fn dial_h3(
+    dialer: H3Dialer,
     local_id: &str,
     peer_id: &str,
     peer_secret: &str,
     ca_cert_path: Option<&Path>,
-    bindif: Option<&str>,
-    tun_if: Option<&str>,
-    probe: &P,
-    insecure_skip_verify: bool,
 ) -> Result<H3Connection, DialError> {
-    debug!(%remote_addr, %server_name, %local_id, %peer_id, "dialing H3 endpoint");
+    let H3Dialer {
+        socket,
+        remote_addr,
+        server_name,
+        path,
+        insecure_skip_verify,
+    } = dialer;
 
-    // Create connected socket with route probing
-    let socket = make_client_udp_socket(remote_addr, tun_if, bindif, probe)
-        .await
-        .map_err(|e| DialError::Socket(e.to_string()))?;
+    debug!(%remote_addr, %server_name, %local_id, %peer_id, "dialing H3 endpoint");
 
     // TODO: Implement custom CA certificate support for server verification.
     // Currently using system roots via tokio-quiche defaults.
@@ -421,7 +490,7 @@ pub async fn dial_h3<P: RouteProbe>(
         socket
             .try_into()
             .map_err(|e: std::io::Error| DialError::Socket(e.to_string()))?,
-        Some(server_name),
+        Some(&server_name),
         &params,
         h3_driver,
     )
@@ -554,6 +623,17 @@ pub async fn dial_h3<P: RouteProbe>(
 
 // ========== Receive Loop ==========
 
+/// H3 receive actor state.
+///
+/// Holds the datagram receiver and peer metadata for the receive loop.
+#[derive(Debug)]
+pub struct H3Rx {
+    /// Peer identifier for logging and metrics.
+    pub peer_id: String,
+    /// Inbound datagram receiver (from tokio-quiche).
+    pub datagram_rx: InboundFrameStream,
+}
+
 /// Spawns the HTTP/3 receive loop for a single connection.
 ///
 /// Receives datagrams from the inbound channel and forwards IP packets
@@ -561,18 +641,20 @@ pub async fn dial_h3<P: RouteProbe>(
 ///
 /// # Arguments
 ///
-/// * `peer_id` - Peer identifier for logging and metrics.
-/// * `datagram_rx` - Inbound datagram receiver (from tokio-quiche).
+/// * `rx` - H3 receive state (peer_id and datagram_rx).
 /// * `packet_tx` - Bounded channel to push received packets into (data plane).
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
 pub fn spawn_h3_rx(
-    peer_id: String,
-    mut datagram_rx: InboundFrameStream,
+    rx: H3Rx,
     packet_tx: mpsc::Sender<Vec<u8>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<ActorExitResult> {
+    let H3Rx {
+        peer_id,
+        mut datagram_rx,
+    } = rx;
     let peer = peer_id.clone();
 
     tokio::spawn(async move {
@@ -635,30 +717,44 @@ pub fn spawn_h3_rx(
 
 // ========== Transmit Loop ==========
 
+/// H3 transmit actor state.
+///
+/// Holds the datagram sender and flow ID for the transmit loop.
+#[derive(Debug)]
+pub struct H3Tx {
+    /// Peer identifier for logging and metrics.
+    pub peer_id: String,
+    /// Outbound datagram sender (to tokio-quiche).
+    pub datagram_tx: OutboundFrameSender,
+    /// DATAGRAM flow ID for this connection.
+    pub flow_id: u64,
+}
+
 /// Spawns the HTTP/3 send loop for a single connection.
 ///
 /// Receives packets from TUN-Rx and sends as datagrams with Context ID 0
 /// through the outbound datagram sender.
 ///
+/// Creates a bounded packet channel internally (actor owns the receiver).
+/// Returns the packet sender and join handle.
+///
 /// # Arguments
 ///
-/// * `peer_id` - Peer identifier for logging and metrics.
-/// * `datagram_tx` - Outbound datagram sender (to tokio-quiche).
-/// * `flow_id` - DATAGRAM flow ID for this connection.
+/// * `tx` - H3 transmit state (peer_id, datagram_tx, flow_id).
 /// * `events_tx` - Unbounded channel for emitting transmit metrics.
 /// * `interval` - Metrics emission interval.
-///
-/// # Returns
-///
-/// Returns the packet sender channel and join handle.
 pub fn spawn_h3_tx(
-    peer_id: String,
-    mut datagram_tx: OutboundFrameSender,
-    flow_id: u64,
+    tx: H3Tx,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
     let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
+
+    let H3Tx {
+        peer_id,
+        mut datagram_tx,
+        flow_id,
+    } = tx;
     let peer = peer_id.clone();
 
     let handle = tokio::spawn(async move {
@@ -1123,6 +1219,49 @@ mod tests {
         assert!(has_capsule_protocol(&headers));
     }
 
+    // ========== make_h3_dialer Tests ==========
+
+    #[tokio::test]
+    async fn make_h3_dialer_creates_socket() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let probe = FakeRouteProbe::noop();
+        let result = make_h3_dialer(
+            dest,
+            "localhost",
+            "/.well-known/masque/udp/*/*/",
+            None,
+            None,
+            &probe,
+            true,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let dialer = result.unwrap();
+        assert_eq!(dialer.remote_addr, dest);
+        assert_eq!(dialer.server_name, "localhost");
+    }
+
+    #[tokio::test]
+    async fn make_h3_dialer_stores_insecure_flag() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let probe = FakeRouteProbe::noop();
+
+        let secure = make_h3_dialer(dest, "localhost", "/", None, None, &probe, false)
+            .await
+            .unwrap();
+        assert!(!secure.insecure_skip_verify);
+
+        let insecure = make_h3_dialer(dest, "localhost", "/", None, None, &probe, true)
+            .await
+            .unwrap();
+        assert!(insecure.insecure_skip_verify);
+    }
+
     // ========== make_h3_listener Tests ==========
 
     #[test]
@@ -1214,20 +1353,19 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let probe = FakeRouteProbe::noop();
-        let client_result = dial_h3(
+        let dialer = make_h3_dialer(
             bound_addr,
             "localhost",
             "/.well-known/masque/udp/*/*/",
-            peer_id,
-            peer_id,
-            secret,
-            None,
             None,
             None,
             &probe,
             true, // insecure_skip_verify for testing
         )
-        .await;
+        .await
+        .expect("make_h3_dialer");
+
+        let client_result = dial_h3(dialer, peer_id, peer_id, secret, None).await;
 
         assert!(
             client_result.is_ok(),
@@ -1248,6 +1386,54 @@ mod tests {
         drop(cmd_tx);
     }
 
+    // ========== H3Connection::into_actors Tests ==========
+
+    #[tokio::test]
+    async fn h3_connection_into_actors_preserves_peer_id() {
+        let certs = TestCertBundle::generate();
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let peer_id = "split-test-peer";
+        let secret = "split-test-secret";
+        let peer_secrets = HashMap::from([(peer_id.to_string(), secret.to_string())]);
+
+        let (conn_tx, mut conn_rx) = mpsc::unbounded_channel();
+
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+            .expect("make listener");
+        let (cmd_tx, _handle, bound_addr) = spawn_h3_listener(listener, peer_secrets, conn_tx);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let probe = FakeRouteProbe::noop();
+        let dialer = make_h3_dialer(
+            bound_addr,
+            "localhost",
+            "/.well-known/masque/udp/*/*/",
+            None,
+            None,
+            &probe,
+            true,
+        )
+        .await
+        .expect("make dialer");
+
+        let _client_conn = dial_h3(dialer, peer_id, peer_id, secret, None)
+            .await
+            .expect("dial");
+
+        let server_conn = tokio::time::timeout(Duration::from_secs(5), conn_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("no conn");
+
+        let (rx, tx) = server_conn.into_actors();
+        assert_eq!(rx.peer_id, peer_id);
+        assert_eq!(tx.peer_id, peer_id);
+
+        drop(cmd_tx);
+    }
+
     #[tokio::test]
     async fn handshake_rejects_wrong_secret() {
         let certs = TestCertBundle::generate();
@@ -1265,20 +1451,19 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let probe = FakeRouteProbe::noop();
-        let result = dial_h3(
+        let dialer = make_h3_dialer(
             bound_addr,
             "localhost",
             "/.well-known/masque/udp/*/*/",
-            "test-client",
-            "test-client",
-            "wrong-secret",
-            None,
             None,
             None,
             &probe,
             true, // insecure_skip_verify for testing
         )
-        .await;
+        .await
+        .expect("make_h3_dialer");
+
+        let result = dial_h3(dialer, "test-client", "test-client", "wrong-secret", None).await;
 
         match result {
             Err(DialError::Auth(_)) | Err(DialError::Rejected(401)) => {}
@@ -1313,20 +1498,19 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let probe = FakeRouteProbe::noop();
-        let result = dial_h3(
+        let dialer = make_h3_dialer(
             bound_addr,
             "localhost",
             "/.well-known/masque/udp/*/*/",
-            "unknown-peer",
-            "unknown-peer",
-            "any-secret",
-            None,
             None,
             None,
             &probe,
             true, // insecure_skip_verify for testing
         )
-        .await;
+        .await
+        .expect("make_h3_dialer");
+
+        let result = dial_h3(dialer, "unknown-peer", "unknown-peer", "any-secret", None).await;
 
         assert!(matches!(
             result,
@@ -1358,21 +1542,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let probe = FakeRouteProbe::noop();
-        let client_conn = dial_h3(
+        let dialer = make_h3_dialer(
             bound_addr,
             "localhost",
             "/.well-known/masque/udp/*/*/",
-            peer_id,
-            peer_id,
-            secret,
-            None,
             None,
             None,
             &probe,
             true, // insecure_skip_verify for testing
         )
         .await
-        .expect("dial failed");
+        .expect("make_h3_dialer");
+
+        let client_conn = dial_h3(dialer, peer_id, peer_id, secret, None)
+            .await
+            .expect("dial failed");
 
         let server_conn = tokio::time::timeout(Duration::from_secs(5), conn_rx.recv())
             .await
@@ -1382,24 +1566,20 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let metrics_interval = Duration::from_secs(60);
 
+        // Split client connection into RX/TX actors
+        let (_client_rx, client_tx) = client_conn.into_actors();
+
         // Client TX actor
-        let (client_packet_tx, _client_tx_handle) = spawn_h3_tx(
-            peer_id.to_string(),
-            client_conn.datagram_tx,
-            client_conn.flow_id,
-            events_tx.clone(),
-            metrics_interval,
-        );
+        let (client_packet_tx, _client_tx_handle) =
+            spawn_h3_tx(client_tx, events_tx.clone(), metrics_interval);
+
+        // Split server connection for RX
+        let (server_rx, _server_tx) = server_conn.into_actors();
 
         // Server RX actor
         let (server_packet_tx, mut server_packet_rx) = mpsc::channel(16);
-        let _server_rx_handle = spawn_h3_rx(
-            peer_id.to_string(),
-            server_conn.datagram_rx,
-            server_packet_tx,
-            events_tx,
-            metrics_interval,
-        );
+        let _server_rx_handle =
+            spawn_h3_rx(server_rx, server_packet_tx, events_tx, metrics_interval);
 
         // Send test packet
         let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
@@ -1441,21 +1621,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let probe = FakeRouteProbe::noop();
-        let client_conn = dial_h3(
+        let dialer = make_h3_dialer(
             bound_addr,
             "localhost",
             "/.well-known/masque/udp/*/*/",
-            peer_id,
-            peer_id,
-            secret,
-            None,
             None,
             None,
             &probe,
             true, // insecure_skip_verify for testing
         )
         .await
-        .expect("dial failed");
+        .expect("make_h3_dialer");
+
+        let client_conn = dial_h3(dialer, peer_id, peer_id, secret, None)
+            .await
+            .expect("dial failed");
 
         let server_conn = tokio::time::timeout(Duration::from_secs(5), conn_rx.recv())
             .await
@@ -1465,41 +1645,29 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let metrics_interval = Duration::from_secs(60);
 
+        // Split client connection
+        let (client_rx, client_tx) = client_conn.into_actors();
+
         // Client TX -> Server RX
-        let (client_send_tx, _) = spawn_h3_tx(
-            peer_id.to_string(),
-            client_conn.datagram_tx,
-            client_conn.flow_id,
-            events_tx.clone(),
-            metrics_interval,
-        );
+        let (client_send_tx, _) = spawn_h3_tx(client_tx, events_tx.clone(), metrics_interval);
 
         let (server_to_client_tx, mut client_packet_rx) = mpsc::channel(16);
         let _client_rx_handle = spawn_h3_rx(
-            peer_id.to_string(),
-            client_conn.datagram_rx,
+            client_rx,
             server_to_client_tx,
             events_tx.clone(),
             metrics_interval,
         );
 
+        // Split server connection
+        let (server_rx, server_tx) = server_conn.into_actors();
+
         // Server TX -> Client RX
-        let (server_send_tx, _) = spawn_h3_tx(
-            "server".to_string(),
-            server_conn.datagram_tx,
-            server_conn.flow_id,
-            events_tx.clone(),
-            metrics_interval,
-        );
+        let (server_send_tx, _) = spawn_h3_tx(server_tx, events_tx.clone(), metrics_interval);
 
         let (client_to_server_tx, mut server_packet_rx) = mpsc::channel(16);
-        let _server_rx_handle = spawn_h3_rx(
-            "server".to_string(),
-            server_conn.datagram_rx,
-            client_to_server_tx,
-            events_tx,
-            metrics_interval,
-        );
+        let _server_rx_handle =
+            spawn_h3_rx(server_rx, client_to_server_tx, events_tx, metrics_interval);
 
         // Test client -> server
         let packet_c2s = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
@@ -1543,21 +1711,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let probe = FakeRouteProbe::noop();
-        let _client_conn = dial_h3(
+        let dialer = make_h3_dialer(
             bound_addr,
             "localhost",
             "/.well-known/masque/udp/*/*/",
-            peer_id,
-            peer_id,
-            secret,
-            None,
             None,
             None,
             &probe,
             true, // insecure_skip_verify for testing
         )
         .await
-        .expect("dial failed");
+        .expect("make_h3_dialer");
+
+        let _client_conn = dial_h3(dialer, peer_id, peer_id, secret, None)
+            .await
+            .expect("dial failed");
 
         let _server_conn = tokio::time::timeout(Duration::from_secs(5), conn_rx.recv())
             .await

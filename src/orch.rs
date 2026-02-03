@@ -7,8 +7,8 @@ use crate::config::{parse_h3_uri, parse_udp_uri, Config, Peer};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{DnsEventDetail, DnsIpExpired, DnsIpResolved, Event, TransportEvent};
 use crate::h3::{
-    dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3Connection,
-    H3ListenerCommand,
+    dial_h3, make_h3_dialer, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx,
+    H3Connection, H3ListenerCommand,
 };
 use crate::route::{sync_tun_routes, RouteManagerHandle};
 use crate::tun::{self, RoutingTable, TunRxCommand};
@@ -709,22 +709,20 @@ impl Orchestrator {
 
         debug!(peer = %peer_id, addr = %remote_addr, "H3 inbound connection accepted");
 
-        // Spawn RX/TX actors
+        // Split connection into actor states
+        let (rx_state, tx_state) = conn.into_actors();
+
+        // Spawn RX actor
         let rx_handle = spawn_h3_rx(
-            peer_id.to_string(),
-            conn.datagram_rx,
+            rx_state,
             self.tun_packet_tx.clone(),
             self.events_tx.clone(),
             METRICS_INTERVAL,
         );
 
-        let (packet_tx, tx_handle) = spawn_h3_tx(
-            peer_id.to_string(),
-            conn.datagram_tx,
-            conn.flow_id,
-            self.events_tx.clone(),
-            METRICS_INTERVAL,
-        );
+        // Spawn TX actor
+        let (packet_tx, tx_handle) =
+            spawn_h3_tx(tx_state, self.events_tx.clone(), METRICS_INTERVAL);
 
         let bound_id = self.next_bound_id();
         let entry = self.peers.get_mut(peer_id).unwrap();
@@ -756,18 +754,33 @@ impl Orchestrator {
         insecure: bool,
     ) -> Option<(mpsc::Sender<Vec<u8>>, Vec<JoinHandle<ActorExitResult>>)> {
         let probe = DefaultRouteProbe;
-        let conn = match dial_h3(
+
+        // make: fallible socket setup
+        let dialer = match make_h3_dialer(
             dest,
             server_name,
             path,
-            &self.local_id,
-            peer_id,
-            secret,
-            ca_path.map(Path::new),
             None, // bindif - TODO: support H3 bindifs
             Some(&self.tun_if),
             &probe,
             insecure,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(peer = %peer_id, addr = %dest, error = %e, "H3 dialer setup failed");
+                return None;
+            }
+        };
+
+        // dial: QUIC handshake
+        let conn = match dial_h3(
+            dialer,
+            &self.local_id,
+            peer_id,
+            secret,
+            ca_path.map(Path::new),
         )
         .await
         {
@@ -780,21 +793,17 @@ impl Orchestrator {
 
         debug!(peer = %peer_id, addr = %dest, "H3 connection established");
 
+        let (rx_state, tx_state) = conn.into_actors();
+
         let rx_handle = spawn_h3_rx(
-            peer_id.to_string(),
-            conn.datagram_rx,
+            rx_state,
             self.tun_packet_tx.clone(),
             self.events_tx.clone(),
             METRICS_INTERVAL,
         );
 
-        let (packet_tx, tx_handle) = spawn_h3_tx(
-            peer_id.to_string(),
-            conn.datagram_tx,
-            conn.flow_id,
-            self.events_tx.clone(),
-            METRICS_INTERVAL,
-        );
+        let (packet_tx, tx_handle) =
+            spawn_h3_tx(tx_state, self.events_tx.clone(), METRICS_INTERVAL);
 
         Some((packet_tx, vec![rx_handle, tx_handle]))
     }
