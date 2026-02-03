@@ -16,7 +16,8 @@ const RESOLVER_TIMEOUT: Duration = Duration::from_secs(5);
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 use h3llo::actor::ActorExitResult;
-use h3llo::dns::{DnsCommand, DnsResolver};
+use h3llo::config::LocalDns;
+use h3llo::dns::{make_dns, spawn_dns, DnsCommand};
 use h3llo::events::{DnsEventDetail, DnsIpResolved, Event};
 use h3llo::test_utils::FakeRouteProbe;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
@@ -79,7 +80,7 @@ async fn start_coredns() -> (ContainerAsync<GenericImage>, tempfile::TempDir, u1
     (container, dir, port)
 }
 
-/// Spawns a DnsResolver targeting the given server address.
+/// Spawns a DNS resolver targeting the given server address.
 ///
 /// Uses zero refresh interval so tests don't get automatic re-queries.
 async fn spawn_resolver(
@@ -91,12 +92,20 @@ async fn spawn_resolver(
     tokio::task::JoinHandle<ActorExitResult>,
 ) {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    // refresh_interval = ZERO disables automatic refresh
-    let resolver = DnsResolver::new(server, None, None, timeout, Duration::ZERO);
-    let (cmd_tx, handle) = resolver
-        .spawn(FakeRouteProbe::noop(), event_tx)
+
+    // Build LocalDns config for make_dns (needs udp:// scheme)
+    let local_dns = LocalDns {
+        server: format!("udp://{}", server),
+        bindif: None,
+        refresh: 0, // ZERO disables automatic refresh
+    };
+
+    let probe = FakeRouteProbe::noop();
+    let dns_actor = make_dns(&local_dns, None, timeout, &probe)
         .await
-        .expect("resolver spawn failed");
+        .expect("make_dns failed");
+
+    let (cmd_tx, handle) = spawn_dns(dns_actor, event_tx);
     (cmd_tx, event_rx, handle)
 }
 

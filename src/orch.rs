@@ -4,7 +4,7 @@ use crate::actor::{ActorError, ActorExitResult, ActorKind};
 use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUdpRxCommand};
 use crate::bind::DefaultRouteProbe;
 use crate::config::{parse_h3_uri, parse_udp_uri, Config, Peer};
-use crate::dns::{DnsCommand, DnsResolver};
+use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{DnsEventDetail, DnsIpExpired, DnsIpResolved, Event, TransportEvent};
 use crate::h3::{
     dial_h3, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3Connection, H3ListenerCommand,
@@ -357,16 +357,19 @@ impl Orchestrator {
             .map(|p| (p.id.clone(), PeerEntry::new(p.clone())))
             .collect();
 
-        // Spawn DNS resolver - actor creates its own command channel
-        let resolver =
-            DnsResolver::from_config(&config.local.dns, Some(tun_if.clone()), DNS_QUERY_TIMEOUT)
-                .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
-
+        // Create DNS actor state (performs fallible socket binding)
         let probe = DefaultRouteProbe;
-        let (dns_cmd_tx, handle) = resolver
-            .spawn(probe, events_tx.clone())
-            .await
-            .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
+        let dns_actor = make_dns(
+            &config.local.dns,
+            Some(tun_if.as_str()),
+            DNS_QUERY_TIMEOUT,
+            &probe,
+        )
+        .await
+        .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
+
+        // Spawn DNS actor task (infallible)
+        let (dns_cmd_tx, handle) = spawn_dns(dns_actor, events_tx.clone());
 
         // Send all hostnames to DNS module in one shot.
         // IP literals are handled by the DNS module directly (immediate IpResolved event).
