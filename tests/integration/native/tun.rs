@@ -22,7 +22,7 @@ use super::common::{
 
 /// Runs the TUN integration test binary inside a privileged Docker container.
 ///
-/// The container binary exercises `h3llo::tun::from_config()` with real TUN
+/// The container binary exercises `h3llo::tun::make_tun()` with real TUN
 /// devices, verifying device creation, multi-address assignment, and MTU.
 #[tokio::test]
 #[ignore = "requires Docker and pre-built test image with embedded binaries"]

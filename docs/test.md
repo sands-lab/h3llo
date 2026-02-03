@@ -167,10 +167,10 @@ Orchestrator: `tests/integration/native/tun.rs`
 
 Verifies TUN device creation, multi-address assignment (IPv4+IPv6), MTU
 configuration, and actual data transmission (send/receive) using
-`h3llo::tun::from_config()` inside a privileged container.
+`h3llo::tun::make_tun()` inside a privileged container.
 
 Data-path test uses a userspace ICMP echo responder:
-1. Creates a TUN device via `from_config()` and routes a remote IP through it
+1. Creates a TUN device via `make_tun()` and routes a remote IP through it
 2. Spawns an async task that reads ICMP echo requests via `TunRx::recv()`
 3. Crafts ICMP echo replies (swap IPs, fix checksums) and writes them back via `TunTx::send()`
 4. Runs `ping` targeting the routed address
