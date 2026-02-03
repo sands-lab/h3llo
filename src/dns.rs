@@ -119,7 +119,6 @@ pub struct DnsActor {
 ///
 /// # Errors
 ///
-/// Returns `ResolveInitError::InvalidServer` when the DNS server URI is malformed.
 /// Returns `ResolveInitError::Socket` when socket creation, binding, or connect fails.
 pub async fn make_dns<P: RouteProbe>(
     local_dns: &LocalDns,

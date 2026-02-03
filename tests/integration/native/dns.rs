@@ -93,9 +93,9 @@ async fn spawn_resolver(
 ) {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-    // Build LocalDns config for make_dns (needs udp:// scheme)
+    // Build LocalDns config for make_dns (server is pre-parsed SocketAddr)
     let local_dns = LocalDns {
-        server: format!("udp://{}", server),
+        server,
         bindif: None,
         refresh: 0, // ZERO disables automatic refresh
     };
