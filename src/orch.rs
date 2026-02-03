@@ -612,31 +612,57 @@ impl Orchestrator {
                 targets
             };
 
-            // Now dial H3 peers
+            // Spawn non-blocking dial tasks for H3 peers
             for (destination, server_name, path, secret, ca_path, insecure) in h3_dial_targets {
-                // Dial and emit event through unified channel
-                if let Some(conn) = self
-                    .dial_h3_peer(
-                        &peer_id,
+                let events_tx = self.events_tx.clone();
+                let local_id = self.local_id.clone();
+                let tun_if = self.tun_if.clone();
+                let peer_id_owned = peer_id.clone();
+
+                tokio::spawn(async move {
+                    let probe = DefaultRouteProbe;
+
+                    let dialer = match make_h3_dialer(
                         destination,
                         &server_name,
                         &path,
-                        &secret,
-                        ca_path.as_deref(),
+                        None, // bindif - TODO: support H3 bindifs
+                        Some(&tun_if),
+                        &probe,
                         insecure,
                     )
                     .await
-                {
-                    // Emit event - will be handled by handle_h3_connection
-                    let event = Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
-                        connection: conn,
-                        direction: ConnectionDirection::Outbound,
-                    }));
-                    if self.events_tx.send(event).is_err() {
-                        warn!(peer = %peer_id, "events channel closed during dial");
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(peer = %peer_id_owned, addr = %destination, error = %e, "H3 dialer setup failed");
+                            return;
+                        }
+                    };
+
+                    match dial_h3(
+                        dialer,
+                        &local_id,
+                        &peer_id_owned,
+                        &secret,
+                        ca_path.as_deref().map(Path::new),
+                    )
+                    .await
+                    {
+                        Ok(conn) => {
+                            debug!(peer = %peer_id_owned, addr = %destination, "H3 connection established");
+                            let event =
+                                Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
+                                    connection: conn,
+                                    direction: ConnectionDirection::Outbound,
+                                }));
+                            let _ = events_tx.send(event);
+                        }
+                        Err(e) => {
+                            warn!(peer = %peer_id_owned, addr = %destination, error = %e, "H3 dial failed");
+                        }
                     }
-                    // Note: on_bounds_changed called by handle_h3_connection
-                }
+                });
             }
         }
     }
@@ -729,64 +755,6 @@ impl Orchestrator {
         self.join_set.spawn(tx_handle);
 
         self.on_bounds_changed().await;
-    }
-
-    /// Dials an H3 peer and returns the established connection.
-    ///
-    /// Returns the connection, or None if dialing fails.
-    /// Actor spawning is handled by the unified `handle_h3_connection`.
-    #[allow(clippy::too_many_arguments)]
-    async fn dial_h3_peer(
-        &self,
-        peer_id: &str,
-        dest: SocketAddr,
-        server_name: &str,
-        path: &str,
-        secret: &str,
-        ca_path: Option<&str>,
-        insecure: bool,
-    ) -> Option<crate::h3::H3Connection> {
-        let probe = DefaultRouteProbe;
-
-        // make: fallible socket setup
-        let dialer = match make_h3_dialer(
-            dest,
-            server_name,
-            path,
-            None, // bindif - TODO: support H3 bindifs
-            Some(&self.tun_if),
-            &probe,
-            insecure,
-        )
-        .await
-        {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(peer = %peer_id, addr = %dest, error = %e, "H3 dialer setup failed");
-                return None;
-            }
-        };
-
-        // dial: QUIC handshake
-        let conn = match dial_h3(
-            dialer,
-            &self.local_id,
-            peer_id,
-            secret,
-            ca_path.map(Path::new),
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(peer = %peer_id, addr = %dest, error = %e, "H3 dial failed");
-                return None;
-            }
-        };
-
-        debug!(peer = %peer_id, addr = %dest, "H3 connection established");
-
-        Some(conn)
     }
 }
 
@@ -1556,6 +1524,59 @@ mod tests {
         assert!(
             result.contains("127.0.0.1"),
             "IP literals should be collected for DNS module to handle"
+        );
+    }
+
+    // ========== Non-blocking H3 dial test ==========
+
+    /// Helper to create test peers with H3 configuration at a specific host.
+    fn h3_peer_at_host(id: &str, host: &str, port: u16, allowed: &[&str]) -> Peer {
+        use crate::config::PeerH3;
+        Peer {
+            id: id.to_string(),
+            enabled: true,
+            h3: Some(PeerH3 {
+                endpoints: vec![format!("https://{}:{}/", host, port)],
+                secret: "test-secret-12345".to_string(),
+                ca: None,
+                insecure: true,
+                bindif: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_ip_resolved_does_not_block_on_h3_dial() {
+        use std::time::Instant;
+
+        // Create peer with H3 endpoint pointing to non-routable address (will timeout)
+        let peer = h3_peer_at_host("h3-peer", "10.255.255.1", 443, &["10.0.0.0/24"]);
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        let resolved = DnsIpResolved {
+            host: "10.255.255.1".to_string(),
+            address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 255, 255, 1)),
+        };
+
+        // The key assertion: handle_ip_resolved should return immediately
+        // (within milliseconds), not block for 30 seconds waiting for dial timeout
+        let start = Instant::now();
+        orch.handle_ip_resolved(resolved).await;
+        let elapsed = start.elapsed();
+
+        // If dial was blocking, this would take ~30 seconds (H3_HANDSHAKE_TIMEOUT)
+        // With non-blocking spawn, it should return in < 500ms
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "handle_ip_resolved blocked for {:?}, expected < 500ms (dial should be non-blocking)",
+            elapsed
         );
     }
 }
