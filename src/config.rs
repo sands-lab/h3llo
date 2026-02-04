@@ -124,9 +124,9 @@ pub struct Peer {
 /// HTTP/3 options per peer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerH3 {
-    /// Optional dialing endpoints (scheme/host/port/path); omit or leave empty for listen-only posture.
-    #[serde(default, deserialize_with = "deserialize_h3_endpoints")]
-    pub endpoints: Vec<H3Endpoint>,
+    /// Optional dialing endpoint (scheme/host/port/path); omit for listen-only posture.
+    #[serde(default)]
+    pub endpoint: Option<H3Endpoint>,
     /// Remote peer secret (> 8 characters) required whenever HTTP/3 is configured, including listen-only peers.
     pub secret: String,
     /// Optional custom CA bundle.
@@ -599,26 +599,6 @@ pub fn parse_udp_uri(raw: &str) -> Result<UdpEndpoint, String> {
     })
 }
 
-fn deserialize_h3_endpoints<'de, D>(deserializer: D) -> Result<Vec<H3Endpoint>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw_endpoints: Vec<String> = Vec::deserialize(deserializer)?;
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::with_capacity(raw_endpoints.len());
-
-    for (idx, raw) in raw_endpoints.into_iter().enumerate() {
-        let endpoint = parse_h3_uri(&raw)
-            .map_err(|e| de::Error::custom(format!("endpoints[{}]: {}", idx, e)))?;
-        // Deduplicate by canonical string representation
-        let canonical = format!("{}:{}:{}", endpoint.host, endpoint.port, endpoint.path);
-        if seen.insert(canonical) {
-            deduped.push(endpoint);
-        }
-    }
-    Ok(deduped)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,11 +638,11 @@ mod tests {
                 enabled: true,
                 h3: Some(PeerH3 {
                     secret: "example-node-2-secret".to_string(),
-                    endpoints: vec![H3Endpoint {
+                    endpoint: Some(H3Endpoint {
                         host: "peer.example.com".to_string(),
                         port: 443,
                         path: "/path".to_string(),
-                    }],
+                    }),
                     ca: None,
                     insecure: false,
                     bindif: None,
@@ -824,7 +804,7 @@ mod tests {
         let mut config = sample_h3_config();
         if let Some(h3) = config.peers[0].h3.as_mut() {
             h3.secret = "".to_string();
-            h3.endpoints.clear();
+            h3.endpoint = None;
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
@@ -889,7 +869,7 @@ peers:
         assert!(cfg.peers[0].enabled);
         assert!(cfg.peers[0].h3.is_some());
         if let Some(h3) = cfg.peers[0].h3.as_ref() {
-            assert!(h3.endpoints.is_empty());
+            assert!(h3.endpoint.is_none());
             assert!(h3.bindif.is_none());
         } else {
             panic!("peer h3 should be present");
@@ -897,7 +877,7 @@ peers:
     }
 
     #[test]
-    fn deduplicates_endpoints_and_applies_dns_defaults() {
+    fn parses_single_endpoint_and_applies_dns_defaults() {
         let yaml = r#"
 local:
   id: example-node-1
@@ -911,10 +891,7 @@ peers:
 - id: example-node-2
   h3:
     secret: example-node-2-secret
-    endpoints:
-      - https://peer.example.com/path
-      - https://peer.example.com/path
-      - https://peer2.example.com/path
+    endpoint: https://peer.example.com/path
     bindif: eth0
   tun:
     allowedIPs:
@@ -927,11 +904,10 @@ peers:
         );
         assert_eq!(cfg.local.dns.refresh, 60);
         let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
-        assert_eq!(h3.endpoints.len(), 2);
-        assert_eq!(h3.endpoints[0].host, "peer.example.com");
-        assert_eq!(h3.endpoints[0].port, 443);
-        assert_eq!(h3.endpoints[0].path, "/path");
-        assert_eq!(h3.endpoints[1].host, "peer2.example.com");
+        let endpoint = h3.endpoint.as_ref().expect("endpoint should be present");
+        assert_eq!(endpoint.host, "peer.example.com");
+        assert_eq!(endpoint.port, 443);
+        assert_eq!(endpoint.path, "/path");
         assert_eq!(h3.bindif, Some("eth0".to_string()));
     }
 
@@ -1040,8 +1016,7 @@ peers:
 - id: remote-peer
   h3:
     secret: remote-peer-secret
-    endpoints:
-      - https://peer.example.com:443/path
+    endpoint: https://peer.example.com:443/path
   tun:
     allowedIPs:
       - 192.168.180.2/32
@@ -1070,8 +1045,7 @@ peers:
 - id: example-node-2
   h3:
     secret: example-node-2-secret
-    endpoints:
-      - https://peer.example.com:443/path
+    endpoint: https://peer.example.com:443/path
     bindif: eth0
   tun:
     allowedIPs:
