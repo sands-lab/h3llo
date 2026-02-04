@@ -115,8 +115,7 @@ peers:
   - id: {peer_id}
     enabled: true
     h3:
-      endpoints:
-        - {peer_endpoint}
+      endpoint: {peer_endpoint}
       secret: {peer_secret}
       insecure: true
     tun:
