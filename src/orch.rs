@@ -641,69 +641,32 @@ impl Orchestrator {
         }
     }
 
-    /// Handles IP expiration event - dispatches to transport-specific handlers.
-    async fn handle_ip_expired(&mut self, expired: DnsIpExpired) {
-        self.handle_bare_ip_expired(&expired).await;
-        self.handle_h3_ip_expired(&expired).await;
-    }
-
-    /// Handles IP expiration for BareUDP peers.
+    /// Handles IP expiration event.
     ///
-    /// - Removes expired IP from bare_allowed_ips
-    /// - Removes bound if it was using the expired IP
-    async fn handle_bare_ip_expired(&mut self, expired: &DnsIpExpired) {
-        let mut allowed_ips_changed = false;
-        let mut bounds_changed = false;
+    /// - Removes expired IP from bare_allowed_ips (for BareUDP RX filtering)
+    /// - Removes bound from any peer using the expired IP
+    async fn handle_ip_expired(&mut self, expired: DnsIpExpired) {
+        let mut changed = false;
 
-        // Remove from allowed_ips
+        // BareUDP-specific: update allowed_ips filter
         if self.bare_allowed_ips.remove(&expired.address) {
-            allowed_ips_changed = true;
+            changed = true;
             debug!(host = %expired.host, ip = %expired.address, "removed from bare_allowed_ips");
         }
 
-        // Remove bound if it was using the expired IP
+        // Remove bound for any peer using this IP
         for entry in self.peers.values_mut() {
-            if entry.config.bare.is_none() {
-                continue;
-            }
-
             if let Some(ref bound) = entry.bound {
                 if bound.dest.ip() == expired.address {
                     entry.bound = None;
-                    bounds_changed = true;
-                    debug!(peer = %entry.config.id, ip = %expired.address, "bare bound removed due to IP expiration");
+                    changed = true;
+                    debug!(peer = %entry.config.id, ip = %expired.address, "bound removed due to IP expiration");
                     // TODO: Implement reconnection on disconnect
                 }
             }
         }
 
-        if allowed_ips_changed || bounds_changed {
-            self.on_bounds_changed().await;
-        }
-    }
-
-    /// Handles IP expiration for HTTP/3 peers.
-    ///
-    /// - Removes bound if it was using the expired IP
-    async fn handle_h3_ip_expired(&mut self, expired: &DnsIpExpired) {
-        let mut bounds_changed = false;
-
-        for entry in self.peers.values_mut() {
-            if entry.config.h3.is_none() {
-                continue;
-            }
-
-            if let Some(ref bound) = entry.bound {
-                if bound.dest.ip() == expired.address {
-                    entry.bound = None;
-                    bounds_changed = true;
-                    debug!(peer = %entry.config.id, ip = %expired.address, "H3 bound removed due to IP expiration");
-                    // TODO: Implement reconnection on disconnect
-                }
-            }
-        }
-
-        if bounds_changed {
+        if changed {
             self.on_bounds_changed().await;
         }
     }
