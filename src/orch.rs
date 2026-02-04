@@ -39,6 +39,8 @@ enum TransportType {
 /// A single active connection bound to a peer.
 #[derive(Debug)]
 struct BoundState {
+    /// Endpoint hostname for DNS expiration matching.
+    hostname: Option<String>,
     /// Transport kind for this bound.
     #[allow(dead_code)]
     transport: TransportType,
@@ -536,6 +538,7 @@ impl Orchestrator {
                 spawn_udp_tx(tx_socket, events_tx.clone(), METRICS_INTERVAL);
 
             entry.bound = Some(BoundState {
+                hostname: Some(bare.endpoint.host.clone()),
                 transport: TransportType::BareUdp,
                 dest: destination,
                 tx: packet_tx,
@@ -643,7 +646,7 @@ impl Orchestrator {
     /// Handles IP expiration event.
     ///
     /// - Removes expired IP from bare_allowed_ips (for BareUDP RX filtering)
-    /// - Removes bound from any peer using the expired IP
+    /// - Removes bound from peers whose IP and hostname match the expired entry
     async fn handle_ip_expired(&mut self, expired: DnsIpExpired) {
         let mut changed = false;
 
@@ -653,13 +656,23 @@ impl Orchestrator {
             debug!(host = %expired.host, ip = %expired.address, "removed from bare_allowed_ips");
         }
 
-        // Remove bound for any peer using this IP
+        // Remove bound for peers whose endpoint hostname matches the expired hostname.
+        // This prevents incorrect disconnection when multiple peers share the same IP
+        // (e.g., peer-a.example.com and peer-b.example.com both resolve to 1.2.3.4).
         for entry in self.peers.values_mut() {
             if let Some(ref bound) = entry.bound {
-                if bound.dest.ip() == expired.address {
+                let ip_matches = bound.dest.ip() == expired.address;
+                let host_matches = bound.hostname.as_ref().is_some_and(|h| h == &expired.host);
+
+                if ip_matches && host_matches {
                     entry.bound = None;
                     changed = true;
-                    debug!(peer = %entry.config.id, ip = %expired.address, "bound removed due to IP expiration");
+                    debug!(
+                        peer = %entry.config.id,
+                        host = %expired.host,
+                        ip = %expired.address,
+                        "bound removed due to IP expiration"
+                    );
                     // TODO: Implement reconnection on disconnect
                 }
             }
@@ -706,6 +719,18 @@ impl Orchestrator {
             return;
         }
 
+        // Extract endpoint hostname for outbound connections (used for IP expiration matching).
+        // Inbound connections have no outbound endpoint, so hostname is None.
+        let hostname = match direction {
+            ConnectionDirection::Outbound => entry
+                .config
+                .h3
+                .as_ref()
+                .and_then(|h3| h3.endpoint.as_ref())
+                .map(|ep| strip_ipv6_brackets(&ep.host).to_string()),
+            ConnectionDirection::Inbound => None,
+        };
+
         debug!(
             peer = %peer_id,
             addr = %remote_addr,
@@ -730,6 +755,7 @@ impl Orchestrator {
 
         let entry = self.peers.get_mut(&peer_id).unwrap();
         entry.bound = Some(BoundState {
+            hostname,
             transport: TransportType::Http3,
             dest: remote_addr,
             tx: packet_tx,
@@ -900,7 +926,13 @@ mod test_support {
             tx: mpsc::Sender<Vec<u8>>,
         ) -> Self {
             if let Some(entry) = self.peers.get_mut(peer_id) {
+                let hostname = entry
+                    .config
+                    .bare
+                    .as_ref()
+                    .map(|bare| bare.endpoint.host.clone());
                 entry.bound = Some(BoundState {
+                    hostname,
                     transport: TransportType::BareUdp,
                     dest,
                     tx,
@@ -981,6 +1013,7 @@ mod tests {
 
         let (tx1, _rx1) = mpsc::channel(1);
         entry.bound = Some(BoundState {
+            hostname: None,
             transport: TransportType::BareUdp,
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx: tx1,
@@ -992,6 +1025,7 @@ mod tests {
         // Replace bound (at most one connection)
         let (tx2, _rx2) = mpsc::channel(1);
         entry.bound = Some(BoundState {
+            hostname: None,
             transport: TransportType::BareUdp,
             dest: "5.6.7.8:5353".parse().unwrap(),
             tx: tx2,
@@ -1380,6 +1414,76 @@ mod tests {
 
         // Bound should be removed
         assert!(!orch.peers.get("peer1").unwrap().is_connected());
+    }
+
+    #[tokio::test]
+    async fn handle_ip_expired_respects_hostname() {
+        // Two peers with DIFFERENT hostnames but SAME resolved IP
+        let peer_a = bare_peer_at_host("peer-a", "alpha.example.com", 5353, &["10.0.0.0/24"]);
+        let peer_b = bare_peer_at_host("peer-b", "beta.example.com", 5353, &["172.16.0.0/16"]);
+
+        let (tx_a, _rx_a) = mpsc::channel(1);
+        let (tx_b, _rx_b) = mpsc::channel(1);
+
+        // Both peers connected to the SAME IP (simulating shared hosting / CDN)
+        let shared_ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let dest = SocketAddr::new(shared_ip, 5353);
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer_a, peer_b])
+            .with_peer_tx("peer-a", dest, tx_a)
+            .with_peer_tx("peer-b", dest, tx_b)
+            .build();
+
+        // Verify both peers are connected
+        assert!(orch.peers.get("peer-a").unwrap().is_connected());
+        assert!(orch.peers.get("peer-b").unwrap().is_connected());
+
+        // Expire only alpha.example.com's DNS entry
+        let expired = DnsIpExpired {
+            host: "alpha.example.com".to_string(),
+            address: shared_ip,
+        };
+
+        orch.handle_ip_expired(expired).await;
+
+        // Only peer-a should be disconnected (hostname matches)
+        assert!(!orch.peers.get("peer-a").unwrap().is_connected());
+        // peer-b should remain connected (different hostname, same IP)
+        assert!(orch.peers.get("peer-b").unwrap().is_connected());
+    }
+
+    #[tokio::test]
+    async fn handle_ip_expired_ignores_none_hostname() {
+        // Simulate inbound connection (no hostname)
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+
+        let (tx, _rx) = mpsc::channel(1);
+        let dest: SocketAddr = "1.2.3.4:5353".parse().unwrap();
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        // Manually set bound with None hostname (simulating inbound)
+        orch.peers.get_mut("peer1").unwrap().bound = Some(BoundState {
+            hostname: None,
+            transport: TransportType::BareUdp,
+            dest,
+            tx,
+        });
+
+        assert!(orch.peers.get("peer1").unwrap().is_connected());
+
+        let expired = DnsIpExpired {
+            host: "example.com".to_string(),
+            address: "1.2.3.4".parse().unwrap(),
+        };
+
+        orch.handle_ip_expired(expired).await;
+
+        // Bound should remain (hostname is None, so host_matches is false)
+        assert!(orch.peers.get("peer1").unwrap().is_connected());
     }
 
     // ========== collect_hostnames helper function tests ==========
