@@ -49,8 +49,7 @@ peers:
 - id: example-node-1
   h3:
     secret: example-secret
-    endpoints:
-      - https://node1.example.com:443/path
+    endpoint: https://node1.example.com:443/path
   tun:
     allowedIPs:
       - 192.168.180.1/32
@@ -69,7 +68,7 @@ High-level connection/auth/routing summary; see `docs/protocol.md` for auth/tran
 ### Architecture
 
 - Client/server-style: One side only listens (`listen`); the other only dials via `endpoints`. Suitable for hub-and-spoke.
-- Peer-to-peer: Both sides listen and dial each other for symmetry; multipath/connection selection details live in `docs/internals.md`.
+- Peer-to-peer: Both sides listen and dial each other for symmetry; connection details live in `docs/internals.md`.
 
 ### Authentication and Security
 

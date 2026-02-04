@@ -27,10 +27,9 @@ local:
 peers: # optional, default: []
 - id: example-node-1
   enabled: true # optional, default: true
-  h3: # optional, conflicts with peers.bare; endpoints optional (listen-only if omitted)
+  h3: # optional, conflicts with peers.bare; endpoint optional (listen-only if omitted)
     secret: example-secret # required whenever peers[].h3 is set (including listen-only)
-    endpoints:
-      - https://node1.example.com:443/path # optional; deduped; order does not imply priority
+    endpoint: https://node1.example.com:443/path # optional; omit for listen-only
     ca: ./ca.pem # optional
     insecure: false # optional, default: false
     bindif: eth0 # optional; omit to auto-detect
@@ -63,7 +62,7 @@ peers: # optional, default: []
 - `peers[].id`: Remote node ID; must match the peer’s `local.id`.
 - `peers[].h3.secret`: Remote peer authentication secret; required (and must be longer than 8 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. HTTP Basic Auth for CONNECT uses `username = remote local.id` and `password = peers[username].h3.secret` on the server side; clients send `password = peers[target].h3.secret`.
 - `peers[].enabled` (default `true`): Whether this peer entry is active.
-- `peers[].h3.endpoints` (optional, deduped): List of HTTP/3 dialing addresses (scheme/host/port/path); omit or leave empty to wait for inbound HTTP/3 from the peer. Mutually exclusive with peers[].bare; dialing/multipath details are in `docs/internals.md`.
+- `peers[].h3.endpoint` (optional): HTTP/3 dialing address (scheme/host/port/path); omit to wait for inbound HTTP/3 from the peer. Mutually exclusive with `peers[].bare`.
 - `peers[].h3.bindif` (optional): Interface for HTTP/3 dialer. When omitted, auto-detects at most one interface. Probe/bind fallbacks and recursive-routing warnings are described in `docs/internals.md`.
 - `peers[].h3.ca`: Custom CA bundle path for validating the peer’s certificate (useful for self-signed certs); otherwise the system trust store is used.
 - `peers[].h3.insecure` (default `false`): Skip TLS certificate validation (not recommended; prefer `ca`).
@@ -76,6 +75,6 @@ peers: # optional, default: []
 - Transport selection: `local.h3` and `local.bare` can both be configured so the node offers HTTP/3 and BareUDP concurrently; each `peers[]` entry must pick exactly one of H3 or BareUDP.
 - Dynamic updates: Require both `local.h3.listen` and `local.h3.admin` (with `name` and `pass` set and longer than 8 characters); when absent, the control-plane API remains disabled. Update semantics are described in `docs/protocol.md`; dynamic POST allows updating `local.h3.admin` and `peers` (other `local` fields are rejected).
 - Routing scope with `local.table=false`: POST still refreshes internal routes and peer transports, but system routes remain untouched (only host routes from `local.tun.addrs` stay).
-- H3 dialing optionality: If `peers[].h3` is present but `peers[].h3.endpoints` is empty or omitted, the node waits for the peer to initiate an HTTP/3 connection (listener-only posture). Connection set/selection rules live in `docs/internals.md`.
+- H3 dialing optionality: If `peers[].h3` is present but `peers[].h3.endpoint` is omitted, the node waits for the peer to initiate an HTTP/3 connection (listener-only posture).
 - DNS resolution and binding behavior: summarized above; resolver cadence, binding probes, and recursion guards are detailed in `docs/internals.md`.
 - BareUDP constraints: plaintext, NAT-unfriendly, and source-IP-filtered; DNS and binding/refresh rules are documented in `docs/protocol.md` and `docs/internals.md`.

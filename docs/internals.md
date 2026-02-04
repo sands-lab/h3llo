@@ -15,7 +15,7 @@ Why recursive routing happens: if h3llo installs the default route into the TUN 
 Binding workflow for HTTP/3, BareUDP, and DNS:
 1. Pick the DNS interface: prefer `local.dns.bindif` when provided and present in probe results; warn and fall back to the first probed non-TUN interface when the preferred one is missing. If no interface is available or probing fails, log a warning and continue with an unbound DNS socket. Probing uses `route_manager` to list routes, performs prefix matches against the target IP, filters entries whose `ifindex` matches the TUN, and maps interface indexes back to names; `route_manager` does not expose route metrics/priority, so ties with equal prefixes rely on route enumeration order—set `local.dns.bindif` / `peers[].h3.bindifs` (non-empty) explicitly when interface preference matters.
 2. DNS resolver actor: bind a UDP socket by interface index (Linux/macOS via `bind_device_by_index_v4/6`, Windows via `IP_UNICAST_IF` / `IPV6_UNICAST_IF`) when available. The actor runs a `select` over its command queue, UDP socket, a one-second timer tick, and a refresh timer (configurable via `local.dns.refresh`). The orchestrator sends a single `SetHostnames { hosts: HashSet<String> }` command with all peer endpoint hostnames; the DNS module owns hostname registration and refresh scheduling internally. For each hostname, the resolver assigns random unique transaction IDs for A and AAAA queries and tracks `(domain, id)` pairs. The resolver maintains an internal cache keyed by `(hostname, IP)` with TTL-based expiration (minimum 60 seconds). On DNS response, only new IPs emit `IpResolved` events; refreshing an existing IP only extends its TTL without emitting duplicate events. When an IP expires (TTL elapsed) or a hostname is removed from registration, the resolver emits `IpExpired` events. DNS warnings (NXDOMAIN, truncation, recursion refusal) are logged at origin via `warn!` instead of propagating through events. Timer ticks re-send timed-out entries with new transaction IDs.
-3. Transport binding: for each resolved IP (HTTP/3) or selected outbound IP (BareUDP), probe the WAN-facing interface excluding the TUN; bind transport sockets to that interface. HTTP/3 creates connections across the Cartesian product of DNS answers, `peers[].h3.endpoints`, and provided `peers[].h3.bindifs` (auto-detected bindif yields at most one entry when the field is omitted); BareUDP uses a single listener socket (RX-only) and one outbound socket per BareUDP peer (TX-only). If probing or binding fails, warn and continue unbound.
+3. Transport binding: for each resolved IP, probe the WAN-facing interface excluding the TUN; bind transport sockets to that interface. HTTP/3 dials all DNS-resolved IPs in parallel; first successful connection wins. BareUDP uses a single listener socket (RX-only) and one outbound socket per BareUDP peer (TX-only). If probing or binding fails, warn and continue unbound.
 
 Platform tiers and binding behavior:
 - Linux (primary): uses `bind_device_by_index_v4` / `bind_device_by_index_v6` with `if_nametoindex` to pin sockets by interface index.
@@ -192,15 +192,18 @@ Spawn an actor for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP
 
 When configuration changes arrive (external controller POST or initialization), update the allowed-source filter first (fast, in-memory), then the internal routing table, then the system routing table. Dynamic reconfiguration flows through the orchestrator via command queues.
 
-H3 connection pooling and selection:
-- Build `a*b` HTTP/3 connections for each peer where `a =` DNS answers and `b = |peers[].h3.endpoints|`, optionally bound to `peers[].h3.bindif` (auto-detected when unspecified).
-- Deduplicate endpoints before dialing. Warn if more than 10 connections exist for a peer; otherwise maintain all connections in the pool.
-- Prefer the earliest established connection until it disconnects or becomes invalid because its IP left the latest DNS result set. Fall back to the next-most-recent connection; newly rebuilt connections sit at the end of the ordering.
+H3 connection management:
+- For each peer, dial all DNS-resolved IPs in parallel when a new IP is resolved and no connection exists.
+- First successful connection wins and becomes the active connection for the peer.
+- When the active connection disconnects or its IP expires, the connection is removed. Reconnection is not yet implemented.
+- Each peer has at most one active connection at any time.
 
 DNS lifecycle management:
 - The DNS module owns the refresh timer internally; every `local.dns.refresh` seconds (when nonzero), it re-queries all registered hostnames.
 - The DNS module maintains an internal cache keyed by `(hostname, IpAddr)` with TTL-based expiration (minimum 60 seconds). Tick-based iteration checks for expired entries.
-- On new IP resolution, the DNS module emits `IpResolved`; the orchestrator spawns H3 dialers or BareUDP TX actors for matching peers and updates allowed source filters.
+- On new IP resolution, the DNS module emits `IpResolved`; the orchestrator:
+  - For BareUDP peers: adds the IP to `bare_allowed_ips` and spawns a TX actor only if no connection exists (first IP wins for TX)
+  - For H3 peers: spawns a dial attempt only if no connection exists; first successful connection wins
 - On IP expiration (TTL elapsed) or hostname removal, the DNS module emits `IpExpired`; the orchestrator removes the corresponding bound and updates filters.
 - Refreshing an existing IP extends its TTL without emitting duplicate `IpResolved` events.
 - DNS warnings (NXDOMAIN, truncation, recursion refusal) are logged via `warn!` at the DNS module (origin) rather than propagating through events.
