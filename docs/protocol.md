@@ -9,7 +9,7 @@ h3llo uses HTTP Basic Auth for authentication and a subset of MASQUE/CONNECT-IP 
 Authentication summary: CONNECT and GET/POST all ride the same HTTP path and require Basic Auth; CONNECT uses per-peer secrets, while control-plane GET/POST use dedicated admin credentials. HTTP requests do not apply source-IP filtering (unlike BareUDP).
 
 When the HTTP/3 initiator (client) requests the configured HTTP path, the receiver (server) performs HTTP Basic Auth:
-- CONNECT-IP: client sends `username = client local.id`, `password = peers[target].h3.secret` from its own config; server checks `username ∈ peers[].id` and `password == peers[username].h3.secret`. Every HTTP/3 peer entry must include `h3.secret` (longer than 8 characters) even when `peers[].h3.endpoints` is empty. Secrets may differ per direction; ensure both nodes carry the secret associated with the remote peer ID they validate.
+- CONNECT-IP: client sends `username = client local.id`, `password = peers[target].h3.secret` from its own config; server checks `username ∈ peers[].id` and `password == peers[username].h3.secret`. Every HTTP/3 peer entry must include `h3.secret` (longer than 8 characters) even when `peers[].h3.endpoint` is absent. Secrets may differ per direction; ensure both nodes carry the secret associated with the remote peer ID they validate.
 - Control plane GET/POST (enabled only when both `local.h3.admin.name` and `local.h3.admin.pass` are set, each longer than 8 characters): client sends `username = local.h3.admin.name`, `password = local.h3.admin.pass`; server checks both against its `local.h3.admin`.
 
 On authentication failure, the server requests Basic Auth again. The client waits for a period (default 5 seconds) before attempting to reconnect.
