@@ -49,8 +49,7 @@ peers:
 - id: example-node-1
   h3:
     secret: example-secret
-    endpoints:
-      - https://node1.example.com:443/path
+    endpoint: https://node1.example.com:443/path
   tun:
     allowedIPs:
       - 192.168.180.1/32
@@ -68,13 +67,13 @@ High-level connection/auth/routing summary; see `docs/protocol.md` for auth/tran
 
 ### Architecture
 
-- Client/server-style: One side only listens (`listen`); the other only dials via `endpoints`. Suitable for hub-and-spoke.
-- Peer-to-peer: Both sides listen and dial each other for symmetry; multipath/connection selection details live in `docs/internals.md`.
+- Client/server-style: One side only listens (`listen`); the other only dials via `endpoint`. Suitable for hub-and-spoke.
+- Peer-to-peer: Both sides listen and dial each other for symmetry; connection details live in `docs/internals.md`.
 
 ### Authentication and Security
 
 - Identity: every node needs a unique `id` (>= 6 chars).
-- Basic Auth for CONNECT uses `username = client local.id`, `password = peers[target].h3.secret`; the server checks `peers[auth.user].h3.secret == auth.pass`. Every HTTP/3 peer entry must set `h3.secret` (>= 9 chars) even when `endpoints` is empty, and secrets may differ per peer/direction. Control-plane GET/POST still use `local.h3.admin` (`name`/`pass`). Full rules live in `docs/protocol.md`. QUIC/TLS certificates are required for HTTP/3.
+- Basic Auth for CONNECT uses `username = client local.id`, `password = peers[target].h3.secret`; the server checks `peers[auth.user].h3.secret == auth.pass`. Every HTTP/3 peer entry must set `h3.secret` (>= 9 chars) even when `endpoint` is absent, and secrets may differ per peer/direction. Control-plane GET/POST still use `local.h3.admin` (`name`/`pass`). Full rules live in `docs/protocol.md`. QUIC/TLS certificates are required for HTTP/3.
 
 ### Routing
 
