@@ -64,6 +64,22 @@ impl PeerEntry {
     fn is_connected(&self) -> bool {
         self.bound.is_some()
     }
+
+    /// Checks if the bound should be expired based on available IPs.
+    ///
+    /// Returns true if the bound was removed (IP no longer available for hostname).
+    /// Inbound connections (hostname=None) are never expired by this check.
+    fn expire_bound_if_stale(&mut self, host: &str, available_ips: &[IpAddr]) -> bool {
+        if let Some(ref bound) = self.bound {
+            if let Some(ref bound_host) = bound.hostname {
+                if bound_host == host && !available_ips.contains(&bound.dest.ip()) {
+                    self.bound = None;
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Errors returned by the orchestrator.
@@ -608,19 +624,12 @@ impl Orchestrator {
 
                 // Check if current bound is expired
                 let entry = self.peers.get_mut(&peer_id).unwrap();
-                if let Some(ref bound) = entry.bound {
-                    if let Some(ref bound_host) = bound.hostname {
-                        if bound_host == &host && !available_ips.contains(&bound.dest.ip()) {
-                            debug!(
-                                peer = %peer_id,
-                                host = %host,
-                                ip = %bound.dest.ip(),
-                                "bound removed due to IP expiration"
-                            );
-                            entry.bound = None;
-                            bounds_changed = true;
-                        }
+                let expired_ip = entry.bound.as_ref().map(|b| b.dest.ip());
+                if entry.expire_bound_if_stale(&host, &available_ips) {
+                    if let Some(ip) = expired_ip {
+                        debug!(peer = %peer_id, host = %host, ip = %ip, "bound removed due to IP expiration");
                     }
+                    bounds_changed = true;
                 }
 
                 // If unbound, create connection with first available IP
@@ -646,19 +655,12 @@ impl Orchestrator {
 
                 // Check if current bound is expired
                 let entry = self.peers.get_mut(&peer_id).unwrap();
-                if let Some(ref bound) = entry.bound {
-                    if let Some(ref bound_host) = bound.hostname {
-                        if bound_host == &host && !available_ips.contains(&bound.dest.ip()) {
-                            debug!(
-                                peer = %peer_id,
-                                host = %host,
-                                ip = %bound.dest.ip(),
-                                "bound removed due to IP expiration"
-                            );
-                            entry.bound = None;
-                            bounds_changed = true;
-                        }
+                let expired_ip = entry.bound.as_ref().map(|b| b.dest.ip());
+                if entry.expire_bound_if_stale(&host, &available_ips) {
+                    if let Some(ip) = expired_ip {
+                        debug!(peer = %peer_id, host = %host, ip = %ip, "bound removed due to IP expiration");
                     }
+                    bounds_changed = true;
                 }
 
                 // If unbound, dial ALL resolved IPs (per docs/protocol.md)
@@ -680,7 +682,10 @@ impl Orchestrator {
         }
 
         if bounds_changed {
-            // Compute bare allowed IPs inline from dns_state (no stored snapshot)
+            // Compute bare allowed IPs from dns_state (includes ALL resolved IPs for bare peers).
+            // This differs from compute_bare_allowed_ips_from_bounds() which only includes
+            // currently-bound peer IPs. Here we have the full DNS state available, so we
+            // include all IPs to allow receiving from any resolved address.
             let mut allowed_ips = HashSet::new();
             for entry in self.peers.values() {
                 if !entry.config.enabled {
