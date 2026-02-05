@@ -139,38 +139,17 @@ pub struct TransportMetrics {
     pub stats: TransportStats,
 }
 
-/// Captures DNS observations per packet or timer tick.
+/// DNS resolution state change notification.
+///
+/// Emitted by the DNS resolver when the resolution state changes.
+/// Contains the complete hostname→IP mapping snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsEvent {
     /// DNS server socket address.
     pub server: SocketAddr,
-    /// Detail of the DNS observation.
-    pub detail: DnsEventDetail,
-}
-
-/// Enumerates DNS outcomes emitted by the resolver.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DnsEventDetail {
-    /// A new IP address was resolved for a hostname.
-    IpResolved(DnsIpResolved),
-    /// An IP address has expired and should no longer be used.
-    IpExpired(DnsIpExpired),
-}
-
-/// Notification that a new IP was resolved for a hostname.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsIpResolved {
-    /// The hostname that was resolved.
-    pub host: String,
-    /// The resolved IP address.
-    pub address: IpAddr,
-}
-
-/// Notification that an IP has expired for a hostname.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsIpExpired {
-    /// The hostname whose IP expired.
-    pub host: String,
-    /// The expired IP address.
-    pub address: IpAddr,
+    /// Complete resolution state: hostname -> resolved IPs.
+    ///
+    /// Each hostname maps to its currently valid IPs (TTL not expired).
+    /// Empty Vec indicates hostname is registered but has no valid IPs.
+    pub state: HashMap<String, Vec<IpAddr>>,
 }

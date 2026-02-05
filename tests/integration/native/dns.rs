@@ -18,7 +18,7 @@ const COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
 use h3llo::actor::ActorExitResult;
 use h3llo::config::LocalDns;
 use h3llo::dns::{make_dns, spawn_dns, DnsCommand};
-use h3llo::events::{DnsEventDetail, DnsIpResolved, Event};
+use h3llo::events::Event;
 use h3llo::test_utils::FakeRouteProbe;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -109,28 +109,35 @@ async fn spawn_resolver(
     (cmd_tx, event_rx, handle)
 }
 
-/// Collects IpResolved events until timeout or expected count reached.
+/// Waits for a DNS snapshot with at least `expected_count` IPs, returning the snapshot contents.
+///
+/// Since snapshots represent complete state (not deltas), this returns the contents of the
+/// first snapshot that meets the expected count, rather than accumulating across snapshots.
 async fn collect_ip_resolved(
     rx: &mut mpsc::UnboundedReceiver<Event>,
     timeout: Duration,
     expected_count: usize,
-) -> Vec<DnsIpResolved> {
-    let mut resolved = Vec::new();
+) -> Vec<(String, IpAddr)> {
     let deadline = tokio::time::Instant::now() + timeout;
 
-    while resolved.len() < expected_count {
+    loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(Event::Dns(ev))) => {
-                if let DnsEventDetail::IpResolved(ip) = ev.detail {
-                    resolved.push(ip);
+                let resolved: Vec<(String, IpAddr)> = ev
+                    .state
+                    .iter()
+                    .flat_map(|(host, ips)| ips.iter().map(|ip| (host.clone(), *ip)))
+                    .collect();
+                if resolved.len() >= expected_count {
+                    return resolved;
                 }
+                // Continue waiting for a snapshot with enough IPs
             }
             Ok(Some(_)) => continue,
-            Ok(None) => break,
-            Err(_) => break,
+            Ok(None) => return Vec::new(),
+            Err(_) => return Vec::new(),
         }
     }
-    resolved
 }
 
 /// Helper to create a HashSet from a slice of strings.
@@ -155,14 +162,11 @@ async fn dns_resolve_single_a_record() {
     // Expect at least 1 IpResolved event
     let resolved = collect_ip_resolved(&mut event_rx, COLLECT_TIMEOUT, 1).await;
 
-    assert!(
-        !resolved.is_empty(),
-        "expected at least one IpResolved event"
-    );
+    assert!(!resolved.is_empty(), "expected at least one IP in snapshot");
 
     let has_expected_ip = resolved
         .iter()
-        .any(|r| r.host == "single.test.h3llo" && r.address.to_string() == "10.0.0.1");
+        .any(|(host, addr)| host == "single.test.h3llo" && addr.to_string() == "10.0.0.1");
     assert!(
         has_expected_ip,
         "expected 10.0.0.1 for single.test.h3llo: {:?}",
@@ -186,10 +190,10 @@ async fn dns_resolve_multiple_records() {
         .unwrap();
 
     // multi.test.h3llo has: 10.0.0.2, 10.0.0.3 (A), and 2001:db8::2 (AAAA)
-    // Expect 3 IpResolved events
+    // Expect 3 IPs in snapshot
     let resolved = collect_ip_resolved(&mut event_rx, COLLECT_TIMEOUT, 3).await;
 
-    let addrs: Vec<IpAddr> = resolved.iter().map(|r| r.address).collect();
+    let addrs: Vec<IpAddr> = resolved.iter().map(|(_, addr)| *addr).collect();
 
     assert!(
         addrs.contains(&"10.0.0.2".parse().unwrap()),
@@ -225,7 +229,7 @@ async fn dns_resolve_aaaa_only() {
 
     let has_expected_ip = resolved
         .iter()
-        .any(|r| r.host == "ipv6only.test.h3llo" && r.address.to_string() == "2001:db8::1");
+        .any(|(host, addr)| host == "ipv6only.test.h3llo" && addr.to_string() == "2001:db8::1");
     assert!(
         has_expected_ip,
         "expected 2001:db8::1 for ipv6only.test.h3llo: {:?}",
@@ -248,12 +252,16 @@ async fn dns_resolve_nxdomain_emits_no_events() {
         })
         .unwrap();
 
-    // NXDOMAIN should not emit IpResolved events (warning is logged at origin)
+    // NXDOMAIN should not emit IPs in snapshot (warning is logged at origin)
     let resolved = collect_ip_resolved(&mut event_rx, Duration::from_secs(3), 1).await;
 
+    // NXDOMAIN should not produce any resolved IPs for that hostname
     assert!(
-        resolved.is_empty(),
-        "expected no IpResolved events for NXDOMAIN, got: {:?}",
+        resolved.is_empty()
+            || resolved
+                .iter()
+                .all(|(host, _)| host != "nonexistent.test.h3llo"),
+        "expected no IPs for NXDOMAIN, got: {:?}",
         resolved
     );
 
@@ -279,10 +287,10 @@ async fn dns_resolve_multiple_hostnames() {
 
     let single_resolved = resolved
         .iter()
-        .any(|r| r.host == "single.test.h3llo" && r.address.to_string() == "10.0.0.1");
+        .any(|(host, addr)| host == "single.test.h3llo" && addr.to_string() == "10.0.0.1");
     let ipv6only_resolved = resolved
         .iter()
-        .any(|r| r.host == "ipv6only.test.h3llo" && r.address.to_string() == "2001:db8::1");
+        .any(|(host, addr)| host == "ipv6only.test.h3llo" && addr.to_string() == "2001:db8::1");
 
     assert!(single_resolved, "missing single.test.h3llo: {:?}", resolved);
     assert!(

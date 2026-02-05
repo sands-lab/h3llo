@@ -1,10 +1,10 @@
 //! DNS resolver coroutine: consumes SetHostnames commands, manages IP lifecycle with TTL-based expiration,
-//! and emits IpResolved/IpExpired events.
+//! and emits state snapshot events on resolution changes.
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_client_udp_socket, RouteProbe};
 use crate::config::LocalDns;
-use crate::events::{DnsEvent, DnsEventDetail, DnsIpExpired, DnsIpResolved, Event};
+use crate::events::{DnsEvent, Event};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use rand::Rng;
@@ -31,36 +31,121 @@ pub enum DnsCommand {
     /// Register/update the set of hostnames to monitor.
     ///
     /// Replaces the previous registration set entirely. The DNS module will:
-    /// - Start tracking new hostnames (issue queries, emit IpResolved)
+    /// - Start tracking new hostnames (issue queries)
     /// - Continue tracking existing hostnames (refresh before TTL expiry)
-    /// - Stop tracking removed hostnames (emit IpExpired for active IPs)
+    /// - Stop tracking removed hostnames (remove from state, mark dirty)
     SetHostnames { hosts: HashSet<String> },
 }
 
-/// Cached DNS resolution result with expiration tracking.
-#[derive(Debug, Clone)]
-struct CachedRecord {
-    /// Absolute expiration time.
-    expires_at: Instant,
+/// Unified DNS resolution state.
+///
+/// Consolidates hostname registration and IP cache into a single structure.
+/// Emits state snapshots on change rather than per-IP events.
+#[derive(Debug, Clone, Default)]
+struct DnsState {
+    /// Active resolutions: hostname -> (IP -> expiration time).
+    entries: HashMap<String, HashMap<IpAddr, Instant>>,
+    /// True if state changed since last snapshot emission.
+    dirty: bool,
 }
 
-impl CachedRecord {
-    /// Creates a new cached record with TTL floored to MIN_TTL_SECS.
-    fn new(ttl: u32) -> Self {
+impl DnsState {
+    /// Updates the set of registered hostnames.
+    ///
+    /// Removes unregistered hostnames and their IPs; adds new hostnames with
+    /// empty IP maps. Returns true if registration changed.
+    fn set_hostnames(&mut self, hosts: &HashSet<String>) -> bool {
+        let mut changed = false;
+
+        // Remove unregistered hostnames
+        self.entries.retain(|h, _| {
+            let keep = hosts.contains(h);
+            if !keep {
+                changed = true;
+            }
+            keep
+        });
+
+        // Add new hostnames (empty IP map)
+        for host in hosts {
+            self.entries.entry(host.clone()).or_insert_with(|| {
+                changed = true;
+                HashMap::new()
+            });
+        }
+
+        if changed {
+            self.dirty = true;
+        }
+        changed
+    }
+
+    /// Records a resolved IP for a hostname. Returns true if the IP is new.
+    fn record_ip(&mut self, host: &str, ip: IpAddr, ttl: u32) -> bool {
+        let Some(ips) = self.entries.get_mut(host) else {
+            return false;
+        };
+
         let ttl_secs = ttl.max(MIN_TTL_SECS);
         let expires_at = Instant::now() + Duration::from_secs(ttl_secs as u64);
-        Self { expires_at }
+        let is_new = !ips.contains_key(&ip);
+        ips.insert(ip, expires_at);
+
+        if is_new {
+            self.dirty = true;
+        }
+        is_new
     }
 
-    /// Returns true if this record has expired.
-    fn is_expired(&self) -> bool {
-        Instant::now() >= self.expires_at
+    /// Removes expired IPs. Returns true if any were removed.
+    fn expire_stale(&mut self) -> bool {
+        let now = Instant::now();
+        let mut removed = false;
+
+        for ips in self.entries.values_mut() {
+            ips.retain(|_, expires_at| {
+                let keep = *expires_at > now;
+                if !keep {
+                    removed = true;
+                }
+                keep
+            });
+        }
+
+        if removed {
+            self.dirty = true;
+        }
+        removed
     }
 
-    /// Refreshes the TTL, resetting the expiration time.
-    fn refresh(&mut self, ttl: u32) {
-        let ttl_secs = ttl.max(MIN_TTL_SECS);
-        self.expires_at = Instant::now() + Duration::from_secs(ttl_secs as u64);
+    /// Returns snapshot if dirty, clearing the dirty flag.
+    fn take_snapshot(&mut self) -> Option<HashMap<String, Vec<IpAddr>>> {
+        if !self.dirty {
+            return None;
+        }
+        self.dirty = false;
+
+        Some(
+            self.entries
+                .iter()
+                .map(|(host, ips)| (host.clone(), ips.keys().copied().collect()))
+                .collect(),
+        )
+    }
+
+    /// Checks if a hostname is registered.
+    fn is_registered(&self, host: &str) -> bool {
+        self.entries.contains_key(host)
+    }
+
+    /// Returns an iterator over registered hostnames.
+    fn hostnames(&self) -> impl Iterator<Item = &String> {
+        self.entries.keys()
+    }
+
+    /// Returns true if all entries have empty IP maps and no pending work.
+    fn is_idle(&self) -> bool {
+        self.entries.values().all(|ips| ips.is_empty())
     }
 }
 
@@ -173,8 +258,7 @@ pub fn spawn_dns(
     let handle = tokio::spawn(async move {
         let mut pending: HashMap<u16, PendingRequest> = HashMap::new();
         let mut cmd_rx_closed = false;
-        let mut registered_hosts: HashSet<String> = HashSet::new();
-        let mut cache: HashMap<(String, IpAddr), CachedRecord> = HashMap::new();
+        let mut state = DnsState::default();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
         let mut ticker = time::interval(TICK_INTERVAL);
@@ -193,12 +277,9 @@ pub fn spawn_dns(
                     handle_command(
                         maybe_cmd,
                         &mut cmd_rx_closed,
-                        &mut registered_hosts,
-                        &mut cache,
+                        &mut state,
                         &mut pending,
                         &socket,
-                        server,
-                        &events_tx,
                     ).await;
                 }
                 result = socket.recv(&mut buf) => {
@@ -207,9 +288,7 @@ pub fn spawn_dns(
                             handle_packet(
                                 &buf[..len],
                                 &mut pending,
-                                &mut cache,
-                                server,
-                                &events_tx,
+                                &mut state,
                             ).await;
                         }
                         Ok(_) => {}
@@ -221,16 +300,17 @@ pub fn spawn_dns(
                 }
                 _ = ticker.tick() => {
                     handle_tick(&mut pending, &socket, timeout).await;
+                    state.expire_stale();
+                    if let Some(snapshot) = state.take_snapshot() {
+                        let _ = events_tx.send(Event::Dns(DnsEvent { server, state: snapshot }));
+                    }
                 }
                 _ = refresh_ticker.tick(), if !refresh_interval.is_zero() => {
-                    trigger_refresh(&registered_hosts, &mut pending, &socket).await;
+                    trigger_refresh(&state, &mut pending, &socket).await;
                 }
             }
 
-            // Check for expired IPs on every iteration
-            check_expirations(&mut cache, server, &events_tx);
-
-            if cmd_rx_closed && pending.is_empty() && cache.is_empty() {
+            if cmd_rx_closed && pending.is_empty() && state.is_idle() {
                 return Ok(());
             }
         }
@@ -248,29 +328,16 @@ struct PendingRequest {
 }
 
 /// Handles commands from the orchestrator queue.
-#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     command: Option<DnsCommand>,
     cmd_rx_closed: &mut bool,
-    registered_hosts: &mut HashSet<String>,
-    cache: &mut HashMap<(String, IpAddr), CachedRecord>,
+    state: &mut DnsState,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
-    server: SocketAddr,
-    events_tx: &mpsc::UnboundedSender<Event>,
 ) {
     match command {
         Some(DnsCommand::SetHostnames { hosts }) => {
-            handle_set_hostnames(
-                hosts,
-                registered_hosts,
-                cache,
-                pending,
-                socket,
-                server,
-                events_tx,
-            )
-            .await;
+            handle_set_hostnames(hosts, state, pending, socket).await;
         }
         None => {
             *cmd_rx_closed = true;
@@ -279,118 +346,57 @@ async fn handle_command(
 }
 
 /// Handles the SetHostnames command: diff against current state.
-#[allow(clippy::too_many_arguments)]
 async fn handle_set_hostnames(
     new_hosts: HashSet<String>,
-    registered_hosts: &mut HashSet<String>,
-    cache: &mut HashMap<(String, IpAddr), CachedRecord>,
+    state: &mut DnsState,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
-    server: SocketAddr,
-    events_tx: &mpsc::UnboundedSender<Event>,
 ) {
-    // Find removed hostnames
-    let removed: Vec<String> = registered_hosts.difference(&new_hosts).cloned().collect();
-
     // Find added hostnames
-    let added: Vec<String> = new_hosts.difference(registered_hosts).cloned().collect();
+    let added: Vec<String> = new_hosts
+        .iter()
+        .filter(|h| !state.is_registered(h))
+        .cloned()
+        .collect();
 
-    // Update registered set
-    *registered_hosts = new_hosts;
-
-    // Emit IpExpired for all IPs of removed hostnames
-    for host in removed {
-        expire_hostname(&host, cache, server, events_tx);
-    }
+    // Update state (handles adds + removes + dirty flag)
+    state.set_hostnames(&new_hosts);
 
     // Issue queries for added hostnames
     for host in added {
-        resolve_hostname(&host, cache, pending, socket, server, events_tx).await;
+        resolve_hostname(&host, state, pending, socket).await;
     }
 }
 
 /// Issues DNS queries for a hostname (handling IP literals).
 async fn resolve_hostname(
     host: &str,
-    cache: &mut HashMap<(String, IpAddr), CachedRecord>,
+    state: &mut DnsState,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
-    server: SocketAddr,
-    events_tx: &mpsc::UnboundedSender<Event>,
 ) {
     // Fast path: IP literal detection
     if let Ok(ip) = host.parse::<IpAddr>() {
-        handle_ip_literal(host.to_string(), ip, cache, server, events_tx);
+        // IP literals use max TTL (effectively never expire)
+        state.record_ip(host, ip, u32::MAX);
     } else {
         issue_query(host.to_string(), DnsRecordType::A, pending, socket).await;
         issue_query(host.to_string(), DnsRecordType::Aaaa, pending, socket).await;
     }
 }
 
-/// Handles IP literal: emit IpResolved immediately, cache with max TTL.
-fn handle_ip_literal(
-    host: String,
-    ip: IpAddr,
-    cache: &mut HashMap<(String, IpAddr), CachedRecord>,
-    server: SocketAddr,
-    events_tx: &mpsc::UnboundedSender<Event>,
-) {
-    let key = (host.clone(), ip);
-    if cache.contains_key(&key) {
-        return; // Already cached
-    }
-
-    // IP literals use max TTL (effectively never expire)
-    cache.insert(key, CachedRecord::new(u32::MAX));
-    emit_ip_resolved(&host, ip, server, events_tx);
-}
-
-/// Expires all IPs for a hostname and emits IpExpired events.
-fn expire_hostname(
-    host: &str,
-    cache: &mut HashMap<(String, IpAddr), CachedRecord>,
-    server: SocketAddr,
-    events_tx: &mpsc::UnboundedSender<Event>,
-) {
-    let keys_to_remove: Vec<(String, IpAddr)> =
-        cache.keys().filter(|(h, _)| h == host).cloned().collect();
-
-    for (h, ip) in keys_to_remove {
-        cache.remove(&(h.clone(), ip));
-        emit_ip_expired(&h, ip, server, events_tx);
-    }
-}
-
 /// Triggers refresh for all registered hostnames.
 async fn trigger_refresh(
-    registered_hosts: &HashSet<String>,
+    state: &DnsState,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
 ) {
-    for host in registered_hosts.iter() {
+    for host in state.hostnames() {
         // Skip IP literals (never need refresh)
         if host.parse::<IpAddr>().is_err() {
             issue_query(host.clone(), DnsRecordType::A, pending, socket).await;
             issue_query(host.clone(), DnsRecordType::Aaaa, pending, socket).await;
         }
-    }
-}
-
-/// Checks for expired cache entries and emits IpExpired events.
-fn check_expirations(
-    cache: &mut HashMap<(String, IpAddr), CachedRecord>,
-    server: SocketAddr,
-    events_tx: &mpsc::UnboundedSender<Event>,
-) {
-    let expired: Vec<(String, IpAddr)> = cache
-        .iter()
-        .filter(|(_, record)| record.is_expired())
-        .map(|((host, ip), _)| (host.clone(), *ip))
-        .collect();
-
-    for (host, ip) in expired {
-        cache.remove(&(host.clone(), ip));
-        emit_ip_expired(&host, ip, server, events_tx);
     }
 }
 
@@ -448,13 +454,11 @@ fn allocate_id(pending: &HashMap<u16, PendingRequest>) -> u16 {
     }
 }
 
-/// Parses a DNS packet and emits the corresponding event.
+/// Parses a DNS packet and updates state accordingly.
 async fn handle_packet(
     data: &[u8],
     pending: &mut HashMap<u16, PendingRequest>,
-    cache: &mut HashMap<(String, IpAddr), CachedRecord>,
-    server: SocketAddr,
-    events_tx: &mpsc::UnboundedSender<Event>,
+    state: &mut DnsState,
 ) {
     let message = match Message::from_vec(data) {
         Ok(msg) => msg,
@@ -466,20 +470,14 @@ async fn handle_packet(
 
     let id = message.id();
     if let Some(request) = pending.remove(&id) {
-        handle_decoded_packet(message, request, cache, server, events_tx);
+        handle_decoded_packet(message, request, state);
     } else {
         warn!(id = id, "dns: unknown transaction ID");
     }
 }
 
 /// Handles a parsed DNS packet that matches a pending request.
-fn handle_decoded_packet(
-    message: Message,
-    request: PendingRequest,
-    cache: &mut HashMap<(String, IpAddr), CachedRecord>,
-    server: SocketAddr,
-    events_tx: &mpsc::UnboundedSender<Event>,
-) {
+fn handle_decoded_packet(message: Message, request: PendingRequest, state: &mut DnsState) {
     // Log warnings at origin instead of sending via events
     log_response_warnings(&message, &request.host);
 
@@ -497,17 +495,9 @@ fn handle_decoded_packet(
         }
     }
 
-    // Process each record: cache and emit new IPs, refresh existing
+    // Process each record: record new IPs, refresh existing TTLs
     for record in records {
-        let key = (request.host.clone(), record.address);
-        if let Some(cached) = cache.get_mut(&key) {
-            // Existing IP - refresh TTL (no event emitted)
-            cached.refresh(record.ttl);
-        } else {
-            // New IP - cache and emit IpResolved
-            cache.insert(key, CachedRecord::new(record.ttl));
-            emit_ip_resolved(&request.host, record.address, server, events_tx);
-        }
+        state.record_ip(&request.host, record.address, record.ttl);
     }
 }
 
@@ -535,40 +525,6 @@ async fn handle_tick(
             warn!(host = %request.host, error = %err, "dns: retry send failed");
         }
     }
-}
-
-/// Emits an IpResolved event.
-fn emit_ip_resolved(
-    host: &str,
-    address: IpAddr,
-    server: SocketAddr,
-    events_tx: &mpsc::UnboundedSender<Event>,
-) {
-    let event = Event::Dns(DnsEvent {
-        server,
-        detail: DnsEventDetail::IpResolved(DnsIpResolved {
-            host: host.to_string(),
-            address,
-        }),
-    });
-    let _ = events_tx.send(event);
-}
-
-/// Emits an IpExpired event.
-fn emit_ip_expired(
-    host: &str,
-    address: IpAddr,
-    server: SocketAddr,
-    events_tx: &mpsc::UnboundedSender<Event>,
-) {
-    let event = Event::Dns(DnsEvent {
-        server,
-        detail: DnsEventDetail::IpExpired(DnsIpExpired {
-            host: host.to_string(),
-            address,
-        }),
-    });
-    let _ = events_tx.send(event);
 }
 
 /// Builds a query for `name` and `record_type`.
@@ -726,22 +682,39 @@ mod tests {
         response.to_vec().unwrap()
     }
 
-    /// Receives the next DNS event detail.
-    async fn next_relevant_detail(
+    /// Receives the next DNS snapshot event.
+    async fn next_dns_snapshot(
         events_rx: &mut mpsc::UnboundedReceiver<Event>,
-    ) -> DnsEventDetail {
+    ) -> HashMap<String, Vec<IpAddr>> {
         loop {
             let event = events_rx.recv().await.expect("dns event");
             if let Event::Dns(dns) = event {
-                return dns.detail;
+                return dns.state;
             }
         }
     }
 
-    // ========== IpResolved Tests ==========
+    /// Waits for a DNS snapshot where the specified hostname has at least one IP.
+    ///
+    /// Skips snapshots where the hostname is missing or has empty IPs.
+    async fn next_dns_snapshot_with_ips(
+        events_rx: &mut mpsc::UnboundedReceiver<Event>,
+        hostname: &str,
+    ) -> HashMap<String, Vec<IpAddr>> {
+        loop {
+            let snapshot = next_dns_snapshot(events_rx).await;
+            if let Some(ips) = snapshot.get(hostname) {
+                if !ips.is_empty() {
+                    return snapshot;
+                }
+            }
+        }
+    }
+
+    // ========== Snapshot Tests ==========
 
     #[tokio::test]
-    async fn emits_ip_resolved_for_new_ip() {
+    async fn emits_snapshot_for_new_ip() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
@@ -766,20 +739,16 @@ mod tests {
         );
         socket.send_to(&response, peer).await.unwrap();
 
-        let detail = next_relevant_detail(&mut events_rx).await;
-        match detail {
-            DnsEventDetail::IpResolved(resolved) => {
-                assert_eq!(resolved.host, "example.com");
-                assert_eq!(resolved.address, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
-            }
-            _ => panic!("expected IpResolved event"),
-        }
+        // Wait for snapshot with resolved IPs (may skip initial empty snapshot)
+        let snapshot = next_dns_snapshot_with_ips(&mut events_rx, "example.com").await;
+        let ips = snapshot.get("example.com").expect("missing example.com");
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
 
         handle.abort();
     }
 
     #[tokio::test]
-    async fn does_not_emit_duplicate_ip_on_refresh() {
+    async fn does_not_emit_duplicate_snapshot_on_refresh() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
@@ -805,8 +774,8 @@ mod tests {
         );
         socket.send_to(&response, peer).await.unwrap();
 
-        // Wait for first IpResolved
-        let _ = next_relevant_detail(&mut events_rx).await;
+        // Wait for first snapshot
+        let _ = next_dns_snapshot(&mut events_rx).await;
 
         // Consume AAAA query
         let (len2, peer2) = socket.recv_from(&mut buf).await.unwrap();
@@ -827,17 +796,14 @@ mod tests {
             .send(DnsCommand::SetHostnames { hosts: hosts2 })
             .unwrap();
 
-        // Should not receive another IpResolved (no new hostnames added)
+        // Should not receive another snapshot (no new hostnames added, no state change)
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 // Expected - no event
             }
             event = events_rx.recv() => {
-                // Only IpResolved events should not fire for same IP
-                if let Some(Event::Dns(dns)) = event {
-                    if matches!(dns.detail, DnsEventDetail::IpResolved(_)) {
-                        panic!("should not emit duplicate IpResolved");
-                    }
+                if let Some(Event::Dns(_)) = event {
+                    panic!("should not emit duplicate snapshot when state unchanged");
                 }
             }
         }
@@ -846,7 +812,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emits_ip_expired_on_hostname_removal() {
+    async fn emits_snapshot_on_hostname_removal() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
@@ -872,8 +838,12 @@ mod tests {
         );
         socket.send_to(&response, peer).await.unwrap();
 
-        // Wait for IpResolved
-        let _ = next_relevant_detail(&mut events_rx).await;
+        // Wait for snapshot with IPs (may skip initial empty snapshot)
+        let snapshot = next_dns_snapshot_with_ips(&mut events_rx, "example.com").await;
+        assert!(snapshot
+            .get("example.com")
+            .unwrap()
+            .contains(&IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
 
         // Consume AAAA query
         let (len2, peer2) = socket.recv_from(&mut buf).await.unwrap();
@@ -893,15 +863,12 @@ mod tests {
             })
             .unwrap();
 
-        // Should receive IpExpired
-        let detail = next_relevant_detail(&mut events_rx).await;
-        match detail {
-            DnsEventDetail::IpExpired(expired) => {
-                assert_eq!(expired.host, "example.com");
-                assert_eq!(expired.address, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
-            }
-            _ => panic!("expected IpExpired event"),
-        }
+        // Should receive snapshot with example.com removed
+        let snapshot = next_dns_snapshot(&mut events_rx).await;
+        assert!(
+            !snapshot.contains_key("example.com"),
+            "example.com should be removed"
+        );
 
         handle.abort();
     }
@@ -909,7 +876,7 @@ mod tests {
     // ========== IP Literal Tests ==========
 
     #[tokio::test]
-    async fn ip_literal_emits_immediate_ip_resolved() {
+    async fn ip_literal_emits_snapshot_on_tick() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
@@ -919,21 +886,16 @@ mod tests {
         hosts.insert("192.168.1.100".to_string());
         cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
 
-        // Should receive immediate IpResolved (no network query)
-        let detail = next_relevant_detail(&mut events_rx).await;
-        match detail {
-            DnsEventDetail::IpResolved(resolved) => {
-                assert_eq!(resolved.host, "192.168.1.100");
-                assert_eq!(resolved.address.to_string(), "192.168.1.100");
-            }
-            _ => panic!("expected IpResolved event"),
-        }
+        // Snapshot emitted on next tick (not immediately anymore)
+        let snapshot = next_dns_snapshot(&mut events_rx).await;
+        let ips = snapshot.get("192.168.1.100").expect("missing IP literal");
+        assert!(ips.contains(&"192.168.1.100".parse::<IpAddr>().unwrap()));
 
         handle.abort();
     }
 
     #[tokio::test]
-    async fn ipv6_literal_emits_immediate_ip_resolved() {
+    async fn ipv6_literal_emits_snapshot_on_tick() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
@@ -943,23 +905,18 @@ mod tests {
         hosts.insert("2001:db8::1".to_string());
         cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
 
-        // Should receive immediate IpResolved
-        let detail = next_relevant_detail(&mut events_rx).await;
-        match detail {
-            DnsEventDetail::IpResolved(resolved) => {
-                assert_eq!(resolved.host, "2001:db8::1");
-                assert!(resolved.address.is_ipv6());
-            }
-            _ => panic!("expected IpResolved event"),
-        }
+        // Snapshot emitted on next tick
+        let snapshot = next_dns_snapshot(&mut events_rx).await;
+        let ips = snapshot.get("2001:db8::1").expect("missing IPv6 literal");
+        assert!(ips.iter().any(|ip| ip.is_ipv6()));
 
         handle.abort();
     }
 
-    // ========== Deduplication Tests ==========
+    // ========== Multi-IP Tests ==========
 
     #[tokio::test]
-    async fn emits_multiple_ips_for_same_hostname() {
+    async fn snapshot_contains_multiple_ips_for_same_hostname() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
@@ -991,18 +948,9 @@ mod tests {
         );
         socket.send_to(&response, peer).await.unwrap();
 
-        // Should receive two IpResolved events
-        let detail1 = next_relevant_detail(&mut events_rx).await;
-        let detail2 = next_relevant_detail(&mut events_rx).await;
-
-        let mut ips = HashSet::new();
-        if let DnsEventDetail::IpResolved(r) = detail1 {
-            ips.insert(r.address);
-        }
-        if let DnsEventDetail::IpResolved(r) = detail2 {
-            ips.insert(r.address);
-        }
-
+        // Single snapshot contains both IPs (may skip initial empty snapshot)
+        let snapshot = next_dns_snapshot_with_ips(&mut events_rx, "multi.example.com").await;
+        let ips = snapshot.get("multi.example.com").expect("missing host");
         assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
 
