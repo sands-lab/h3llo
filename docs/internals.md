@@ -185,7 +185,7 @@ Orchestrator DNS handling:
 - **Single event loop**: The orchestrator runs one unified event loop that handles all events including DNS lifecycle events. There is no separate initialization event loop.
 - **Listen hostname**: If the listen address is a hostname (not IP literal), perform synchronous DNS lookup before starting the event loop. This ensures BareUDP RX and TUN TX are created immediately.
 - **Unified hostname registration**: The orchestrator sends a single `SetHostnames { hosts: HashSet<String> }` command at startup with all unique peer endpoint hostnames. IP literals are handled by the DNS module directly (recorded with max TTL, included in next snapshot). The DNS module owns hostname tracking, refresh scheduling, and TTL-based expiration internally.
-- **Event-driven IP lifecycle**: The orchestrator reacts to DNS state snapshot events. When a snapshot arrives, the orchestrator diffs it against its previous snapshot to determine added and removed IPs. Added IPs trigger TX actor creation (BareUDP) or dial attempts (H3); removed IPs trigger bound removal. The `bare_allowed_ips` set is computed on-demand from the snapshot rather than maintained incrementally.
+- **Event-driven IP lifecycle**: The orchestrator reacts to DNS state snapshot events. When a snapshot arrives, the orchestrator iterates over all peers to check connection state and IP validity. For unbound peers, available IPs trigger TX actor creation (BareUDP) or dial attempts (H3); for bound peers, IP expiration triggers bound removal. The `bare_allowed_ips` set is computed on-demand from the snapshot rather than maintained incrementally.
 - **First IP wins**: For peer endpoints, use the first resolved IP for outbound traffic. All resolved IPs are added to the allowed source filter.
 
 Spawn an actor for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx actor; BareUDP owns one listener socket for RX and a separate TX-only socket per BareUDP peer.
@@ -202,10 +202,13 @@ DNS lifecycle management:
 - The DNS module owns the refresh timer internally; every `local.dns.refresh` seconds (when nonzero), it re-queries all registered hostnames.
 - The DNS module maintains unified state tracking each hostname's resolved IPs with TTL-based expiration (minimum 60 seconds). A dirty flag tracks whether state changed since the last snapshot emission.
 - On any state change (new IP, IP expiration, hostname add/remove), the dirty flag is set. On the next tick, if dirty, the DNS module emits a single state snapshot containing all hostname→IP mappings and clears the flag.
-- The orchestrator diffs the incoming snapshot against its previous one:
-  - For BareUDP peers: adds the IP to `bare_allowed_ips` and spawns a TX actor only if no connection exists (first IP wins for TX)
-  - For H3 peers: spawns a dial attempt only if no connection exists; first successful connection wins
-  - For removed IPs: removes bounds for peers whose endpoint hostname matches, updates routing and allowed-source filter
+- The orchestrator iterates over all peers when a snapshot arrives:
+  - For each peer, check the endpoint hostname against the new snapshot
+  - If no active connection: create connection using first available IP (BareUDP) or dial all IPs (H3)
+  - If active connection exists: check if destination IP is still in the snapshot for that hostname
+    - If expired: remove bound and immediately attempt reconnection if new IPs available
+    - If still valid: do nothing
+  - After processing all peers, update routing and allowed-source filter if any bounds changed
 - Refreshing an existing IP extends its TTL without changing the snapshot (no duplicate events).
 - DNS warnings (NXDOMAIN, truncation, recursion refusal) are logged via `warn!` at the DNS module (origin) rather than propagating through events.
 
