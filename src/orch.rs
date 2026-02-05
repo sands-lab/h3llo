@@ -486,120 +486,6 @@ impl Orchestrator {
         }
     }
 
-    /// Creates a BareUDP TX connection for a peer.
-    ///
-    /// Returns true if bound was created successfully.
-    async fn create_bare_connection(
-        &mut self,
-        peer_id: &str,
-        host: &str,
-        ip: IpAddr,
-        port: u16,
-    ) -> bool {
-        let entry = self.peers.get(peer_id).unwrap();
-        if entry.is_connected() {
-            return false;
-        }
-        let bare = entry.config.bare.as_ref().unwrap();
-
-        let destination = SocketAddr::new(ip, port);
-        let probe = DefaultRouteProbe;
-        let tx_socket = match make_bare_tx(
-            destination,
-            bare.bindif.as_deref(),
-            Some(&self.tun_if),
-            &probe,
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(err) => {
-                warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
-                return false;
-            }
-        };
-
-        let (packet_tx, tx_handle) =
-            spawn_udp_tx(tx_socket, self.events_tx.clone(), METRICS_INTERVAL);
-
-        let entry = self.peers.get_mut(peer_id).unwrap();
-        entry.bound = Some(BoundState {
-            hostname: Some(host.to_string()),
-            dest: destination,
-            tx: packet_tx,
-        });
-
-        self.join_set.spawn(tx_handle);
-        true
-    }
-
-    /// Spawns a non-blocking H3 dial attempt for a peer.
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_h3_dial(
-        &self,
-        peer_id: &str,
-        host: &str,
-        ip: IpAddr,
-        port: u16,
-        path: &str,
-        secret: &str,
-        ca: Option<&str>,
-        insecure: bool,
-    ) {
-        let destination = SocketAddr::new(ip, port);
-        let server_name = host.to_string();
-        let path = path.to_string();
-        let secret = secret.to_string();
-        let ca_path = ca.map(|s| s.to_string());
-        let events_tx = self.events_tx.clone();
-        let local_id = self.local_id.clone();
-        let tun_if = self.tun_if.clone();
-        let peer_id = peer_id.to_string();
-
-        tokio::spawn(async move {
-            let probe = DefaultRouteProbe;
-            let dialer = match make_h3_dialer(
-                destination,
-                &server_name,
-                &path,
-                None,
-                Some(&tun_if),
-                &probe,
-                insecure,
-            )
-            .await
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dialer setup failed");
-                    return;
-                }
-            };
-
-            match dial_h3(
-                dialer,
-                &local_id,
-                &peer_id,
-                &secret,
-                ca_path.as_deref().map(Path::new),
-            )
-            .await
-            {
-                Ok(conn) => {
-                    debug!(peer = %peer_id, addr = %destination, "H3 connection established");
-                    let event = Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
-                        connection: conn,
-                        direction: ConnectionDirection::Outbound,
-                    }));
-                    let _ = events_tx.send(event);
-                }
-                Err(e) => {
-                    warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
-                }
-            }
-        });
-    }
-
     /// Handles a DNS state snapshot by iterating peers directly.
     ///
     /// For each peer:
@@ -609,10 +495,7 @@ impl Orchestrator {
         let dns_state = dns_event.state;
         let mut bounds_changed = false;
 
-        let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
-
-        for peer_id in peer_ids {
-            let entry = self.peers.get(&peer_id).unwrap();
+        for (peer_id, entry) in &mut self.peers {
             if !entry.config.enabled {
                 continue;
             }
@@ -620,10 +503,10 @@ impl Orchestrator {
             if let Some(bare) = entry.config.bare.as_ref() {
                 let host = bare.endpoint.host.clone();
                 let port = bare.endpoint.port;
+                let bindif = bare.bindif.clone();
                 let available_ips: Vec<IpAddr> = dns_state.get(&host).cloned().unwrap_or_default();
 
                 // Check if current bound is expired
-                let entry = self.peers.get_mut(&peer_id).unwrap();
                 let expired_ip = entry.bound.as_ref().map(|b| b.dest.ip());
                 if entry.expire_bound_if_stale(&host, &available_ips) {
                     if let Some(ip) = expired_ip {
@@ -633,11 +516,36 @@ impl Orchestrator {
                 }
 
                 // If unbound, create connection with first available IP
-                if !self.peers.get(&peer_id).unwrap().is_connected() {
+                if !entry.is_connected() {
                     if let Some(&ip) = available_ips.first() {
-                        if self.create_bare_connection(&peer_id, &host, ip, port).await {
-                            bounds_changed = true;
-                        }
+                        let destination = SocketAddr::new(ip, port);
+                        let probe = DefaultRouteProbe;
+                        let tx_socket = match make_bare_tx(
+                            destination,
+                            bindif.as_deref(),
+                            Some(&self.tun_if),
+                            &probe,
+                        )
+                        .await
+                        {
+                            Ok(s) => s,
+                            Err(err) => {
+                                warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
+                                continue;
+                            }
+                        };
+
+                        let (packet_tx, tx_handle) =
+                            spawn_udp_tx(tx_socket, self.events_tx.clone(), METRICS_INTERVAL);
+
+                        entry.bound = Some(BoundState {
+                            hostname: Some(host.clone()),
+                            dest: destination,
+                            tx: packet_tx,
+                        });
+
+                        self.join_set.spawn(tx_handle);
+                        bounds_changed = true;
                     }
                 }
             } else if let Some(h3) = entry.config.h3.as_ref() {
@@ -654,7 +562,6 @@ impl Orchestrator {
                 let available_ips: Vec<IpAddr> = dns_state.get(&host).cloned().unwrap_or_default();
 
                 // Check if current bound is expired
-                let entry = self.peers.get_mut(&peer_id).unwrap();
                 let expired_ip = entry.bound.as_ref().map(|b| b.dest.ip());
                 if entry.expire_bound_if_stale(&host, &available_ips) {
                     if let Some(ip) = expired_ip {
@@ -664,18 +571,67 @@ impl Orchestrator {
                 }
 
                 // If unbound, dial ALL resolved IPs (per docs/protocol.md)
-                if !self.peers.get(&peer_id).unwrap().is_connected() {
+                if !entry.is_connected() {
+                    // Clone values needed for spawned tasks before the loop
+                    let events_tx = self.events_tx.clone();
+                    let local_id = self.local_id.clone();
+                    let tun_if = self.tun_if.clone();
+
                     for &ip in &available_ips {
-                        self.spawn_h3_dial(
-                            &peer_id,
-                            &host_raw,
-                            ip,
-                            port,
-                            &path,
-                            &secret,
-                            ca.as_deref(),
-                            insecure,
-                        );
+                        let destination = SocketAddr::new(ip, port);
+                        let server_name = host_raw.clone();
+                        let path = path.clone();
+                        let secret = secret.clone();
+                        let ca_path = ca.clone();
+                        let events_tx = events_tx.clone();
+                        let local_id = local_id.clone();
+                        let tun_if = tun_if.clone();
+                        let peer_id = peer_id.clone();
+
+                        tokio::spawn(async move {
+                            let probe = DefaultRouteProbe;
+                            let dialer = match make_h3_dialer(
+                                destination,
+                                &server_name,
+                                &path,
+                                None,
+                                Some(&tun_if),
+                                &probe,
+                                insecure,
+                            )
+                            .await
+                            {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dialer setup failed");
+                                    return;
+                                }
+                            };
+
+                            match dial_h3(
+                                dialer,
+                                &local_id,
+                                &peer_id,
+                                &secret,
+                                ca_path.as_deref().map(Path::new),
+                            )
+                            .await
+                            {
+                                Ok(conn) => {
+                                    debug!(peer = %peer_id, addr = %destination, "H3 connection established");
+                                    let event = Event::Transport(TransportEvent::H3Connected(
+                                        H3ConnectedEvent {
+                                            connection: conn,
+                                            direction: ConnectionDirection::Outbound,
+                                        },
+                                    ));
+                                    let _ = events_tx.send(event);
+                                }
+                                Err(e) => {
+                                    warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
+                                }
+                            }
+                        });
                     }
                 }
             }
