@@ -5,10 +5,7 @@ use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUd
 use crate::bind::DefaultRouteProbe;
 use crate::config::{Config, Peer};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
-use crate::events::{
-    ConnectionDirection, DnsEventDetail, DnsIpExpired, DnsIpResolved, Event, H3ConnectedEvent,
-    TransportEvent,
-};
+use crate::events::{ConnectionDirection, DnsEvent, Event, H3ConnectedEvent, TransportEvent};
 use crate::h3::{
     dial_h3, make_h3_dialer, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx,
     H3ListenerCommand,
@@ -131,9 +128,8 @@ pub struct Orchestrator {
     mtu: usize,
     /// Unified peer state: config + active bound.
     peers: HashMap<String, PeerEntry>,
-    /// Allowed source IPs for BareUDP RX filtering.
-    /// Tracks all resolved IPs for all bare peers.
-    bare_allowed_ips: HashSet<IpAddr>,
+    /// Previous DNS state snapshot for computing deltas.
+    prev_dns_snapshot: HashMap<String, Vec<IpAddr>>,
     tun_cmd_tx: mpsc::UnboundedSender<TunRxCommand>,
     bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
     /// H3 listener command sender (if listening).
@@ -153,6 +149,23 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
+    /// Computes allowed IPs for BareUDP RX filtering from DNS snapshot.
+    fn compute_bare_allowed_ips(&self) -> HashSet<IpAddr> {
+        let mut allowed = HashSet::new();
+        for entry in self.peers.values() {
+            if !entry.config.enabled {
+                continue;
+            }
+            let Some(bare) = entry.config.bare.as_ref() else {
+                continue;
+            };
+            if let Some(ips) = self.prev_dns_snapshot.get(&bare.endpoint.host) {
+                allowed.extend(ips.iter().copied());
+            }
+        }
+        allowed
+    }
+
     /// Updates all dependent subsystems after bounds topology changes.
     ///
     /// Performs the three-update sequence:
@@ -161,11 +174,11 @@ impl Orchestrator {
     /// 3. System routes (if `local.table` is enabled)
     ///
     /// Called after any bound is added or removed.
-    async fn on_bounds_changed(&self) {
+    async fn on_bounds_changed(&self, bare_allowed_ips: &HashSet<IpAddr>) {
         // 1. Update allowed sources (fast, in-memory filter)
         if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
             if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAllowedSources(
-                self.bare_allowed_ips.clone(),
+                bare_allowed_ips.clone(),
             )) {
                 warn!(error = %e, "failed to send allowed sources update command");
             }
@@ -347,7 +360,7 @@ impl Orchestrator {
             tun_if,
             mtu,
             peers,
-            bare_allowed_ips: HashSet::new(),
+            prev_dns_snapshot: HashMap::new(),
             tun_cmd_tx,
             bare_rx_cmd_tx,
             h3_listener_cmd_tx,
@@ -434,14 +447,9 @@ impl Orchestrator {
     /// Handles an event from a child actor.
     async fn handle_event(&mut self, event: Event) {
         match event {
-            Event::Dns(dns_event) => match dns_event.detail {
-                DnsEventDetail::IpResolved(resolved) => {
-                    self.handle_ip_resolved(resolved).await;
-                }
-                DnsEventDetail::IpExpired(expired) => {
-                    self.handle_ip_expired(expired).await;
-                }
-            },
+            Event::Dns(dns_event) => {
+                self.handle_dns_snapshot(dns_event).await;
+            }
             Event::Transport(TransportEvent::Metrics(metrics)) => {
                 let labels = &metrics.labels;
                 let stats = &metrics.stats;
@@ -475,25 +483,80 @@ impl Orchestrator {
         }
     }
 
-    /// Handles a new IP resolution event.
-    ///
-    /// Dispatches to transport-specific handlers for BareUDP and H3.
-    async fn handle_ip_resolved(&mut self, resolved: DnsIpResolved) {
-        self.handle_bare_ip_resolved(&resolved).await;
-        self.handle_h3_ip_resolved(&resolved).await;
-    }
+    /// Handles a DNS state snapshot by computing deltas and applying changes.
+    async fn handle_dns_snapshot(&mut self, dns_event: DnsEvent) {
+        let new_state = dns_event.state;
+        let old_state = std::mem::replace(&mut self.prev_dns_snapshot, new_state.clone());
 
-    /// Handles IP resolution for BareUDP peers.
-    ///
-    /// - Adds resolved IP to bare_allowed_ips for RX filtering
-    /// - Creates TX socket only for first resolution (if not already connected)
-    async fn handle_bare_ip_resolved(&mut self, resolved: &DnsIpResolved) {
-        let mut allowed_ips_changed = false;
+        // Compute added IPs
+        let mut added: Vec<(String, IpAddr)> = Vec::new();
+        for (host, new_ips) in &new_state {
+            let old_ips: HashSet<IpAddr> = old_state
+                .get(host)
+                .map(|v| v.iter().copied().collect())
+                .unwrap_or_default();
+            for ip in new_ips {
+                if !old_ips.contains(ip) {
+                    added.push((host.clone(), *ip));
+                }
+            }
+        }
+
+        // Compute removed IPs
+        let mut removed: Vec<(String, IpAddr)> = Vec::new();
+        for (host, old_ips) in &old_state {
+            let new_ips: HashSet<IpAddr> = new_state
+                .get(host)
+                .map(|v| v.iter().copied().collect())
+                .unwrap_or_default();
+            for ip in old_ips {
+                if !new_ips.contains(ip) {
+                    removed.push((host.clone(), *ip));
+                }
+            }
+        }
+
         let mut bounds_changed = false;
 
-        // Split borrow to access multiple fields simultaneously
+        // Process removed IPs: remove bounds for matching hostname+IP
+        for (host, ip) in &removed {
+            for entry in self.peers.values_mut() {
+                if let Some(ref bound) = entry.bound {
+                    let ip_matches = bound.dest.ip() == *ip;
+                    let host_matches = bound.hostname.as_ref().is_some_and(|h| h == host);
+                    if ip_matches && host_matches {
+                        debug!(
+                            peer = %entry.config.id,
+                            host = %host,
+                            ip = %ip,
+                            "bound removed due to IP expiration"
+                        );
+                        entry.bound = None;
+                        bounds_changed = true;
+                    }
+                }
+            }
+        }
+
+        // Process added IPs: BareUDP TX and H3 dial
+        for (host, ip) in &added {
+            if self.handle_bare_ip_added(host, *ip).await {
+                bounds_changed = true;
+            }
+            self.handle_h3_ip_added(host, *ip).await;
+        }
+
+        if bounds_changed {
+            let allowed_ips = self.compute_bare_allowed_ips();
+            self.on_bounds_changed(&allowed_ips).await;
+        }
+    }
+
+    /// Handles a newly added IP for BareUDP peers. Returns true if bounds changed.
+    async fn handle_bare_ip_added(&mut self, host: &str, ip: IpAddr) -> bool {
+        let mut bounds_changed = false;
+
         let peers = &mut self.peers;
-        let bare_allowed_ips = &mut self.bare_allowed_ips;
         let tun_if = &self.tun_if;
         let events_tx = &self.events_tx;
         let join_set = &mut self.join_set;
@@ -502,28 +565,18 @@ impl Orchestrator {
             if !entry.config.enabled {
                 continue;
             }
-
             let Some(bare) = entry.config.bare.as_ref() else {
                 continue;
             };
-
-            if bare.endpoint.host != resolved.host {
+            if bare.endpoint.host != host {
                 continue;
             }
-
-            // Update allowed_ips for all matching bare peers
-            if bare_allowed_ips.insert(resolved.address) {
-                allowed_ips_changed = true;
-            }
-
-            // Only create TX socket if not already connected
             if entry.is_connected() {
                 continue;
             }
 
-            let destination = SocketAddr::new(resolved.address, bare.endpoint.port);
+            let destination = SocketAddr::new(ip, bare.endpoint.port);
             let probe = DefaultRouteProbe;
-
             let tx_socket =
                 match make_bare_tx(destination, bare.bindif.as_deref(), Some(tun_if), &probe).await
                 {
@@ -546,20 +599,13 @@ impl Orchestrator {
 
             join_set.spawn(tx_handle);
             bounds_changed = true;
-            // TODO: Implement reconnection on disconnect
         }
 
-        if allowed_ips_changed || bounds_changed {
-            self.on_bounds_changed().await;
-        }
+        bounds_changed
     }
 
-    /// Handles IP resolution for HTTP/3 peers.
-    ///
-    /// - Spawns dial attempts for all DNS results in parallel
-    /// - First successful connection wins (handled in handle_h3_connection)
-    async fn handle_h3_ip_resolved(&mut self, resolved: &DnsIpResolved) {
-        // Clone shared state before iterating (required for tokio::spawn 'static bound)
+    /// Handles a newly added IP for H3 peers (non-blocking dial).
+    async fn handle_h3_ip_added(&mut self, host: &str, ip: IpAddr) {
         let events_tx = self.events_tx.clone();
         let local_id = self.local_id.clone();
         let tun_if = self.tun_if.clone();
@@ -568,28 +614,22 @@ impl Orchestrator {
             if !entry.config.enabled || entry.is_connected() {
                 continue;
             }
-
             let Some(h3) = entry.config.h3.as_ref() else {
                 continue;
             };
-
             let Some(endpoint) = h3.endpoint.as_ref() else {
-                continue; // Listen-only peer
+                continue;
             };
-
-            // Strip IPv6 brackets for comparison
-            if strip_ipv6_brackets(&endpoint.host) != resolved.host {
+            if strip_ipv6_brackets(&endpoint.host) != host {
                 continue;
             }
 
-            let destination = SocketAddr::new(resolved.address, endpoint.port);
+            let destination = SocketAddr::new(ip, endpoint.port);
             let server_name = endpoint.host.clone();
             let path = endpoint.path.clone();
             let secret = h3.secret.clone();
             let ca_path = h3.ca.clone();
             let insecure = h3.insecure;
-
-            // Clone for the spawned task
             let events_tx = events_tx.clone();
             let local_id = local_id.clone();
             let tun_if = tun_if.clone();
@@ -597,12 +637,11 @@ impl Orchestrator {
 
             tokio::spawn(async move {
                 let probe = DefaultRouteProbe;
-
                 let dialer = match make_h3_dialer(
                     destination,
                     &server_name,
                     &path,
-                    None, // bindif - TODO: support H3 bindif
+                    None,
                     Some(&tun_if),
                     &probe,
                     insecure,
@@ -636,50 +675,9 @@ impl Orchestrator {
                     }
                     Err(e) => {
                         warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
-                        // TODO: Implement reconnection on disconnect
                     }
                 }
             });
-        }
-    }
-
-    /// Handles IP expiration event.
-    ///
-    /// - Removes expired IP from bare_allowed_ips (for BareUDP RX filtering)
-    /// - Removes bound from peers whose IP and hostname match the expired entry
-    async fn handle_ip_expired(&mut self, expired: DnsIpExpired) {
-        let mut changed = false;
-
-        // BareUDP-specific: update allowed_ips filter
-        if self.bare_allowed_ips.remove(&expired.address) {
-            changed = true;
-            debug!(host = %expired.host, ip = %expired.address, "removed from bare_allowed_ips");
-        }
-
-        // Remove bound for peers whose endpoint hostname matches the expired hostname.
-        // This prevents incorrect disconnection when multiple peers share the same IP
-        // (e.g., peer-a.example.com and peer-b.example.com both resolve to 1.2.3.4).
-        for entry in self.peers.values_mut() {
-            if let Some(ref bound) = entry.bound {
-                let ip_matches = bound.dest.ip() == expired.address;
-                let host_matches = bound.hostname.as_ref().is_some_and(|h| h == &expired.host);
-
-                if ip_matches && host_matches {
-                    entry.bound = None;
-                    changed = true;
-                    debug!(
-                        peer = %entry.config.id,
-                        host = %expired.host,
-                        ip = %expired.address,
-                        "bound removed due to IP expiration"
-                    );
-                    // TODO: Implement reconnection on disconnect
-                }
-            }
-        }
-
-        if changed {
-            self.on_bounds_changed().await;
         }
     }
 
@@ -764,7 +762,8 @@ impl Orchestrator {
         self.join_set.spawn(rx_handle);
         self.join_set.spawn(tx_handle);
 
-        self.on_bounds_changed().await;
+        let allowed_ips = self.compute_bare_allowed_ips();
+        self.on_bounds_changed(&allowed_ips).await;
     }
 }
 
@@ -883,7 +882,7 @@ mod test_support {
         tun_if: String,
         mtu: usize,
         peers: HashMap<String, PeerEntry>,
-        bare_allowed_ips: HashSet<IpAddr>,
+        prev_dns_snapshot: HashMap<String, Vec<IpAddr>>,
         manage_routes: bool,
         tun_addrs: Vec<IpNet>,
     }
@@ -894,7 +893,7 @@ mod test_support {
                 tun_if: "test0".to_string(),
                 mtu: 1400,
                 peers: HashMap::new(),
-                bare_allowed_ips: HashSet::new(),
+                prev_dns_snapshot: HashMap::new(),
                 manage_routes: false,
                 tun_addrs: Vec::new(),
             }
@@ -960,7 +959,7 @@ mod test_support {
                 tun_if: self.tun_if,
                 mtu: self.mtu,
                 peers: self.peers,
-                bare_allowed_ips: self.bare_allowed_ips,
+                prev_dns_snapshot: self.prev_dns_snapshot,
                 tun_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
                 h3_listener_cmd_tx: None,
@@ -989,8 +988,8 @@ mod tests {
     use super::*;
     use crate::config::{PeerBare, PeerTun};
     use crate::events::{
-        Direction, DnsEvent, DnsEventDetail, DnsIpExpired, DnsIpResolved, TransportEvent,
-        TransportKind, TransportLabels, TransportMetrics, TransportStats,
+        Direction, DnsEvent, TransportEvent, TransportKind, TransportLabels, TransportMetrics,
+        TransportStats,
     };
 
     // ========== PeerEntry unit tests ==========
@@ -1305,23 +1304,29 @@ mod tests {
         assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
     }
 
+    fn make_dns_snapshot_event(state: HashMap<String, Vec<IpAddr>>) -> Event {
+        Event::Dns(DnsEvent {
+            server: "127.0.0.1:53".parse().unwrap(),
+            state,
+        })
+    }
+
     #[tokio::test]
-    async fn handle_ip_resolved_ignores_unknown_host() {
-        // Peer configured for known.example.com, but we send IpResolved for unknown host
+    async fn handle_dns_snapshot_ignores_unknown_host() {
+        // Peer configured for known.example.com, but we send snapshot for unknown host
         let peer = bare_peer_at_host("peer1", "known.example.com", 5353, &["10.0.0.0/24"]);
 
         let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer])
             .build();
 
-        // IpResolved for a host that doesn't match any peer
-        let event = Event::Dns(DnsEvent {
-            server: "127.0.0.1:53".parse().unwrap(),
-            detail: DnsEventDetail::IpResolved(DnsIpResolved {
-                host: "unknown.example.com".to_string(),
-                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
-            }),
-        });
+        // Snapshot for a host that doesn't match any peer
+        let mut state = HashMap::new();
+        state.insert(
+            "unknown.example.com".to_string(),
+            vec!["1.2.3.4".parse().unwrap()],
+        );
+        let event = make_dns_snapshot_event(state);
         orch.handle_event(event).await;
 
         // No bound created (hostname doesn't match)
@@ -1332,7 +1337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_ip_resolved_iterates_all_matching_peers() {
+    async fn handle_dns_snapshot_iterates_all_matching_peers() {
         let peer1 = bare_peer_at_host("peer1", "shared.example.com", 5353, &["10.0.0.0/24"]);
         let peer2 = bare_peer_at_host("peer2", "shared.example.com", 5354, &["172.16.0.0/16"]);
 
@@ -1340,12 +1345,13 @@ mod tests {
             .with_peers(vec![peer1, peer2])
             .build();
 
-        let resolved = DnsIpResolved {
-            host: "shared.example.com".to_string(),
-            address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
-        };
-
-        orch.handle_ip_resolved(resolved).await;
+        let mut state = HashMap::new();
+        state.insert(
+            "shared.example.com".to_string(),
+            vec!["1.2.3.4".parse().unwrap()],
+        );
+        let event = make_dns_snapshot_event(state);
+        orch.handle_event(event).await;
 
         // Both peers should be processed (iteration covers all matching)
         // Note: actual socket binding may fail in test environment,
@@ -1353,19 +1359,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_ip_resolved_ignores_non_matching_hostnames() {
+    async fn handle_dns_snapshot_ignores_non_matching_hostnames() {
         let peer = bare_peer_at_host("peer1", "different.example.com", 5353, &["10.0.0.0/24"]);
 
         let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer])
             .build();
 
-        let resolved = DnsIpResolved {
-            host: "other.example.com".to_string(),
-            address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
-        };
-
-        orch.handle_ip_resolved(resolved).await;
+        let mut state = HashMap::new();
+        state.insert(
+            "other.example.com".to_string(),
+            vec!["1.2.3.4".parse().unwrap()],
+        );
+        let event = make_dns_snapshot_event(state);
+        orch.handle_event(event).await;
 
         // No commands should be sent (no peers matched)
         assert!(handles.tun_cmd_rx.try_recv().is_err());
@@ -1373,7 +1380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_ip_resolved_skips_disabled_peers() {
+    async fn handle_dns_snapshot_skips_disabled_peers() {
         let mut peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
         peer.enabled = false;
 
@@ -1381,19 +1388,17 @@ mod tests {
             .with_peers(vec![peer])
             .build();
 
-        let resolved = DnsIpResolved {
-            host: "example.com".to_string(),
-            address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
-        };
-
-        orch.handle_ip_resolved(resolved).await;
+        let mut state = HashMap::new();
+        state.insert("example.com".to_string(), vec!["1.2.3.4".parse().unwrap()]);
+        let event = make_dns_snapshot_event(state);
+        orch.handle_event(event).await;
 
         // No commands should be sent (peer disabled)
         assert!(handles.tun_cmd_rx.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn handle_ip_expired_removes_bound() {
+    async fn handle_dns_snapshot_removes_bound_on_ip_disappearance() {
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
 
         let (tx, _rx) = mpsc::channel(1);
@@ -1402,22 +1407,28 @@ mod tests {
             .with_peer_tx("peer1", "1.2.3.4:5353".parse().unwrap(), tx)
             .build();
 
+        // Set previous snapshot with the IP
+        orch.prev_dns_snapshot = {
+            let mut m = HashMap::new();
+            m.insert("example.com".to_string(), vec!["1.2.3.4".parse().unwrap()]);
+            m
+        };
+
         // Verify bound exists before expiration
         assert!(orch.peers.get("peer1").unwrap().is_connected());
 
-        let expired = DnsIpExpired {
-            host: "example.com".to_string(),
-            address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
-        };
-
-        orch.handle_ip_expired(expired).await;
+        // Send snapshot WITHOUT the IP (simulating expiration)
+        let mut state = HashMap::new();
+        state.insert("example.com".to_string(), vec![]);
+        let event = make_dns_snapshot_event(state);
+        orch.handle_event(event).await;
 
         // Bound should be removed
         assert!(!orch.peers.get("peer1").unwrap().is_connected());
     }
 
     #[tokio::test]
-    async fn handle_ip_expired_respects_hostname() {
+    async fn handle_dns_snapshot_respects_hostname_on_removal() {
         // Two peers with DIFFERENT hostnames but SAME resolved IP
         let peer_a = bare_peer_at_host("peer-a", "alpha.example.com", 5353, &["10.0.0.0/24"]);
         let peer_b = bare_peer_at_host("peer-b", "beta.example.com", 5353, &["172.16.0.0/16"]);
@@ -1435,17 +1446,24 @@ mod tests {
             .with_peer_tx("peer-b", dest, tx_b)
             .build();
 
+        // Previous snapshot: both hostnames resolve to same IP
+        orch.prev_dns_snapshot = {
+            let mut m = HashMap::new();
+            m.insert("alpha.example.com".to_string(), vec![shared_ip]);
+            m.insert("beta.example.com".to_string(), vec![shared_ip]);
+            m
+        };
+
         // Verify both peers are connected
         assert!(orch.peers.get("peer-a").unwrap().is_connected());
         assert!(orch.peers.get("peer-b").unwrap().is_connected());
 
-        // Expire only alpha.example.com's DNS entry
-        let expired = DnsIpExpired {
-            host: "alpha.example.com".to_string(),
-            address: shared_ip,
-        };
-
-        orch.handle_ip_expired(expired).await;
+        // New snapshot: alpha expired, beta still alive
+        let mut state = HashMap::new();
+        state.insert("alpha.example.com".to_string(), vec![]);
+        state.insert("beta.example.com".to_string(), vec![shared_ip]);
+        let event = make_dns_snapshot_event(state);
+        orch.handle_event(event).await;
 
         // Only peer-a should be disconnected (hostname matches)
         assert!(!orch.peers.get("peer-a").unwrap().is_connected());
@@ -1454,7 +1472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_ip_expired_ignores_none_hostname() {
+    async fn handle_dns_snapshot_ignores_none_hostname_bound() {
         // Simulate inbound connection (no hostname)
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
 
@@ -1473,14 +1491,20 @@ mod tests {
             tx,
         });
 
-        assert!(orch.peers.get("peer1").unwrap().is_connected());
-
-        let expired = DnsIpExpired {
-            host: "example.com".to_string(),
-            address: "1.2.3.4".parse().unwrap(),
+        // Previous snapshot has the IP
+        orch.prev_dns_snapshot = {
+            let mut m = HashMap::new();
+            m.insert("example.com".to_string(), vec!["1.2.3.4".parse().unwrap()]);
+            m
         };
 
-        orch.handle_ip_expired(expired).await;
+        assert!(orch.peers.get("peer1").unwrap().is_connected());
+
+        // Send snapshot without the IP
+        let mut state = HashMap::new();
+        state.insert("example.com".to_string(), vec![]);
+        let event = make_dns_snapshot_event(state);
+        orch.handle_event(event).await;
 
         // Bound should remain (hostname is None, so host_matches is false)
         assert!(orch.peers.get("peer1").unwrap().is_connected());
@@ -1570,7 +1594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_ip_resolved_does_not_block_on_h3_dial() {
+    async fn handle_dns_snapshot_does_not_block_on_h3_dial() {
         use std::time::Instant;
 
         // Create peer with H3 endpoint pointing to non-routable address (will timeout)
@@ -1580,22 +1604,24 @@ mod tests {
             .with_peers(vec![peer])
             .build();
 
-        let resolved = DnsIpResolved {
-            host: "10.255.255.1".to_string(),
-            address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 255, 255, 1)),
-        };
+        let mut state = HashMap::new();
+        state.insert(
+            "10.255.255.1".to_string(),
+            vec!["10.255.255.1".parse().unwrap()],
+        );
+        let event = make_dns_snapshot_event(state);
 
-        // The key assertion: handle_ip_resolved should return immediately
+        // The key assertion: handle_dns_snapshot should return immediately
         // (within milliseconds), not block for 30 seconds waiting for dial timeout
         let start = Instant::now();
-        orch.handle_ip_resolved(resolved).await;
+        orch.handle_event(event).await;
         let elapsed = start.elapsed();
 
         // If dial was blocking, this would take ~30 seconds (H3_HANDSHAKE_TIMEOUT)
         // With non-blocking spawn, it should return in < 500ms
         assert!(
             elapsed < std::time::Duration::from_millis(500),
-            "handle_ip_resolved blocked for {:?}, expected < 500ms (dial should be non-blocking)",
+            "handle_dns_snapshot blocked for {:?}, expected < 500ms (dial should be non-blocking)",
             elapsed
         );
     }
