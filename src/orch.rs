@@ -26,21 +26,11 @@ use tracing::{debug, error, info, warn};
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Identifies the transport protocol for a bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransportType {
-    BareUdp,
-    Http3,
-}
-
 /// A single active connection bound to a peer.
 #[derive(Debug)]
 struct BoundState {
     /// Endpoint hostname for DNS expiration matching.
     hostname: Option<String>,
-    /// Transport kind for this bound.
-    #[allow(dead_code)]
-    transport: TransportType,
     /// Destination socket address.
     dest: SocketAddr,
     /// TX channel for sending packets.
@@ -128,8 +118,6 @@ pub struct Orchestrator {
     mtu: usize,
     /// Unified peer state: config + active bound.
     peers: HashMap<String, PeerEntry>,
-    /// Previous DNS state snapshot for computing deltas.
-    prev_dns_snapshot: HashMap<String, Vec<IpAddr>>,
     tun_cmd_tx: mpsc::UnboundedSender<TunRxCommand>,
     bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
     /// H3 listener command sender (if listening).
@@ -149,18 +137,18 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
-    /// Computes allowed IPs for BareUDP RX filtering from DNS snapshot.
-    fn compute_bare_allowed_ips(&self) -> HashSet<IpAddr> {
+    /// Computes allowed BareUDP source IPs from active peer bounds.
+    ///
+    /// Used when DNS state is unavailable (e.g., after H3 connection establishment).
+    /// Only includes IPs of currently-bound bare peers.
+    fn compute_bare_allowed_ips_from_bounds(&self) -> HashSet<IpAddr> {
         let mut allowed = HashSet::new();
         for entry in self.peers.values() {
-            if !entry.config.enabled {
+            if !entry.config.enabled || entry.config.bare.is_none() {
                 continue;
             }
-            let Some(bare) = entry.config.bare.as_ref() else {
-                continue;
-            };
-            if let Some(ips) = self.prev_dns_snapshot.get(&bare.endpoint.host) {
-                allowed.extend(ips.iter().copied());
+            if let Some(ref bound) = entry.bound {
+                allowed.insert(bound.dest.ip());
             }
         }
         allowed
@@ -360,7 +348,6 @@ impl Orchestrator {
             tun_if,
             mtu,
             peers,
-            prev_dns_snapshot: HashMap::new(),
             tun_cmd_tx,
             bare_rx_cmd_tx,
             h3_listener_cmd_tx,
@@ -483,201 +470,230 @@ impl Orchestrator {
         }
     }
 
-    /// Handles a DNS state snapshot by computing deltas and applying changes.
-    async fn handle_dns_snapshot(&mut self, dns_event: DnsEvent) {
-        let new_state = dns_event.state;
-        let old_state = std::mem::replace(&mut self.prev_dns_snapshot, new_state.clone());
+    /// Creates a BareUDP TX connection for a peer.
+    ///
+    /// Returns true if bound was created successfully.
+    async fn create_bare_connection(
+        &mut self,
+        peer_id: &str,
+        host: &str,
+        ip: IpAddr,
+        port: u16,
+    ) -> bool {
+        let entry = self.peers.get(peer_id).unwrap();
+        if entry.is_connected() {
+            return false;
+        }
+        let bare = entry.config.bare.as_ref().unwrap();
 
-        // Compute added IPs
-        let mut added: Vec<(String, IpAddr)> = Vec::new();
-        for (host, new_ips) in &new_state {
-            let old_ips: HashSet<IpAddr> = old_state
-                .get(host)
-                .map(|v| v.iter().copied().collect())
-                .unwrap_or_default();
-            for ip in new_ips {
-                if !old_ips.contains(ip) {
-                    added.push((host.clone(), *ip));
-                }
+        let destination = SocketAddr::new(ip, port);
+        let probe = DefaultRouteProbe;
+        let tx_socket = match make_bare_tx(
+            destination,
+            bare.bindif.as_deref(),
+            Some(&self.tun_if),
+            &probe,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(err) => {
+                warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
+                return false;
             }
-        }
+        };
 
-        // Compute removed IPs
-        let mut removed: Vec<(String, IpAddr)> = Vec::new();
-        for (host, old_ips) in &old_state {
-            let new_ips: HashSet<IpAddr> = new_state
-                .get(host)
-                .map(|v| v.iter().copied().collect())
-                .unwrap_or_default();
-            for ip in old_ips {
-                if !new_ips.contains(ip) {
-                    removed.push((host.clone(), *ip));
-                }
-            }
-        }
+        let (packet_tx, tx_handle) =
+            spawn_udp_tx(tx_socket, self.events_tx.clone(), METRICS_INTERVAL);
 
-        let mut bounds_changed = false;
+        let entry = self.peers.get_mut(peer_id).unwrap();
+        entry.bound = Some(BoundState {
+            hostname: Some(host.to_string()),
+            dest: destination,
+            tx: packet_tx,
+        });
 
-        // Process removed IPs: remove bounds for matching hostname+IP
-        for (host, ip) in &removed {
-            for entry in self.peers.values_mut() {
-                if let Some(ref bound) = entry.bound {
-                    let ip_matches = bound.dest.ip() == *ip;
-                    let host_matches = bound.hostname.as_ref().is_some_and(|h| h == host);
-                    if ip_matches && host_matches {
-                        debug!(
-                            peer = %entry.config.id,
-                            host = %host,
-                            ip = %ip,
-                            "bound removed due to IP expiration"
-                        );
-                        entry.bound = None;
-                        bounds_changed = true;
-                    }
-                }
-            }
-        }
-
-        // Process added IPs: BareUDP TX and H3 dial
-        for (host, ip) in &added {
-            if self.handle_bare_ip_added(host, *ip).await {
-                bounds_changed = true;
-            }
-            self.handle_h3_ip_added(host, *ip).await;
-        }
-
-        if bounds_changed {
-            let allowed_ips = self.compute_bare_allowed_ips();
-            self.on_bounds_changed(&allowed_ips).await;
-        }
+        self.join_set.spawn(tx_handle);
+        true
     }
 
-    /// Handles a newly added IP for BareUDP peers. Returns true if bounds changed.
-    async fn handle_bare_ip_added(&mut self, host: &str, ip: IpAddr) -> bool {
-        let mut bounds_changed = false;
-
-        let peers = &mut self.peers;
-        let tun_if = &self.tun_if;
-        let events_tx = &self.events_tx;
-        let join_set = &mut self.join_set;
-
-        for (peer_id, entry) in peers.iter_mut() {
-            if !entry.config.enabled {
-                continue;
-            }
-            let Some(bare) = entry.config.bare.as_ref() else {
-                continue;
-            };
-            if bare.endpoint.host != host {
-                continue;
-            }
-            if entry.is_connected() {
-                continue;
-            }
-
-            let destination = SocketAddr::new(ip, bare.endpoint.port);
-            let probe = DefaultRouteProbe;
-            let tx_socket =
-                match make_bare_tx(destination, bare.bindif.as_deref(), Some(tun_if), &probe).await
-                {
-                    Ok(s) => s,
-                    Err(err) => {
-                        warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
-                        continue;
-                    }
-                };
-
-            let (packet_tx, tx_handle) =
-                spawn_udp_tx(tx_socket, events_tx.clone(), METRICS_INTERVAL);
-
-            entry.bound = Some(BoundState {
-                hostname: Some(bare.endpoint.host.clone()),
-                transport: TransportType::BareUdp,
-                dest: destination,
-                tx: packet_tx,
-            });
-
-            join_set.spawn(tx_handle);
-            bounds_changed = true;
-        }
-
-        bounds_changed
-    }
-
-    /// Handles a newly added IP for H3 peers (non-blocking dial).
-    async fn handle_h3_ip_added(&mut self, host: &str, ip: IpAddr) {
+    /// Spawns a non-blocking H3 dial attempt for a peer.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_h3_dial(
+        &self,
+        peer_id: &str,
+        host: &str,
+        ip: IpAddr,
+        port: u16,
+        path: &str,
+        secret: &str,
+        ca: Option<&str>,
+        insecure: bool,
+    ) {
+        let destination = SocketAddr::new(ip, port);
+        let server_name = host.to_string();
+        let path = path.to_string();
+        let secret = secret.to_string();
+        let ca_path = ca.map(|s| s.to_string());
         let events_tx = self.events_tx.clone();
         let local_id = self.local_id.clone();
         let tun_if = self.tun_if.clone();
+        let peer_id = peer_id.to_string();
 
-        for (peer_id, entry) in &self.peers {
-            if !entry.config.enabled || entry.is_connected() {
+        tokio::spawn(async move {
+            let probe = DefaultRouteProbe;
+            let dialer = match make_h3_dialer(
+                destination,
+                &server_name,
+                &path,
+                None,
+                Some(&tun_if),
+                &probe,
+                insecure,
+            )
+            .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dialer setup failed");
+                    return;
+                }
+            };
+
+            match dial_h3(
+                dialer,
+                &local_id,
+                &peer_id,
+                &secret,
+                ca_path.as_deref().map(Path::new),
+            )
+            .await
+            {
+                Ok(conn) => {
+                    debug!(peer = %peer_id, addr = %destination, "H3 connection established");
+                    let event = Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
+                        connection: conn,
+                        direction: ConnectionDirection::Outbound,
+                    }));
+                    let _ = events_tx.send(event);
+                }
+                Err(e) => {
+                    warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
+                }
+            }
+        });
+    }
+
+    /// Handles a DNS state snapshot by iterating peers directly.
+    ///
+    /// For each peer:
+    /// - If no bound: create connection using first available IP (BareUDP) or dial all IPs (H3)
+    /// - If bound: check if dest IP still in snapshot; remove if expired, reconnect if possible
+    async fn handle_dns_snapshot(&mut self, dns_event: DnsEvent) {
+        let dns_state = dns_event.state;
+        let mut bounds_changed = false;
+
+        let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
+
+        for peer_id in peer_ids {
+            let entry = self.peers.get(&peer_id).unwrap();
+            if !entry.config.enabled {
                 continue;
             }
-            let Some(h3) = entry.config.h3.as_ref() else {
-                continue;
-            };
-            let Some(endpoint) = h3.endpoint.as_ref() else {
-                continue;
-            };
-            if strip_ipv6_brackets(&endpoint.host) != host {
-                continue;
-            }
 
-            let destination = SocketAddr::new(ip, endpoint.port);
-            let server_name = endpoint.host.clone();
-            let path = endpoint.path.clone();
-            let secret = h3.secret.clone();
-            let ca_path = h3.ca.clone();
-            let insecure = h3.insecure;
-            let events_tx = events_tx.clone();
-            let local_id = local_id.clone();
-            let tun_if = tun_if.clone();
-            let peer_id = peer_id.clone();
+            if let Some(bare) = entry.config.bare.as_ref() {
+                let host = bare.endpoint.host.clone();
+                let port = bare.endpoint.port;
+                let available_ips: Vec<IpAddr> = dns_state.get(&host).cloned().unwrap_or_default();
 
-            tokio::spawn(async move {
-                let probe = DefaultRouteProbe;
-                let dialer = match make_h3_dialer(
-                    destination,
-                    &server_name,
-                    &path,
-                    None,
-                    Some(&tun_if),
-                    &probe,
-                    insecure,
-                )
-                .await
-                {
-                    Ok(d) => d,
-                    Err(e) => {
-                        warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dialer setup failed");
-                        return;
-                    }
-                };
-
-                match dial_h3(
-                    dialer,
-                    &local_id,
-                    &peer_id,
-                    &secret,
-                    ca_path.as_deref().map(Path::new),
-                )
-                .await
-                {
-                    Ok(conn) => {
-                        debug!(peer = %peer_id, addr = %destination, "H3 connection established");
-                        let event =
-                            Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
-                                connection: conn,
-                                direction: ConnectionDirection::Outbound,
-                            }));
-                        let _ = events_tx.send(event);
-                    }
-                    Err(e) => {
-                        warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
+                // Check if current bound is expired
+                let entry = self.peers.get_mut(&peer_id).unwrap();
+                if let Some(ref bound) = entry.bound {
+                    if let Some(ref bound_host) = bound.hostname {
+                        if bound_host == &host && !available_ips.contains(&bound.dest.ip()) {
+                            debug!(
+                                peer = %peer_id,
+                                host = %host,
+                                ip = %bound.dest.ip(),
+                                "bound removed due to IP expiration"
+                            );
+                            entry.bound = None;
+                            bounds_changed = true;
+                        }
                     }
                 }
-            });
+
+                // If unbound, create connection with first available IP
+                if !self.peers.get(&peer_id).unwrap().is_connected() {
+                    if let Some(&ip) = available_ips.first() {
+                        if self.create_bare_connection(&peer_id, &host, ip, port).await {
+                            bounds_changed = true;
+                        }
+                    }
+                }
+            } else if let Some(h3) = entry.config.h3.as_ref() {
+                let Some(endpoint) = h3.endpoint.as_ref() else {
+                    continue;
+                };
+                let host_raw = endpoint.host.clone();
+                let host = strip_ipv6_brackets(&host_raw).to_string();
+                let port = endpoint.port;
+                let path = endpoint.path.clone();
+                let secret = h3.secret.clone();
+                let ca = h3.ca.clone();
+                let insecure = h3.insecure;
+                let available_ips: Vec<IpAddr> = dns_state.get(&host).cloned().unwrap_or_default();
+
+                // Check if current bound is expired
+                let entry = self.peers.get_mut(&peer_id).unwrap();
+                if let Some(ref bound) = entry.bound {
+                    if let Some(ref bound_host) = bound.hostname {
+                        if bound_host == &host && !available_ips.contains(&bound.dest.ip()) {
+                            debug!(
+                                peer = %peer_id,
+                                host = %host,
+                                ip = %bound.dest.ip(),
+                                "bound removed due to IP expiration"
+                            );
+                            entry.bound = None;
+                            bounds_changed = true;
+                        }
+                    }
+                }
+
+                // If unbound, dial ALL resolved IPs (per docs/protocol.md)
+                if !self.peers.get(&peer_id).unwrap().is_connected() {
+                    for &ip in &available_ips {
+                        self.spawn_h3_dial(
+                            &peer_id,
+                            &host_raw,
+                            ip,
+                            port,
+                            &path,
+                            &secret,
+                            ca.as_deref(),
+                            insecure,
+                        );
+                    }
+                }
+            }
+        }
+
+        if bounds_changed {
+            // Compute bare allowed IPs inline from dns_state (no stored snapshot)
+            let mut allowed_ips = HashSet::new();
+            for entry in self.peers.values() {
+                if !entry.config.enabled {
+                    continue;
+                }
+                let Some(bare) = entry.config.bare.as_ref() else {
+                    continue;
+                };
+                if let Some(ips) = dns_state.get(&bare.endpoint.host) {
+                    allowed_ips.extend(ips.iter().copied());
+                }
+            }
+            self.on_bounds_changed(&allowed_ips).await;
         }
     }
 
@@ -754,7 +770,6 @@ impl Orchestrator {
         let entry = self.peers.get_mut(&peer_id).unwrap();
         entry.bound = Some(BoundState {
             hostname,
-            transport: TransportType::Http3,
             dest: remote_addr,
             tx: packet_tx,
         });
@@ -762,7 +777,7 @@ impl Orchestrator {
         self.join_set.spawn(rx_handle);
         self.join_set.spawn(tx_handle);
 
-        let allowed_ips = self.compute_bare_allowed_ips();
+        let allowed_ips = self.compute_bare_allowed_ips_from_bounds();
         self.on_bounds_changed(&allowed_ips).await;
     }
 }
@@ -882,7 +897,6 @@ mod test_support {
         tun_if: String,
         mtu: usize,
         peers: HashMap<String, PeerEntry>,
-        prev_dns_snapshot: HashMap<String, Vec<IpAddr>>,
         manage_routes: bool,
         tun_addrs: Vec<IpNet>,
     }
@@ -893,7 +907,6 @@ mod test_support {
                 tun_if: "test0".to_string(),
                 mtu: 1400,
                 peers: HashMap::new(),
-                prev_dns_snapshot: HashMap::new(),
                 manage_routes: false,
                 tun_addrs: Vec::new(),
             }
@@ -930,12 +943,7 @@ mod test_support {
                     .bare
                     .as_ref()
                     .map(|bare| bare.endpoint.host.clone());
-                entry.bound = Some(BoundState {
-                    hostname,
-                    transport: TransportType::BareUdp,
-                    dest,
-                    tx,
-                });
+                entry.bound = Some(BoundState { hostname, dest, tx });
             }
             self
         }
@@ -959,7 +967,6 @@ mod test_support {
                 tun_if: self.tun_if,
                 mtu: self.mtu,
                 peers: self.peers,
-                prev_dns_snapshot: self.prev_dns_snapshot,
                 tun_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
                 h3_listener_cmd_tx: None,
@@ -1013,7 +1020,6 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         entry.bound = Some(BoundState {
             hostname: None,
-            transport: TransportType::BareUdp,
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx: tx1,
         });
@@ -1025,7 +1031,6 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         entry.bound = Some(BoundState {
             hostname: None,
-            transport: TransportType::BareUdp,
             dest: "5.6.7.8:5353".parse().unwrap(),
             tx: tx2,
         });
@@ -1407,13 +1412,6 @@ mod tests {
             .with_peer_tx("peer1", "1.2.3.4:5353".parse().unwrap(), tx)
             .build();
 
-        // Set previous snapshot with the IP
-        orch.prev_dns_snapshot = {
-            let mut m = HashMap::new();
-            m.insert("example.com".to_string(), vec!["1.2.3.4".parse().unwrap()]);
-            m
-        };
-
         // Verify bound exists before expiration
         assert!(orch.peers.get("peer1").unwrap().is_connected());
 
@@ -1445,14 +1443,6 @@ mod tests {
             .with_peer_tx("peer-a", dest, tx_a)
             .with_peer_tx("peer-b", dest, tx_b)
             .build();
-
-        // Previous snapshot: both hostnames resolve to same IP
-        orch.prev_dns_snapshot = {
-            let mut m = HashMap::new();
-            m.insert("alpha.example.com".to_string(), vec![shared_ip]);
-            m.insert("beta.example.com".to_string(), vec![shared_ip]);
-            m
-        };
 
         // Verify both peers are connected
         assert!(orch.peers.get("peer-a").unwrap().is_connected());
@@ -1486,17 +1476,9 @@ mod tests {
         // Manually set bound with None hostname (simulating inbound)
         orch.peers.get_mut("peer1").unwrap().bound = Some(BoundState {
             hostname: None,
-            transport: TransportType::BareUdp,
             dest,
             tx,
         });
-
-        // Previous snapshot has the IP
-        orch.prev_dns_snapshot = {
-            let mut m = HashMap::new();
-            m.insert("example.com".to_string(), vec!["1.2.3.4".parse().unwrap()]);
-            m
-        };
 
         assert!(orch.peers.get("peer1").unwrap().is_connected());
 

@@ -202,10 +202,13 @@ DNS lifecycle management:
 - The DNS module owns the refresh timer internally; every `local.dns.refresh` seconds (when nonzero), it re-queries all registered hostnames.
 - The DNS module maintains unified state tracking each hostname's resolved IPs with TTL-based expiration (minimum 60 seconds). A dirty flag tracks whether state changed since the last snapshot emission.
 - On any state change (new IP, IP expiration, hostname add/remove), the dirty flag is set. On the next tick, if dirty, the DNS module emits a single state snapshot containing all hostname→IP mappings and clears the flag.
-- The orchestrator diffs the incoming snapshot against its previous one:
-  - For BareUDP peers: adds the IP to `bare_allowed_ips` and spawns a TX actor only if no connection exists (first IP wins for TX)
-  - For H3 peers: spawns a dial attempt only if no connection exists; first successful connection wins
-  - For removed IPs: removes bounds for peers whose endpoint hostname matches, updates routing and allowed-source filter
+- The orchestrator iterates over all peers when a snapshot arrives:
+  - For each peer, check the endpoint hostname against the new snapshot
+  - If no active connection: create connection using first available IP (BareUDP) or dial all IPs (H3)
+  - If active connection exists: check if destination IP is still in the snapshot for that hostname
+    - If expired: remove bound and immediately attempt reconnection if new IPs available
+    - If still valid: do nothing
+  - After processing all peers, update routing and allowed-source filter if any bounds changed
 - Refreshing an existing IP extends its TTL without changing the snapshot (no duplicate events).
 - DNS warnings (NXDOMAIN, truncation, recursion refusal) are logged via `warn!` at the DNS module (origin) rather than propagating through events.
 
