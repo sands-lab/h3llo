@@ -7,8 +7,7 @@ use crate::config::{Config, Peer};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{ConnectionDirection, DnsEvent, Event, H3ConnectedEvent, TransportEvent};
 use crate::h3::{
-    dial_h3, make_h3_dialer, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx,
-    H3ListenerCommand,
+    dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
 };
 use crate::route::{sync_tun_routes, RouteManagerHandle};
 use crate::tun::{self, RoutingTable, TunRxCommand};
@@ -552,13 +551,9 @@ impl Orchestrator {
                 let Some(endpoint) = h3.endpoint.as_ref() else {
                     continue;
                 };
-                let host_raw = endpoint.host.clone();
-                let host = strip_ipv6_brackets(&host_raw).to_string();
+                let host = strip_ipv6_brackets(&endpoint.host).to_string();
                 let port = endpoint.port;
-                let path = endpoint.path.clone();
-                let secret = h3.secret.clone();
-                let ca = h3.ca.clone();
-                let insecure = h3.insecure;
+                let peer_h3 = h3.clone();
                 let available_ips: Vec<IpAddr> = dns_state.get(&host).cloned().unwrap_or_default();
 
                 // Check if current bound is expired
@@ -572,17 +567,13 @@ impl Orchestrator {
 
                 // If unbound, dial ALL resolved IPs (per docs/protocol.md)
                 if !entry.is_connected() {
-                    // Clone values needed for spawned tasks before the loop
                     let events_tx = self.events_tx.clone();
                     let local_id = self.local_id.clone();
                     let tun_if = self.tun_if.clone();
 
                     for &ip in &available_ips {
                         let destination = SocketAddr::new(ip, port);
-                        let server_name = host_raw.clone();
-                        let path = path.clone();
-                        let secret = secret.clone();
-                        let ca_path = ca.clone();
+                        let peer_h3 = peer_h3.clone();
                         let events_tx = events_tx.clone();
                         let local_id = local_id.clone();
                         let tun_if = tun_if.clone();
@@ -590,30 +581,13 @@ impl Orchestrator {
 
                         tokio::spawn(async move {
                             let probe = DefaultRouteProbe;
-                            let dialer = match make_h3_dialer(
-                                destination,
-                                &server_name,
-                                &path,
-                                None,
-                                Some(&tun_if),
-                                &probe,
-                                insecure,
-                            )
-                            .await
-                            {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dialer setup failed");
-                                    return;
-                                }
-                            };
-
                             match dial_h3(
-                                dialer,
+                                &peer_h3,
+                                destination,
                                 &local_id,
                                 &peer_id,
-                                &secret,
-                                ca_path.as_deref().map(Path::new),
+                                Some(&tun_if),
+                                &probe,
                             )
                             .await
                             {
