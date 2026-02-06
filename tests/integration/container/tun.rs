@@ -129,9 +129,9 @@ async fn check_multi_address() -> Result<(), String> {
     eprintln!("  ip addr show itun1:\n{stdout}");
 
     for expected in &addrs {
-        // Extract the IP address part (without prefix) for verification
-        // since `ip addr show` displays addresses with their assigned prefix
-        let addr_str = expected.addr().to_string();
+        // Match full CIDR notation (e.g., "10.99.1.1/32") to avoid false positives
+        // from substring matches (e.g., "10.99.1.1" matching "10.99.1.10").
+        let addr_str = expected.to_string();
         if !stdout.contains(&addr_str) {
             return Err(format!("multi_address: missing address {addr_str}"));
         }
