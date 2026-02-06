@@ -6,6 +6,7 @@
 //!
 //! Exit code 0 = all checks passed, 1 = failure.
 
+use ipnet::IpNet;
 use std::process::{Command, Stdio};
 use tokio::process::Command as AsyncCommand;
 
@@ -95,17 +96,18 @@ fn has_ipv6_support() -> bool {
 
 /// Verifies multiple IPv4 (and IPv6 if available) addresses are assigned correctly.
 async fn check_multi_address() -> Result<(), String> {
-    use std::net::IpAddr;
-
     let ipv6_available = has_ipv6_support();
     if !ipv6_available {
         eprintln!("  note: IPv6 not available, testing IPv4 only");
     }
 
-    let mut addrs: Vec<IpAddr> = vec!["10.99.1.1".parse().unwrap(), "10.99.1.2".parse().unwrap()];
+    let mut addrs: Vec<IpNet> = vec![
+        "10.99.1.1/32".parse().unwrap(),
+        "10.99.1.2/32".parse().unwrap(),
+    ];
     if ipv6_available {
-        addrs.push("fd99::1".parse().unwrap());
-        addrs.push("fd99::2".parse().unwrap());
+        addrs.push("fd99::1/128".parse().unwrap());
+        addrs.push("fd99::2/128".parse().unwrap());
     }
 
     let local_tun = h3llo::config::LocalTun {
@@ -127,8 +129,11 @@ async fn check_multi_address() -> Result<(), String> {
     eprintln!("  ip addr show itun1:\n{stdout}");
 
     for expected in &addrs {
-        if !stdout.contains(&expected.to_string()) {
-            return Err(format!("multi_address: missing address {expected}"));
+        // Extract the IP address part (without prefix) for verification
+        // since `ip addr show` displays addresses with their assigned prefix
+        let addr_str = expected.addr().to_string();
+        if !stdout.contains(&addr_str) {
+            return Err(format!("multi_address: missing address {addr_str}"));
         }
     }
 

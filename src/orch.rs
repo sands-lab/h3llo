@@ -218,7 +218,7 @@ impl Orchestrator {
         let tun_if = config.local.tun.ifname.clone();
         let mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
-        let tun_addrs = tun_prefixes(&config.local.tun.addrs);
+        let tun_addrs = config.local.tun.addrs.clone();
 
         // Note: NoTransportConfigured validation moved to Config::validate()
 
@@ -739,18 +739,6 @@ fn collect_allowed_ips(peers: &[Peer]) -> Vec<IpNet> {
         .collect()
 }
 
-fn tun_prefixes(addrs: &[IpAddr]) -> Vec<IpNet> {
-    addrs
-        .iter()
-        .map(|ip| match ip {
-            // SAFETY: /32 is always valid for IPv4 (max prefix length)
-            IpAddr::V4(v4) => IpNet::new((*v4).into(), 32).unwrap(),
-            // SAFETY: /128 is always valid for IPv6 (max prefix length)
-            IpAddr::V6(v6) => IpNet::new((*v6).into(), 128).unwrap(),
-        })
-        .collect()
-}
-
 /// Collects all unique hostnames from peer configurations.
 ///
 /// Handles both BareUDP and H3 endpoints. Endpoints are pre-parsed during
@@ -1031,46 +1019,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // ========== tun_prefixes tests ==========
-
-    #[test]
-    fn tun_prefixes_converts_ipv4_addresses() {
-        let addrs: Vec<IpAddr> = vec!["192.168.1.1".parse().unwrap(), "10.0.0.1".parse().unwrap()];
-        let result = tun_prefixes(&addrs);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].prefix_len(), 32);
-        assert_eq!(result[1].prefix_len(), 32);
-    }
-
-    #[test]
-    fn tun_prefixes_converts_ipv6_addresses() {
-        let addrs: Vec<IpAddr> = vec!["2001:db8::1".parse().unwrap()];
-        let result = tun_prefixes(&addrs);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].prefix_len(), 128);
-    }
-
-    // Note: tun_prefixes_rejects_invalid_address test removed - IP address parsing
-    // now happens during config deserialization
-
-    #[test]
-    fn tun_prefixes_handles_mixed_families() {
-        let addrs: Vec<IpAddr> = vec![
-            "192.168.1.1".parse().unwrap(),
-            "2001:db8::1".parse().unwrap(),
-        ];
-        let result = tun_prefixes(&addrs);
-        assert_eq!(result.len(), 2);
-        assert!(result[0].addr().is_ipv4());
-        assert!(result[1].addr().is_ipv6());
-    }
-
-    #[test]
-    fn tun_prefixes_handles_empty_addrs() {
-        let addrs: Vec<IpAddr> = vec![];
-        let result = tun_prefixes(&addrs);
-        assert!(result.is_empty());
-    }
+    // Note: tun_prefixes tests removed - function deleted; LocalTun.addrs is now Vec<IpNet>
 
     // ========== OrchestratorError tests ==========
 

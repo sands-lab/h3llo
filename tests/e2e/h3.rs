@@ -127,7 +127,7 @@ async fn test_two_node_h3_tunnel() {
     let shared_secret = "shared-tunnel-secret";
     let node_a_config = h3_node_config(
         "node-a-h3",
-        "10.0.0.1",
+        "10.0.0.1/32",
         "node-b-h3",
         "https://node-b-h3.h3llo-test-net:443/",
         shared_secret,
@@ -138,7 +138,7 @@ async fn test_two_node_h3_tunnel() {
 
     let node_b_config = h3_node_config(
         "node-b-h3",
-        "10.0.0.2",
+        "10.0.0.2/32",
         "node-a-h3",
         "https://node-a-h3.h3llo-test-net:443/",
         shared_secret,

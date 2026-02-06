@@ -25,7 +25,7 @@ local:
   tun:
     ifname: tun0
     addrs:
-      - 10.0.0.1
+      - 10.0.0.1/32
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
@@ -49,7 +49,7 @@ local:
   tun:
     ifname: tun0
     addrs:
-      - 10.0.0.2
+      - 10.0.0.2/32
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
@@ -199,7 +199,7 @@ async fn test_h3_tcp_throughput() {
     let shared_secret = "throughput-test-secret";
     let node_a_config = h3_node_config(
         "node-a-tp-h3",
-        "10.0.0.1",
+        "10.0.0.1/32",
         "node-b-tp-h3",
         "https://node-b-tp-h3.h3llo-test-net:443/",
         shared_secret,
@@ -209,7 +209,7 @@ async fn test_h3_tcp_throughput() {
     );
     let node_b_config = h3_node_config(
         "node-b-tp-h3",
-        "10.0.0.2",
+        "10.0.0.2/32",
         "node-a-tp-h3",
         "https://node-a-tp-h3.h3llo-test-net:443/",
         shared_secret,

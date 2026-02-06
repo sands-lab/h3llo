@@ -123,10 +123,14 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
     // These are the prefixes we *want to route through the TUN*.
     let desired_routes: HashSet<IpNet> = expand_allowed_prefixes(allowed);
 
-    // Prefixes that must exist on the TUN interface when we are done:
-    // - desired_routes (from allowed + default split),
-    // - plus tun_addrs (interface address routes).
-    let tun_addr_set: HashSet<IpNet> = tun_addrs.iter().cloned().collect();
+    // TUN address prefixes that are NOT already in desired_routes.
+    // If a TUN prefix exactly matches a desired route, the desired route
+    // already ensures it is kept/added — no need to track it separately.
+    let tun_addr_set: HashSet<IpNet> = tun_addrs
+        .iter()
+        .filter(|addr| !desired_routes.contains(addr))
+        .cloned()
+        .collect();
     let mut existing_tun: HashSet<IpNet> = HashSet::new();
     let mut conflicts: HashMap<IpNet, u32> = HashMap::new();
 
@@ -563,5 +567,89 @@ mod tests {
         assert!(logs_contain("10.9.0.0/16"));
         assert!(logs_contain("route add failed"));
         assert!(logs_contain("10.8.0.0/16"));
+    }
+
+    // ========== Route deduplication tests (Option 1B) ==========
+
+    #[tokio::test]
+    #[traced_test]
+    /// When tun_addrs exactly matches allowed_ips, tun_addr_set is empty (covered by desired_routes).
+    async fn tun_addr_exact_match_with_allowed_is_deduplicated() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![]);
+        let tun_addrs: Vec<IpNet> = vec!["192.168.1.0/24".parse().unwrap()];
+        let allowed: Vec<IpNet> = vec!["192.168.1.0/24".parse().unwrap()];
+
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        // Verify: 192.168.1.0/24 is added once (from desired_routes), not duplicated
+        assert_eq!(handle.ops(), vec!["add 192.168.1.0/24"]);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// Non-canonical TUN addr (192.168.1.1/24) differs from allowed (192.168.1.0/24) — both preserved.
+    async fn tun_addr_non_canonical_preserved_when_different_from_allowed() {
+        let resolver = FakeResolver { idx: 10 };
+        // Simulate OS-created route for TUN address
+        let mut handle = FakeHandle::new(vec![route("192.168.1.1/24", Some(10))]);
+        let tun_addrs: Vec<IpNet> = vec!["192.168.1.1/24".parse().unwrap()];
+        let allowed: Vec<IpNet> = vec!["192.168.1.0/24".parse().unwrap()];
+
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        // Verify: OS route 192.168.1.1/24 was NOT deleted (preserved by tun_addr_set)
+        // and 192.168.1.0/24 is added from allowed
+        let ops = handle.ops();
+        assert!(ops.contains(&"add 192.168.1.0/24".to_string()));
+        assert!(!ops.contains(&"del 192.168.1.1/24".to_string()));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// TUN addr in a completely different subnet is preserved.
+    async fn tun_addr_different_subnet_preserved() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![route("10.0.0.1/32", Some(10))]);
+        let tun_addrs: Vec<IpNet> = vec!["10.0.0.1/32".parse().unwrap()];
+        let allowed: Vec<IpNet> = vec!["192.168.1.0/24".parse().unwrap()];
+
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        // Verify: OS route 10.0.0.1/32 was NOT deleted (preserved by tun_addr_set)
+        let ops = handle.ops();
+        assert!(!ops.contains(&"del 10.0.0.1/32".to_string()));
+        assert!(ops.contains(&"add 192.168.1.0/24".to_string()));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// Multiple TUN addrs with mixed matching — only exact matches are deduplicated.
+    async fn tun_addrs_mixed_matching() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![
+            route("192.168.1.0/24", Some(10)), // exact match with allowed
+            route("10.0.0.1/32", Some(10)),    // different from allowed
+        ]);
+        let tun_addrs: Vec<IpNet> = vec![
+            "192.168.1.0/24".parse().unwrap(), // will be deduplicated
+            "10.0.0.1/32".parse().unwrap(),    // will be in tun_addr_set
+        ];
+        let allowed: Vec<IpNet> = vec!["192.168.1.0/24".parse().unwrap()];
+
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        // Neither route should be deleted — 192.168.1.0/24 is in desired_routes,
+        // 10.0.0.1/32 is in tun_addr_set
+        let ops = handle.ops();
+        assert!(ops.is_empty());
     }
 }
