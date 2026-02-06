@@ -6,18 +6,19 @@
 //! Run with: `cargo test --test e2e -- --ignored --nocapture`
 
 use std::io::Write;
-use std::process::Command;
 use std::time::Duration;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-const TEST_IMAGE: &str = "h3llo";
-const TEST_TAG: &str = "test";
-const TEST_NETWORK: &str = "h3llo-test-net";
+use super::common::{require_image_and_network, TEST_IMAGE, TEST_NETWORK, TEST_TAG};
 
 /// Generates self-signed certificates for testing.
-fn generate_test_certs(
+///
+/// # Returns
+///
+/// Tuple of `(cert_path, key_path)` pointing to PEM files in `temp_dir`.
+pub(super) fn generate_test_certs(
     temp_dir: &std::path::Path,
     hostname: &str,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -48,44 +49,19 @@ fn generate_test_certs(
     (cert_path, key_path)
 }
 
-/// Verifies Docker image exists before running tests.
-fn ensure_image_exists() -> bool {
-    let output = Command::new("docker")
-        .args(["image", "inspect", &format!("{}:{}", TEST_IMAGE, TEST_TAG)])
-        .output();
-
-    match output {
-        Ok(o) => o.status.success(),
-        Err(_) => false,
-    }
-}
-
-/// Creates the test Docker network if it doesn't exist.
-fn ensure_network_exists() {
-    let check = Command::new("docker")
-        .args(["network", "inspect", TEST_NETWORK])
-        .output();
-
-    if check.map(|o| o.status.success()).unwrap_or(false) {
-        return;
-    }
-
-    let result = Command::new("docker")
-        .args(["network", "create", TEST_NETWORK])
-        .output()
-        .expect("create network");
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        if stderr.contains("already exists") {
-            return;
-        }
-        panic!("Failed to create network: {}", stderr);
-    }
-}
-
 /// Test configuration template for H3 node.
-fn h3_node_config(
+///
+/// # Arguments
+///
+/// * `local_id` - Node identifier (must match peer's `peer_id`)
+/// * `tun_addr` - VPN tunnel IP address (e.g., "10.0.0.1")
+/// * `peer_id` - Remote peer identifier
+/// * `peer_endpoint` - HTTPS endpoint URL for peer (FQDN format)
+/// * `peer_secret` - Shared authentication secret
+/// * `peer_allowed_ip` - CIDR allowed IP for peer traffic
+/// * `cert_path` - Container path to TLS certificate
+/// * `key_path` - Container path to TLS private key
+pub(super) fn h3_node_config(
     local_id: &str,
     tun_addr: &str,
     peer_id: &str,
@@ -135,16 +111,7 @@ peers:
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image with H3 support"]
 async fn test_two_node_h3_tunnel() {
-    if !ensure_image_exists() {
-        eprintln!(
-            "Docker image {}:{} not found. Build with:",
-            TEST_IMAGE, TEST_TAG
-        );
-        eprintln!("  docker build -t {}:{} .", TEST_IMAGE, TEST_TAG);
-        panic!("Missing Docker image");
-    }
-
-    ensure_network_exists();
+    require_image_and_network();
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 

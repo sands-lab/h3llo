@@ -55,6 +55,6 @@ Compose modules into higher-level components with focused integration tests.
 Full end-to-end scenarios across multiple nodes.
 
 - [ ] Step 1: Run two-node BareUDP: static IP reachability, invalid source drop, MTU boundary checks.
-- [ ] Step 2: Exercise two-node HTTP/3 end-to-end: ping/iperf, cert rotation, auth failures, path errors, reconnection.
+- [ ] Step 2: Exercise two-node HTTP/3 end-to-end: ping/iperf (BareUDP + H3 iperf3 done), cert rotation, auth failures, path errors, reconnection.
 - [ ] Step 3: Validate mixed mode: POST-driven transport/peer changes with zero-downtime goal and route drift checks.
 - [ ] Step 4: Verify observability: structured logs and metrics hooks emit expected events under the above scenarios.

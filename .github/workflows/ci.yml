@@ -43,8 +43,8 @@ jobs:
           push: false
           tags: h3llo:test
           target: test
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # cache-from: type=gha
+          # cache-to: type=gha,mode=max
           load: true
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable

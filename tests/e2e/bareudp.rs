@@ -6,15 +6,12 @@
 //!
 //! Run with: `cargo test --test e2e -- --ignored --nocapture`
 
-use std::process::Command;
 use std::time::Duration;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-const TEST_IMAGE: &str = "h3llo";
-const TEST_TAG: &str = "test";
-const TEST_NETWORK: &str = "h3llo-test-net";
+use super::common::{require_image_and_network, TEST_IMAGE, TEST_NETWORK, TEST_TAG};
 
 /// Test configuration for node A (server role).
 /// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
@@ -68,44 +65,6 @@ peers:
         - 10.0.0.1/32
 "#;
 
-/// Verifies Docker image exists before running tests.
-fn ensure_image_exists() -> bool {
-    let output = Command::new("docker")
-        .args(["image", "inspect", &format!("{}:{}", TEST_IMAGE, TEST_TAG)])
-        .output();
-
-    match output {
-        Ok(o) => o.status.success(),
-        Err(_) => false,
-    }
-}
-
-/// Creates the test Docker network if it doesn't exist.
-/// Handles race conditions when multiple tests run in parallel.
-fn ensure_network_exists() {
-    let check = Command::new("docker")
-        .args(["network", "inspect", TEST_NETWORK])
-        .output();
-
-    if check.map(|o| o.status.success()).unwrap_or(false) {
-        return; // Network already exists
-    }
-
-    let result = Command::new("docker")
-        .args(["network", "create", TEST_NETWORK])
-        .output()
-        .expect("create network");
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        // Ignore "already exists" error from parallel test execution
-        if stderr.contains("already exists") {
-            return;
-        }
-        panic!("Failed to create network: {}", stderr);
-    }
-}
-
 /// Integration test: Two-node BareUDP tunnel connectivity.
 ///
 /// This test:
@@ -115,17 +74,7 @@ fn ensure_network_exists() {
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_two_node_bareudp_tunnel() {
-    if !ensure_image_exists() {
-        eprintln!(
-            "Docker image {}:{} not found. Build with:",
-            TEST_IMAGE, TEST_TAG
-        );
-        eprintln!("  docker build -t {}:{} .", TEST_IMAGE, TEST_TAG);
-        panic!("Missing Docker image");
-    }
-
-    // Ensure test network exists for hostname resolution
-    ensure_network_exists();
+    require_image_and_network();
 
     // Create temporary config files (TempDir auto-cleans on drop)
     let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -221,11 +170,7 @@ async fn test_two_node_bareudp_tunnel() {
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_source_ip_filtering() {
-    if !ensure_image_exists() {
-        panic!("Missing Docker image {}:{}", TEST_IMAGE, TEST_TAG);
-    }
-
-    ensure_network_exists();
+    require_image_and_network();
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 
@@ -347,11 +292,7 @@ peers:
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_mtu_boundary_drop() {
-    if !ensure_image_exists() {
-        panic!("Missing Docker image {}:{}", TEST_IMAGE, TEST_TAG);
-    }
-
-    ensure_network_exists();
+    require_image_and_network();
 
     // Dedicated configs with container names matching the endpoints.
     // Short DNS refresh (1s) allows h3llo to handle startup order automatically.

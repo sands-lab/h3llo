@@ -73,7 +73,7 @@ CMD ["-c", "/etc/h3llo/config.yaml"]
 
 # Stage 5: Test - Adds diagnostic tools for integration tests
 FROM runtime AS test
-RUN apk add --no-cache iproute2 iputils-ping
+RUN apk add --no-cache iproute2 iputils-ping iperf3
 # Include pre-built test binaries for Container Test Pattern
 COPY --from=builder /app/test-binaries/integration-container-tun /usr/local/bin/
 COPY --from=builder /app/test-binaries/integration-container-route /usr/local/bin/
