@@ -14,8 +14,27 @@ pub const TEST_TAG: &str = "test";
 /// Docker network for E2E tests.
 pub const TEST_NETWORK: &str = "h3llo-test-net";
 
+/// Panics with build instructions if the test Docker image is not available.
+///
+/// Also ensures the test Docker network exists. Call at the start of every
+/// E2E test to fail fast with actionable diagnostics.
+pub fn require_image_and_network() {
+    if !ensure_image_exists() {
+        eprintln!(
+            "Docker image {}:{} not found. Build with:",
+            TEST_IMAGE, TEST_TAG
+        );
+        eprintln!(
+            "  docker build --target test -t {}:{} .",
+            TEST_IMAGE, TEST_TAG
+        );
+        panic!("Missing Docker image");
+    }
+    ensure_network_exists();
+}
+
 /// Checks if the Docker test image exists locally.
-pub fn ensure_image_exists() -> bool {
+fn ensure_image_exists() -> bool {
     let output = Command::new("docker")
         .args(["image", "inspect", &format!("{}:{}", TEST_IMAGE, TEST_TAG)])
         .output();
@@ -28,7 +47,7 @@ pub fn ensure_image_exists() -> bool {
 /// Creates the test Docker network if it doesn't exist.
 ///
 /// Handles race conditions when multiple tests run in parallel.
-pub fn ensure_network_exists() {
+fn ensure_network_exists() {
     let check = Command::new("docker")
         .args(["network", "inspect", TEST_NETWORK])
         .output();
@@ -86,5 +105,25 @@ mod tests {
     fn test_parse_iperf3_bps_invalid() {
         assert!(parse_iperf3_bps("not json").is_none());
         assert!(parse_iperf3_bps(r#"{"end":{}}"#).is_none());
+    }
+
+    #[test]
+    fn test_format_throughput_gbps() {
+        assert_eq!(format_throughput(2_500_000_000.0), "2.50 Gbps");
+    }
+
+    #[test]
+    fn test_format_throughput_mbps() {
+        assert_eq!(format_throughput(123_456_789.0), "123.46 Mbps");
+    }
+
+    #[test]
+    fn test_format_throughput_kbps() {
+        assert_eq!(format_throughput(45_678.0), "45.68 Kbps");
+    }
+
+    #[test]
+    fn test_format_throughput_bps() {
+        assert_eq!(format_throughput(999.0), "999 bps");
     }
 }

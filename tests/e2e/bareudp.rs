@@ -11,9 +11,7 @@ use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-use super::common::{
-    ensure_image_exists, ensure_network_exists, TEST_IMAGE, TEST_NETWORK, TEST_TAG,
-};
+use super::common::{require_image_and_network, TEST_IMAGE, TEST_NETWORK, TEST_TAG};
 
 /// Test configuration for node A (server role).
 /// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
@@ -76,17 +74,7 @@ peers:
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_two_node_bareudp_tunnel() {
-    if !ensure_image_exists() {
-        eprintln!(
-            "Docker image {}:{} not found. Build with:",
-            TEST_IMAGE, TEST_TAG
-        );
-        eprintln!("  docker build -t {}:{} .", TEST_IMAGE, TEST_TAG);
-        panic!("Missing Docker image");
-    }
-
-    // Ensure test network exists for hostname resolution
-    ensure_network_exists();
+    require_image_and_network();
 
     // Create temporary config files (TempDir auto-cleans on drop)
     let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -182,11 +170,7 @@ async fn test_two_node_bareudp_tunnel() {
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_source_ip_filtering() {
-    if !ensure_image_exists() {
-        panic!("Missing Docker image {}:{}", TEST_IMAGE, TEST_TAG);
-    }
-
-    ensure_network_exists();
+    require_image_and_network();
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 
@@ -308,11 +292,7 @@ peers:
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_mtu_boundary_drop() {
-    if !ensure_image_exists() {
-        panic!("Missing Docker image {}:{}", TEST_IMAGE, TEST_TAG);
-    }
-
-    ensure_network_exists();
+    require_image_and_network();
 
     // Dedicated configs with container names matching the endpoints.
     // Short DNS refresh (1s) allows h3llo to handle startup order automatically.
