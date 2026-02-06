@@ -61,7 +61,7 @@ async fn check_device_creation() -> Result<(), String> {
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun0".to_string(),
         addrs: vec!["10.99.0.1/32".parse().unwrap()],
-        mtu: 1400,
+        mtu: h3llo::config::default_mtu(),
     };
 
     let (_reader, _writer) = h3llo::tun::make_tun(&local_tun)
@@ -152,7 +152,7 @@ async fn check_send_recv() -> Result<(), String> {
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun3".to_string(),
         addrs: vec!["10.99.3.1/32".parse().unwrap()],
-        mtu: 1400,
+        mtu: h3llo::config::default_mtu(),
     };
 
     let (mut reader, mut writer) = h3llo::tun::make_tun(&local_tun)

@@ -33,7 +33,6 @@ local:
     addrs:
       - 10.0.0.1/24
       - 10.0.1.1/24
-    mtu: 1400
   dns:
     server: udp://127.0.0.11:53
     refresh: 1
@@ -75,7 +74,6 @@ local:
     addrs:
       - 10.0.0.2/24
       - 10.0.1.2/24
-    mtu: 1400
   dns:
     server: udp://127.0.0.11:53
     refresh: 1

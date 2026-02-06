@@ -405,7 +405,7 @@ fn default_ifname() -> String {
 
 /// Default TUN MTU: safe for IPv6 outer transport on a 1500-byte WAN.
 /// 1500 (Ethernet MTU) - 48 (IPv6 + UDP) - 59 (CONNECT-IP overhead) = 1393.
-fn default_mtu() -> u16 {
+pub fn default_mtu() -> u16 {
     1393
 }
 

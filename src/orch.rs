@@ -800,7 +800,7 @@ mod test_support {
         fn default() -> Self {
             Self {
                 tun_if: "test0".to_string(),
-                mtu: 1400,
+                mtu: crate::config::default_mtu() as usize,
                 peers: HashMap::new(),
                 manage_routes: false,
                 tun_addrs: Vec::new(),

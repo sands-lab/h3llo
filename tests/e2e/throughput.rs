@@ -26,7 +26,6 @@ local:
     ifname: tun0
     addrs:
       - 10.0.0.1/32
-    mtu: 1400
   dns:
     server: udp://127.0.0.11:53
     refresh: 1
@@ -50,7 +49,6 @@ local:
     ifname: tun0
     addrs:
       - 10.0.0.2/32
-    mtu: 1400
   dns:
     server: udp://127.0.0.11:53
     refresh: 1
