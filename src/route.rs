@@ -136,11 +136,8 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
         })
         .collect();
 
-    let mut existing_tun: HashSet<IpNet> = HashSet::new();
+    let mut existing_routes: HashSet<IpNet> = HashSet::new();
 
-    // Single pass over all routes:
-    // - TUN routes: keep if in desired_routes or tun_addr_set, otherwise delete.
-    // - Non-TUN routes: log conflict if prefix overlaps with desired_routes.
     for route in &routes {
         let Some(net) = ipnet_from_route(route) else {
             warn!(
@@ -150,36 +147,35 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
             continue;
         };
 
-        match route.if_index() {
-            Some(idx) if idx == tun_ifindex => {
-                if desired_routes.contains(&net) || tun_addr_set.contains(&net) {
-                    existing_tun.insert(net);
-                } else if let Err(err) = handle.delete(route).await {
-                    warn!(prefix = %net, error = %err, "route delete failed");
+        if desired_routes.contains(&net) || tun_addr_set.contains(&net) {
+            match route.if_index() {
+                Some(idx) if idx == tun_ifindex => {
+                    existing_routes.insert(net);
                 }
-            }
-            Some(idx) => {
-                if desired_routes.contains(&net) {
+                Some(idx) => {
                     warn!(prefix = %net, existing_ifindex = idx, "route conflict with existing interface");
                 }
+                None => {
+                    warn!(prefix = %net, "route missing ifindex, skipped");
+                }
             }
-            None => {
-                warn!(prefix = %net, "route missing ifindex, skipped");
+        } else if route.if_index() == Some(tun_ifindex) {
+            if let Err(err) = handle.delete(route).await {
+                warn!(prefix = %net, error = %err, "route delete failed");
             }
         }
     }
 
-    // Add missing desired routes on the TUN interface.
-    // Only routes from `desired_routes` (allowed) are added; tun_addr_set routes are OS-managed.
+    // Add missing desired routes. tun_addr_set routes are OS-managed, never added by us.
     for net in &desired_routes {
-        if existing_tun.contains(net) {
+        if existing_routes.contains(net) {
             continue;
         }
 
         let route = Route::new(net.addr(), net.prefix_len()).with_if_index(tun_ifindex);
         match handle.add(&route).await {
             Ok(_) => {
-                existing_tun.insert(*net);
+                existing_routes.insert(*net);
             }
             Err(err) => {
                 warn!(prefix = %net, error = %err, "route add failed");
