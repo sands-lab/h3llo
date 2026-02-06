@@ -60,7 +60,7 @@ async fn run_checks() -> Result<(), String> {
 async fn check_device_creation() -> Result<(), String> {
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun0".to_string(),
-        addrs: vec!["10.99.0.1".parse().unwrap()],
+        addrs: vec!["10.99.0.1/32".parse().unwrap()],
         mtu: 1400,
     };
 
@@ -151,7 +151,7 @@ async fn check_send_recv() -> Result<(), String> {
 
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun3".to_string(),
-        addrs: vec!["10.99.3.1".parse().unwrap()],
+        addrs: vec!["10.99.3.1/32".parse().unwrap()],
         mtu: 1400,
     };
 
@@ -281,7 +281,7 @@ fn internet_checksum(data: &[u8]) -> u16 {
 async fn check_mtu_configuration() -> Result<(), String> {
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun2".to_string(),
-        addrs: vec!["10.99.2.1".parse().unwrap()],
+        addrs: vec!["10.99.2.1/32".parse().unwrap()],
         mtu: 1280,
     };
 
