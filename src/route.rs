@@ -126,14 +126,7 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
     // - the host address (192.168.1.2/32) — kernel host route
     let tun_addr_set: HashSet<IpNet> = tun_addrs
         .iter()
-        .flat_map(|addr| {
-            let network = addr.trunc();
-            let host = match addr.addr() {
-                IpAddr::V4(v4) => IpNet::V4(Ipv4Net::new(v4, 32).unwrap()),
-                IpAddr::V6(v6) => IpNet::V6(Ipv6Net::new(v6, 128).unwrap()),
-            };
-            [network, host]
-        })
+        .flat_map(|addr| [addr.trunc(), addr.addr().into()])
         .collect();
 
     let mut existing_routes: HashSet<IpNet> = HashSet::new();
@@ -148,16 +141,13 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
         };
 
         if desired_routes.contains(&net) || tun_addr_set.contains(&net) {
-            match route.if_index() {
-                Some(idx) if idx == tun_ifindex => {
-                    existing_routes.insert(net);
-                }
-                Some(idx) => {
-                    warn!(prefix = %net, existing_ifindex = idx, "route conflict with existing interface");
-                }
-                None => {
-                    warn!(prefix = %net, "route missing ifindex, skipped");
-                }
+            if route.if_index() == Some(tun_ifindex) {
+                existing_routes.insert(net);
+            } else {
+                let ifindex = route
+                    .if_index()
+                    .map_or("unknown".to_string(), |i| i.to_string());
+                warn!(prefix = %net, existing_ifindex = ifindex, "route conflict with existing interface");
             }
         } else if route.if_index() == Some(tun_ifindex) {
             if let Err(err) = handle.delete(route).await {
@@ -173,13 +163,8 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
         }
 
         let route = Route::new(net.addr(), net.prefix_len()).with_if_index(tun_ifindex);
-        match handle.add(&route).await {
-            Ok(_) => {
-                existing_routes.insert(*net);
-            }
-            Err(err) => {
-                warn!(prefix = %net, error = %err, "route add failed");
-            }
+        if let Err(err) = handle.add(&route).await {
+            warn!(prefix = %net, error = %err, "route add failed");
         }
     }
 
@@ -411,7 +396,7 @@ mod tests {
         assert_eq!(handle.ops(), vec!["add 192.168.0.0/24"]);
         assert!(logs_contain("route conflict"));
         assert!(logs_contain("192.168.0.0/24"));
-        assert!(logs_contain("existing_ifindex=2"));
+        assert!(logs_contain("existing_ifindex=\"2\""));
     }
 
     #[tokio::test]
@@ -428,8 +413,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(handle.ops(), vec!["add 10.0.0.0/24"]);
-        assert!(logs_contain("route missing ifindex"));
-        assert!(logs_contain("10.0.0.0/24"));
+        assert!(logs_contain("route conflict"));
+        assert!(logs_contain("existing_ifindex=\"unknown\""));
     }
 
     #[tokio::test]
