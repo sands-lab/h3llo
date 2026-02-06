@@ -96,7 +96,7 @@ pub struct LocalTun {
     /// TUN addresses with CIDR prefixes (IPv4/IPv6, required).
     /// Example: `192.168.180.1/24`, `2001:db8::1/64`
     pub addrs: Vec<IpNet>,
-    /// TUN MTU (default: 1410).
+    /// TUN MTU (default: 1393).
     #[serde(default = "default_mtu")]
     pub mtu: u16,
 }
@@ -403,8 +403,10 @@ fn default_ifname() -> String {
     "h3llo0".to_string()
 }
 
+/// Default TUN MTU: safe for IPv6 outer transport on a 1500-byte WAN.
+/// 1500 (Ethernet MTU) - 48 (IPv6 + UDP) - 59 (CONNECT-IP overhead) = 1393.
 fn default_mtu() -> u16 {
-    1410
+    1393
 }
 
 /// Deserializes a DNS server from a `udp://` URI string to `SocketAddr`.
@@ -637,7 +639,7 @@ mod tests {
                 tun: LocalTun {
                     ifname: "h3llo0".to_string(),
                     addrs: vec!["192.168.180.1/32".parse().unwrap()],
-                    mtu: 1410,
+                    mtu: 1393,
                 },
             },
             peers: vec![Peer {
@@ -947,7 +949,7 @@ peers:
         assert_eq!(cfg.local.dns.refresh, 60);
         assert_eq!(cfg.local.dns.bindif, None);
         assert_eq!(cfg.local.tun.ifname, "h3llo0");
-        assert_eq!(cfg.local.tun.mtu, 1410);
+        assert_eq!(cfg.local.tun.mtu, 1393);
         assert!(cfg.peers[0].enabled);
         assert!(cfg.peers[0].h3.is_some());
         if let Some(h3) = cfg.peers[0].h3.as_ref() {

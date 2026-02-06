@@ -132,7 +132,6 @@ pub struct Orchestrator {
 
     // Runtime state
     tun_if: String,
-    #[allow(dead_code)]
     mtu: usize,
     /// Unified peer state: config + active bound.
     peers: HashMap<String, PeerEntry>,
@@ -293,8 +292,12 @@ impl Orchestrator {
                     .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
 
                 // spawn: infallible task creation; listener sends events through events_tx
-                let (cmd_tx, listener_handle, _bound_addr) =
-                    spawn_h3_listener(listener, peer_tokens, events_tx.clone());
+                let (cmd_tx, listener_handle, _bound_addr) = spawn_h3_listener(
+                    listener,
+                    peer_tokens,
+                    config.local.tun.mtu,
+                    events_tx.clone(),
+                );
 
                 join_set.spawn(listener_handle);
                 Some(cmd_tx)
@@ -540,6 +543,7 @@ impl Orchestrator {
                 let available_ips = dns_state.get(&host).map(|v| v.as_slice()).unwrap_or(&[]);
                 let events_tx = self.events_tx.clone();
                 let tun_if = self.tun_if.clone();
+                let tun_mtu = self.mtu as u16;
 
                 for &ip in available_ips {
                     let destination = SocketAddr::new(ip, port);
@@ -550,7 +554,15 @@ impl Orchestrator {
 
                     tokio::spawn(async move {
                         let probe = DefaultRouteProbe;
-                        match dial_h3(&peer_h3, destination, &peer_id, Some(&tun_if), &probe).await
+                        match dial_h3(
+                            &peer_h3,
+                            destination,
+                            &peer_id,
+                            Some(&tun_if),
+                            tun_mtu,
+                            &probe,
+                        )
+                        .await
                         {
                             Ok(conn) => {
                                 debug!(peer = %peer_id, addr = %destination, "H3 connection established");
