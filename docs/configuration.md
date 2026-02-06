@@ -22,7 +22,7 @@ local:
     ifname: h3llo0 # optional, default: h3llo0
     addrs: # required (CIDR notation with prefix length)
       - 192.168.180.2/24 # required; supports subnets (e.g., /24) or host addresses (/32, /128)
-    mtu: 1410 # optional, default: 1410 (see docs/protocol.md for MTU sizing)
+    mtu: 1393 # optional, default: 1393 (see docs/protocol.md for MTU sizing)
 peers: # optional, default: []
 - id: example-node-1
   enabled: true # optional, default: true
@@ -55,7 +55,7 @@ peers: # optional, default: []
 - `local.bare.listen`: BareUDP listen address when using the plaintext fast path; required to start BareUDP and optional alongside `local.h3`.
 - `local.tun.ifname` (default `h3llo0`): Name of the TUN interface created by h3llo.
 - `local.tun.addrs` (required): IP prefixes in CIDR notation (e.g., `192.168.180.1/24`, `2001:db8::1/64`) for the TUN interface. Supports IPv4, IPv6, dual-stack, and multiple prefixes. Extra system routes come from `peers[].tun.allowedIPs` when `local.table=true`.
-- `local.tun.mtu` (default `1410`): MTU for the TUN interface; see `docs/protocol.md` for sizing guidance.
+- `local.tun.mtu` (default `1393`): MTU for the TUN interface; see `docs/protocol.md` for sizing guidance.
 - `peers[]`: Remote peer entries.
 - `peers[].id`: Remote peer identifier; must be unique within the configuration and non-empty.
 - `peers[].h3.token`: Remote peer authentication token; required (and must be at least 12 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. Must be unique across all peers. Bearer Token auth for CONNECT uses `Authorization: Bearer <token>`; server matches tokens to identify peers.
