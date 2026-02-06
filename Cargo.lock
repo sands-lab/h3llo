@@ -1160,6 +1160,7 @@ dependencies = [
  "route_manager",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "serde_yaml 0.9.34+deprecated",
  "socket2",
  "subtle",

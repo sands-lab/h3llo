@@ -6,15 +6,14 @@
 //!
 //! Run with: `cargo test --test e2e -- --ignored --nocapture`
 
-use std::process::Command;
 use std::time::Duration;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-const TEST_IMAGE: &str = "h3llo";
-const TEST_TAG: &str = "test";
-const TEST_NETWORK: &str = "h3llo-test-net";
+use super::common::{
+    ensure_image_exists, ensure_network_exists, TEST_IMAGE, TEST_NETWORK, TEST_TAG,
+};
 
 /// Test configuration for node A (server role).
 /// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
@@ -67,44 +66,6 @@ peers:
       allowedIPs:
         - 10.0.0.1/32
 "#;
-
-/// Verifies Docker image exists before running tests.
-fn ensure_image_exists() -> bool {
-    let output = Command::new("docker")
-        .args(["image", "inspect", &format!("{}:{}", TEST_IMAGE, TEST_TAG)])
-        .output();
-
-    match output {
-        Ok(o) => o.status.success(),
-        Err(_) => false,
-    }
-}
-
-/// Creates the test Docker network if it doesn't exist.
-/// Handles race conditions when multiple tests run in parallel.
-fn ensure_network_exists() {
-    let check = Command::new("docker")
-        .args(["network", "inspect", TEST_NETWORK])
-        .output();
-
-    if check.map(|o| o.status.success()).unwrap_or(false) {
-        return; // Network already exists
-    }
-
-    let result = Command::new("docker")
-        .args(["network", "create", TEST_NETWORK])
-        .output()
-        .expect("create network");
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        // Ignore "already exists" error from parallel test execution
-        if stderr.contains("already exists") {
-            return;
-        }
-        panic!("Failed to create network: {}", stderr);
-    }
-}
 
 /// Integration test: Two-node BareUDP tunnel connectivity.
 ///
