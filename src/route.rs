@@ -1,11 +1,10 @@
 //! System route synchronization using route_manager.
 use crate::bind::lookup_ifindex;
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use ipnet::IpNet;
 use route_manager::AsyncRouteManager;
 pub use route_manager::Route;
 use std::collections::HashSet;
 use std::io;
-use std::net::IpAddr;
 use thiserror::Error;
 use tracing::warn;
 
@@ -236,10 +235,7 @@ fn resolve_ifindex(name: &str) -> Result<u32, RouteSyncError> {
 
 /// Converts a `route_manager::Route` into `IpNet` when the address family is supported.
 pub fn ipnet_from_route(route: &Route) -> Option<IpNet> {
-    match route.destination() {
-        IpAddr::V4(addr) => Ipv4Net::new(addr, route.prefix()).ok().map(IpNet::V4),
-        IpAddr::V6(addr) => Ipv6Net::new(addr, route.prefix()).ok().map(IpNet::V6),
-    }
+    IpNet::new(route.destination(), route.prefix()).ok()
 }
 
 #[cfg(test)]
