@@ -25,7 +25,10 @@ tests/
       tun.rs    # Standalone TUN test binary (harness = false)
   e2e/
     main.rs
-    bareudp.rs  # Full system E2E (requires Docker + privileged)
+    common.rs     # Shared E2E utilities (Docker helpers, iperf3 parsing)
+    bareudp.rs    # BareUDP E2E (requires Docker + privileged)
+    h3.rs         # HTTP/3 E2E (requires Docker + privileged)
+    throughput.rs # iperf3 throughput tests (BareUDP + H3)
 ```
 
 ## Local Unit Tests
@@ -125,6 +128,20 @@ The `tests/integration/native/common/` module provides utilities shared across C
 1. **Two-node BareUDP tunnel**: Verifies bidirectional VPN connectivity between two containers
 2. **Source IP filtering**: Verifies unauthorized sources are rejected
 3. **MTU boundary checks**: Verifies MTU-fitting packets pass and oversized packets with DF are dropped
+
+### E2E Test Scenarios (`tests/e2e/h3.rs`)
+
+1. **Two-node H3 tunnel**: Verifies bidirectional VPN connectivity over HTTP/3 with self-signed certificates
+
+### E2E Test Scenarios (`tests/e2e/throughput.rs`)
+
+1. **BareUDP TCP throughput**: Runs iperf3 through BareUDP tunnel, verifies measurable TCP throughput via JSON output parsing
+2. **H3 TCP throughput**: Runs iperf3 through HTTP/3 tunnel with self-signed certificates, verifies measurable TCP throughput
+
+Prerequisites: `iperf3` is included in the Docker test image. Run with:
+```bash
+cargo test --test e2e -- --ignored --nocapture throughput
+```
 
 ### Integration Test Scenarios (`tests/integration/native/dns.rs`)
 
@@ -232,6 +249,8 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Unit: `src/dns.rs` real-network DNS resolver tests.
 - Unit: `src/bare.rs` real-network BareUDP tests.
 - Docker E2E: `tests/e2e/bareudp.rs` multi-node BareUDP connectivity, source IP filtering, and MTU boundary checks via testcontainers-rs.
+- Docker E2E: `tests/e2e/h3.rs` multi-node HTTP/3 connectivity via testcontainers-rs.
+- Docker E2E: `tests/e2e/throughput.rs` iperf3 TCP throughput tests for BareUDP and HTTP/3 tunnels.
 - Docker Integration: `tests/integration/native/dns.rs` DNS resolver integration tests against CoreDNS container.
 - Docker Integration: `tests/integration/native/tun.rs` TUN device creation and addressing via Container Test Pattern.
 - Docker Integration: `tests/integration/native/route.rs` Route sync with real netlink API via Container Test Pattern.
