@@ -156,42 +156,26 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
-    /// Computes allowed BareUDP source IPs from active peer bounds.
+    /// Updates BareUDP RX accepted source filter.
     ///
-    /// Used when DNS state is unavailable (e.g., after H3 connection establishment).
-    /// Only includes IPs of currently-bound bare peers.
-    fn compute_bare_allowed_ips_from_bounds(&self) -> HashSet<IpAddr> {
-        let mut allowed = HashSet::new();
-        for entry in self.peers.values() {
-            if !entry.config.enabled || entry.config.bare.is_none() {
-                continue;
-            }
-            if let Some(ref bound) = entry.bound {
-                allowed.insert(bound.dest.ip());
+    /// Sends the new set of accepted source IPs to the BareUDP RX actor.
+    /// No-op when BareUDP is not configured (`bare_rx_cmd_tx` is `None`).
+    fn update_accepted_sources(&self, accepted_ips: &HashSet<IpAddr>) {
+        if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
+            if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAcceptedSources(
+                accepted_ips.clone(),
+            )) {
+                warn!(error = %e, "failed to send accepted sources update command");
             }
         }
-        allowed
     }
 
-    /// Updates all dependent subsystems after bounds topology changes.
+    /// Updates internal routing table and system routes.
     ///
-    /// Performs the three-update sequence:
-    /// 1. BareRx allowed sources (in-memory filter)
-    /// 2. TUN routing table (internal forwarding)
-    /// 3. System routes (if `local.table` is enabled)
-    ///
-    /// Called after any bound is added or removed.
-    async fn on_bounds_changed(&self, bare_allowed_ips: &HashSet<IpAddr>) {
-        // 1. Update allowed sources (fast, in-memory filter)
-        if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
-            if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAllowedSources(
-                bare_allowed_ips.clone(),
-            )) {
-                warn!(error = %e, "failed to send allowed sources update command");
-            }
-        }
-
-        // 2. Update internal routing table
+    /// Performs the routing update sequence:
+    /// 1. TUN routing table (internal forwarding)
+    /// 2. System routes (if `local.table` is enabled)
+    async fn update_routing(&self) {
         let peer_configs = self.peer_configs();
         let peer_txs = self.peer_txs();
         if let Ok(routing) = RoutingTable::from_peers(&peer_configs, &peer_txs) {
@@ -203,7 +187,6 @@ impl Orchestrator {
             }
         }
 
-        // 3. Sync system routes if enabled
         if self.manage_routes {
             let allowed = collect_allowed_ips(&peer_configs);
             sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await;
@@ -601,24 +584,25 @@ impl Orchestrator {
             }
         }
 
-        if bounds_changed {
-            // Compute bare allowed IPs from dns_state (includes ALL resolved IPs for bare peers).
-            // This differs from compute_bare_allowed_ips_from_bounds() which only includes
-            // currently-bound peer IPs. Here we have the full DNS state available, so we
-            // include all IPs to allow receiving from any resolved address.
-            let mut allowed_ips = HashSet::new();
-            for entry in self.peers.values() {
-                if !entry.config.enabled {
-                    continue;
-                }
-                let Some(bare) = entry.config.bare.as_ref() else {
-                    continue;
-                };
-                if let Some(ips) = dns_state.get(&bare.endpoint.host) {
-                    allowed_ips.extend(ips.iter().copied());
-                }
+        // Always update accepted sources from DNS state — includes ALL resolved IPs for
+        // bare peers, not just currently-bound ones. DNS can resolve new IPs without
+        // triggering a bounds change (e.g., peer already connected to one IP).
+        let mut accepted_ips = HashSet::new();
+        for entry in self.peers.values() {
+            if !entry.config.enabled {
+                continue;
             }
-            self.on_bounds_changed(&allowed_ips).await;
+            let Some(bare) = entry.config.bare.as_ref() else {
+                continue;
+            };
+            if let Some(ips) = dns_state.get(&bare.endpoint.host) {
+                accepted_ips.extend(ips.iter().copied());
+            }
+        }
+        self.update_accepted_sources(&accepted_ips);
+
+        if bounds_changed {
+            self.update_routing().await;
         }
     }
 
@@ -702,8 +686,7 @@ impl Orchestrator {
         self.join_set.spawn(rx_handle);
         self.join_set.spawn(tx_handle);
 
-        let allowed_ips = self.compute_bare_allowed_ips_from_bounds();
-        self.on_bounds_changed(&allowed_ips).await;
+        self.update_routing().await;
     }
 }
 
@@ -1261,9 +1244,14 @@ mod tests {
 
         // No bound created (hostname doesn't match)
         assert!(!orch.peers.get("peer1").unwrap().is_connected());
-        // No commands sent
+        // Routing not updated (no bounds change)
         assert!(handles.tun_cmd_rx.try_recv().is_err());
-        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
+        // Accepted sources always updated (unconditionally), but empty since no hostname matched
+        let cmd = handles
+            .bare_rx_cmd_rx
+            .try_recv()
+            .expect("accepted sources always sent");
+        assert_eq!(cmd, BareUdpRxCommand::UpdateAcceptedSources(HashSet::new()));
     }
 
     #[tokio::test]
@@ -1304,9 +1292,14 @@ mod tests {
         let event = make_dns_snapshot_event(state);
         orch.handle_event(event).await;
 
-        // No commands should be sent (no peers matched)
+        // Routing not updated (no bounds change)
         assert!(handles.tun_cmd_rx.try_recv().is_err());
-        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
+        // Accepted sources always updated (unconditionally), but empty since no hostname matched
+        let cmd = handles
+            .bare_rx_cmd_rx
+            .try_recv()
+            .expect("accepted sources always sent");
+        assert_eq!(cmd, BareUdpRxCommand::UpdateAcceptedSources(HashSet::new()));
     }
 
     #[tokio::test]
@@ -1531,5 +1524,79 @@ mod tests {
             "handle_dns_snapshot blocked for {:?}, expected < 500ms (dial should be non-blocking)",
             elapsed
         );
+    }
+
+    // ========== update_accepted_sources / update_routing independence tests ==========
+
+    #[tokio::test]
+    async fn update_accepted_sources_independent_of_routing() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+
+        let (orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        let accepted = HashSet::from(["1.2.3.4".parse::<IpAddr>().unwrap()]);
+        orch.update_accepted_sources(&accepted);
+
+        let BareUdpRxCommand::UpdateAcceptedSources(ips) = handles
+            .bare_rx_cmd_rx
+            .try_recv()
+            .expect("accepted sources update expected");
+        assert_eq!(ips.len(), 1);
+        assert!(ips.contains(&"1.2.3.4".parse().unwrap()));
+
+        // Routing command should NOT be sent
+        assert!(handles.tun_cmd_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn update_routing_independent_of_accepted_sources() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_tx("peer1", "1.2.3.4:5353".parse().unwrap(), tx)
+            .build();
+
+        orch.update_routing().await;
+
+        // Routing command SHOULD be sent
+        assert!(handles.tun_cmd_rx.try_recv().is_ok());
+
+        // Accepted sources command should NOT be sent
+        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_dns_snapshot_always_updates_accepted_sources() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_tx("peer1", "1.2.3.4:5353".parse().unwrap(), tx)
+            .build();
+
+        // Peer already connected — no bounds_changed will occur
+        let mut state = HashMap::new();
+        state.insert(
+            "example.com".to_string(),
+            vec!["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()],
+        );
+        let event = make_dns_snapshot_event(state);
+        orch.handle_event(event).await;
+
+        // Accepted sources SHOULD be updated (unconditionally)
+        let BareUdpRxCommand::UpdateAcceptedSources(ips) = handles
+            .bare_rx_cmd_rx
+            .try_recv()
+            .expect("accepted sources update expected");
+        assert!(ips.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()));
+        assert!(ips.contains(&"5.6.7.8".parse::<IpAddr>().unwrap()));
+
+        // Routing should NOT be updated (no bounds change)
+        assert!(handles.tun_cmd_rx.try_recv().is_err());
     }
 }

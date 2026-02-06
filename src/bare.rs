@@ -18,8 +18,11 @@ use tokio::time;
 /// Commands accepted by the BareUDP receive loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BareUdpRxCommand {
-    /// Replace the allowed source IP filter set.
-    UpdateAllowedSources(HashSet<IpAddr>),
+    /// Replace the accepted source IP filter set.
+    ///
+    /// "Accepted sources" controls which source IPs are permitted for inbound
+    /// BareUDP packets, distinct from TUN's "allowed IPs" (routing prefixes).
+    UpdateAcceptedSources(HashSet<IpAddr>),
 }
 
 /// Provides receive-only access to a BareUDP socket.
@@ -81,13 +84,13 @@ pub async fn make_bare_tx<P: RouteProbe>(
 ///
 /// # Arguments
 /// - `rx`: Receive-only socket and MTU.
-/// - `allowed_sources`: Initial allowed source IP set.
+/// - `accepted_sources`: Initial accepted source IP set.
 /// - `packet_tx`: Bounded channel to push accepted packets into (data plane).
 /// - `events_tx`: Unbounded channel for emitting receive metrics.
 /// - `interval`: Metrics emission interval.
 pub fn spawn_udp_rx(
     rx: BareUdpRx,
-    mut allowed_sources: HashSet<IpAddr>,
+    mut accepted_sources: HashSet<IpAddr>,
     packet_tx: mpsc::Sender<Vec<u8>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
@@ -117,7 +120,7 @@ pub fn spawn_udp_rx(
                             if len == 0 {
                                 continue;
                             }
-                            if !allowed_sources.contains(&remote.ip()) {
+                            if !accepted_sources.contains(&remote.ip()) {
                                 counters.record_drop(DropReason::DisallowedSource, len);
                                 continue;
                             }
@@ -139,8 +142,8 @@ pub fn spawn_udp_rx(
                         return Ok(()); // Channel closed, exit gracefully
                     };
                     // Single-variant enum: destructure directly
-                    let BareUdpRxCommand::UpdateAllowedSources(update) = command;
-                    allowed_sources = update;
+                    let BareUdpRxCommand::UpdateAcceptedSources(update) = command;
+                    accepted_sources = update;
                 }
                 _ = ticker.tick() => {
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
@@ -246,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_rx_filters_disallowed_sources() {
+    async fn udp_rx_filters_non_accepted_sources() {
         let (socket, addr) = {
             let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = sock.local_addr().unwrap();
@@ -254,12 +257,12 @@ mod tests {
         };
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
-        let allowed = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))]);
+        let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))]);
         let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
         let context = BareUdpRx { socket, mtu: 64 };
         let (_cmd_tx, handle) = spawn_udp_rx(
             context,
-            allowed,
+            accepted,
             packet_tx,
             events_tx,
             Duration::from_millis(200),
@@ -279,7 +282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_rx_updates_allowed_sources() {
+    async fn udp_rx_updates_accepted_sources() {
         let (socket, addr) = {
             let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = sock.local_addr().unwrap();
@@ -311,7 +314,7 @@ mod tests {
         );
 
         cmd_tx
-            .send(BareUdpRxCommand::UpdateAllowedSources(HashSet::from([
+            .send(BareUdpRxCommand::UpdateAcceptedSources(HashSet::from([
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             ])))
             .unwrap();
@@ -476,9 +479,9 @@ mod tests {
             Duration::from_secs(60),
         );
 
-        // Verify cmd_tx is functional by sending an allowed sources update
+        // Verify cmd_tx is functional by sending an accepted sources update
         assert!(cmd_tx
-            .send(BareUdpRxCommand::UpdateAllowedSources(HashSet::from([
+            .send(BareUdpRxCommand::UpdateAcceptedSources(HashSet::from([
                 IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))
             ])))
             .is_ok());
@@ -585,13 +588,13 @@ mod tests {
         );
 
         // Spawn RX with TX's packet channel as output (direct wiring, no forwarder)
-        let allowed = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
+        let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
         let (_cmd_tx, rx_handle) = spawn_udp_rx(
             BareUdpRx {
                 socket: rx_socket,
                 mtu: 64,
             },
-            allowed,
+            accepted,
             packet_tx,
             events_tx,
             Duration::from_secs(60),

@@ -185,12 +185,14 @@ Orchestrator DNS handling:
 - **Single event loop**: The orchestrator runs one unified event loop that handles all events including DNS lifecycle events. There is no separate initialization event loop.
 - **Listen hostname**: If the listen address is a hostname (not IP literal), perform synchronous DNS lookup before starting the event loop. This ensures BareUDP RX and TUN TX are created immediately.
 - **Unified hostname registration**: The orchestrator sends a single `SetHostnames { hosts: HashSet<String> }` command at startup with all unique peer endpoint hostnames. IP literals are handled by the DNS module directly (recorded with max TTL, included in next snapshot). The DNS module owns hostname tracking, refresh scheduling, and TTL-based expiration internally.
-- **Event-driven IP lifecycle**: The orchestrator reacts to DNS state snapshot events. When a snapshot arrives, the orchestrator iterates over all peers to check connection state and IP validity. For unbound peers, available IPs trigger TX actor creation (BareUDP) or dial attempts (H3); for bound peers, IP expiration triggers bound removal. The `bare_allowed_ips` set is computed on-demand from the snapshot rather than maintained incrementally.
-- **First IP wins**: For peer endpoints, use the first resolved IP for outbound traffic. All resolved IPs are added to the allowed source filter.
+- **Event-driven IP lifecycle**: The orchestrator reacts to DNS state snapshot events. When a snapshot arrives, the orchestrator iterates over all peers to check connection state and IP validity. For unbound peers, available IPs trigger TX actor creation (BareUDP) or dial attempts (H3); for bound peers, IP expiration triggers bound removal. The accepted source IPs are computed on-demand from the snapshot rather than maintained incrementally.
+- **First IP wins**: For peer endpoints, use the first resolved IP for outbound traffic. All resolved IPs are added to the accepted source filter.
 
 Spawn an actor for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx actor; BareUDP owns one listener socket for RX and a separate TX-only socket per BareUDP peer.
 
-When configuration changes arrive (external controller POST or initialization), update the allowed-source filter first (fast, in-memory), then the internal routing table, then the system routing table. Dynamic reconfiguration flows through the orchestrator via command queues.
+When configuration changes arrive (external controller POST or initialization), update the accepted-source filter first (fast, in-memory), then the internal routing table, then the system routing table. Dynamic reconfiguration flows through the orchestrator via command queues.
+
+**Terminology**: "Accepted sources" refers to the BareUDP RX source IP filter. "Allowed IPs" refers to TUN routing prefixes (`peers[].tun.allowedIPs`).
 
 H3 connection management:
 - For each peer, dial all DNS-resolved IPs in parallel when a new IP is resolved and no connection exists.
@@ -208,7 +210,9 @@ DNS lifecycle management:
   - If active connection exists: check if destination IP is still in the snapshot for that hostname
     - If expired: remove bound and immediately attempt reconnection if new IPs available
     - If still valid: do nothing
-  - After processing all peers, update routing and allowed-source filter if any bounds changed
+  - After processing all peers:
+    - Always update accepted-source filter (DNS may resolve new IPs without bounds change)
+    - Update routing only when bounds actually changed (new connections or disconnections)
 - Refreshing an existing IP extends its TTL without changing the snapshot (no duplicate events).
 - DNS warnings (NXDOMAIN, truncation, recursion refusal) are logged via `warn!` at the DNS module (origin) rather than propagating through events.
 
