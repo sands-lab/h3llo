@@ -77,15 +77,15 @@ async fn run_iperf3_throughput(
     target_ip: &str,
     label: &str,
 ) -> f64 {
-    // Start iperf3 server (daemon mode, -1 = exit after single client)
-    let srv = server
+    // Start iperf3 server (-1 = exit after single client).
+    // Don't use -D (daemon) as it forks, which breaks exit_code() in container exec.
+    // exec() returns immediately, so the server runs in the background.
+    let _srv = server
         .exec(testcontainers::core::ExecCommand::new([
-            "iperf3", "-s", "-D", "-1",
+            "iperf3", "-s", "-1",
         ]))
         .await
         .expect("start iperf3 server");
-    let srv_exit = srv.exit_code().await.unwrap();
-    assert_eq!(srv_exit, Some(0), "iperf3 server failed to start");
 
     // Brief pause for server readiness
     tokio::time::sleep(Duration::from_millis(500)).await;

@@ -47,6 +47,13 @@ use tracing::{debug, error, warn};
 /// Context ID for IP payloads per RFC 9484 (always 0 for CONNECT-IP).
 const CONTEXT_ID_IP: u8 = 0x00;
 
+/// Maximum QUIC packet size (UDP payload) assuming IPv4 WAN MTU 1500.
+///
+/// tokio-quiche defaults to 1350, which is too conservative for typical
+/// deployments and silently drops DATAGRAM frames that exceed it.
+/// 1472 = 1500 (WAN MTU) - 20 (IPv4 header) - 8 (UDP header).
+const MAX_SEND_UDP_PAYLOAD_SIZE: usize = 1472;
+
 // ========== Auth Helpers ==========
 
 /// Extracts and validates the Authorization header from HTTP/3 headers.
@@ -447,6 +454,9 @@ pub async fn dial_h3<P: RouteProbe>(
     if !peer_h3.insecure {
         quic_settings.verify_peer = true;
     }
+
+    quic_settings.max_send_udp_payload_size = MAX_SEND_UDP_PAYLOAD_SIZE;
+    quic_settings.max_recv_udp_payload_size = MAX_SEND_UDP_PAYLOAD_SIZE;
 
     let params = ConnectionParams::new_client(quic_settings, None, Hooks::default());
 
@@ -876,8 +886,11 @@ pub fn spawn_h3_listener(
         kind: CertificateKind::X509,
     };
 
-    let conn_params =
-        ConnectionParams::new_server(Default::default(), tls_config, Default::default());
+    let mut quic_settings = QuicSettings::default();
+    quic_settings.max_send_udp_payload_size = MAX_SEND_UDP_PAYLOAD_SIZE;
+    quic_settings.max_recv_udp_payload_size = MAX_SEND_UDP_PAYLOAD_SIZE;
+
+    let conn_params = ConnectionParams::new_server(quic_settings, tls_config, Default::default());
 
     // Create tokio-quiche listener (infallible after socket is bound)
     let mut listeners = listen(
