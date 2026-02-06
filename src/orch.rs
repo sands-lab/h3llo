@@ -1539,16 +1539,12 @@ mod tests {
         let accepted = HashSet::from(["1.2.3.4".parse::<IpAddr>().unwrap()]);
         orch.update_accepted_sources(&accepted);
 
-        let cmd = handles
+        let BareUdpRxCommand::UpdateAcceptedSources(ips) = handles
             .bare_rx_cmd_rx
             .try_recv()
             .expect("accepted sources update expected");
-        match cmd {
-            BareUdpRxCommand::UpdateAcceptedSources(ips) => {
-                assert_eq!(ips.len(), 1);
-                assert!(ips.contains(&"1.2.3.4".parse().unwrap()));
-            }
-        }
+        assert_eq!(ips.len(), 1);
+        assert!(ips.contains(&"1.2.3.4".parse().unwrap()));
 
         // Routing command should NOT be sent
         assert!(handles.tun_cmd_rx.try_recv().is_err());
@@ -1593,16 +1589,12 @@ mod tests {
         orch.handle_event(event).await;
 
         // Accepted sources SHOULD be updated (unconditionally)
-        let cmd = handles
+        let BareUdpRxCommand::UpdateAcceptedSources(ips) = handles
             .bare_rx_cmd_rx
             .try_recv()
             .expect("accepted sources update expected");
-        match cmd {
-            BareUdpRxCommand::UpdateAcceptedSources(ips) => {
-                assert!(ips.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()));
-                assert!(ips.contains(&"5.6.7.8".parse::<IpAddr>().unwrap()));
-            }
-        }
+        assert!(ips.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()));
+        assert!(ips.contains(&"5.6.7.8".parse::<IpAddr>().unwrap()));
 
         // Routing should NOT be updated (no bounds change)
         assert!(handles.tun_cmd_rx.try_recv().is_err());
