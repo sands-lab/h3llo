@@ -177,18 +177,16 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
 /// - `::/0` is expanded into `::/1` and `8000::/1`.
 /// - Default routes emit a warning when split.
 fn expand_allowed_prefixes(allowed: &[IpNet]) -> HashSet<IpNet> {
-    let mut result = HashSet::new();
+    let mut result = HashSet::with_capacity(allowed.len() * 2);
 
     for &net in allowed {
-        if is_default_prefix(&net) {
+        if net.prefix_len() == 0 {
             warn!(prefix = %net, "default route split into two /1 prefixes");
-            if let Some(children) = split_default_prefix(&net) {
-                result.insert(children[0]);
-                result.insert(children[1]);
-            } else {
-                // Fallback: should never happen for a valid default route,
-                // but in case it does, keep the original prefix.
-                result.insert(net);
+            match split_default_prefix(&net) {
+                Some([a, b]) => result.extend([a, b]),
+                None => {
+                    result.insert(net);
+                }
             }
         } else {
             result.insert(net);
@@ -198,31 +196,13 @@ fn expand_allowed_prefixes(allowed: &[IpNet]) -> HashSet<IpNet> {
     result
 }
 
-/// Returns true when `net` represents a default route (IPv4 or IPv6).
-fn is_default_prefix(net: &IpNet) -> bool {
-    net.prefix_len() == 0
-}
-
-/// Splits a default route into two halves using `ipnet` helper APIs.
-///
-/// This keeps the behavior of splitting `0.0.0.0/0` / `::/0` into two /1 routes,
-/// but avoids manual bit-level arithmetic.
+/// Splits a `/0` default route into two `/1` halves.
 fn split_default_prefix(net: &IpNet) -> Option<[IpNet; 2]> {
-    match net {
-        IpNet::V4(v4) if v4.prefix_len() == 0 => {
-            let mut it = v4.subnets(1).ok()?;
-            let left = it.next()?;
-            let right = it.next()?;
-            Some([IpNet::V4(left), IpNet::V4(right)])
-        }
-        IpNet::V6(v6) if v6.prefix_len() == 0 => {
-            let mut it = v6.subnets(1).ok()?;
-            let left = it.next()?;
-            let right = it.next()?;
-            Some([IpNet::V6(left), IpNet::V6(right)])
-        }
-        _ => None,
+    if net.prefix_len() != 0 {
+        return None;
     }
+    let mut it = net.subnets(1).ok()?;
+    Some([it.next()?, it.next()?])
 }
 
 /// Resolves an interface index using the platform helper from `bind`.
