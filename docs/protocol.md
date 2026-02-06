@@ -115,10 +115,15 @@ BareUDP sends the inner IP packet directly as the UDP payload; there is no QUIC 
 
 #### MTU Guidance
 
-MTU summary: pick the lowest MTU across transports using IPv4/IPv6 figures per endpoint’s resolved family; default `1410` is safe for IPv6 CONNECT-IP, IPv4-only CONNECT-IP can go higher, BareUDP-only can go higher still, and mixed H3/BareUDP should stick to the H3 lower bound.
+MTU summary: pick the lowest MTU across transports using IPv4/IPv6 figures per endpoint's resolved family; default `1393` is safe for IPv6 CONNECT-IP over Ethernet (WAN MTU `1500`), IPv4-only CONNECT-IP can go higher, BareUDP-only can go higher still, and mixed H3/BareUDP should stick to the H3 lower bound.
 
-- CONNECT-IP overhead: 20/40 (outer IP) + 8 (UDP) + 25 (max QUIC Short) + 9 (max DATAGRAM frame) + 8 (max H3 datagram Context ID) = 70/90 bytes.
-    - With WAN MTU 1500: TUN MTU up to 1500 - 70 = 1430 (IPv4) and 1500 - 90 = 1410 (IPv6).
+- CONNECT-IP overhead per [RFC 9484 Section 7.2](https://datatracker.ietf.org/doc/html/rfc9484#section-7.2): the QUIC-internal encapsulation overhead is conservatively 59 bytes (51 base + 8 optional DATAGRAM Length field).
+    - Base breakdown (51B): 1B QUIC Short Header type + 20B max Destination Connection ID + 4B max packet number + 1B DATAGRAM frame type + 8B max Quarter Stream ID + 1B Context ID (0x00) + 16B AEAD authentication tag.
+    - Optional: DATAGRAM Length field ([RFC 9221](https://datatracker.ietf.org/doc/html/rfc9221) frame type 0x31) adds up to 8B variable-length integer encoding.
+    - Outer transport overhead: 28 bytes (IPv4: 20B IP + 8B UDP) or 48 bytes (IPv6: 40B IP + 8B UDP).
+    - Total overhead: 87 bytes (IPv4) or 107 bytes (IPv6).
+    - With WAN MTU 1500: TUN MTU up to 1500 − 59 − 28 = 1413 (IPv4) or 1500 − 59 − 48 = 1393 (IPv6).
+    - QUIC `max_send/recv_udp_payload_size` is set automatically to `TUN_MTU + 59`.
 - BareUDP overhead: 20/40 (outer IP) + 8 (UDP) = 28/48 bytes.
     - with WAN MTU 1500 and only BareUDP peers: TUN MTU up to 1472 (IPv4) and 1452 (IPv6).
 

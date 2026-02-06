@@ -47,12 +47,13 @@ use tracing::{debug, error, warn};
 /// Context ID for IP payloads per RFC 9484 (always 0 for CONNECT-IP).
 const CONTEXT_ID_IP: u8 = 0x00;
 
-/// Maximum QUIC packet size (UDP payload) assuming IPv4 WAN MTU 1500.
+/// Conservative CONNECT-IP encapsulation overhead in bytes per
+/// [RFC 9484 Section 7.2](https://datatracker.ietf.org/doc/html/rfc9484#section-7.2).
 ///
-/// tokio-quiche defaults to 1350, which is too conservative for typical
-/// deployments and silently drops DATAGRAM frames that exceed it.
-/// 1472 = 1500 (WAN MTU) - 20 (IPv4 header) - 8 (UDP header).
-const MAX_SEND_UDP_PAYLOAD_SIZE: usize = 1472;
+/// 51B base (QUIC v1 worst-case) + 8B optional DATAGRAM Length = 59B.
+/// See `docs/protocol.md` § MTU Guidance for the full byte-by-byte breakdown.
+/// QUIC `max_send/recv_udp_payload_size` = `TUN_MTU + CONNECT_IP_OVERHEAD`.
+const CONNECT_IP_OVERHEAD: usize = 59;
 
 // ========== Auth Helpers ==========
 
@@ -408,6 +409,7 @@ impl H3Connection {
 /// * `remote_addr` - Resolved target socket address (from DNS resolution).
 /// * `peer_id` - Remote peer ID.
 /// * `tun_if` - Optional TUN interface name to exclude from route probing.
+/// * `tun_mtu` - TUN interface MTU for deriving QUIC payload size.
 /// * `probe` - Route probe implementation for interface selection.
 ///
 /// # Errors
@@ -422,6 +424,7 @@ pub async fn dial_h3<P: RouteProbe>(
     remote_addr: SocketAddr,
     peer_id: &str,
     tun_if: Option<&str>,
+    tun_mtu: u16,
     probe: &P,
 ) -> Result<H3Connection, DialError> {
     // Extract endpoint fields - return error if None (listen-only peer)
@@ -446,6 +449,7 @@ pub async fn dial_h3<P: RouteProbe>(
     }
 
     // Configure QUIC settings
+    let quic_udp_payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
     let mut quic_settings = QuicSettings::default();
     quic_settings.max_idle_timeout = Some(H3_HANDSHAKE_TIMEOUT);
     // Only disable verification when explicitly requested (testing only)
@@ -453,8 +457,8 @@ pub async fn dial_h3<P: RouteProbe>(
         quic_settings.verify_peer = true;
     }
 
-    quic_settings.max_send_udp_payload_size = MAX_SEND_UDP_PAYLOAD_SIZE;
-    quic_settings.max_recv_udp_payload_size = MAX_SEND_UDP_PAYLOAD_SIZE;
+    quic_settings.max_send_udp_payload_size = quic_udp_payload_size;
+    quic_settings.max_recv_udp_payload_size = quic_udp_payload_size;
 
     let params = ConnectionParams::new_client(quic_settings, None, Hooks::default());
 
@@ -856,10 +860,12 @@ pub fn make_h3_listener(
 ///
 /// * `listener` - H3 listener state from `make_h3_listener`.
 /// * `peer_tokens` - Map of peer ID to expected token for authentication.
+/// * `tun_mtu` - TUN interface MTU for deriving QUIC payload size.
 /// * `events_tx` - Unbounded channel for emitting events to orchestrator.
 pub fn spawn_h3_listener(
     listener: H3Listener,
     mut peer_tokens: HashMap<String, String>,
+    tun_mtu: u16,
     events_tx: mpsc::UnboundedSender<Event>,
 ) -> (
     mpsc::UnboundedSender<H3ListenerCommand>,
@@ -884,9 +890,10 @@ pub fn spawn_h3_listener(
         kind: CertificateKind::X509,
     };
 
+    let quic_udp_payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
     let mut quic_settings = QuicSettings::default();
-    quic_settings.max_send_udp_payload_size = MAX_SEND_UDP_PAYLOAD_SIZE;
-    quic_settings.max_recv_udp_payload_size = MAX_SEND_UDP_PAYLOAD_SIZE;
+    quic_settings.max_send_udp_payload_size = quic_udp_payload_size;
+    quic_settings.max_recv_udp_payload_size = quic_udp_payload_size;
 
     let conn_params = ConnectionParams::new_server(quic_settings, tls_config, Default::default());
 
@@ -1220,6 +1227,7 @@ mod tests {
             "127.0.0.1:443".parse().unwrap(),
             "peer_id",
             None,
+            crate::config::default_mtu(),
             &probe,
         )
         .await;
@@ -1250,7 +1258,12 @@ mod tests {
             .expect("make_h3_listener");
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, handle, bound_addr) = spawn_h3_listener(listener, HashMap::new(), events_tx);
+        let (cmd_tx, handle, bound_addr) = spawn_h3_listener(
+            listener,
+            HashMap::new(),
+            crate::config::default_mtu(),
+            events_tx,
+        );
 
         // Verify bound address is valid
         assert_ne!(bound_addr.port(), 0);
@@ -1277,7 +1290,12 @@ mod tests {
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
-        let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(listener, peer_tokens, events_tx);
+        let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(
+            listener,
+            peer_tokens,
+            crate::config::default_mtu(),
+            events_tx,
+        );
 
         // Verify command channel is functional
         assert!(cmd_tx
@@ -1331,15 +1349,27 @@ mod tests {
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
-        let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_tokens, events_tx);
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
+            listener,
+            peer_tokens,
+            crate::config::default_mtu(),
+            events_tx,
+        );
 
         // Give listener time to bind
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
-        let client_result = dial_h3(&peer_h3, bound_addr, peer_id, None, &probe).await;
+        let client_result = dial_h3(
+            &peer_h3,
+            bound_addr,
+            peer_id,
+            None,
+            crate::config::default_mtu(),
+            &probe,
+        )
+        .await;
 
         assert!(
             client_result.is_ok(),
@@ -1385,15 +1415,27 @@ mod tests {
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make listener");
-        let (cmd_tx, _handle, bound_addr) = spawn_h3_listener(listener, peer_tokens, events_tx);
+        let (cmd_tx, _handle, bound_addr) = spawn_h3_listener(
+            listener,
+            peer_tokens,
+            crate::config::default_mtu(),
+            events_tx,
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
-        let _client_conn = dial_h3(&peer_h3, bound_addr, peer_id, None, &probe)
-            .await
-            .expect("dial");
+        let _client_conn = dial_h3(
+            &peer_h3,
+            bound_addr,
+            peer_id,
+            None,
+            crate::config::default_mtu(),
+            &probe,
+        )
+        .await
+        .expect("dial");
 
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
@@ -1427,15 +1469,27 @@ mod tests {
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
-        let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_tokens, events_tx);
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
+            listener,
+            peer_tokens,
+            crate::config::default_mtu(),
+            events_tx,
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // PeerH3 with intentionally wrong token
         let peer_h3 = test_peer_h3(bound_addr, "wrong-token-12ch");
         let probe = FakeRouteProbe::noop();
-        let result = dial_h3(&peer_h3, bound_addr, "test-client", None, &probe).await;
+        let result = dial_h3(
+            &peer_h3,
+            bound_addr,
+            "test-client",
+            None,
+            crate::config::default_mtu(),
+            &probe,
+        )
+        .await;
 
         match result {
             Err(DialError::Auth(_)) | Err(DialError::Rejected(401)) => {}
@@ -1473,14 +1527,26 @@ mod tests {
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
-        let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_tokens, events_tx);
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
+            listener,
+            peer_tokens,
+            crate::config::default_mtu(),
+            events_tx,
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let peer_h3 = test_peer_h3(bound_addr, "any-token-12chr");
         let probe = FakeRouteProbe::noop();
-        let result = dial_h3(&peer_h3, bound_addr, "unknown-peer", None, &probe).await;
+        let result = dial_h3(
+            &peer_h3,
+            bound_addr,
+            "unknown-peer",
+            None,
+            crate::config::default_mtu(),
+            &probe,
+        )
+        .await;
 
         assert!(matches!(
             result,
@@ -1507,16 +1573,27 @@ mod tests {
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
-        let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_tokens, listener_events_tx);
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
+            listener,
+            peer_tokens,
+            crate::config::default_mtu(),
+            listener_events_tx,
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
-        let client_conn = dial_h3(&peer_h3, bound_addr, peer_id, None, &probe)
-            .await
-            .expect("dial failed");
+        let client_conn = dial_h3(
+            &peer_h3,
+            bound_addr,
+            peer_id,
+            None,
+            crate::config::default_mtu(),
+            &probe,
+        )
+        .await
+        .expect("dial failed");
 
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = listener_events_rx.recv().await {
@@ -1583,16 +1660,27 @@ mod tests {
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
-        let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_tokens, listener_events_tx);
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
+            listener,
+            peer_tokens,
+            crate::config::default_mtu(),
+            listener_events_tx,
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
-        let client_conn = dial_h3(&peer_h3, bound_addr, peer_id, None, &probe)
-            .await
-            .expect("dial failed");
+        let client_conn = dial_h3(
+            &peer_h3,
+            bound_addr,
+            peer_id,
+            None,
+            crate::config::default_mtu(),
+            &probe,
+        )
+        .await
+        .expect("dial failed");
 
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = listener_events_rx.recv().await {
@@ -1671,16 +1759,27 @@ mod tests {
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
-        let (cmd_tx, listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_tokens, events_tx);
+        let (cmd_tx, listener_handle, bound_addr) = spawn_h3_listener(
+            listener,
+            peer_tokens,
+            crate::config::default_mtu(),
+            events_tx,
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
-        let _client_conn = dial_h3(&peer_h3, bound_addr, peer_id, None, &probe)
-            .await
-            .expect("dial failed");
+        let _client_conn = dial_h3(
+            &peer_h3,
+            bound_addr,
+            peer_id,
+            None,
+            crate::config::default_mtu(),
+            &probe,
+        )
+        .await
+        .expect("dial failed");
 
         let _server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
@@ -1702,6 +1801,17 @@ mod tests {
         assert!(
             matches!(result, Ok(Ok(Ok(())))),
             "listener should shutdown gracefully"
+        );
+    }
+
+    #[test]
+    fn default_mtu_fits_ipv6_ethernet() {
+        // Verify: default TUN MTU + CONNECT-IP overhead + IPv6/UDP headers <= 1500
+        let default_mtu: usize = crate::config::default_mtu() as usize;
+        let total = default_mtu + CONNECT_IP_OVERHEAD + 48;
+        assert!(
+            total <= 1500,
+            "default MTU {total} exceeds 1500-byte Ethernet frame"
         );
     }
 }

@@ -79,7 +79,6 @@ local:
     ifname: tun0
     addrs:
       - {tun_addr}
-    mtu: 1400
   dns:
     server: udp://127.0.0.11:53
     refresh: 1

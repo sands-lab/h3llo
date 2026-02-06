@@ -23,7 +23,6 @@ local:
     ifname: tun0
     addrs:
       - 10.0.0.1/32
-    mtu: 1400
   dns:
     server: udp://127.0.0.11:53
     refresh: 1
@@ -49,7 +48,6 @@ local:
     ifname: tun0
     addrs:
       - 10.0.0.2/32
-    mtu: 1400
   dns:
     server: udp://127.0.0.11:53
     refresh: 1
@@ -182,7 +180,6 @@ local:
     ifname: tun0
     addrs:
       - 10.0.0.3/32
-    mtu: 1400
   dns:
     server: udp://127.0.0.11:53
     refresh: 1
@@ -206,7 +203,6 @@ local:
     ifname: tun0
     addrs:
       - 10.0.0.1/32
-    mtu: 1400
   dns:
     server: udp://127.0.0.11:53
     refresh: 1
@@ -287,8 +283,8 @@ peers:
 
 /// Integration test: MTU boundary checks.
 ///
-/// Verifies that packets at the configured MTU (1400) pass through while
-/// oversized packets are dropped when DF (Don't Fragment) is set.
+/// Verifies that packets at the default MTU pass through while oversized
+/// packets are dropped when DF (Don't Fragment) is set.
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_mtu_boundary_drop() {
@@ -303,7 +299,6 @@ local:
     ifname: tun0
     addrs:
       - 10.0.0.1/32
-    mtu: 1400
   dns:
     server: udp://127.0.0.11:53
     refresh: 1
@@ -326,7 +321,6 @@ local:
     ifname: tun0
     addrs:
       - 10.0.0.2/32
-    mtu: 1400
   dns:
     server: udp://127.0.0.11:53
     refresh: 1
@@ -381,17 +375,31 @@ peers:
     // Wait for DNS refresh cycles to resolve both peers (1s interval + buffer)
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Ping with payload fitting within MTU: 1400 - 20 (IP hdr) - 8 (ICMP hdr) = 1372 bytes
+    // Compute ping payload sizes from default MTU.
+    // Max payload = MTU - 20 (IP hdr) - 8 (ICMP hdr).
+    let mtu = h3llo::config::default_mtu() as u16;
+    let ok_payload = (mtu - 20 - 8).to_string();
+    let exceed_payload = mtu.to_string();
+
     let mut ping_ok = node_a
         .exec(testcontainers::core::ExecCommand::new([
-            "ping", "-c", "2", "-W", "2", "-s", "1372", "-M", "do", "10.0.0.2",
+            "ping",
+            "-c",
+            "2",
+            "-W",
+            "2",
+            "-s",
+            ok_payload.as_str(),
+            "-M",
+            "do",
+            "10.0.0.2",
         ]))
         .await
         .expect("exec ping mtu-ok");
     let ping_ok_out = ping_ok.stdout_to_vec().await.unwrap();
     let exit_ok = ping_ok.exit_code().await.unwrap();
     println!(
-        "Ping MTU-ok (1372 bytes payload):\n{}",
+        "Ping MTU-ok ({ok_payload} bytes payload):\n{}",
         String::from_utf8_lossy(&ping_ok_out)
     );
     assert_eq!(
@@ -403,14 +411,23 @@ peers:
     // Ping with payload exceeding MTU (DF set, should be dropped)
     let mut ping_big = node_a
         .exec(testcontainers::core::ExecCommand::new([
-            "ping", "-c", "2", "-W", "2", "-s", "1400", "-M", "do", "10.0.0.2",
+            "ping",
+            "-c",
+            "2",
+            "-W",
+            "2",
+            "-s",
+            exceed_payload.as_str(),
+            "-M",
+            "do",
+            "10.0.0.2",
         ]))
         .await
         .expect("exec ping mtu-exceed");
     let ping_big_out = ping_big.stdout_to_vec().await.unwrap();
     let exit_big = ping_big.exit_code().await.unwrap();
     println!(
-        "Ping MTU-exceed (1400 bytes payload, should fail):\n{}",
+        "Ping MTU-exceed ({exceed_payload} bytes payload, should fail):\n{}",
         String::from_utf8_lossy(&ping_big_out)
     );
     assert_ne!(
