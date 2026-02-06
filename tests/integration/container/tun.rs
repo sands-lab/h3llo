@@ -6,6 +6,7 @@
 //!
 //! Exit code 0 = all checks passed, 1 = failure.
 
+use ipnet::IpNet;
 use std::process::{Command, Stdio};
 use tokio::process::Command as AsyncCommand;
 
@@ -59,7 +60,7 @@ async fn run_checks() -> Result<(), String> {
 async fn check_device_creation() -> Result<(), String> {
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun0".to_string(),
-        addrs: vec!["10.99.0.1".parse().unwrap()],
+        addrs: vec!["10.99.0.1/32".parse().unwrap()],
         mtu: 1400,
     };
 
@@ -95,17 +96,18 @@ fn has_ipv6_support() -> bool {
 
 /// Verifies multiple IPv4 (and IPv6 if available) addresses are assigned correctly.
 async fn check_multi_address() -> Result<(), String> {
-    use std::net::IpAddr;
-
     let ipv6_available = has_ipv6_support();
     if !ipv6_available {
         eprintln!("  note: IPv6 not available, testing IPv4 only");
     }
 
-    let mut addrs: Vec<IpAddr> = vec!["10.99.1.1".parse().unwrap(), "10.99.1.2".parse().unwrap()];
+    let mut addrs: Vec<IpNet> = vec![
+        "10.99.1.1/32".parse().unwrap(),
+        "10.99.1.2/32".parse().unwrap(),
+    ];
     if ipv6_available {
-        addrs.push("fd99::1".parse().unwrap());
-        addrs.push("fd99::2".parse().unwrap());
+        addrs.push("fd99::1/128".parse().unwrap());
+        addrs.push("fd99::2/128".parse().unwrap());
     }
 
     let local_tun = h3llo::config::LocalTun {
@@ -127,8 +129,11 @@ async fn check_multi_address() -> Result<(), String> {
     eprintln!("  ip addr show itun1:\n{stdout}");
 
     for expected in &addrs {
-        if !stdout.contains(&expected.to_string()) {
-            return Err(format!("multi_address: missing address {expected}"));
+        // Match full CIDR notation (e.g., "10.99.1.1/32") to avoid false positives
+        // from substring matches (e.g., "10.99.1.1" matching "10.99.1.10").
+        let addr_str = expected.to_string();
+        if !stdout.contains(&addr_str) {
+            return Err(format!("multi_address: missing address {addr_str}"));
         }
     }
 
@@ -146,7 +151,7 @@ async fn check_send_recv() -> Result<(), String> {
 
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun3".to_string(),
-        addrs: vec!["10.99.3.1".parse().unwrap()],
+        addrs: vec!["10.99.3.1/32".parse().unwrap()],
         mtu: 1400,
     };
 
@@ -276,7 +281,7 @@ fn internet_checksum(data: &[u8]) -> u16 {
 async fn check_mtu_configuration() -> Result<(), String> {
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun2".to_string(),
-        addrs: vec!["10.99.2.1".parse().unwrap()],
+        addrs: vec!["10.99.2.1/32".parse().unwrap()],
         mtu: 1280,
     };
 

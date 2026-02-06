@@ -12,6 +12,7 @@ h3llo is a lightweight overlay network that rides on standard HTTP/3 (MASQUE/CON
 - Zero-downtime updates: atomic peer/routing refresh without disrupting active traffic.
 - Two protocols: encrypted HTTP/3 by default; BareUDP as an opt-in, high-throughput plaintext path for trusted networks.
 - Routing aware: longest-prefix routing per peer; optional system route updates.
+- Preliminary multipath support: route different subnets through different transports (BareUDP for low-latency, H3 for encrypted paths).
 
 ## Quick Start
 
@@ -27,7 +28,7 @@ local:
   tun:
     ifname: h3llo0
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/24
 peers:
 - id: example-node-2
   h3:
@@ -42,7 +43,7 @@ local:
   tun:
     ifname: h3llo0
     addrs:
-      - 192.168.180.2
+      - 192.168.180.2/24
 peers:
 - id: example-node-1
   h3:

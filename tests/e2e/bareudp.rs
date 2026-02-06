@@ -22,7 +22,7 @@ local:
   tun:
     ifname: tun0
     addrs:
-      - 10.0.0.1
+      - 10.0.0.1/32
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
@@ -48,7 +48,7 @@ local:
   tun:
     ifname: tun0
     addrs:
-      - 10.0.0.2
+      - 10.0.0.2/32
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
@@ -181,7 +181,7 @@ local:
   tun:
     ifname: tun0
     addrs:
-      - 10.0.0.3
+      - 10.0.0.3/32
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
@@ -205,7 +205,7 @@ local:
   tun:
     ifname: tun0
     addrs:
-      - 10.0.0.1
+      - 10.0.0.1/32
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
@@ -302,7 +302,7 @@ local:
   tun:
     ifname: tun0
     addrs:
-      - 10.0.0.1
+      - 10.0.0.1/32
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53
@@ -325,7 +325,7 @@ local:
   tun:
     ifname: tun0
     addrs:
-      - 10.0.0.2
+      - 10.0.0.2/32
     mtu: 1400
   dns:
     server: udp://127.0.0.11:53

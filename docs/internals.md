@@ -230,9 +230,15 @@ Route update summary: keep the TUN interface’s routes aligned with `peers[].tu
 
 ### Longest-Prefix-Match Algorithm
 
-LPM summary: reuse WireGuard’s longest-prefix-match behavior when choosing peers for IP packets.
+LPM summary: reuse WireGuard's longest-prefix-match behavior when choosing peers for IP packets.
 
 h3llo should use the same longest-prefix-match algorithm as WireGuard when matching entries in the internal routing table.
+
+### Multipath Support (Preliminary)
+
+h3llo supports routing different subnets through different transport peers. Each peer can be configured with either BareUDP or H3 transport, and different `allowedIPs` prefixes can be assigned to different peers. The routing table uses longest-prefix matching to forward packets to the appropriate peer based on destination IP.
+
+Route deduplication: when synchronizing system routes, if a TUN address prefix (from `local.tun.addrs`) exactly matches a desired route (from peer `allowedIPs`), h3llo avoids tracking it as a separate TUN address route since the desired route already covers it.
 
 ### Observability
 

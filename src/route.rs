@@ -1,11 +1,10 @@
 //! System route synchronization using route_manager.
 use crate::bind::lookup_ifindex;
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use ipnet::IpNet;
 use route_manager::AsyncRouteManager;
 pub use route_manager::Route;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io;
-use std::net::IpAddr;
 use thiserror::Error;
 use tracing::warn;
 
@@ -86,13 +85,13 @@ pub enum RouteSyncError {
 /// Synchronizes system routes for the TUN interface.
 ///
 /// Final semantics:
-/// - Routes on the TUN interface will be exactly:
-///   * all prefixes derived from `allowed`
-///     - default routes (`0.0.0.0/0` / `::/0`) are expanded into two /1 prefixes,
-///   * plus the exact prefixes listed in `tun_addrs` (these are preserved but never added).
-/// - Any other route currently on the TUN interface is considered stale and will be deleted.
-/// - For every prefix we add that is already present on another interface, a conflict
-///   warning is logged, but the add is still attempted.
+/// - Routes derived from `allowed` (default routes expanded into two /1 prefixes)
+///   are actively added/preserved on the TUN interface.
+/// - OS-managed routes from `tun_addrs` are preserved but never added. For each TUN
+///   address (e.g., `10.0.0.1/24`), both the network prefix (`10.0.0.0/24`) and the
+///   host route (`10.0.0.1/32`) are protected from deletion.
+/// - Any other route on the TUN interface is considered stale and will be deleted.
+/// - If a desired prefix already exists on another interface, a conflict warning is logged.
 /// - Failures when adding or deleting are logged as warnings.
 pub async fn sync_tun_routes<H: RouteHandle>(
     tun_if: &str,
@@ -118,24 +117,19 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
         .await
         .map_err(|err| RouteSyncError::ListFailed(err.to_string()))?;
 
-    // Expand allowed prefixes, splitting default routes once into two /1 prefixes.
-    //
-    // These are the prefixes we *want to route through the TUN*.
     let desired_routes: HashSet<IpNet> = expand_allowed_prefixes(allowed);
 
-    // Prefixes that must exist on the TUN interface when we are done:
-    // - desired_routes (from allowed + default split),
-    // - plus tun_addrs (interface address routes).
-    let tun_addr_set: HashSet<IpNet> = tun_addrs.iter().cloned().collect();
-    let mut existing_tun: HashSet<IpNet> = HashSet::new();
-    let mut conflicts: HashMap<IpNet, u32> = HashMap::new();
+    // OS-managed routes to preserve (never added, only protected from deletion).
+    // For each TUN address (e.g., 192.168.1.2/24), include both:
+    // - the network prefix (192.168.1.0/24) — kernel connected route
+    // - the host address (192.168.1.2/32) — kernel host route
+    let tun_addr_set: HashSet<IpNet> = tun_addrs
+        .iter()
+        .flat_map(|addr| [addr.trunc(), addr.addr().into()])
+        .collect();
 
-    // Single pass over all routes:
-    // - For TUN routes:
-    //   * keep if net in keep_set (record in existing_tun),
-    //   * otherwise delete.
-    // - For non-TUN routes:
-    //   * record as potential conflicts (prefix -> first seen ifindex).
+    let mut existing_routes: HashSet<IpNet> = HashSet::new();
+
     for route in &routes {
         let Some(net) = ipnet_from_route(route) else {
             warn!(
@@ -145,48 +139,31 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
             continue;
         };
 
-        match route.if_index() {
-            Some(idx) if idx == tun_ifindex => {
-                // Route on the TUN interface.
-                if desired_routes.contains(&net) || tun_addr_set.contains(&net) {
-                    existing_tun.insert(net);
-                } else if let Err(err) = handle.delete(route).await {
-                    warn!(prefix = %net, error = %err, "route delete failed");
-                }
+        if desired_routes.contains(&net) || tun_addr_set.contains(&net) {
+            if route.if_index() == Some(tun_ifindex) {
+                existing_routes.insert(net);
+            } else {
+                let ifindex = route
+                    .if_index()
+                    .map_or("unknown".to_string(), |i| i.to_string());
+                warn!(prefix = %net, existing_ifindex = ifindex, "route conflict with existing interface");
             }
-            Some(idx) => {
-                // Route on some other interface: track as a potential conflict.
-                conflicts.entry(net).or_insert(idx);
-            }
-            None => {
-                // Route without ifindex: we cannot attribute it reliably; ignore.
-                warn!(prefix = %net, "route missing ifindex, skipped");
+        } else if route.if_index() == Some(tun_ifindex) {
+            if let Err(err) = handle.delete(route).await {
+                warn!(prefix = %net, error = %err, "route delete failed");
             }
         }
     }
 
-    // Add missing desired routes on the TUN interface.
-    //
-    // Note:
-    // - We only add prefixes from `desired_routes` (i.e. from `allowed`), not from `tun_addrs`.
-    //   Interface address routes are assumed to be managed by the OS.
-    for net in desired_routes.iter().cloned() {
-        if existing_tun.contains(&net) {
+    // Add missing desired routes. tun_addr_set routes are OS-managed, never added by us.
+    for net in &desired_routes {
+        if existing_routes.contains(net) {
             continue;
         }
 
-        if let Some(&ifindex) = conflicts.get(&net) {
-            warn!(prefix = %net, existing_ifindex = ifindex, "route conflict with existing interface");
-        }
-
         let route = Route::new(net.addr(), net.prefix_len()).with_if_index(tun_ifindex);
-        match handle.add(&route).await {
-            Ok(_) => {
-                existing_tun.insert(net);
-            }
-            Err(err) => {
-                warn!(prefix = %net, error = %err, "route add failed");
-            }
+        if let Err(err) = handle.add(&route).await {
+            warn!(prefix = %net, error = %err, "route add failed");
         }
     }
 
@@ -200,18 +177,16 @@ pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
 /// - `::/0` is expanded into `::/1` and `8000::/1`.
 /// - Default routes emit a warning when split.
 fn expand_allowed_prefixes(allowed: &[IpNet]) -> HashSet<IpNet> {
-    let mut result = HashSet::new();
+    let mut result = HashSet::with_capacity(allowed.len() * 2);
 
     for &net in allowed {
-        if is_default_prefix(&net) {
+        if net.prefix_len() == 0 {
             warn!(prefix = %net, "default route split into two /1 prefixes");
-            if let Some(children) = split_default_prefix(&net) {
-                result.insert(children[0]);
-                result.insert(children[1]);
-            } else {
-                // Fallback: should never happen for a valid default route,
-                // but in case it does, keep the original prefix.
-                result.insert(net);
+            match split_default_prefix(&net) {
+                Some([a, b]) => result.extend([a, b]),
+                None => {
+                    result.insert(net);
+                }
             }
         } else {
             result.insert(net);
@@ -221,31 +196,13 @@ fn expand_allowed_prefixes(allowed: &[IpNet]) -> HashSet<IpNet> {
     result
 }
 
-/// Returns true when `net` represents a default route (IPv4 or IPv6).
-fn is_default_prefix(net: &IpNet) -> bool {
-    net.prefix_len() == 0
-}
-
-/// Splits a default route into two halves using `ipnet` helper APIs.
-///
-/// This keeps the behavior of splitting `0.0.0.0/0` / `::/0` into two /1 routes,
-/// but avoids manual bit-level arithmetic.
+/// Splits a `/0` default route into two `/1` halves.
 fn split_default_prefix(net: &IpNet) -> Option<[IpNet; 2]> {
-    match net {
-        IpNet::V4(v4) if v4.prefix_len() == 0 => {
-            let mut it = v4.subnets(1).ok()?;
-            let left = it.next()?;
-            let right = it.next()?;
-            Some([IpNet::V4(left), IpNet::V4(right)])
-        }
-        IpNet::V6(v6) if v6.prefix_len() == 0 => {
-            let mut it = v6.subnets(1).ok()?;
-            let left = it.next()?;
-            let right = it.next()?;
-            Some([IpNet::V6(left), IpNet::V6(right)])
-        }
-        _ => None,
+    if net.prefix_len() != 0 {
+        return None;
     }
+    let mut it = net.subnets(1).ok()?;
+    Some([it.next()?, it.next()?])
 }
 
 /// Resolves an interface index using the platform helper from `bind`.
@@ -258,10 +215,7 @@ fn resolve_ifindex(name: &str) -> Result<u32, RouteSyncError> {
 
 /// Converts a `route_manager::Route` into `IpNet` when the address family is supported.
 pub fn ipnet_from_route(route: &Route) -> Option<IpNet> {
-    match route.destination() {
-        IpAddr::V4(addr) => Ipv4Net::new(addr, route.prefix()).ok().map(IpNet::V4),
-        IpAddr::V6(addr) => Ipv6Net::new(addr, route.prefix()).ok().map(IpNet::V6),
-    }
+    IpNet::new(route.destination(), route.prefix()).ok()
 }
 
 #[cfg(test)]
@@ -418,7 +372,7 @@ mod tests {
         assert_eq!(handle.ops(), vec!["add 192.168.0.0/24"]);
         assert!(logs_contain("route conflict"));
         assert!(logs_contain("192.168.0.0/24"));
-        assert!(logs_contain("existing_ifindex=2"));
+        assert!(logs_contain("existing_ifindex=\"2\""));
     }
 
     #[tokio::test]
@@ -435,8 +389,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(handle.ops(), vec!["add 10.0.0.0/24"]);
-        assert!(logs_contain("route missing ifindex"));
-        assert!(logs_contain("10.0.0.0/24"));
+        assert!(logs_contain("route conflict"));
+        assert!(logs_contain("existing_ifindex=\"unknown\""));
     }
 
     #[tokio::test]
@@ -563,5 +517,80 @@ mod tests {
         assert!(logs_contain("10.9.0.0/16"));
         assert!(logs_contain("route add failed"));
         assert!(logs_contain("10.8.0.0/16"));
+    }
+
+    // ========== TUN address preservation tests ==========
+
+    #[tokio::test]
+    #[traced_test]
+    /// Kernel connected route (network prefix) preserved via tun_addr_set.
+    async fn kernel_connected_route_preserved() {
+        let resolver = FakeResolver { idx: 10 };
+        // Kernel creates 192.168.1.0/24 when TUN addr is 192.168.1.2/24
+        let mut handle = FakeHandle::new(vec![route("192.168.1.0/24", Some(10))]);
+        let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
+        let allowed: Vec<IpNet> = vec![];
+
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        // Kernel route preserved, not deleted or re-added
+        assert!(handle.ops().is_empty());
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// Kernel host route (/32) preserved via tun_addr_set.
+    async fn kernel_host_route_preserved() {
+        let resolver = FakeResolver { idx: 10 };
+        // Kernel creates host route 192.168.1.2/32 for the assigned address
+        let mut handle = FakeHandle::new(vec![route("192.168.1.2/32", Some(10))]);
+        let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
+        let allowed: Vec<IpNet> = vec![];
+
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        assert!(handle.ops().is_empty());
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// TUN addr routes are preserved but NOT actively added — only allowed routes are added.
+    async fn tun_addr_routes_not_added() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![]);
+        let tun_addrs: Vec<IpNet> = vec!["10.0.0.1/24".parse().unwrap()];
+        let allowed: Vec<IpNet> = vec!["192.168.1.0/24".parse().unwrap()];
+
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        // Only allowed route added; tun_addr routes are OS-managed, not added by us
+        assert_eq!(handle.ops(), vec!["add 192.168.1.0/24"]);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// Both kernel routes (connected + host) and allowed routes are preserved together.
+    async fn mixed_tun_and_allowed_routes_preserved() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![
+            route("192.168.1.0/24", Some(10)), // kernel connected route
+            route("192.168.1.2/32", Some(10)), // kernel host route
+            route("10.0.0.0/8", Some(10)),     // allowed route
+        ]);
+        let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
+        let allowed: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+
+        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        // All routes already exist, no operations
+        assert!(handle.ops().is_empty());
     }
 }

@@ -339,19 +339,17 @@ pub enum RoutingError {
     },
 }
 
-/// Groups pre-parsed IP addresses by version, converting to host-prefix networks.
-fn split_addrs_by_version(addrs: &[IpAddr]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
+/// Groups pre-parsed CIDR networks by IP version.
+fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
     for addr in addrs {
         match addr {
-            IpAddr::V4(ip) => {
-                // SAFETY: /32 prefix is always valid for IPv4
-                v4.push(Ipv4Net::new(*ip, 32).unwrap());
+            IpNet::V4(net) => {
+                v4.push(*net);
             }
-            IpAddr::V6(ip) => {
-                // SAFETY: /128 prefix is always valid for IPv6
-                v6.push(Ipv6Net::new(*ip, 128).unwrap());
+            IpNet::V6(net) => {
+                v6.push(*net);
             }
         }
     }
@@ -658,18 +656,18 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
-    async fn splits_addresses_and_normalizes_to_host_prefix() {
-        let addrs: Vec<IpAddr> = vec![
-            "192.168.1.1".parse().unwrap(),
-            "2001:db8::1".parse().unwrap(),
+    async fn splits_addresses_and_preserves_prefix_length() {
+        let addrs: Vec<IpNet> = vec![
+            "192.168.1.0/24".parse().unwrap(),
+            "2001:db8::/64".parse().unwrap(),
         ];
         let (v4, v6) = split_addrs_by_version(&addrs);
         assert_eq!(v4.len(), 1);
-        assert_eq!(v4[0].addr(), Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(v4[0].prefix_len(), 32);
+        assert_eq!(v4[0].addr(), Ipv4Addr::new(192, 168, 1, 0));
+        assert_eq!(v4[0].prefix_len(), 24);
         assert_eq!(v6.len(), 1);
-        assert_eq!(v6[0].addr(), "2001:db8::1".parse::<Ipv6Addr>().unwrap());
-        assert_eq!(v6[0].prefix_len(), 128);
+        assert_eq!(v6[0].addr(), "2001:db8::".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(v6[0].prefix_len(), 64);
     }
 
     #[tokio::test]

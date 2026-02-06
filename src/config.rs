@@ -93,9 +93,9 @@ pub struct LocalTun {
     /// TUN interface name (default: h3llo0).
     #[serde(default = "default_ifname")]
     pub ifname: String,
-    /// TUN addresses without prefixes (IPv4/IPv6, required). Parsed as `IpAddr` during deserialization.
-    #[serde(deserialize_with = "deserialize_ip_addrs")]
-    pub addrs: Vec<IpAddr>,
+    /// TUN addresses with CIDR prefixes (IPv4/IPv6, required).
+    /// Example: `192.168.180.1/24`, `2001:db8::1/64`
+    pub addrs: Vec<IpNet>,
     /// TUN MTU (default: 1410).
     #[serde(default = "default_mtu")]
     pub mtu: u16,
@@ -407,24 +407,6 @@ fn default_mtu() -> u16 {
     1410
 }
 
-/// Deserializes a list of IP address strings into `Vec<IpAddr>`.
-///
-/// Validates each entry is a valid IP address (not CIDR notation).
-fn deserialize_ip_addrs<'de, D>(deserializer: D) -> Result<Vec<IpAddr>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw_addrs: Vec<String> = Vec::deserialize(deserializer)?;
-    raw_addrs
-        .into_iter()
-        .enumerate()
-        .map(|(idx, addr)| {
-            addr.parse::<IpAddr>()
-                .map_err(|e| de::Error::custom(format!("addrs[{}] '{}': {}", idx, addr, e)))
-        })
-        .collect()
-}
-
 /// Deserializes a DNS server from a `udp://` URI string to `SocketAddr`.
 fn deserialize_dns_server<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
 where
@@ -654,7 +636,7 @@ mod tests {
                 bare: None,
                 tun: LocalTun {
                     ifname: "h3llo0".to_string(),
-                    addrs: vec!["192.168.180.1".parse().unwrap()],
+                    addrs: vec!["192.168.180.1/32".parse().unwrap()],
                     mtu: 1410,
                 },
             },
@@ -947,7 +929,7 @@ local:
     key: ./key.pem
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 peers:
 - id: example-node-2
   h3:
@@ -985,7 +967,7 @@ local:
     server: udp://8.8.8.8:53
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 peers:
 - id: example-node-2
   h3:
@@ -1109,7 +1091,7 @@ local:
   h3: {}
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 peers:
 - id: remote-peer
   h3:
@@ -1137,7 +1119,7 @@ local:
     key: ./key.pem
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 peers:
 - id: example-node-2
   h3:
@@ -1223,7 +1205,7 @@ local:
     listen: not-a-valid-uri
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 "#;
         let result = Config::load_from_str(yaml);
         assert!(matches!(result, Err(ConfigError::Parse(_))));
@@ -1235,7 +1217,7 @@ local:
 local:
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 "#;
         let result = Config::load_from_str(yaml);
         assert!(matches!(
@@ -1248,19 +1230,19 @@ local:
     // ========== Parse-at-deserialization tests ==========
 
     #[test]
-    fn deserializes_local_tun_addrs_as_ip_addr() {
+    fn deserializes_local_tun_addrs_as_ipnet() {
         let yaml = r#"
 local:
   h3: {}
   tun:
     addrs:
-      - 192.168.180.1
-      - 2001:db8::1
+      - 192.168.180.0/24
+      - 2001:db8::/64
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.local.tun.addrs.len(), 2);
-        assert!(cfg.local.tun.addrs[0].is_ipv4());
-        assert!(cfg.local.tun.addrs[1].is_ipv6());
+        assert_eq!(cfg.local.tun.addrs[0].prefix_len(), 24);
+        assert_eq!(cfg.local.tun.addrs[1].prefix_len(), 64);
     }
 
     #[test]
@@ -1270,23 +1252,26 @@ local:
   h3: {}
   tun:
     addrs:
-      - not-an-ip
+      - not-a-cidr
 "#;
         let result = Config::load_from_str(yaml);
         assert!(matches!(result, Err(ConfigError::Parse(_))));
     }
 
     #[test]
-    fn rejects_cidr_in_tun_addrs_at_parse_time() {
+    fn accepts_cidr_in_tun_addrs() {
         let yaml = r#"
 local:
   h3: {}
   tun:
     addrs:
       - 192.168.180.1/32
+      - 10.0.0.0/24
 "#;
-        let result = Config::load_from_str(yaml);
-        assert!(matches!(result, Err(ConfigError::Parse(_))));
+        let cfg = Config::load_from_str(yaml).expect("CIDR should be accepted");
+        assert_eq!(cfg.local.tun.addrs.len(), 2);
+        assert_eq!(cfg.local.tun.addrs[0].prefix_len(), 32);
+        assert_eq!(cfg.local.tun.addrs[1].prefix_len(), 24);
     }
 
     #[test]
@@ -1296,7 +1281,7 @@ local:
   h3: {}
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 peers:
 - id: example-node-2
   h3:
@@ -1319,7 +1304,7 @@ local:
   h3: {}
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 peers:
 - id: example-node-2
   h3:
@@ -1341,7 +1326,7 @@ local:
     server: udp://8.8.8.8:53
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.local.dns.server.ip().to_string(), "8.8.8.8");
@@ -1357,7 +1342,7 @@ local:
     server: tcp://8.8.8.8:53
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 "#;
         let result = Config::load_from_str(yaml);
         assert!(matches!(result, Err(ConfigError::Parse(_))));
@@ -1372,7 +1357,7 @@ local:
     server: udp://8.8.8.8:53
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         let serialized = serde_yaml::to_string(&cfg).expect("should serialize");
@@ -1390,7 +1375,7 @@ local:
     server: udp://[2001:4860:4860::8888]:53
   tun:
     addrs:
-      - 192.168.180.1
+      - 192.168.180.1/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         let serialized = serde_yaml::to_string(&cfg).expect("should serialize");
