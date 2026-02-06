@@ -4,7 +4,6 @@ This page shows a full configuration sample, then explains each field and its de
 
 ```yaml
 local:
-  id: example-node-2 # required
   table: true # optional, default: true (manage system routes)
   dns: # optional
     server: udp://1.1.1.1:53 # optional, default: udp://1.1.1.1:53
@@ -28,7 +27,7 @@ peers: # optional, default: []
 - id: example-node-1
   enabled: true # optional, default: true
   h3: # optional, conflicts with peers.bare; endpoint optional (listen-only if omitted)
-    secret: example-secret # required whenever peers[].h3 is set (including listen-only)
+    token: example-token-12ch # required whenever peers[].h3 is set (minimum 12 characters)
     endpoint: https://node1.example.com:443/path # optional; omit for listen-only
     ca: ./ca.pem # optional
     insecure: false # optional, default: false
@@ -43,7 +42,6 @@ peers: # optional, default: []
 
 ## Field notes
 
-- `local.id`: Unique node identifier validated by peers; must be globally unique; use a string of at least 6 characters.
 - `peers` (default `[]`): Optional peer list; omit entirely when running standalone.
 - `local.h3` (optional): Enables HTTP/3 transport. When `local.h3.listen` is set, `cert` and `key` are required. When `listen` is omitted, the node operates in dial-only mode (can connect to peers but not accept inbound connections).
 - `local.bare` (optional): When present, `local.bare.listen` is required.
@@ -59,8 +57,8 @@ peers: # optional, default: []
 - `local.tun.addrs` (required): Host IP assignments (IPv4/IPv6, dual-stack, multiple addresses) for the TUN interface; h3llo applies `/32` or `/128` automatically. Extra system routes come from `peers[].tun.allowedIPs` when `local.table=true`.
 - `local.tun.mtu` (default `1410`): MTU for the TUN interface; see `docs/protocol.md` for sizing guidance.
 - `peers[]`: Remote peer entries.
-- `peers[].id`: Remote node ID; must match the peer’s `local.id`.
-- `peers[].h3.secret`: Remote peer authentication secret; required (and must be longer than 8 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. HTTP Basic Auth for CONNECT uses `username = remote local.id` and `password = peers[username].h3.secret` on the server side; clients send `password = peers[target].h3.secret`.
+- `peers[].id`: Remote peer identifier; must be unique within the configuration and non-empty.
+- `peers[].h3.token`: Remote peer authentication token; required (and must be at least 12 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. Must be unique across all peers. Bearer Token auth for CONNECT uses `Authorization: Bearer <token>`; server matches tokens to identify peers.
 - `peers[].enabled` (default `true`): Whether this peer entry is active.
 - `peers[].h3.endpoint` (optional): HTTP/3 dialing address (scheme/host/port/path); omit to wait for inbound HTTP/3 from the peer. Mutually exclusive with `peers[].bare`.
 - `peers[].h3.bindif` (optional): Interface for HTTP/3 dialer. When omitted, auto-detects at most one interface. Probe/bind fallbacks and recursive-routing warnings are described in `docs/internals.md`.

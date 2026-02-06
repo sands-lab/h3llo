@@ -1,18 +1,18 @@
 ## Protocol
 
-Protocol overview: HTTP Basic Auth with per-peer secrets, HTTP/3 CONNECT-IP as the encrypted default path, BareUDP as an optional fast path, and POST-driven admin rotation plus peer refresh on the shared HTTP path. Runtime connection selection and binding behavior are detailed in `docs/internals.md`.
+Protocol overview: HTTP Bearer Token Auth with per-peer tokens for CONNECT-IP, HTTP/3 CONNECT-IP as the encrypted default path, BareUDP as an optional fast path, and POST-driven admin rotation plus peer refresh on the shared HTTP path. Runtime connection selection and binding behavior are detailed in `docs/internals.md`.
 
-h3llo uses HTTP Basic Auth for authentication and a subset of MASQUE/CONNECT-IP ([RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484)) to encapsulate IP packets and deliver them to peers.
+h3llo uses HTTP Bearer Token Auth (per [RFC 6750](https://datatracker.ietf.org/doc/html/rfc6750)) for CONNECT-IP authentication and a subset of MASQUE/CONNECT-IP ([RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484)) to encapsulate IP packets and deliver them to peers.
 
 ### Authentication
 
-Authentication summary: CONNECT and GET/POST all ride the same HTTP path and require Basic Auth; CONNECT uses per-peer secrets, while control-plane GET/POST use dedicated admin credentials. HTTP requests do not apply source-IP filtering (unlike BareUDP).
+Authentication summary: CONNECT uses Bearer Token auth with per-peer tokens; control-plane GET/POST use Basic Auth with dedicated admin credentials. HTTP requests do not apply source-IP filtering (unlike BareUDP).
 
-When the HTTP/3 initiator (client) requests the configured HTTP path, the receiver (server) performs HTTP Basic Auth:
-- CONNECT-IP: client sends `username = client local.id`, `password = peers[target].h3.secret` from its own config; server checks `username ∈ peers[].id` and `password == peers[username].h3.secret`. Every HTTP/3 peer entry must include `h3.secret` (longer than 8 characters) even when `peers[].h3.endpoint` is absent. Secrets may differ per direction; ensure both nodes carry the secret associated with the remote peer ID they validate.
+When the HTTP/3 initiator (client) requests the configured HTTP path, the receiver (server) performs authentication:
+- CONNECT-IP: client sends `Authorization: Bearer <token>` where token is `peers[target].h3.token` from its own config; server matches the token against its `peers[].h3.token` collection to identify the peer. Every HTTP/3 peer entry must include `h3.token` (at least 12 characters) even when `peers[].h3.endpoint` is absent. Tokens may differ per direction; ensure both nodes carry the token associated with the remote peer they validate. Both `peers[].id` and `peers[].h3.token` must be unique within a configuration.
 - Control plane GET/POST (enabled only when both `local.h3.admin.name` and `local.h3.admin.pass` are set, each longer than 8 characters): client sends `username = local.h3.admin.name`, `password = local.h3.admin.pass`; server checks both against its `local.h3.admin`.
 
-On authentication failure, the server requests Basic Auth again. The client waits for a period (default 5 seconds) before attempting to reconnect.
+On CONNECT-IP authentication failure, the server rejects with 401 Unauthorized. The client waits for a period (default 5 seconds) before attempting to reconnect.
 
 ### HTTP/3 Transport (CONNECT-IP)
 
@@ -49,14 +49,11 @@ sequenceDiagram
     Note over C,P: SETTINGS<br>H3_DATAGRAM = 1
 
     %% 2. First CONNECT-IP attempt (credentials may be absent)
-    C->>P: HEADERS (CONNECT)<br>:method = CONNECT<br>:protocol = connect-ip<br>:scheme = https<br>:authority = node1.example.com<br>:path = /path<br>Capsule-Protocol: ?1<br>Datagram-Format: 1<br>Authorization: ...
+    C->>P: HEADERS (CONNECT)<br>:method = CONNECT<br>:protocol = connect-ip<br>:scheme = https<br>:authority = node1.example.com<br>:path = /path<br>Capsule-Protocol: ?1<br>Datagram-Format: 1<br>Authorization: Bearer &lt;token&gt;
 
     alt Missing or invalid credentials
-        %% 3. Server challenges with Basic Auth
-        P-->>C: HEADERS<br>:status = 401 Unauthorized<br>WWW-Authenticate: Basic realm="masque"
-
-        %% 4. Client retries CONNECT-IP with Basic Auth
-        C->>P: HEADERS (CONNECT)<br>:method = CONNECT<br>:protocol = connect-ip<br>:scheme = https<br>:authority = node1.example.com<br>:path = /path<br>Capsule-Protocol: ?1<br>Datagram-Format: 1<br>Authorization: Basic base64(user:pass)
+        %% 3. Server rejects with 401
+        P-->>C: HEADERS<br>:status = 401 Unauthorized
     end
 
     %% 5. CONNECT-IP established
@@ -150,7 +147,6 @@ Examples:
 ```yaml
 # GET returns the current configuration
 local:
-  id: example-node-1
   ...
 peers:
 - id: example-node-2
@@ -163,11 +159,11 @@ local:
       name: new-admin-name
       pass: new-admin-pass
 
-# POST: rotate a peer secret
+# POST: rotate a peer token
 peers:
 - id: example-node-2
   h3:
-    secret: new-secret-123
+    token: new-token-for-peer-123
 
 # POST partial update: disable a peer
 peers:
@@ -179,7 +175,7 @@ peers:
 - id: example-node-1
   enabled: true
   h3:
-    secret: peer-secret-123
+    token: peer-token-12chars
     endpoint: https://node1.example.com:443/path
     ca: ./ca.pem
     insecure: false

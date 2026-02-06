@@ -131,7 +131,6 @@ pub struct Orchestrator {
     join_set: JoinSet<Result<ActorExitResult, tokio::task::JoinError>>,
 
     // Runtime state
-    local_id: String,
     tun_if: String,
     #[allow(dead_code)]
     mtu: usize,
@@ -216,7 +215,6 @@ impl Orchestrator {
     ///
     /// Returns `OrchestratorError` when initialization fails.
     pub async fn new(config: Config) -> Result<Self, OrchestratorError> {
-        let local_id = config.local.id.clone();
         let tun_if = config.local.tun.ifname.clone();
         let mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
@@ -282,12 +280,12 @@ impl Orchestrator {
                 let cert_path = Path::new(h3_cfg.cert.as_ref().expect("validated"));
                 let key_path = Path::new(h3_cfg.key.as_ref().expect("validated"));
 
-                // Build peer secrets map for authentication
-                let peer_secrets: HashMap<String, String> = config
+                // Build peer tokens map for authentication
+                let peer_tokens: HashMap<String, String> = config
                     .peers
                     .iter()
                     .filter(|p| p.enabled && p.h3.is_some())
-                    .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().secret.clone()))
+                    .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().token.clone()))
                     .collect();
 
                 // make: fallible I/O (socket bind, TLS config)
@@ -296,7 +294,7 @@ impl Orchestrator {
 
                 // spawn: infallible task creation; listener sends events through events_tx
                 let (cmd_tx, listener_handle, _bound_addr) =
-                    spawn_h3_listener(listener, peer_secrets, events_tx.clone());
+                    spawn_h3_listener(listener, peer_tokens, events_tx.clone());
 
                 join_set.spawn(listener_handle);
                 Some(cmd_tx)
@@ -346,7 +344,6 @@ impl Orchestrator {
             events_rx,
             events_tx,
             join_set,
-            local_id,
             tun_if,
             mtu,
             peers,
@@ -542,28 +539,18 @@ impl Orchestrator {
                 let peer_h3 = h3.clone();
                 let available_ips = dns_state.get(&host).map(|v| v.as_slice()).unwrap_or(&[]);
                 let events_tx = self.events_tx.clone();
-                let local_id = self.local_id.clone();
                 let tun_if = self.tun_if.clone();
 
                 for &ip in available_ips {
                     let destination = SocketAddr::new(ip, port);
                     let peer_h3 = peer_h3.clone();
                     let events_tx = events_tx.clone();
-                    let local_id = local_id.clone();
                     let tun_if = tun_if.clone();
                     let peer_id = peer_id.clone();
 
                     tokio::spawn(async move {
                         let probe = DefaultRouteProbe;
-                        match dial_h3(
-                            &peer_h3,
-                            destination,
-                            &local_id,
-                            &peer_id,
-                            Some(&tun_if),
-                            &probe,
-                        )
-                        .await
+                        match dial_h3(&peer_h3, destination, &peer_id, Some(&tun_if), &probe).await
                         {
                             Ok(conn) => {
                                 debug!(peer = %peer_id, addr = %destination, "H3 connection established");
@@ -871,7 +858,6 @@ mod test_support {
                 events_rx,
                 events_tx: events_tx.clone(),
                 join_set: JoinSet::new(),
-                local_id: "test-local".to_string(),
                 tun_if: self.tun_if,
                 mtu: self.mtu,
                 peers: self.peers,
@@ -1481,7 +1467,7 @@ mod tests {
                     port,
                     path: "/".to_string(),
                 }),
-                secret: "test-secret-12345".to_string(),
+                token: "test-token-12chars".to_string(),
                 ca: None,
                 insecure: true,
                 bindif: None,

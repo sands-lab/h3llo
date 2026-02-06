@@ -12,7 +12,7 @@
 //! - `spawn_h3_listener`: Accepts inbound CONNECT-IP connections
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::auth::{generate_basic_auth, validate_connect_auth};
+use crate::auth::{generate_bearer_auth, validate_connect_auth};
 use crate::bind::{make_client_udp_socket, RouteProbe};
 use crate::config::PeerH3;
 use crate::events::{
@@ -61,14 +61,14 @@ const MAX_SEND_UDP_PAYLOAD_SIZE: usize = 1472;
 /// Returns the authenticated peer ID on success, or an error reason on failure.
 fn extract_and_validate_auth(
     headers: &[Header],
-    secrets: &HashMap<String, String>,
+    tokens: &HashMap<String, String>,
 ) -> Result<String, &'static str> {
     let auth_header = headers
         .iter()
         .find(|h| h.name().eq_ignore_ascii_case(b"authorization"))
         .map(|h| String::from_utf8_lossy(h.value()).to_string());
 
-    let peer_iter = secrets.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    let peer_iter = tokens.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     validate_connect_auth(auth_header.as_deref(), peer_iter)
 }
 
@@ -153,7 +153,7 @@ async fn handle_h3_connection(
     mut controller: tokio_quiche::http3::driver::ServerH3Controller,
     quic_conn: QuicConnection,
     remote_addr: SocketAddr,
-    secrets: HashMap<String, String>,
+    tokens: HashMap<String, String>,
     events_tx: mpsc::UnboundedSender<Event>,
 ) {
     let handshake = async {
@@ -184,7 +184,7 @@ async fn handle_h3_connection(
                         return;
                     }
 
-                    match extract_and_validate_auth(&incoming_headers.headers, &secrets) {
+                    match extract_and_validate_auth(&incoming_headers.headers, &tokens) {
                         Ok(peer_id) => {
                             pending_auth = Some(peer_id);
                             pending_sender = Some(incoming_headers.send);
@@ -404,9 +404,8 @@ impl H3Connection {
 ///
 /// # Arguments
 ///
-/// * `peer_h3` - Peer HTTP/3 configuration (endpoint, secret, ca, insecure, bindif).
+/// * `peer_h3` - Peer HTTP/3 configuration (endpoint, token, ca, insecure, bindif).
 /// * `remote_addr` - Resolved target socket address (from DNS resolution).
-/// * `local_id` - Local node ID (Basic Auth username).
 /// * `peer_id` - Remote peer ID.
 /// * `tun_if` - Optional TUN interface name to exclude from route probing.
 /// * `probe` - Route probe implementation for interface selection.
@@ -421,7 +420,6 @@ impl H3Connection {
 pub async fn dial_h3<P: RouteProbe>(
     peer_h3: &PeerH3,
     remote_addr: SocketAddr,
-    local_id: &str,
     peer_id: &str,
     tun_if: Option<&str>,
     probe: &P,
@@ -434,7 +432,7 @@ pub async fn dial_h3<P: RouteProbe>(
     let server_name = &endpoint.host;
     let path = &endpoint.path;
 
-    debug!(%remote_addr, %server_name, %local_id, %peer_id, "dialing H3 endpoint");
+    debug!(%remote_addr, %server_name, %peer_id, "dialing H3 endpoint");
 
     // Create UDP socket with route probing
     let socket = make_client_udp_socket(remote_addr, tun_if, peer_h3.bindif.as_deref(), probe)
@@ -476,7 +474,7 @@ pub async fn dial_h3<P: RouteProbe>(
     .map_err(|e| DialError::Handshake(format!("QUIC connect failed: {}", e)))?;
 
     // Build auth header
-    let auth_header = generate_basic_auth(local_id, &peer_h3.secret);
+    let auth_header = generate_bearer_auth(&peer_h3.token);
 
     // Build Extended CONNECT request headers per RFC 9484 / protocol.md
     let headers = vec![
@@ -798,8 +796,8 @@ pub struct H3Listener {
 /// Note: No Shutdown command - shutdown via channel close (consistent with other actors).
 #[derive(Debug, Clone)]
 pub enum H3ListenerCommand {
-    /// Update peer secrets for authentication.
-    UpdatePeerSecrets(HashMap<String, String>),
+    /// Update peer tokens for authentication.
+    UpdatePeerTokens(HashMap<String, String>),
 }
 
 /// Creates H3 listener state from configuration.
@@ -857,11 +855,11 @@ pub fn make_h3_listener(
 /// # Arguments
 ///
 /// * `listener` - H3 listener state from `make_h3_listener`.
-/// * `peer_secrets` - Map of peer ID to expected secret for authentication.
+/// * `peer_tokens` - Map of peer ID to expected token for authentication.
 /// * `events_tx` - Unbounded channel for emitting events to orchestrator.
 pub fn spawn_h3_listener(
     listener: H3Listener,
-    mut peer_secrets: HashMap<String, String>,
+    mut peer_tokens: HashMap<String, String>,
     events_tx: mpsc::UnboundedSender<Event>,
 ) -> (
     mpsc::UnboundedSender<H3ListenerCommand>,
@@ -908,9 +906,9 @@ pub fn spawn_h3_listener(
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(H3ListenerCommand::UpdatePeerSecrets(update)) => {
-                            peer_secrets = update;
-                            debug!("updated peer secrets");
+                        Some(H3ListenerCommand::UpdatePeerTokens(update)) => {
+                            peer_tokens = update;
+                            debug!("updated peer tokens");
                         }
                         None => {
                             return Ok(());
@@ -929,7 +927,7 @@ pub fn spawn_h3_listener(
                                 controller,
                                 quic_conn,
                                 remote_addr,
-                                peer_secrets.clone(),
+                                peer_tokens.clone(),
                                 events_tx.clone(),
                             ));
                         }
@@ -957,39 +955,41 @@ mod tests {
 
     #[test]
     fn extract_and_validate_auth_accepts_valid() {
-        let auth_header = crate::auth::generate_basic_auth("peer1", "secret123");
+        let auth_header = crate::auth::generate_bearer_auth("token-for-peer1");
         let headers = vec![
             Header::new(b":method", b"CONNECT"),
             Header::new(b"authorization", auth_header.as_bytes()),
         ];
-        let secrets: HashMap<String, String> = [("peer1".to_string(), "secret123".to_string())]
-            .into_iter()
-            .collect();
+        let tokens: HashMap<String, String> =
+            [("peer1".to_string(), "token-for-peer1".to_string())]
+                .into_iter()
+                .collect();
 
-        let result = extract_and_validate_auth(&headers, &secrets);
+        let result = extract_and_validate_auth(&headers, &tokens);
         assert_eq!(result, Ok("peer1".to_string()));
     }
 
     #[test]
     fn extract_and_validate_auth_rejects_missing() {
         let headers = vec![Header::new(b":method", b"CONNECT")];
-        let secrets: HashMap<String, String> = [("peer1".to_string(), "secret123".to_string())]
-            .into_iter()
-            .collect();
+        let tokens: HashMap<String, String> =
+            [("peer1".to_string(), "token-for-peer1".to_string())]
+                .into_iter()
+                .collect();
 
-        let result = extract_and_validate_auth(&headers, &secrets);
+        let result = extract_and_validate_auth(&headers, &tokens);
         assert!(result.is_err());
     }
 
     #[test]
-    fn extract_and_validate_auth_rejects_wrong_secret() {
-        let auth_header = crate::auth::generate_basic_auth("peer1", "wrongpass");
+    fn extract_and_validate_auth_rejects_wrong_token() {
+        let auth_header = crate::auth::generate_bearer_auth("wrong-token");
         let headers = vec![Header::new(b"authorization", auth_header.as_bytes())];
-        let secrets: HashMap<String, String> = [("peer1".to_string(), "secret123".to_string())]
+        let tokens: HashMap<String, String> = [("peer1".to_string(), "correct-token".to_string())]
             .into_iter()
             .collect();
 
-        let result = extract_and_validate_auth(&headers, &secrets);
+        let result = extract_and_validate_auth(&headers, &tokens);
         assert!(result.is_err());
     }
 
@@ -1208,7 +1208,7 @@ mod tests {
 
         let peer_h3 = PeerH3 {
             endpoint: None,
-            secret: "test-secret".to_string(),
+            token: "test-token-12ch".to_string(),
             ca: None,
             insecure: true,
             bindif: None,
@@ -1218,7 +1218,6 @@ mod tests {
         let result = dial_h3(
             &peer_h3,
             "127.0.0.1:443".parse().unwrap(),
-            "local_id",
             "peer_id",
             None,
             &probe,
@@ -1273,16 +1272,16 @@ mod tests {
         let certs = TestCertBundle::generate();
 
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let peer_secrets = HashMap::from([("test-peer".to_string(), "test-secret".to_string())]);
+        let peer_tokens = HashMap::from([("test-peer".to_string(), "test-token-12ch".to_string())]);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
-        let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(listener, peer_secrets, events_tx);
+        let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(listener, peer_tokens, events_tx);
 
         // Verify command channel is functional
         assert!(cmd_tx
-            .send(H3ListenerCommand::UpdatePeerSecrets(HashMap::new()))
+            .send(H3ListenerCommand::UpdatePeerTokens(HashMap::new()))
             .is_ok());
 
         // Clean shutdown
@@ -1297,7 +1296,7 @@ mod tests {
     // ========== Test Helper: build PeerH3 for dial tests ==========
 
     /// Creates a test `PeerH3` for integration tests with insecure TLS.
-    fn test_peer_h3(bound_addr: SocketAddr, secret: &str) -> crate::config::PeerH3 {
+    fn test_peer_h3(bound_addr: SocketAddr, token: &str) -> crate::config::PeerH3 {
         use crate::config::{H3Endpoint, PeerH3};
         PeerH3 {
             endpoint: Some(H3Endpoint {
@@ -1305,7 +1304,7 @@ mod tests {
                 port: bound_addr.port(),
                 path: "/.well-known/masque/udp/*/*/".to_string(),
             }),
-            secret: secret.to_string(),
+            token: token.to_string(),
             ca: None,
             insecure: true,
             bindif: None,
@@ -1325,22 +1324,22 @@ mod tests {
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let peer_id = "test-client";
-        let secret = "test-secret-123";
-        let peer_secrets = HashMap::from([(peer_id.to_string(), secret.to_string())]);
+        let token = "test-token-12chars";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, events_tx);
+            spawn_h3_listener(listener, peer_tokens, events_tx);
 
         // Give listener time to bind
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let peer_h3 = test_peer_h3(bound_addr, secret);
+        let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
-        let client_result = dial_h3(&peer_h3, bound_addr, peer_id, peer_id, None, &probe).await;
+        let client_result = dial_h3(&peer_h3, bound_addr, peer_id, None, &probe).await;
 
         assert!(
             client_result.is_ok(),
@@ -1379,20 +1378,20 @@ mod tests {
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let peer_id = "split-test-peer";
-        let secret = "split-test-secret";
-        let peer_secrets = HashMap::from([(peer_id.to_string(), secret.to_string())]);
+        let token = "split-test-token12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make listener");
-        let (cmd_tx, _handle, bound_addr) = spawn_h3_listener(listener, peer_secrets, events_tx);
+        let (cmd_tx, _handle, bound_addr) = spawn_h3_listener(listener, peer_tokens, events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let peer_h3 = test_peer_h3(bound_addr, secret);
+        let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
-        let _client_conn = dial_h3(&peer_h3, bound_addr, peer_id, peer_id, None, &probe)
+        let _client_conn = dial_h3(&peer_h3, bound_addr, peer_id, None, &probe)
             .await
             .expect("dial");
 
@@ -1422,29 +1421,21 @@ mod tests {
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        let peer_secrets =
-            HashMap::from([("test-client".to_string(), "correct-secret".to_string())]);
+        let peer_tokens =
+            HashMap::from([("test-client".to_string(), "correct-token-12".to_string())]);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, events_tx);
+            spawn_h3_listener(listener, peer_tokens, events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // PeerH3 with intentionally wrong secret
-        let peer_h3 = test_peer_h3(bound_addr, "wrong-secret");
+        // PeerH3 with intentionally wrong token
+        let peer_h3 = test_peer_h3(bound_addr, "wrong-token-12ch");
         let probe = FakeRouteProbe::noop();
-        let result = dial_h3(
-            &peer_h3,
-            bound_addr,
-            "test-client",
-            "test-client",
-            None,
-            &probe,
-        )
-        .await;
+        let result = dial_h3(&peer_h3, bound_addr, "test-client", None, &probe).await;
 
         match result {
             Err(DialError::Auth(_)) | Err(DialError::Rejected(401)) => {}
@@ -1476,27 +1467,20 @@ mod tests {
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         // Server only knows "known-peer"
-        let peer_secrets = HashMap::from([("known-peer".to_string(), "secret".to_string())]);
+        let peer_tokens =
+            HashMap::from([("known-peer".to_string(), "token-12chars-x".to_string())]);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, events_tx);
+            spawn_h3_listener(listener, peer_tokens, events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let peer_h3 = test_peer_h3(bound_addr, "any-secret");
+        let peer_h3 = test_peer_h3(bound_addr, "any-token-12chr");
         let probe = FakeRouteProbe::noop();
-        let result = dial_h3(
-            &peer_h3,
-            bound_addr,
-            "unknown-peer",
-            "unknown-peer",
-            None,
-            &probe,
-        )
-        .await;
+        let result = dial_h3(&peer_h3, bound_addr, "unknown-peer", None, &probe).await;
 
         assert!(matches!(
             result,
@@ -1516,21 +1500,21 @@ mod tests {
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let peer_id = "datagram-client";
-        let secret = "datagram-secret";
-        let peer_secrets = HashMap::from([(peer_id.to_string(), secret.to_string())]);
+        let token = "datagram-token-12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let (listener_events_tx, mut listener_events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, listener_events_tx);
+            spawn_h3_listener(listener, peer_tokens, listener_events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let peer_h3 = test_peer_h3(bound_addr, secret);
+        let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
-        let client_conn = dial_h3(&peer_h3, bound_addr, peer_id, peer_id, None, &probe)
+        let client_conn = dial_h3(&peer_h3, bound_addr, peer_id, None, &probe)
             .await
             .expect("dial failed");
 
@@ -1592,21 +1576,21 @@ mod tests {
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let peer_id = "bidir-client";
-        let secret = "bidir-secret";
-        let peer_secrets = HashMap::from([(peer_id.to_string(), secret.to_string())]);
+        let token = "bidir-token-12ch";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let (listener_events_tx, mut listener_events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, listener_events_tx);
+            spawn_h3_listener(listener, peer_tokens, listener_events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let peer_h3 = test_peer_h3(bound_addr, secret);
+        let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
-        let client_conn = dial_h3(&peer_h3, bound_addr, peer_id, peer_id, None, &probe)
+        let client_conn = dial_h3(&peer_h3, bound_addr, peer_id, None, &probe)
             .await
             .expect("dial failed");
 
@@ -1680,21 +1664,21 @@ mod tests {
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let peer_id = "shutdown-client";
-        let secret = "shutdown-secret";
-        let peer_secrets = HashMap::from([(peer_id.to_string(), secret.to_string())]);
+        let token = "shutdown-token-12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
             .expect("make_h3_listener");
         let (cmd_tx, listener_handle, bound_addr) =
-            spawn_h3_listener(listener, peer_secrets, events_tx);
+            spawn_h3_listener(listener, peer_tokens, events_tx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let peer_h3 = test_peer_h3(bound_addr, secret);
+        let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
-        let _client_conn = dial_h3(&peer_h3, bound_addr, peer_id, peer_id, None, &probe)
+        let _client_conn = dial_h3(&peer_h3, bound_addr, peer_id, None, &probe)
             .await
             .expect("dial failed");
 

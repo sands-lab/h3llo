@@ -20,7 +20,6 @@ Below is a minimal two-node example. If you know `wg-quick`, the structure shoul
 ```yaml
 # Configuration on node1
 local:
-  id: example-node-1
   h3:
     listen: https://[::]:443/path
     cert: ./cert.pem
@@ -32,7 +31,7 @@ local:
 peers:
 - id: example-node-2
   h3:
-    secret: example-secret
+    token: example-token-12ch
   tun:
     allowedIPs:
       - 192.168.180.2/32
@@ -40,7 +39,6 @@ peers:
 ```yaml
 # Configuration on node2
 local:
-  id: example-node-2
   tun:
     ifname: h3llo0
     addrs:
@@ -48,7 +46,7 @@ local:
 peers:
 - id: example-node-1
   h3:
-    secret: example-secret
+    token: example-token-12ch
     endpoint: https://node1.example.com:443/path
   tun:
     allowedIPs:
@@ -72,8 +70,8 @@ High-level connection/auth/routing summary; see `docs/protocol.md` for auth/tran
 
 ### Authentication and Security
 
-- Identity: every node needs a unique `id` (>= 6 chars).
-- Basic Auth for CONNECT uses `username = client local.id`, `password = peers[target].h3.secret`; the server checks `peers[auth.user].h3.secret == auth.pass`. Every HTTP/3 peer entry must set `h3.secret` (>= 9 chars) even when `endpoint` is absent, and secrets may differ per peer/direction. Control-plane GET/POST still use `local.h3.admin` (`name`/`pass`). Full rules live in `docs/protocol.md`. QUIC/TLS certificates are required for HTTP/3.
+- Identity: every peer needs a unique `id` (non-empty).
+- Bearer Token auth for CONNECT uses `Authorization: Bearer <token>` where token is `peers[target].h3.token`; the server matches the token against its `peers[].h3.token` collection to identify the peer. Every HTTP/3 peer entry must set `h3.token` (>= 12 chars) even when `endpoint` is absent, and tokens may differ per peer/direction. Control-plane GET/POST still use Basic Auth with `local.h3.admin` (`name`/`pass`). Full rules live in `docs/protocol.md`. QUIC/TLS certificates are required for HTTP/3.
 
 ### Routing
 

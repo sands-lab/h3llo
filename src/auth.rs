@@ -1,68 +1,30 @@
-//! Basic Auth helpers for HTTP/3 CONNECT-IP and control plane.
+//! Bearer Token authentication helpers for HTTP/3 CONNECT-IP.
 //!
-//! Provides generation and validation functions reusable across
-//! CONNECT-IP authentication (Step 9) and control plane (Step 10).
+//! Provides Bearer Token generation and validation for CONNECT-IP
+//! authentication per RFC 6750.
 //!
 //! # Security
 //!
-//! All password comparisons use constant-time operations via the `subtle` crate
+//! All token comparisons use constant-time operations via the `subtle` crate
 //! to prevent timing attacks.
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 use subtle::ConstantTimeEq;
 
-/// Generates HTTP Basic Auth header value.
+/// Generates HTTP Bearer Token Authorization header value.
 ///
 /// # Arguments
-/// - `username`: The username (e.g., `local.id` for CONNECT)
-/// - `password`: The password (e.g., `peers[target].h3.secret`)
+/// - `token`: The bearer token (e.g., `peers[target].h3.token`)
 ///
 /// # Returns
-/// Header value: `Basic base64(username:password)`
-pub fn generate_basic_auth(username: &str, password: &str) -> String {
-    let credentials = format!("{}:{}", username, password);
-    format!("Basic {}", BASE64.encode(credentials))
+/// Header value: `Bearer <token>`
+pub fn generate_bearer_auth(token: &str) -> String {
+    format!("Bearer {}", token)
 }
 
-/// Parses and validates HTTP Basic Auth credentials.
+/// Validates CONNECT-IP authentication against peer tokens using Bearer scheme.
 ///
-/// Uses constant-time comparison to prevent timing attacks.
-///
-/// # Arguments
-/// - `header_value`: The Authorization header value
-/// - `expected_username`: Expected username
-/// - `expected_password`: Expected password
-///
-/// # Returns
-/// `true` if credentials match, `false` otherwise.
-pub fn validate_basic_auth(
-    header_value: &str,
-    expected_username: &str,
-    expected_password: &str,
-) -> bool {
-    let Some(encoded) = header_value.strip_prefix("Basic ") else {
-        return false;
-    };
-    let Ok(decoded) = BASE64.decode(encoded.as_bytes()) else {
-        return false;
-    };
-    let Ok(credentials) = String::from_utf8(decoded) else {
-        return false;
-    };
-    let Some((user, pass)) = credentials.split_once(':') else {
-        return false;
-    };
-    // Use constant-time comparison for both username and password
-    let user_match = user.as_bytes().ct_eq(expected_username.as_bytes());
-    let pass_match = pass.as_bytes().ct_eq(expected_password.as_bytes());
-    (user_match & pass_match).into()
-}
-
-/// Validates CONNECT-IP authentication against peer secrets.
-///
-/// Per `docs/protocol.md`: client sends `username = local.id`,
-/// `password = peers[target].h3.secret`.
+/// Per `docs/protocol.md`: client sends `Authorization: Bearer <peers[target].h3.token>`.
+/// Server matches token against its `peers[].h3.token` collection.
 ///
 /// Uses constant-time comparison to prevent timing attacks.
 ///
@@ -70,25 +32,23 @@ pub fn validate_basic_auth(
 /// The peer ID if authentication succeeds, or an error description.
 pub fn validate_connect_auth<'a>(
     header_value: Option<&str>,
-    peer_secrets: impl IntoIterator<Item = (&'a str, &'a str)>,
+    peer_tokens: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<String, &'static str> {
     let header = header_value.ok_or("missing Authorization header")?;
-    let encoded = header.strip_prefix("Basic ").ok_or("not Basic auth")?;
-    let decoded = BASE64
-        .decode(encoded.as_bytes())
-        .map_err(|_| "invalid base64")?;
-    let credentials = String::from_utf8(decoded).map_err(|_| "invalid UTF-8")?;
-    let (username, password) = credentials.split_once(':').ok_or("missing colon")?;
+    let token = header.strip_prefix("Bearer ").ok_or("not Bearer auth")?;
 
-    for (peer_id, secret) in peer_secrets {
+    if token.is_empty() {
+        return Err("empty token");
+    }
+
+    for (peer_id, peer_token) in peer_tokens {
         // Use constant-time comparison to prevent timing attacks
-        let user_match = peer_id.as_bytes().ct_eq(username.as_bytes());
-        let pass_match = secret.as_bytes().ct_eq(password.as_bytes());
-        if (user_match & pass_match).into() {
+        let token_match: bool = peer_token.as_bytes().ct_eq(token.as_bytes()).into();
+        if token_match {
             return Ok(peer_id.to_string());
         }
     }
-    Err("unknown peer or invalid secret")
+    Err("unknown peer or invalid token")
 }
 
 #[cfg(test)]
@@ -96,76 +56,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_and_validate_roundtrip() {
-        let header = generate_basic_auth("node1", "secret123");
-        assert!(validate_basic_auth(&header, "node1", "secret123"));
-    }
-
-    #[test]
-    fn rejects_wrong_password() {
-        let header = generate_basic_auth("node1", "correct");
-        assert!(!validate_basic_auth(&header, "node1", "wrong"));
-    }
-
-    #[test]
-    fn rejects_wrong_username() {
-        let header = generate_basic_auth("node1", "pass");
-        assert!(!validate_basic_auth(&header, "node2", "pass"));
-    }
-
-    #[test]
-    fn rejects_non_basic_prefix() {
-        assert!(!validate_basic_auth("Bearer token", "user", "pass"));
+    fn generate_bearer_auth_format() {
+        let header = generate_bearer_auth("my-secret-token");
+        assert_eq!(header, "Bearer my-secret-token");
     }
 
     #[test]
     fn validate_connect_auth_success() {
-        let header = generate_basic_auth("peer1", "secret1");
-        let secrets = [("peer1", "secret1"), ("peer2", "secret2")];
-        let result = validate_connect_auth(Some(&header), secrets);
+        let header = generate_bearer_auth("token-for-peer1");
+        let tokens = [("peer1", "token-for-peer1"), ("peer2", "token-for-peer2")];
+        let result = validate_connect_auth(Some(&header), tokens);
         assert_eq!(result, Ok("peer1".to_string()));
     }
 
     #[test]
-    fn validate_connect_auth_unknown_peer() {
-        let header = generate_basic_auth("unknown", "secret");
-        let secrets = [("peer1", "secret1")];
-        let result = validate_connect_auth(Some(&header), secrets);
+    fn validate_connect_auth_wrong_token() {
+        let header = generate_bearer_auth("wrong-token");
+        let tokens = [("peer1", "correct-token")];
+        let result = validate_connect_auth(Some(&header), tokens);
         assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "unknown peer or invalid token");
     }
 
     #[test]
     fn validate_connect_auth_missing_header() {
-        let secrets = [("peer1", "secret1")];
-        let result = validate_connect_auth(None, secrets);
+        let tokens = [("peer1", "token1")];
+        let result = validate_connect_auth(None, tokens);
         assert_eq!(result, Err("missing Authorization header"));
     }
 
     #[test]
-    fn validate_connect_auth_invalid_base64() {
-        let result = validate_connect_auth(Some("Basic !!!invalid!!!"), [("p", "s")]);
-        assert_eq!(result, Err("invalid base64"));
-    }
-
-    #[test]
-    fn handles_colon_in_password() {
-        let header = generate_basic_auth("user", "pass:with:colons");
-        assert!(validate_basic_auth(&header, "user", "pass:with:colons"));
+    fn validate_connect_auth_rejects_basic_auth() {
+        let result = validate_connect_auth(Some("Basic dXNlcjpwYXNz"), [("p", "s")]);
+        assert_eq!(result, Err("not Bearer auth"));
     }
 
     #[test]
     fn validate_connect_auth_accepts_second_peer() {
-        let header = generate_basic_auth("peer-b", "secret-b");
-        let secrets = [("peer-a", "secret-a"), ("peer-b", "secret-b")];
-        let result = validate_connect_auth(Some(&header), secrets);
+        let header = generate_bearer_auth("token-b");
+        let tokens = [("peer-a", "token-a"), ("peer-b", "token-b")];
+        let result = validate_connect_auth(Some(&header), tokens);
         assert_eq!(result, Ok("peer-b".to_string()));
     }
 
     #[test]
-    fn validate_connect_auth_wrong_secret() {
-        let header = generate_basic_auth("peer-a", "wrong-secret");
-        let secrets = [("peer-a", "secret-a")];
-        let result = validate_connect_auth(Some(&header), secrets);
-        assert_eq!(result, Err("unknown peer or invalid secret"));
+    fn validate_connect_auth_empty_token() {
+        let result = validate_connect_auth(Some("Bearer "), [("peer", "token")]);
+        assert_eq!(result, Err("empty token"));
     }
 }

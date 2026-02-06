@@ -21,8 +21,6 @@ pub struct Config {
 /// Local node settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Local {
-    /// Unique node identifier (minimum 6 characters).
-    pub id: String,
     /// Whether to manage system routes (default: true).
     #[serde(default = "default_true")]
     pub table: bool,
@@ -127,8 +125,8 @@ pub struct PeerH3 {
     /// Optional dialing endpoint (scheme/host/port/path); omit for listen-only posture.
     #[serde(default)]
     pub endpoint: Option<H3Endpoint>,
-    /// Remote peer secret (> 8 characters) required whenever HTTP/3 is configured, including listen-only peers.
-    pub secret: String,
+    /// Remote peer token (>= 12 characters) required whenever HTTP/3 is configured, including listen-only peers.
+    pub token: String,
     /// Optional custom CA bundle.
     pub ca: Option<String>,
     /// Whether to skip TLS validation (default: false).
@@ -189,9 +187,6 @@ impl std::error::Error for ValidationErrors {}
 /// Individual validation error.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
-    /// `local.id` is missing or too short.
-    #[error("local.id must be at least 6 characters")]
-    LocalIdTooShort,
     /// `local.h3.cert` and `local.h3.key` are required when `local.h3.listen` is set.
     #[error("local.h3.cert and local.h3.key must be set when local.h3.listen is configured")]
     LocalH3CredentialsMissing,
@@ -212,12 +207,24 @@ pub enum ValidationError {
     /// No transport configured (neither H3 nor BareUDP).
     #[error("at least one transport must be configured (local.h3 or local.bare)")]
     NoTransportConfigured,
-    /// Peer identifier is missing or too short.
-    #[error("peer id '{peer_id}' must be at least 6 characters")]
-    PeerIdTooShort { peer_id: String },
-    /// Peer secret missing or too short.
-    #[error("peer '{peer_id}' requires h3.secret longer than 8 characters when h3 is configured")]
-    PeerSecretTooShort { peer_id: String },
+    /// Peer identifier is empty.
+    #[error("peer id must not be empty")]
+    PeerIdEmpty { peer_id: String },
+    /// Peer identifier has leading or trailing whitespace.
+    #[error("peer id '{peer_id}' must not have leading or trailing whitespace")]
+    PeerIdHasWhitespace { peer_id: String },
+    /// Duplicate peer identifier.
+    #[error("duplicate peer id '{peer_id}'")]
+    DuplicatePeerId { peer_id: String },
+    /// Peer token missing or too short.
+    #[error("peer '{peer_id}' requires h3.token of at least 12 characters when h3 is configured")]
+    PeerTokenTooShort { peer_id: String },
+    /// Peer token has leading or trailing whitespace.
+    #[error("peer '{peer_id}' h3.token must not have leading or trailing whitespace")]
+    PeerTokenHasWhitespace { peer_id: String },
+    /// Duplicate peer token.
+    #[error("duplicate peer token for peer '{peer_id}'")]
+    DuplicatePeerToken { peer_id: String },
     /// Peer transport fields conflict.
     #[error("peer '{peer_id}' must configure exactly one of h3 or bare")]
     PeerTransportConflict { peer_id: String },
@@ -248,10 +255,8 @@ impl Config {
     /// Validates structural and semantic constraints.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut errors = Vec::new();
-
-        if self.local.id.trim().len() < 6 {
-            errors.push(ValidationError::LocalIdTooShort);
-        }
+        let mut seen_peer_ids = HashSet::new();
+        let mut seen_peer_tokens = HashSet::new();
 
         // At least one transport must be configured
         if self.local.h3.is_none() && self.local.bare.is_none() {
@@ -301,16 +306,37 @@ impl Config {
         // Note: local.tun.addrs and local.dns.server parsing now happens during deserialization
 
         for peer in &self.peers {
-            if peer.id.trim().len() < 6 {
-                errors.push(ValidationError::PeerIdTooShort {
+            // Peer ID validation: must be non-empty and have no leading/trailing whitespace
+            if peer.id.trim().is_empty() {
+                errors.push(ValidationError::PeerIdEmpty {
+                    peer_id: peer.id.clone(),
+                });
+            } else if peer.id != peer.id.trim() {
+                errors.push(ValidationError::PeerIdHasWhitespace {
+                    peer_id: peer.id.clone(),
+                });
+            }
+
+            if !seen_peer_ids.insert(peer.id.clone()) {
+                errors.push(ValidationError::DuplicatePeerId {
                     peer_id: peer.id.clone(),
                 });
             }
 
             if let Some(h3) = peer.h3.as_ref() {
-                let peer_secret_len = h3.secret.trim().len();
-                if peer_secret_len <= 8 {
-                    errors.push(ValidationError::PeerSecretTooShort {
+                // Token validation: must be >= 12 chars and have no leading/trailing whitespace
+                if h3.token.len() < 12 {
+                    errors.push(ValidationError::PeerTokenTooShort {
+                        peer_id: peer.id.clone(),
+                    });
+                } else if h3.token != h3.token.trim() {
+                    errors.push(ValidationError::PeerTokenHasWhitespace {
+                        peer_id: peer.id.clone(),
+                    });
+                }
+
+                if !seen_peer_tokens.insert(h3.token.clone()) {
+                    errors.push(ValidationError::DuplicatePeerToken {
                         peer_id: peer.id.clone(),
                     });
                 }
@@ -606,7 +632,6 @@ mod tests {
     fn sample_h3_config() -> Config {
         Config {
             local: Local {
-                id: "example-node-1".to_string(),
                 table: true,
                 dns: LocalDns {
                     server: "1.1.1.1:53".parse().unwrap(),
@@ -637,7 +662,7 @@ mod tests {
                 id: "example-node-2".to_string(),
                 enabled: true,
                 h3: Some(PeerH3 {
-                    secret: "example-node-2-secret".to_string(),
+                    token: "example-node-2-token".to_string(), // >= 12 chars
                     endpoint: Some(H3Endpoint {
                         host: "peer.example.com".to_string(),
                         port: 443,
@@ -663,13 +688,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_short_local_id() {
+    fn rejects_empty_peer_id() {
         let mut config = sample_h3_config();
-        config.local.id = "abc".to_string();
+        config.peers[0].id = "".to_string();
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.contains(&ValidationError::LocalIdTooShort)
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerIdEmpty { .. }))
+        ));
+    }
+
+    #[test]
+    fn accepts_short_peer_id() {
+        let mut config = sample_h3_config();
+        config.peers[0].id = "a".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_peer_id_with_leading_whitespace() {
+        let mut config = sample_h3_config();
+        config.peers[0].id = " peer1".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerIdHasWhitespace { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_peer_id_with_trailing_whitespace() {
+        let mut config = sample_h3_config();
+        config.peers[0].id = "peer1 ".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerIdHasWhitespace { .. }))
         ));
     }
 
@@ -787,29 +841,76 @@ mod tests {
     // happens during deserialization (see rejects_invalid_endpoint_uri_at_parse_time).
 
     #[test]
-    fn rejects_missing_peer_secret() {
+    fn rejects_short_peer_token() {
         let mut config = sample_h3_config();
         if let Some(h3) = config.peers[0].h3.as_mut() {
-            h3.secret = "".to_string();
+            h3.token = "short".to_string(); // < 12 chars
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerSecretTooShort { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerTokenTooShort { .. }))
         ));
     }
 
     #[test]
-    fn rejects_listen_only_peer_without_secret() {
+    fn accepts_12_char_peer_token() {
         let mut config = sample_h3_config();
         if let Some(h3) = config.peers[0].h3.as_mut() {
-            h3.secret = "".to_string();
-            h3.endpoint = None;
+            h3.token = "123456789012".to_string(); // Exactly 12 chars
+        }
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_token_with_leading_whitespace() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.token = " 123456789012".to_string(); // 13 chars but has leading space
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerSecretTooShort { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerTokenHasWhitespace { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_token_with_trailing_whitespace() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.token = "123456789012 ".to_string(); // 13 chars but has trailing space
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerTokenHasWhitespace { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_peer_ids() {
+        let mut config = sample_h3_config();
+        let mut peer2 = config.peers[0].clone();
+        peer2.h3.as_mut().unwrap().token = "different-token-123".to_string();
+        config.peers.push(peer2);
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::DuplicatePeerId { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_peer_tokens() {
+        let mut config = sample_h3_config();
+        let mut peer2 = config.peers[0].clone();
+        peer2.id = "different-peer-id".to_string();
+        config.peers.push(peer2);
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::DuplicatePeerToken { .. }))
         ));
     }
 
@@ -840,7 +941,6 @@ mod tests {
     fn parse_from_str_applies_defaults() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3:
     listen: https://[::]:443/path
     cert: ./cert.pem
@@ -851,7 +951,7 @@ local:
 peers:
 - id: example-node-2
   h3:
-    secret: example-node-2-secret
+    token: example-node-2-token
   tun:
     allowedIPs:
       - 192.168.180.2/32
@@ -880,7 +980,6 @@ peers:
     fn parses_single_endpoint_and_applies_dns_defaults() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3: {}
   dns:
     server: udp://8.8.8.8:53
@@ -890,7 +989,7 @@ local:
 peers:
 - id: example-node-2
   h3:
-    secret: example-node-2-secret
+    token: example-node-2-token
     endpoint: https://peer.example.com/path
     bindif: eth0
   tun:
@@ -1007,7 +1106,6 @@ peers:
     fn parse_dial_only_h3_config() {
         let yaml = r#"
 local:
-  id: dial-only-node
   h3: {}
   tun:
     addrs:
@@ -1015,7 +1113,7 @@ local:
 peers:
 - id: remote-peer
   h3:
-    secret: remote-peer-secret
+    token: remote-peer-token
     endpoint: https://peer.example.com:443/path
   tun:
     allowedIPs:
@@ -1033,7 +1131,6 @@ peers:
     fn parse_h3_with_singular_bindif() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3:
     listen: https://[::]:443/path
     cert: ./cert.pem
@@ -1044,7 +1141,7 @@ local:
 peers:
 - id: example-node-2
   h3:
-    secret: example-node-2-secret
+    token: example-node-2-token
     endpoint: https://peer.example.com:443/path
     bindif: eth0
   tun:
@@ -1122,7 +1219,6 @@ peers:
     fn config_rejects_invalid_endpoint_uri_at_parse_time() {
         let yaml = r#"
 local:
-  id: example-node-1
   bare:
     listen: not-a-valid-uri
   tun:
@@ -1137,7 +1233,6 @@ local:
     fn rejects_no_transport_configured() {
         let yaml = r#"
 local:
-  id: example-node-1
   tun:
     addrs:
       - 192.168.180.1
@@ -1156,7 +1251,6 @@ local:
     fn deserializes_local_tun_addrs_as_ip_addr() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3: {}
   tun:
     addrs:
@@ -1173,7 +1267,6 @@ local:
     fn rejects_invalid_tun_addr_at_parse_time() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3: {}
   tun:
     addrs:
@@ -1187,7 +1280,6 @@ local:
     fn rejects_cidr_in_tun_addrs_at_parse_time() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3: {}
   tun:
     addrs:
@@ -1201,7 +1293,6 @@ local:
     fn deserializes_allowed_ips_as_ipnet() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3: {}
   tun:
     addrs:
@@ -1209,7 +1300,7 @@ local:
 peers:
 - id: example-node-2
   h3:
-    secret: example-node-2-secret
+    token: example-node-2-token
   tun:
     allowedIPs:
       - 10.0.0.0/24
@@ -1225,7 +1316,6 @@ peers:
     fn rejects_invalid_allowed_ip_at_parse_time() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3: {}
   tun:
     addrs:
@@ -1233,7 +1323,7 @@ local:
 peers:
 - id: example-node-2
   h3:
-    secret: example-node-2-secret
+    token: example-node-2-token
   tun:
     allowedIPs:
       - not-a-cidr
@@ -1246,7 +1336,6 @@ peers:
     fn deserializes_dns_server_as_socket_addr() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3: {}
   dns:
     server: udp://8.8.8.8:53
@@ -1263,7 +1352,6 @@ local:
     fn rejects_invalid_dns_server_at_parse_time() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3: {}
   dns:
     server: tcp://8.8.8.8:53
@@ -1279,7 +1367,6 @@ local:
     fn dns_server_round_trip_serialization() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3: {}
   dns:
     server: udp://8.8.8.8:53
@@ -1298,7 +1385,6 @@ local:
     fn dns_server_ipv6_round_trip_serialization() {
         let yaml = r#"
 local:
-  id: example-node-1
   h3: {}
   dns:
     server: udp://[2001:4860:4860::8888]:53
