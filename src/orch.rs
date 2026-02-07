@@ -9,7 +9,7 @@ use crate::events::{ConnectionDirection, DnsEvent, Event, H3ConnectedEvent, Tran
 use crate::h3::{
     dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
 };
-use crate::route::{sync_tun_routes, RouteManagerHandle};
+use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -109,9 +109,6 @@ pub enum OrchestratorError {
     /// Routing table build failed.
     #[error("routing table build failed: {0}")]
     Routing(String),
-    /// Route sync failed.
-    #[error("route sync failed: {0}")]
-    RouteSync(String),
     /// An actor exited with an error.
     #[error("actor error: {0}")]
     ActorError(#[from] ActorError),
@@ -147,9 +144,9 @@ pub struct Orchestrator {
     #[allow(dead_code)]
     dns_cmd_tx: mpsc::UnboundedSender<DnsCommand>,
 
-    /// Whether to manage system routes (`local.table`).
-    manage_routes: bool,
-    /// Pre-parsed TUN interface addresses as host-prefixed IpNets (for system route sync).
+    /// Route sync actor command sender (None when `local.table` is false or init failed).
+    route_cmd_tx: Option<mpsc::UnboundedSender<RouteCommand>>,
+    /// TUN interface addresses for route sync commands.
     tun_addrs: Vec<IpNet>,
 }
 
@@ -172,8 +169,8 @@ impl Orchestrator {
     ///
     /// Performs the routing update sequence:
     /// 1. TUN routing table (internal forwarding)
-    /// 2. System routes (if `local.table` is enabled)
-    async fn update_routing(&self) {
+    /// 2. System routes via route actor (if available)
+    fn update_routing(&self) {
         let peer_configs = self.peer_configs();
         let peer_txs = self.peer_txs();
         if let Ok(routing) = RoutingTable::from_peers(&peer_configs, &peer_txs) {
@@ -185,9 +182,14 @@ impl Orchestrator {
             }
         }
 
-        if self.manage_routes {
+        if let Some(route_cmd_tx) = &self.route_cmd_tx {
             let allowed = collect_allowed_ips(&peer_configs);
-            sync_system_routes(&self.tun_if, &self.tun_addrs, &allowed).await;
+            if let Err(e) = route_cmd_tx.send(RouteCommand::SyncRoutes {
+                tun_addrs: self.tun_addrs.clone(),
+                allowed,
+            }) {
+                warn!(error = %e, "failed to send route sync command");
+            }
         }
     }
 
@@ -338,6 +340,24 @@ impl Orchestrator {
 
         join_set.spawn(handle);
 
+        // Initialize route sync actor if system route management is enabled.
+        // Soft failure: if make_route() fails (e.g., no netlink on BSD), warn and continue.
+        let route_cmd_tx = if manage_routes {
+            match make_route() {
+                Ok(route_actor) => {
+                    let (cmd_tx, route_handle) = spawn_route(route_actor, tun_if.clone());
+                    join_set.spawn(route_handle);
+                    Some(cmd_tx)
+                }
+                Err(err) => {
+                    warn!(error = %err, "route manager unavailable, system routes will not be managed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let has_active_peers = peers.values().any(|e| e.config.enabled);
         if !has_active_peers {
             warn!("no active peers; traffic will be dropped");
@@ -355,7 +375,7 @@ impl Orchestrator {
             h3_listener_cmd_tx,
             tun_packet_tx,
             dns_cmd_tx,
-            manage_routes,
+            route_cmd_tx,
             tun_addrs,
         })
     }
@@ -601,7 +621,7 @@ impl Orchestrator {
         self.update_accepted_sources(&accepted_ips);
 
         if bounds_changed {
-            self.update_routing().await;
+            self.update_routing();
         }
     }
 
@@ -685,7 +705,7 @@ impl Orchestrator {
         self.join_set.spawn(rx_handle);
         self.join_set.spawn(tx_handle);
 
-        self.update_routing().await;
+        self.update_routing();
     }
 }
 
@@ -730,18 +750,6 @@ fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, Orchestrator
         );
     }
     Ok(addrs[0])
-}
-
-/// Performs system route synchronization, logging warnings on failure.
-async fn sync_system_routes(tun_if: &str, tun_addrs: &[IpNet], allowed: &[IpNet]) {
-    match RouteManagerHandle::new() {
-        Ok(mut handle) => {
-            if let Err(err) = sync_tun_routes(tun_if, tun_addrs, allowed, &mut handle).await {
-                warn!("route sync failed: {err}");
-            }
-        }
-        Err(err) => warn!("route manager unavailable: {err}"),
-    }
 }
 
 fn collect_allowed_ips(peers: &[Peer]) -> Vec<IpNet> {
@@ -792,7 +800,6 @@ mod test_support {
         tun_if: String,
         mtu: usize,
         peers: HashMap<String, PeerEntry>,
-        manage_routes: bool,
         tun_addrs: Vec<IpNet>,
     }
 
@@ -802,7 +809,6 @@ mod test_support {
                 tun_if: "test0".to_string(),
                 mtu: crate::config::default_mtu() as usize,
                 peers: HashMap::new(),
-                manage_routes: false,
                 tun_addrs: Vec::new(),
             }
         }
@@ -815,6 +821,7 @@ mod test_support {
         pub tun_cmd_rx: mpsc::UnboundedReceiver<TunRxCommand>,
         pub bare_rx_cmd_rx: mpsc::UnboundedReceiver<BareUdpRxCommand>,
         pub dns_cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
+        pub route_cmd_rx: mpsc::UnboundedReceiver<RouteCommand>,
     }
 
     impl TestableOrchestratorBuilder {
@@ -853,6 +860,7 @@ mod test_support {
             let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel();
             let (dns_cmd_tx, dns_cmd_rx) = mpsc::unbounded_channel();
             let (tun_packet_tx, _tun_packet_rx) = mpsc::channel(1);
+            let (route_cmd_tx, route_cmd_rx) = mpsc::unbounded_channel();
 
             let orch = Orchestrator {
                 events_rx,
@@ -866,7 +874,7 @@ mod test_support {
                 h3_listener_cmd_tx: None,
                 tun_packet_tx,
                 dns_cmd_tx,
-                manage_routes: self.manage_routes,
+                route_cmd_tx: Some(route_cmd_tx),
                 tun_addrs: self.tun_addrs,
             };
 
@@ -877,6 +885,7 @@ mod test_support {
                     tun_cmd_rx,
                     bare_rx_cmd_rx,
                     dns_cmd_rx,
+                    route_cmd_rx,
                 },
             )
         }
@@ -1077,12 +1086,6 @@ mod tests {
     fn orchestrator_error_routing() {
         let error = OrchestratorError::Routing("invalid prefix".to_string());
         assert!(error.to_string().contains("invalid prefix"));
-    }
-
-    #[test]
-    fn orchestrator_error_route_sync() {
-        let error = OrchestratorError::RouteSync("permission denied".to_string());
-        assert!(error.to_string().contains("permission denied"));
     }
 
     #[test]
@@ -1507,7 +1510,7 @@ mod tests {
             .with_peer_tx("peer1", "1.2.3.4:5353".parse().unwrap(), tx)
             .build();
 
-        orch.update_routing().await;
+        orch.update_routing();
 
         // Routing command SHOULD be sent
         assert!(handles.tun_cmd_rx.try_recv().is_ok());
