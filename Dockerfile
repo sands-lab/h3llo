@@ -57,8 +57,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     mkdir -p /app/out && \
     cp /app/target/x86_64-unknown-linux-musl/release/h3llo /app/out/ && \
     strip /app/out/h3llo && \
-    find /app/target/x86_64-unknown-linux-musl/release/deps -name 'integration_container_tun-*' -type f ! -name '*.d' -exec cp {} /app/out/integration-container-tun \; && \
-    find /app/target/x86_64-unknown-linux-musl/release/deps -name 'integration_container_route-*' -type f ! -name '*.d' -exec cp {} /app/out/integration-container-route \; && \
+    DEPS=/app/target/x86_64-unknown-linux-musl/release/deps && \
+    test "$(find $DEPS -name 'integration_container_tun-*' -type f ! -name '*.d' | wc -l)" -eq 1 && \
+    find $DEPS -name 'integration_container_tun-*' -type f ! -name '*.d' -exec cp {} /app/out/integration-container-tun \; && \
+    test "$(find $DEPS -name 'integration_container_route-*' -type f ! -name '*.d' | wc -l)" -eq 1 && \
+    find $DEPS -name 'integration_container_route-*' -type f ! -name '*.d' -exec cp {} /app/out/integration-container-route \; && \
     strip /app/out/*
 
 # Stage 3: Runtime - Minimal Alpine production image
