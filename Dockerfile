@@ -48,7 +48,7 @@ COPY tests ./tests
 # Target dir is a cache mount so artifacts are NOT stored in image layers —
 # we must copy them to /app/out/ within this same RUN instruction.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git/db \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target,sharing=locked \
     set -e && \
     cargo build --release --target x86_64-unknown-linux-musl --bin h3llo && \
