@@ -255,3 +255,26 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Docker Integration: `tests/integration/native/tun.rs` TUN device creation and addressing via Container Test Pattern.
 - Docker Integration: `tests/integration/native/route.rs` Route sync with real netlink API via Container Test Pattern.
 - Other platforms: TODO for macOS/Windows when platform-specific code is introduced.
+
+## WireGuard Throughput Baseline
+
+Manual benchmark that measures WireGuard kernel-module throughput for comparison with h3llo tunnel performance. Uses network namespaces (no Docker overhead) following [WireGuard's own testing methodology](https://git.zx2c4.com/wireguard-linux/tree/tools/testing/selftests/wireguard/netns.sh).
+
+### Prerequisites
+
+- Linux host with WireGuard kernel module loaded (`modprobe wireguard`)
+- `wg`, `iperf3`, and `ip` commands available
+- Root privileges (for network namespace and WireGuard interface creation)
+
+### Running
+
+```bash
+sudo ./scripts/bench-wireguard.sh
+
+# Pass extra iperf3 client flags (e.g., UDP mode, longer duration, JSON output):
+sudo ./scripts/bench-wireguard.sh -t 30
+sudo ./scripts/bench-wireguard.sh -u -b 1G
+sudo ./scripts/bench-wireguard.sh -J          # JSON output for programmatic use
+```
+
+This benchmark is for manual comparison only and is NOT part of CI.
