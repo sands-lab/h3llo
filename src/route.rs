@@ -74,7 +74,7 @@ impl RouteHandle for RouteManagerHandle {
 }
 
 /// Commands accepted by the route sync actor.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum RouteCommand {
     /// Synchronize system routes for the TUN interface.
     ///

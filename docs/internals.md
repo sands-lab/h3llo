@@ -35,7 +35,7 @@ Actor design principles:
 - **Supervision**: the Orchestrator holds senders to child actors; task JoinHandles are registered with `JoinSet` for lifecycle monitoring. Actors return `ActorExitResult`:
   - `Ok(())` for graceful shutdown (e.g., command channel closed)
   - `Err(ActorError)` for I/O errors requiring orchestrator action
-  The orchestrator continues running on graceful exits but terminates on actor errors or task panics.
+  The orchestrator continues running on graceful exits but terminates on actor errors or task panics. Route Sync only returns `Ok(())` (graceful exit); sync errors are logged as warnings at origin. If initialization fails, the orchestrator degrades to no system route management.
 - **Graceful shutdown**: when all senders to an actor's command channel are dropped, `recv()` returns `None`. The actor detects this and exits its event loop gracefully.
 
 #### Actor Initialization Pattern (make + spawn)
