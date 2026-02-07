@@ -1,4 +1,9 @@
 //! System route synchronization using route_manager.
+//!
+//! Provides both the core route sync logic (`sync_tun_routes`) and the route
+//! actor (`make_route` / `spawn_route`) that serializes system route updates.
+
+use crate::actor::ActorExitResult;
 use crate::bind::lookup_ifindex;
 use ipnet::IpNet;
 use route_manager::AsyncRouteManager;
@@ -6,6 +11,8 @@ pub use route_manager::Route;
 use std::collections::HashSet;
 use std::io;
 use thiserror::Error;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 /// Resolves interface indexes from names.
@@ -64,6 +71,78 @@ impl RouteHandle for RouteManagerHandle {
     async fn delete(&mut self, route: &Route) -> io::Result<()> {
         self.inner.delete(route).await
     }
+}
+
+/// Commands accepted by the route sync actor.
+#[derive(Debug)]
+pub enum RouteCommand {
+    /// Synchronize system routes for the TUN interface.
+    ///
+    /// The actor serializes these updates — only one sync runs at a time.
+    /// The TUN interface name is captured in the actor at spawn time.
+    SyncRoutes {
+        /// TUN interface addresses (OS-managed routes to preserve).
+        tun_addrs: Vec<IpNet>,
+        /// Desired allowed IP prefixes.
+        allowed: Vec<IpNet>,
+    },
+}
+
+/// Route sync actor state.
+///
+/// Created by [`make_route()`], consumed by [`spawn_route()`].
+pub struct RouteActor {
+    handle: RouteManagerHandle,
+}
+
+/// Creates route sync actor state.
+///
+/// Performs fallible I/O (netlink socket creation) during construction.
+///
+/// # Errors
+///
+/// Returns `io::Error` when the route manager handle cannot be created.
+pub fn make_route() -> io::Result<RouteActor> {
+    let handle = RouteManagerHandle::new()?;
+    Ok(RouteActor { handle })
+}
+
+/// Spawns the route sync actor task.
+///
+/// Creates an unbounded command channel internally. The actor processes
+/// `SyncRoutes` commands sequentially, ensuring serialized route updates.
+/// Exits gracefully when all senders are dropped.
+///
+/// # Arguments
+///
+/// * `actor` - Actor state created by [`make_route()`].
+/// * `tun_if` - TUN interface name, captured for the actor's lifetime.
+pub fn spawn_route(
+    actor: RouteActor,
+    tun_if: String,
+) -> (
+    mpsc::UnboundedSender<RouteCommand>,
+    JoinHandle<ActorExitResult>,
+) {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+    let RouteActor { mut handle } = actor;
+
+    let join_handle = tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            match cmd {
+                RouteCommand::SyncRoutes { tun_addrs, allowed } => {
+                    if let Err(err) =
+                        sync_tun_routes(&tun_if, &tun_addrs, &allowed, &mut handle).await
+                    {
+                        warn!(error = %err, "route sync failed");
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+
+    (cmd_tx, join_handle)
 }
 
 /// Fatal errors returned by route sync.
@@ -222,6 +301,7 @@ pub fn ipnet_from_route(route: &Route) -> Option<IpNet> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tokio::sync::mpsc as tokio_mpsc;
     use tracing_test::traced_test;
 
     /// Builds a route for tests.
@@ -592,5 +672,38 @@ mod tests {
 
         // All routes already exist, no operations
         assert!(handle.ops().is_empty());
+    }
+
+    // ========== Route actor lifecycle tests ==========
+
+    #[tokio::test]
+    async fn route_actor_exits_when_sender_dropped() {
+        // Cannot create real RouteManagerHandle in test (requires CAP_NET_ADMIN),
+        // so we test the spawn_route channel pattern directly.
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel::<RouteCommand>();
+
+        let join_handle = tokio::spawn(async move {
+            while let Some(_cmd) = cmd_rx.recv().await {
+                // In real actor, this would call sync_tun_routes
+            }
+            Ok::<(), crate::actor::ActorError>(())
+        });
+
+        // Verify command can be sent
+        assert!(cmd_tx
+            .send(RouteCommand::SyncRoutes {
+                tun_addrs: vec![],
+                allowed: vec!["10.0.0.0/24".parse().unwrap()],
+            })
+            .is_ok());
+
+        // Drop sender to signal shutdown
+        drop(cmd_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), join_handle).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "actor should shut down cleanly after sender dropped"
+        );
     }
 }

@@ -28,14 +28,14 @@ Platform tiers and binding behavior:
 Concurrency model overview: h3llo adopts the actor model—each coroutine (actor) owns private state, communicates exclusively via MPSC message queues, and never shares mutable data with other actors. This eliminates lock contention and simplifies reasoning about concurrent correctness.
 
 Actor design principles:
-- **Isolated state**: each actor (TUN-Rx, TUN-Tx, DNS Resolver, BareUDP-Rx/Tx, Orchestrator, H3 connections) maintains its own state; no `Arc<Mutex<_>>` across actors.
+- **Isolated state**: each actor (TUN-Rx, TUN-Tx, DNS Resolver, BareUDP-Rx/Tx, Route Sync, Orchestrator, H3 connections) maintains its own state; no `Arc<Mutex<_>>` across actors.
 - **Actor-owned message box**: each actor creates its own channels during spawn. Control-plane command channels use `mpsc::unbounded_channel()`; data-plane packet channels use `mpsc::channel(PACKET_QUEUE_DEPTH)`. The actor owns the receiver; the caller receives the sender via tuple return (e.g., `(cmd_tx, JoinHandle)` or `(packet_tx, JoinHandle)`). This ensures clear ownership and enables graceful shutdown when all senders are dropped.
 - **Message passing**: actors communicate through typed `mpsc::channel` queues; the `Event` enum and command types define the message protocol.
 - **Async select loop**: each actor runs a `tokio::select!` loop over its input channels, I/O sources, and timers.
 - **Supervision**: the Orchestrator holds senders to child actors; task JoinHandles are registered with `JoinSet` for lifecycle monitoring. Actors return `ActorExitResult`:
   - `Ok(())` for graceful shutdown (e.g., command channel closed)
   - `Err(ActorError)` for I/O errors requiring orchestrator action
-  The orchestrator continues running on graceful exits but terminates on actor errors or task panics.
+  The orchestrator continues running on graceful exits but terminates on actor errors or task panics. Route Sync only returns `Ok(())` (graceful exit); sync errors are logged as warnings at origin. If initialization fails, the orchestrator degrades to no system route management.
 - **Graceful shutdown**: when all senders to an actor's command channel are dropped, `recv()` returns `None`. The actor detects this and exits its event loop gracefully.
 
 #### Actor Initialization Pattern (make + spawn)
@@ -165,7 +165,8 @@ flowchart TB
     cr-h3r -- emit(conn-close) --> cr-orch
     cr-timer -- emit(dns-refresh) --> cr-orch
     
-    cr-orch -- exec(ip route replace) --> rsys
+    cr-route["Actor<br>(Route-Sync)"]
+    cr-orch -- cmd(SyncRoutes) --> cr-route -- exec(route add/del) --> rsys
     cr-orch -- emit(route-update) --> cr-tun
     cr-orch -- emit(query) --> cr-dns -- emit(dns-update)--> cr-orch
     cr-orch -- spawn --> cr-h3d -- emit(conn-estab) --> cr-orch
@@ -226,7 +227,9 @@ Key flows:
 
 ### System Route Updates
 
-Route update summary: keep the TUN interface’s routes aligned with `peers[].tun.allowedIPs` using `route_manager` APIs instead of shelling out (`ip route`, `route`, `netsh`). Flow: (1) resolve the TUN ifindex, (2) list system routes, (3) drop stale TUN routes that are not covered by `allowedIPs` while preserving the configured TUN host addresses, (4) rely on exact prefix matches instead of aggregated coverage when deciding whether an `allowedIPs` entry already exists, (5) when `allowedIPs` includes a default route, split it into two `/1` entries (IPv4 and IPv6) once and warn about the split; if either `/1` conflicts with another interface, emit a conflict warning but still attempt to add the route without further splitting, and (6) warn on unsupported route entries or add/delete failures while continuing to run. If the platform lacks `route_manager` support, h3llo logs a warning, skips system-route changes, and continues running.
+Route update summary: keep the TUN interface's routes aligned with `peers[].tun.allowedIPs` using `route_manager` APIs instead of shelling out (`ip route`, `route`, `netsh`). Route sync is performed by a dedicated Route Sync actor that serializes route updates via an MPSC command channel. The orchestrator sends fire-and-forget `SyncRoutes` commands; the actor processes them one at a time in FIFO order. The `RouteManagerHandle` (netlink socket) is created once during actor initialization and reused across all sync operations. The TUN interface name is captured in the actor at spawn time (immutable for the orchestrator's lifetime). If the route manager cannot be initialized (e.g., BSD platforms without netlink), the orchestrator logs a warning and continues without system route management.
+
+Route sync flow: (1) resolve the TUN ifindex, (2) list system routes, (3) drop stale TUN routes that are not covered by `allowedIPs` while preserving the configured TUN host addresses, (4) rely on exact prefix matches instead of aggregated coverage when deciding whether an `allowedIPs` entry already exists, (5) when `allowedIPs` includes a default route, split it into two `/1` entries (IPv4 and IPv6) once and warn about the split; if either `/1` conflicts with another interface, emit a conflict warning but still attempt to add the route without further splitting, and (6) warn on unsupported route entries or add/delete failures while continuing to run. Route sync failures are logged as warnings by the actor at origin.
 
 ### Longest-Prefix-Match Algorithm
 
