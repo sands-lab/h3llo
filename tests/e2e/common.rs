@@ -25,7 +25,7 @@ pub fn require_image_and_network() {
             TEST_IMAGE, TEST_TAG
         );
         eprintln!(
-            "  docker build --target test -t {}:{} .",
+            "  docker buildx build --target test -t {}:{} --load .",
             TEST_IMAGE, TEST_TAG
         );
         panic!("Missing Docker image");
