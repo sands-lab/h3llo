@@ -10,7 +10,7 @@ set -euo pipefail
 
 # --- Prerequisites ---
 if [[ $EUID -ne 0 ]]; then echo "Error: must run as root" >&2; exit 1; fi
-for cmd in wg iperf3 ip; do
+for cmd in wg iperf3 ip ping; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "Error: $cmd not found" >&2; exit 1; }
 done
 if ! ip link add wg-probe type wireguard 2>/dev/null; then
@@ -21,10 +21,10 @@ ip link del wg-probe 2>/dev/null
 
 # --- Fixed Curve25519 keys (test-only, NOT for production) ---
 # Generated via: wg genkey | tee priv | wg pubkey > pub
-KEY_A_PRIV="yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk="
-KEY_A_PUB="HIgo9xNzJMWLKASShiTqIybxR0V1tB1ZB2el2ETwJQ4="
-KEY_B_PRIV="gN65BkIKy1eCE9pP1wdc8ROUtkHx/R2Hn+RVIWkVVWc="
-KEY_B_PUB="eKMqFAkyQCY6/olbEecPMyVcnPY7jVw8X9YwJ1VcSlg="
+KEY_A_PRIV="yAnw4/bFKWQyuiDKWrXruXyKk/Ah1CJWQfV0FTXcXWU="
+KEY_A_PUB="xopHDYsmeG7tk7UdovGv7RUBaiD1sADUrIlujSYHVFY="
+KEY_B_PRIV="0AMR6oqMwHg1NDZMRMtRXi/xd3Ot6Camb1euWJY1lWI="
+KEY_B_PUB="mqgf3siT/qS86WCoYmZFaXHUx5JRGSFVfjU4avuNanM="
 
 # --- Namespaces and interfaces ---
 NS_A="wg-bench-a"
@@ -32,6 +32,9 @@ NS_B="wg-bench-b"
 
 cleanup() {
     # Namespace deletion also kills all processes within the namespace.
+    # Deleting one veth end auto-destroys its peer; this handles the window
+    # between veth creation and moving both ends into namespaces.
+    ip link del veth-a 2>/dev/null || true
     ip netns del "$NS_A" 2>/dev/null || true
     ip netns del "$NS_B" 2>/dev/null || true
 }
@@ -59,8 +62,9 @@ ip netns exec "$NS_B" wg set wg0 listen-port 51820 private-key <(echo "$KEY_B_PR
     peer "$KEY_A_PUB" allowed-ips 10.0.0.1/32 endpoint 192.168.100.1:51820
 ip netns exec "$NS_A" ip addr add 10.0.0.1/24 dev wg0
 ip netns exec "$NS_B" ip addr add 10.0.0.2/24 dev wg0
-ip netns exec "$NS_A" ip link set wg0 up
-ip netns exec "$NS_B" ip link set wg0 up
+# Match h3llo default TUN MTU (1393) for fair comparison.
+ip netns exec "$NS_A" ip link set wg0 mtu 1393 up
+ip netns exec "$NS_B" ip link set wg0 mtu 1393 up
 
 # --- Verify connectivity ---
 ip netns exec "$NS_A" ping -c 1 -W 2 10.0.0.2 >/dev/null || { echo "Error: WireGuard ping failed" >&2; exit 1; }

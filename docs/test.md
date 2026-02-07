@@ -263,7 +263,7 @@ Manual benchmark that measures WireGuard kernel-module throughput for comparison
 ### Prerequisites
 
 - Linux host with WireGuard kernel module loaded (`modprobe wireguard`)
-- `wg`, `iperf3`, and `ip` commands available
+- `wg`, `iperf3`, `ip`, and `ping` commands available
 - Root privileges (for network namespace and WireGuard interface creation)
 
 ### Running
