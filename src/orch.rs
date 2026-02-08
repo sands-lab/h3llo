@@ -285,7 +285,7 @@ pub enum OrchestratorError {
 ///
 /// Manages child actors with selective supervision:
 /// - Critical actors (TUN, BareUDP-Rx, H3-Listener): failure causes immediate exit
-/// - Peer actors (BareUDP-Tx, H3-Tx/Rx): failure logged (reconnection deferred to future iteration)
+/// - Peer actors (BareUDP-Tx, H3-Tx/Rx): failure triggers maintenance cycle (prune + reconnect)
 pub struct Orchestrator {
     events_rx: mpsc::UnboundedReceiver<Event>,
     events_tx: mpsc::UnboundedSender<Event>,
@@ -552,6 +552,8 @@ impl Orchestrator {
     ///
     /// Returns `OrchestratorError` when a child task exits unexpectedly.
     pub async fn run(mut self) -> Result<(), OrchestratorError> {
+        // Run maintenance at half the connect interval so closed channels and
+        // newly resolved IPs are detected promptly.
         let mut maintenance_ticker = tokio::time::interval(TRY_CONNECT_INTERVAL / 2);
         loop {
             tokio::select! {
