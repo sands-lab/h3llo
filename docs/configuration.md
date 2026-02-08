@@ -29,6 +29,7 @@ peers: # optional, default: []
   h3: # optional, conflicts with peers.bare; endpoint optional (listen-only if omitted)
     token: example-token-12ch # required whenever peers[].h3 is set (minimum 12 characters)
     endpoint: https://node1.example.com:443/path # optional; omit for listen-only
+    sni: node1.example.com # optional; TLS SNI override (defaults to endpoint hostname)
     ca: ./ca.pem # optional
     insecure: false # optional, default: false
     bindif: eth0 # optional; omit to auto-detect
@@ -61,6 +62,7 @@ peers: # optional, default: []
 - `peers[].h3.token`: Remote peer authentication token; required (and must be at least 12 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. Must be unique across all peers. Bearer Token auth for CONNECT uses `Authorization: Bearer <token>`; server matches tokens to identify peers.
 - `peers[].enabled` (default `true`): Whether this peer entry is active.
 - `peers[].h3.endpoint` (optional): HTTP/3 dialing address (scheme/host/port/path); omit to wait for inbound HTTP/3 from the peer. Mutually exclusive with `peers[].bare`.
+- `peers[].h3.sni` (optional): TLS Server Name Indication (SNI) override for the QUIC/TLS handshake. When set, this value is sent as the SNI instead of the hostname from `peers[].h3.endpoint`. The HTTP/3 `:authority` pseudo-header always uses `endpoint`'s hostname regardless. Useful for reverse proxy traversal, CDN-fronted deployments, or when `endpoint` uses an IP address but the server certificate contains a DNS name.
 - `peers[].h3.bindif` (optional): Interface for HTTP/3 dialer. When omitted, auto-detects at most one interface. Probe/bind fallbacks and recursive-routing warnings are described in [docs/internals.md](internals.md).
 - `peers[].h3.ca`: Custom CA bundle path for validating the peer’s certificate (useful for self-signed certs); otherwise the system trust store is used.
 - `peers[].h3.insecure` (default `false`): Skip TLS certificate validation (not recommended; prefer `ca`).

@@ -134,6 +134,12 @@ pub struct PeerH3 {
     pub insecure: bool,
     /// Optional interface to bind HTTP/3 dialers.
     pub bindif: Option<String>,
+    /// Optional TLS Server Name Indication (SNI) override.
+    ///
+    /// When set, this value is used as the SNI during the QUIC/TLS handshake
+    /// instead of the hostname from `endpoint`. The HTTP/3 `:authority`
+    /// pseudo-header still uses `endpoint.host`.
+    pub sni: Option<String>,
 }
 
 /// BareUDP options per peer.
@@ -225,6 +231,12 @@ pub enum ValidationError {
     /// Duplicate peer token.
     #[error("duplicate peer token for peer '{peer_id}'")]
     DuplicatePeerToken { peer_id: String },
+    /// Peer SNI has leading or trailing whitespace.
+    #[error("peer '{peer_id}' h3.sni must not have leading or trailing whitespace")]
+    PeerSniHasWhitespace { peer_id: String },
+    /// Peer bindif has leading or trailing whitespace.
+    #[error("peer '{peer_id}' h3.bindif must not have leading or trailing whitespace")]
+    PeerBindifHasWhitespace { peer_id: String },
     /// Peer transport fields conflict.
     #[error("peer '{peer_id}' must configure exactly one of h3 or bare")]
     PeerTransportConflict { peer_id: String },
@@ -340,7 +352,21 @@ impl Config {
                         peer_id: peer.id.clone(),
                     });
                 }
-                // bindif is now Option<String>; no empty-list validation needed
+                if let Some(sni) = &h3.sni {
+                    if sni != sni.trim() {
+                        errors.push(ValidationError::PeerSniHasWhitespace {
+                            peer_id: peer.id.clone(),
+                        });
+                    }
+                }
+
+                if let Some(bindif) = &h3.bindif {
+                    if bindif != bindif.trim() {
+                        errors.push(ValidationError::PeerBindifHasWhitespace {
+                            peer_id: peer.id.clone(),
+                        });
+                    }
+                }
             }
 
             match (&peer.h3, &peer.bare) {
@@ -655,6 +681,7 @@ mod tests {
                     ca: None,
                     insecure: false,
                     bindif: None,
+                    sni: None,
                 }),
                 bare: None,
                 tun: PeerTun {
@@ -1001,6 +1028,78 @@ peers:
             h3.bindif = Some("eth0".to_string());
         }
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_peer_h3_with_sni() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.sni = Some("custom-sni.example.com".to_string());
+        }
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_peer_h3_without_sni() {
+        let config = sample_h3_config();
+        assert!(config.peers[0].h3.as_ref().unwrap().sni.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_sni_with_leading_whitespace() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.sni = Some(" leading".to_string());
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniHasWhitespace { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_sni_with_trailing_whitespace() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.sni = Some("trailing ".to_string());
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniHasWhitespace { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_bindif_with_leading_whitespace() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.bindif = Some(" eth0".to_string());
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.iter().any(|e| matches!(e, ValidationError::PeerBindifHasWhitespace { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_bindif_with_trailing_whitespace() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.bindif = Some("eth0 ".to_string());
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.iter().any(|e| matches!(e, ValidationError::PeerBindifHasWhitespace { .. }))
+        ));
     }
 
     // Note: rejects_invalid_allowed_ip test removed - validation now happens at parse time.

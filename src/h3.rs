@@ -432,10 +432,11 @@ pub async fn dial_h3<P: RouteProbe>(
         .endpoint
         .as_ref()
         .ok_or_else(|| DialError::Socket("peer_h3.endpoint is None".to_string()))?;
-    let server_name = &endpoint.host;
+    let server_name = peer_h3.sni.as_deref().unwrap_or(&endpoint.host);
+    let authority = &endpoint.host;
     let path = &endpoint.path;
 
-    debug!(%remote_addr, %server_name, %peer_id, "dialing H3 endpoint");
+    debug!(%remote_addr, %server_name, %authority, %peer_id, "dialing H3 endpoint");
 
     // Create UDP socket with route probing
     let socket = make_client_udp_socket(remote_addr, tun_if, peer_h3.bindif.as_deref(), probe)
@@ -487,7 +488,7 @@ pub async fn dial_h3<P: RouteProbe>(
         Header::new(b":method", b"CONNECT"),
         Header::new(b":protocol", b"connect-ip"),
         Header::new(b":scheme", b"https"),
-        Header::new(b":authority", server_name.as_bytes()),
+        Header::new(b":authority", authority.as_bytes()),
         Header::new(b":path", path.as_bytes()),
         Header::new(b"capsule-protocol", b"?1"),
         Header::new(b"authorization", auth_header.as_bytes()),
@@ -1221,6 +1222,7 @@ mod tests {
             ca: None,
             insecure: true,
             bindif: None,
+            sni: None,
         };
         let probe = FakeRouteProbe::noop();
 
@@ -1328,6 +1330,7 @@ mod tests {
             ca: None,
             insecure: true,
             bindif: None,
+            sni: None,
         }
     }
 
