@@ -4,9 +4,22 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::actor::ActorExitResult;
+use crate::config::{H3Endpoint, UdpEndpoint};
 use crate::h3::H3Connection;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// Endpoint type discriminator for bound connections.
+///
+/// Captures the configured endpoint that originated an outbound connection,
+/// enabling prune logic to detect endpoint reconfiguration and DNS staleness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    /// BareUDP endpoint (host:port).
+    Udp(UdpEndpoint),
+    /// HTTP/3 endpoint (host:port/path).
+    H3(H3Endpoint),
+}
 
 /// Indicates connection establishment direction.
 ///
@@ -58,8 +71,8 @@ impl std::fmt::Debug for TransportEvent {
 pub struct BareConnectedEvent {
     /// Peer identifier from configuration.
     pub peer_id: String,
-    /// Endpoint hostname (for DNS expiration matching).
-    pub hostname: String,
+    /// Configured endpoint that originated this connection.
+    pub endpoint: Endpoint,
     /// Destination socket address.
     pub dest: SocketAddr,
     /// TX channel for sending packets to the bare TX actor.
@@ -73,7 +86,7 @@ impl std::fmt::Debug for BareConnectedEvent {
         f.debug_struct("BareConnectedEvent")
             .field("peer_id", &self.peer_id)
             .field("dest", &self.dest)
-            .field("hostname", &self.hostname)
+            .field("endpoint", &self.endpoint)
             .finish_non_exhaustive()
     }
 }
