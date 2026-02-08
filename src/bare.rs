@@ -5,7 +5,6 @@ use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe, Ud
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_interrupted;
 use crate::metrics::TransportCounters;
-use crate::PACKET_QUEUE_DEPTH;
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -173,9 +172,10 @@ pub fn spawn_udp_tx(
     tx: BareUdpTx,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
+    packet_queue_depth: usize,
 ) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(packet_queue_depth);
     let dest_str = tx
         .socket
         .peer_addr()
@@ -346,7 +346,7 @@ mod tests {
         let context = BareUdpTx {
             socket: sender_socket,
         };
-        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200));
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200), 256);
 
         packet_tx.send(vec![9, 8, 7]).await.unwrap();
 
@@ -426,7 +426,7 @@ mod tests {
         let context = BareUdpTx {
             socket: sender_socket,
         };
-        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(10));
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(10), 256);
 
         packet_tx.send(vec![5, 4, 3, 2]).await.unwrap();
 
@@ -530,7 +530,7 @@ mod tests {
             socket: sender_socket,
         };
 
-        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_secs(60));
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_secs(60), 256);
 
         // Verify packet_tx is functional by sending a packet
         assert!(packet_tx.send(vec![1, 2, 3]).await.is_ok());
@@ -552,7 +552,8 @@ mod tests {
             socket: sender_socket,
         };
 
-        let (packet_tx, join_handle) = spawn_udp_tx(context, events_tx, Duration::from_secs(60));
+        let (packet_tx, join_handle) =
+            spawn_udp_tx(context, events_tx, Duration::from_secs(60), 256);
 
         // Drop sender to signal shutdown
         drop(packet_tx);
@@ -585,6 +586,7 @@ mod tests {
             BareUdpTx { socket: tx_socket },
             events_tx.clone(),
             Duration::from_secs(60),
+            256,
         );
 
         // Spawn RX with TX's packet channel as output (direct wiring, no forwarder)

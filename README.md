@@ -34,7 +34,7 @@ peers:
   h3:
     token: example-token-12ch
   tun:
-    allowedIPs:
+    allowed_ips:
       - 192.168.180.2/32
 ```
 ```yaml
@@ -50,7 +50,7 @@ peers:
     token: example-token-12ch
     endpoint: https://node1.example.com:443/path
   tun:
-    allowedIPs:
+    allowed_ips:
       - 192.168.180.1/32
 ```
 
@@ -76,7 +76,7 @@ High-level connection/auth/routing summary; see [docs/protocol.md](docs/protocol
 
 ### Routing
 
-- System routes: optional table updates steer matching `allowedIPs` into the h3llo TUN.
+- System routes: optional table updates steer matching `allowed_ips` into the h3llo TUN.
 - Internal routing: longest-prefix matching across peers; route update flow is documented in [docs/internals.md](docs/internals.md).
 
 ## BareUDP Mode

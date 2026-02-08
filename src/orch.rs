@@ -3,7 +3,7 @@
 use crate::actor::{ActorError, ActorExitResult, ActorKind};
 use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUdpRxCommand};
 use crate::bind::DefaultRouteProbe;
-use crate::config::{Config, Peer};
+use crate::config::{Config, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
     BareConnectedEvent, ConnectionDirection, DnsEvent, Endpoint, Event, H3ConnectedEvent,
@@ -19,16 +19,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
-
-const METRICS_INTERVAL: Duration = Duration::from_secs(30);
-const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
-/// Minimum interval between connection attempts for a single peer.
-const TRY_CONNECT_INTERVAL: Duration = Duration::from_secs(3);
 
 /// A single active connection bound to a peer.
 #[derive(Debug)]
@@ -142,13 +137,19 @@ impl PeerEntry {
 
     /// Spawns connections for resolved IPs not already covered by an existing bound.
     ///
-    /// Rate-limited: only attempts if `TRY_CONNECT_INTERVAL` has elapsed since last attempt.
+    /// Rate-limited: only attempts if `tuning.reconnect_interval` has elapsed since last attempt.
     /// Does nothing if `resolved_ips` is empty. Only updates `last_try_connect` when at
     /// least one connection task is actually spawned.
-    fn try_connect(&mut self, events_tx: &mpsc::UnboundedSender<Event>, tun_if: &str, mtu: usize) {
+    fn try_connect(
+        &mut self,
+        events_tx: &mpsc::UnboundedSender<Event>,
+        tun_if: &str,
+        mtu: usize,
+        tuning: &Tuning,
+    ) {
         // Rate limit
         if let Some(last) = self.last_try_connect {
-            if last.elapsed() < TRY_CONNECT_INTERVAL {
+            if last.elapsed() < tuning.reconnect_interval {
                 return;
             }
         }
@@ -184,14 +185,20 @@ impl PeerEntry {
                 let peer_id = self.config.id.clone();
                 let bindif = bare.bindif.clone();
                 let endpoint = Endpoint::Udp(bare.endpoint.clone());
+                let metrics_interval = tuning.log_metrics_interval;
+                let packet_queue_depth = tuning.packet_queue_depth;
 
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
                     match make_bare_tx(destination, bindif.as_deref(), Some(&tun_if), &probe).await
                     {
                         Ok(tx_socket) => {
-                            let (packet_tx, tx_handle) =
-                                spawn_udp_tx(tx_socket, events_tx.clone(), METRICS_INTERVAL);
+                            let (packet_tx, tx_handle) = spawn_udp_tx(
+                                tx_socket,
+                                events_tx.clone(),
+                                metrics_interval,
+                                packet_queue_depth,
+                            );
                             let event = Event::Transport(TransportEvent::BareConnected(
                                 BareConnectedEvent {
                                     peer_id,
@@ -222,6 +229,7 @@ impl PeerEntry {
                 let tun_if = tun_if.to_string();
                 let peer_id = self.config.id.clone();
                 let peer_h3 = h3.clone();
+                let tuning = tuning.clone();
 
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
@@ -232,6 +240,7 @@ impl PeerEntry {
                         Some(&tun_if),
                         tun_mtu,
                         &probe,
+                        &tuning,
                     )
                     .await
                     {
@@ -313,6 +322,8 @@ pub struct Orchestrator {
     // Runtime state
     tun_if: String,
     mtu: usize,
+    /// Tuning parameters from config.
+    tuning: Tuning,
     /// Unified peer state: config + active bound.
     peers: HashMap<String, PeerEntry>,
     tun_cmd_tx: mpsc::UnboundedSender<TunRxCommand>,
@@ -399,6 +410,7 @@ impl Orchestrator {
     ///
     /// Returns `OrchestratorError` when initialization fails.
     pub async fn new(config: Config) -> Result<Self, OrchestratorError> {
+        let tuning = &config.tuning;
         let tun_if = config.local.tun.ifname.clone();
         let mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
@@ -420,11 +432,19 @@ impl Orchestrator {
         let routing = RoutingTable::new();
 
         // Spawn TUN actors - actors create their own command channels
-        let (tun_cmd_tx, tun_rx_handle) =
-            tun::spawn_tun_rx(tun_reader, routing, events_tx.clone(), METRICS_INTERVAL);
+        let (tun_cmd_tx, tun_rx_handle) = tun::spawn_tun_rx(
+            tun_reader,
+            routing,
+            events_tx.clone(),
+            tuning.log_metrics_interval,
+        );
         // TUN-Tx actor creates its own packet channel; returns sender for transports to use
-        let (tun_packet_tx, tun_tx_handle) =
-            tun::spawn_tun_tx(tun_writer, events_tx.clone(), METRICS_INTERVAL);
+        let (tun_packet_tx, tun_tx_handle) = tun::spawn_tun_tx(
+            tun_writer,
+            events_tx.clone(),
+            tuning.log_metrics_interval,
+            tuning.packet_queue_depth,
+        );
 
         join_set.spawn(tun_rx_handle);
         join_set.spawn(tun_tx_handle);
@@ -442,7 +462,7 @@ impl Orchestrator {
                 std::collections::HashSet::new(),
                 tun_packet_tx.clone(),
                 events_tx.clone(),
-                METRICS_INTERVAL,
+                tuning.log_metrics_interval,
             );
 
             join_set.spawn(bare_rx_handle);
@@ -482,6 +502,7 @@ impl Orchestrator {
                     peer_tokens,
                     config.local.tun.mtu,
                     events_tx.clone(),
+                    tuning,
                 );
 
                 join_set.spawn(listener_handle);
@@ -504,7 +525,8 @@ impl Orchestrator {
         let dns_actor = make_dns(
             &config.local.dns,
             Some(tun_if.as_str()),
-            DNS_QUERY_TIMEOUT,
+            tuning.dns_query_timeout,
+            tuning.dns_refresh_interval,
             &probe,
         )
         .await
@@ -551,6 +573,7 @@ impl Orchestrator {
             join_set,
             tun_if,
             mtu,
+            tuning: config.tuning,
             peers,
             tun_cmd_tx,
             bare_rx_cmd_tx,
@@ -573,7 +596,7 @@ impl Orchestrator {
     pub async fn run(mut self) -> Result<(), OrchestratorError> {
         // Run maintenance at half the connect interval so closed channels and
         // newly resolved IPs are detected promptly.
-        let mut maintenance_ticker = tokio::time::interval(TRY_CONNECT_INTERVAL / 2);
+        let mut maintenance_ticker = tokio::time::interval(self.tuning.reconnect_interval / 2);
         loop {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {
@@ -635,7 +658,7 @@ impl Orchestrator {
             if entry.prune() {
                 routing_changed = true;
             }
-            entry.try_connect(&self.events_tx, &self.tun_if, self.mtu);
+            entry.try_connect(&self.events_tx, &self.tun_if, self.mtu, &self.tuning);
         }
         if routing_changed {
             self.update_routing();
@@ -700,7 +723,7 @@ impl Orchestrator {
             if entry.prune() {
                 routing_changed = true;
             }
-            entry.try_connect(&self.events_tx, &self.tun_if, self.mtu);
+            entry.try_connect(&self.events_tx, &self.tun_if, self.mtu, &self.tuning);
         }
 
         // 3. Update accepted sources (all resolved IPs for bare peers)
@@ -809,12 +832,16 @@ impl Orchestrator {
             rx_state,
             self.tun_packet_tx.clone(),
             self.events_tx.clone(),
-            METRICS_INTERVAL,
+            self.tuning.log_metrics_interval,
         );
 
         // Spawn TX actor
-        let (packet_tx, tx_handle) =
-            spawn_h3_tx(tx_state, self.events_tx.clone(), METRICS_INTERVAL);
+        let (packet_tx, tx_handle) = spawn_h3_tx(
+            tx_state,
+            self.events_tx.clone(),
+            self.tuning.log_metrics_interval,
+            self.tuning.packet_queue_depth,
+        );
 
         self.join_set.spawn(rx_handle);
         self.join_set.spawn(tx_handle);
@@ -969,6 +996,7 @@ mod test_support {
                 join_set: JoinSet::new(),
                 tun_if: self.tun_if,
                 mtu: self.mtu,
+                tuning: Tuning::default(),
                 peers: self.peers,
                 tun_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
@@ -1833,13 +1861,13 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         // First call should set last_try_connect
-        entry.try_connect(&events_tx, "test0", 1393);
+        entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
         assert!(entry.last_try_connect.is_some());
 
         let first_time = entry.last_try_connect.unwrap();
 
         // Second immediate call should be rate-limited (timestamp unchanged)
-        entry.try_connect(&events_tx, "test0", 1393);
+        entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
         assert_eq!(entry.last_try_connect.unwrap(), first_time);
     }
 }

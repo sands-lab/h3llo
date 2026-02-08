@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
@@ -13,6 +14,9 @@ use url::Url;
 pub struct Config {
     /// Local node settings.
     pub local: Local,
+    /// Tuning parameters for timing, capacity, and protocol settings.
+    #[serde(default)]
+    pub tuning: Tuning,
     /// Peer definitions.
     #[serde(default)]
     pub peers: Vec<Peer>,
@@ -80,9 +84,6 @@ pub struct LocalDns {
         serialize_with = "serialize_dns_server"
     )]
     pub server: SocketAddr,
-    /// DNS refresh interval in seconds (`0` disables; any non-zero value enables refresh; 30s+ recommended for production).
-    #[serde(default = "default_dns_refresh")]
-    pub refresh: u64,
     /// Optional outbound interface binding for DNS resolution.
     pub bindif: Option<String>,
 }
@@ -149,8 +150,70 @@ pub struct PeerBare {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerTun {
     /// Allowed IP prefixes routed via this peer. Parsed as `IpNet` during deserialization.
-    #[serde(rename = "allowedIPs")]
     pub allowed_ips: Vec<IpNet>,
+}
+
+/// Tuning parameters for timing, capacity, and protocol settings.
+///
+/// All fields have sensible defaults. The entire section is optional in YAML.
+/// When partially specified, unset fields use their defaults.
+/// Duration fields are serialized as integer seconds in YAML.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Tuning {
+    /// Data-plane packet queue depth for bounded backpressure channels (default: 256).
+    pub packet_queue_depth: usize,
+    /// Minimum interval between reconnection attempts (default: 3s).
+    #[serde(with = "serde_duration_secs")]
+    pub reconnect_interval: Duration,
+    /// Metrics logging interval (default: 30s).
+    #[serde(with = "serde_duration_secs")]
+    pub log_metrics_interval: Duration,
+    /// DNS query timeout (default: 2s).
+    #[serde(with = "serde_duration_secs")]
+    pub dns_query_timeout: Duration,
+    /// DNS refresh interval; 0 disables (default: 60s).
+    #[serde(with = "serde_duration_secs")]
+    pub dns_refresh_interval: Duration,
+    /// HTTP/3 handshake timeout (default: 30s).
+    #[serde(with = "serde_duration_secs")]
+    pub h3_handshake_timeout: Duration,
+    /// HTTP/3 max idle timeout (default: 60s).
+    #[serde(with = "serde_duration_secs")]
+    pub h3_max_idle_timeout: Duration,
+    /// HTTP/3 keepalive interval (default: 20s). Config parsing only; not yet implemented.
+    #[serde(with = "serde_duration_secs")]
+    pub h3_keepalive_interval: Duration,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            packet_queue_depth: 256,
+            reconnect_interval: Duration::from_secs(3),
+            log_metrics_interval: Duration::from_secs(30),
+            dns_query_timeout: Duration::from_secs(2),
+            dns_refresh_interval: Duration::from_secs(60),
+            h3_handshake_timeout: Duration::from_secs(30),
+            h3_max_idle_timeout: Duration::from_secs(60),
+            h3_keepalive_interval: Duration::from_secs(20),
+        }
+    }
+}
+
+/// Serde helper: serializes `Duration` as integer seconds in YAML.
+mod serde_duration_secs {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(d.as_secs())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let secs = u64::deserialize(d)?;
+        Ok(Duration::from_secs(secs))
+    }
 }
 
 /// Configuration parsing or validation error.
@@ -187,6 +250,9 @@ impl std::error::Error for ValidationErrors {}
 /// Individual validation error.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
+    /// `tuning.packet_queue_depth` must be > 0 (mpsc::channel(0) panics).
+    #[error("tuning.packet_queue_depth must be greater than 0")]
+    TuningPacketQueueDepthZero,
     /// `local.h3.cert` and `local.h3.key` are required when `local.h3.listen` is set.
     #[error("local.h3.cert and local.h3.key must be set when local.h3.listen is configured")]
     LocalH3CredentialsMissing,
@@ -229,11 +295,11 @@ pub enum ValidationError {
     #[error("peer '{peer_id}' must configure exactly one of h3 or bare")]
     PeerTransportConflict { peer_id: String },
     /// Allowed IP list missing.
-    #[error("peer '{peer_id}' must include at least one allowedIPs entry")]
+    #[error("peer '{peer_id}' must include at least one allowed_ips entry")]
     PeerMissingAllowedIps { peer_id: String },
     // Note: PeerInvalidAllowedIp removed - parsing now happens during deserialization.
     /// Allowed IP entry duplicates another entry on the same peer.
-    #[error("peer '{peer_id}' has duplicate allowedIPs entry '{cidr}'")]
+    #[error("peer '{peer_id}' has duplicate allowed_ips entry '{cidr}'")]
     PeerDuplicateAllowedIp { peer_id: String, cidr: String },
 }
 
@@ -255,6 +321,12 @@ impl Config {
     /// Validates structural and semantic constraints.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut errors = Vec::new();
+
+        // Tuning validation
+        if self.tuning.packet_queue_depth == 0 {
+            errors.push(ValidationError::TuningPacketQueueDepthZero);
+        }
+
         let mut seen_peer_ids = HashSet::new();
         let mut seen_peer_tokens = HashSet::new();
 
@@ -386,17 +458,12 @@ fn default_true() -> bool {
 fn default_dns() -> LocalDns {
     LocalDns {
         server: default_dns_server(),
-        refresh: default_dns_refresh(),
         bindif: None,
     }
 }
 
 fn default_dns_server() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)
-}
-
-fn default_dns_refresh() -> u64 {
-    60
 }
 
 fn default_ifname() -> String {
@@ -612,6 +679,7 @@ pub fn parse_udp_uri(raw: &str) -> Result<UdpEndpoint, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn sample_h3_config() -> Config {
         Config {
@@ -619,7 +687,6 @@ mod tests {
                 table: true,
                 dns: LocalDns {
                     server: "1.1.1.1:53".parse().unwrap(),
-                    refresh: 60,
                     bindif: None,
                 },
                 h3: Some(LocalH3 {
@@ -642,6 +709,7 @@ mod tests {
                     mtu: 1393,
                 },
             },
+            tuning: Tuning::default(),
             peers: vec![Peer {
                 id: "example-node-2".to_string(),
                 enabled: true,
@@ -937,7 +1005,7 @@ peers:
   h3:
     token: example-node-2-token
   tun:
-    allowedIPs:
+    allowed_ips:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
@@ -946,7 +1014,6 @@ peers:
             cfg.local.dns.server,
             "1.1.1.1:53".parse::<SocketAddr>().unwrap()
         );
-        assert_eq!(cfg.local.dns.refresh, 60);
         assert_eq!(cfg.local.dns.bindif, None);
         assert_eq!(cfg.local.tun.ifname, "h3llo0");
         assert_eq!(cfg.local.tun.mtu, 1393);
@@ -977,7 +1044,7 @@ peers:
     endpoint: https://peer.example.com/path
     bindif: eth0
   tun:
-    allowedIPs:
+    allowed_ips:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
@@ -985,7 +1052,6 @@ peers:
             cfg.local.dns.server,
             "8.8.8.8:53".parse::<SocketAddr>().unwrap()
         );
-        assert_eq!(cfg.local.dns.refresh, 60);
         let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
         let endpoint = h3.endpoint.as_ref().expect("endpoint should be present");
         assert_eq!(endpoint.host, "peer.example.com");
@@ -1100,7 +1166,7 @@ peers:
     token: remote-peer-token
     endpoint: https://peer.example.com:443/path
   tun:
-    allowedIPs:
+    allowed_ips:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
@@ -1129,7 +1195,7 @@ peers:
     endpoint: https://peer.example.com:443/path
     bindif: eth0
   tun:
-    allowedIPs:
+    allowed_ips:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
@@ -1289,7 +1355,7 @@ peers:
   h3:
     token: example-node-2-token
   tun:
-    allowedIPs:
+    allowed_ips:
       - 10.0.0.0/24
       - 2001:db8::/32
 "#;
@@ -1312,7 +1378,7 @@ peers:
   h3:
     token: example-node-2-token
   tun:
-    allowedIPs:
+    allowed_ips:
       - not-a-cidr
 "#;
         let result = Config::load_from_str(yaml);
@@ -1389,5 +1455,84 @@ local:
         // Re-parse to verify round-trip
         let cfg2: Config = serde_yaml::from_str(&serialized).expect("should re-parse");
         assert_eq!(cfg.local.dns.server, cfg2.local.dns.server);
+    }
+
+    #[test]
+    fn tuning_defaults_applied_when_absent() {
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+peers:
+- id: example-node-2
+  h3:
+    token: example-node-2-token
+  tun:
+    allowed_ips:
+      - 192.168.180.2/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert_eq!(cfg.tuning.packet_queue_depth, 256);
+        assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(3));
+        assert_eq!(cfg.tuning.log_metrics_interval, Duration::from_secs(30));
+        assert_eq!(cfg.tuning.dns_query_timeout, Duration::from_secs(2));
+        assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(60));
+        assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.tuning.h3_keepalive_interval, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn tuning_partial_override() {
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  packet_queue_depth: 512
+  h3_max_idle_timeout: 120
+peers:
+- id: example-node-2
+  h3:
+    token: example-node-2-token
+  tun:
+    allowed_ips:
+      - 192.168.180.2/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert_eq!(cfg.tuning.packet_queue_depth, 512);
+        assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(120));
+        assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(3));
+        assert_eq!(cfg.tuning.log_metrics_interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn rejects_zero_packet_queue_depth() {
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  packet_queue_depth: 0
+peers:
+- id: example-node-2
+  h3:
+    token: example-node-2-token
+  tun:
+    allowed_ips:
+      - 192.168.180.2/32
+"#;
+        let result = Config::load_from_str(yaml);
+        assert!(matches!(
+            result,
+            Err(ConfigError::Validation(ValidationErrors(ref errs)))
+                if errs.contains(&ValidationError::TuningPacketQueueDepthZero)
+        ));
     }
 }

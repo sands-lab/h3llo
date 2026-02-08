@@ -37,7 +37,7 @@ peers:
     bare:
       endpoint: "udp://node-b-tp.h3llo-test-net:5353"
     tun:
-      allowedIPs:
+      allowed_ips:
         - 10.0.0.2/32
 "#;
 
@@ -60,7 +60,7 @@ peers:
     bare:
       endpoint: "udp://node-a-tp.h3llo-test-net:5353"
     tun:
-      allowedIPs:
+      allowed_ips:
         - 10.0.0.1/32
 "#;
 

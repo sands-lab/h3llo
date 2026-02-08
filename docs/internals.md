@@ -14,7 +14,7 @@ Why recursive routing happens: if h3llo installs the default route into the TUN 
 
 Binding workflow for HTTP/3, BareUDP, and DNS:
 1. Pick the DNS interface: prefer `local.dns.bindif` when provided and present in probe results; warn and fall back to the first probed non-TUN interface when the preferred one is missing. If no interface is available or probing fails, log a warning and continue with an unbound DNS socket. Probing uses `route_manager` to list routes, performs prefix matches against the target IP, filters entries whose `ifindex` matches the TUN, and maps interface indexes back to names; `route_manager` does not expose route metrics/priority, so ties with equal prefixes rely on route enumeration order—set `local.dns.bindif` / `peers[].h3.bindif` explicitly when interface preference matters.
-2. DNS resolver actor: bind a UDP socket by interface index (Linux/macOS via `bind_device_by_index_v4/6`, Windows via `IP_UNICAST_IF` / `IPV6_UNICAST_IF`) when available. The actor runs a `select` over its command queue, UDP socket, a one-second timer tick, and a refresh timer (configurable via `local.dns.refresh`). The orchestrator sends a single `SetHostnames { hosts: HashSet<String> }` command with all peer endpoint hostnames; the DNS module owns hostname registration and refresh scheduling internally. For each hostname, the resolver assigns random unique transaction IDs for A and AAAA queries and tracks `(domain, id)` pairs. The resolver maintains unified internal state tracking each registered hostname's resolved IPs with TTL-based expiration (minimum 60 seconds). On state change (new IP, IP expired, hostname added/removed), the resolver sets a dirty flag and emits a state snapshot (`HashMap<String, Vec<IpAddr>>`) on the next tick. The orchestrator computes deltas by diffing the new snapshot against the previous one and applies adds/removes accordingly. DNS warnings (NXDOMAIN, truncation, recursion refusal) are logged at origin via `warn!` instead of propagating through events. Timer ticks re-send timed-out entries with new transaction IDs.
+2. DNS resolver actor: bind a UDP socket by interface index (Linux/macOS via `bind_device_by_index_v4/6`, Windows via `IP_UNICAST_IF` / `IPV6_UNICAST_IF`) when available. The actor runs a `select` over its command queue, UDP socket, a one-second timer tick, and a refresh timer (configurable via `tuning.dns_refresh_interval`). The orchestrator sends a single `SetHostnames { hosts: HashSet<String> }` command with all peer endpoint hostnames; the DNS module owns hostname registration and refresh scheduling internally. For each hostname, the resolver assigns random unique transaction IDs for A and AAAA queries and tracks `(domain, id)` pairs. The resolver maintains unified internal state tracking each registered hostname's resolved IPs with TTL-based expiration (minimum 60 seconds). On state change (new IP, IP expired, hostname added/removed), the resolver sets a dirty flag and emits a state snapshot (`HashMap<String, Vec<IpAddr>>`) on the next tick. The orchestrator computes deltas by diffing the new snapshot against the previous one and applies adds/removes accordingly. DNS warnings (NXDOMAIN, truncation, recursion refusal) are logged at origin via `warn!` instead of propagating through events. Timer ticks re-send timed-out entries with new transaction IDs.
 3. Transport binding: for each resolved IP, probe the WAN-facing interface excluding the TUN; bind transport sockets to that interface. HTTP/3 dials all DNS-resolved IPs in parallel; first successful connection wins. BareUDP uses a single listener socket (RX-only) and one outbound socket per BareUDP peer (TX-only). If probing or binding fails, warn and continue unbound.
 
 Platform tiers and binding behavior:
@@ -67,7 +67,7 @@ The orchestrator calls `make` then `spawn` sequentially, never performs actor-sp
 Actors use two channel categories with different capacity policies:
 
 - **Control plane (unbounded)**: Command queues (orchestrator-to-child) and event queues (child-to-orchestrator) use `mpsc::unbounded_channel()`. This prevents deadlocks from message cycles between actors—a bounded channel can deadlock when actors block on `send()` waiting for each other.
-- **Data plane (bounded)**: Packet queues for forwarding IP datagrams use `mpsc::channel(PACKET_QUEUE_DEPTH)` with `PACKET_QUEUE_DEPTH = 256`. Bounded channels provide backpressure, preventing memory exhaustion when producers outpace consumers.
+- **Data plane (bounded)**: Packet queues for forwarding IP datagrams use `mpsc::channel(tuning.packet_queue_depth)` (default 256). Bounded channels provide backpressure, preventing memory exhaustion when producers outpace consumers.
 
 Reference: [Alice Ryhl - Actors with Tokio](https://ryhl.io/blog/actors-with-tokio/)
 
@@ -192,13 +192,13 @@ Spawn an actor for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP
 
 When configuration changes arrive (external controller POST or initialization), update the accepted-source filter first (fast, in-memory), then the internal routing table, then the system routing table. Dynamic reconfiguration flows through the orchestrator via command queues.
 
-**Terminology**: "Accepted sources" refers to the BareUDP RX source IP filter. "Allowed IPs" refers to TUN routing prefixes (`peers[].tun.allowedIPs`).
+**Terminology**: "Accepted sources" refers to the BareUDP RX source IP filter. "Allowed IPs" refers to TUN routing prefixes (`peers[].tun.allowed_ips`).
 
 Connection management:
 - Each peer maintains multiple active connections (`Vec<BoundState>`), one per resolved IP.
 - The first element in the bounds Vec is the preferred TX path for outbound data.
 - When DNS answers change or an endpoint is reconfigured, stale bounds are pruned and new connections are attempted via `try_connect`.
-- `try_connect` is rate-limited to one attempt per 3 seconds per peer (only updates timestamp when connections are actually spawned).
+- `try_connect` is rate-limited to one attempt per `tuning.reconnect_interval` seconds (default 3) per peer (only updates timestamp when connections are actually spawned).
 - Listener-originated (inbound) connections have `endpoint: None` and are never pruned by DNS or endpoint changes.
 - When a restartable actor fails, all peers are pruned (closed TX channels detected via `tx.is_closed()`), and routing is updated if the preferred TX changed.
 
@@ -209,7 +209,7 @@ Connection pruning rules (`PeerEntry::prune`):
 - Inbound connections (`endpoint: None`) are never pruned by endpoint/DNS checks.
 
 DNS lifecycle management:
-- The DNS module owns the refresh timer internally; every `local.dns.refresh` seconds (when nonzero), it re-queries all registered hostnames.
+- The DNS module owns the refresh timer internally; every `tuning.dns_refresh_interval` seconds (when nonzero), it re-queries all registered hostnames.
 - The DNS module maintains unified state tracking each hostname's resolved IPs with TTL-based expiration (minimum 60 seconds). A dirty flag tracks whether state changed since the last snapshot emission.
 - On any state change (new IP, IP expiration, hostname add/remove), the dirty flag is set. On the next tick, if dirty, the DNS module emits a single state snapshot containing all hostname→IP mappings and clears the flag.
 - The orchestrator processes DNS snapshots synchronously in three steps:
@@ -231,9 +231,9 @@ Key flows:
 
 ### System Route Updates
 
-Route update summary: keep the TUN interface's routes aligned with `peers[].tun.allowedIPs` using `route_manager` APIs instead of shelling out (`ip route`, `route`, `netsh`). Route sync is performed by a dedicated Route Sync actor that serializes route updates via an MPSC command channel. The orchestrator sends fire-and-forget `SyncRoutes` commands; the actor processes them one at a time in FIFO order. The `RouteManagerHandle` (netlink socket) is created once during actor initialization and reused across all sync operations. The TUN interface name is captured in the actor at spawn time (immutable for the orchestrator's lifetime). If the route manager cannot be initialized (e.g., BSD platforms without netlink), the orchestrator logs a warning and continues without system route management.
+Route update summary: keep the TUN interface's routes aligned with `peers[].tun.allowed_ips` using `route_manager` APIs instead of shelling out (`ip route`, `route`, `netsh`). Route sync is performed by a dedicated Route Sync actor that serializes route updates via an MPSC command channel. The orchestrator sends fire-and-forget `SyncRoutes` commands; the actor processes them one at a time in FIFO order. The `RouteManagerHandle` (netlink socket) is created once during actor initialization and reused across all sync operations. The TUN interface name is captured in the actor at spawn time (immutable for the orchestrator's lifetime). If the route manager cannot be initialized (e.g., BSD platforms without netlink), the orchestrator logs a warning and continues without system route management.
 
-Route sync flow: (1) resolve the TUN ifindex, (2) list system routes, (3) drop stale TUN routes that are not covered by `allowedIPs` while preserving the configured TUN host addresses, (4) rely on exact prefix matches instead of aggregated coverage when deciding whether an `allowedIPs` entry already exists, (5) when `allowedIPs` includes a default route, split it into two `/1` entries (IPv4 and IPv6) once and warn about the split; if either `/1` conflicts with another interface, emit a conflict warning but still attempt to add the route without further splitting, and (6) warn on unsupported route entries or add/delete failures while continuing to run. Route sync failures are logged as warnings by the actor at origin.
+Route sync flow: (1) resolve the TUN ifindex, (2) list system routes, (3) drop stale TUN routes that are not covered by `allowed_ips` while preserving the configured TUN host addresses, (4) rely on exact prefix matches instead of aggregated coverage when deciding whether an `allowed_ips` entry already exists, (5) when `allowed_ips` includes a default route, split it into two `/1` entries (IPv4 and IPv6) once and warn about the split; if either `/1` conflicts with another interface, emit a conflict warning but still attempt to add the route without further splitting, and (6) warn on unsupported route entries or add/delete failures while continuing to run. Route sync failures are logged as warnings by the actor at origin.
 
 ### Longest-Prefix-Match Algorithm
 
@@ -245,10 +245,10 @@ h3llo should use the same longest-prefix-match algorithm as WireGuard when match
 
 h3llo provides two complementary multi-path capabilities: per-peer subnet routing and per-peer connection redundancy.
 
-- Per-peer subnet routing: different `allowedIPs` prefixes can be assigned to different peers regardless of transport type (H3 or BareUDP). The routing table uses longest-prefix matching to forward packets to the appropriate peer based on destination IP.
+- Per-peer subnet routing: different `allowed_ips` prefixes can be assigned to different peers regardless of transport type (H3 or BareUDP). The routing table uses longest-prefix matching to forward packets to the appropriate peer based on destination IP.
 - Per-peer connection redundancy: when a peer's hostname resolves to multiple IPs, h3llo establishes a connection to each resolved IP (`Vec<BoundState>`). The first bound is the preferred TX path; when it drops, prune promotes the next available bound automatically, providing failover without waiting for DNS or reconnection. See Connection management above for pruning and rate-limiting details.
 
-Route deduplication: when synchronizing system routes, if a TUN address prefix (from `local.tun.addrs`) exactly matches a desired route (from peer `allowedIPs`), h3llo avoids tracking it as a separate TUN address route since the desired route already covers it.
+Route deduplication: when synchronizing system routes, if a TUN address prefix (from `local.tun.addrs`) exactly matches a desired route (from peer `allowed_ips`), h3llo avoids tracking it as a separate TUN address route since the desired route already covers it.
 
 ### Observability
 

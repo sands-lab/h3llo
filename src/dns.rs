@@ -200,6 +200,7 @@ pub struct DnsActor {
 /// * `local_dns` - DNS configuration from config file.
 /// * `tun_if` - Optional TUN interface name to exclude from routing.
 /// * `timeout` - Query timeout duration.
+/// * `refresh_interval` - Periodic re-query interval; `Duration::ZERO` disables.
 /// * `probe` - Route probe for interface selection.
 ///
 /// # Errors
@@ -209,11 +210,11 @@ pub async fn make_dns<P: RouteProbe>(
     local_dns: &LocalDns,
     tun_if: Option<&str>,
     timeout: Duration,
+    refresh_interval: Duration,
     probe: &P,
 ) -> Result<DnsActor, ResolveInitError> {
     // server is pre-parsed as SocketAddr during config deserialization
     let server = local_dns.server;
-    let refresh_interval = Duration::from_secs(local_dns.refresh);
 
     let socket = make_client_udp_socket(server, tun_if, local_dns.bindif.as_deref(), probe)
         .await
@@ -650,13 +651,18 @@ mod tests {
         let local_dns = LocalDns {
             server,
             bindif: None,
-            refresh: 0, // ZERO disables automatic refresh
         };
 
         let probe = FakeRouteProbe::noop();
-        let dns_actor = make_dns(&local_dns, None, Duration::from_millis(50), &probe)
-            .await
-            .expect("make_dns failed");
+        let dns_actor = make_dns(
+            &local_dns,
+            None,
+            Duration::from_millis(50),
+            Duration::ZERO,
+            &probe,
+        )
+        .await
+        .expect("make_dns failed");
 
         let (cmd_tx, handle) = spawn_dns(dns_actor, event_tx);
         (cmd_tx, event_rx, handle)
@@ -967,13 +973,18 @@ mod tests {
         let local_dns = LocalDns {
             server: server_addr,
             bindif: None,
-            refresh: 0,
         };
 
         let probe = FakeRouteProbe::noop();
-        let dns_actor = make_dns(&local_dns, None, Duration::from_millis(50), &probe)
-            .await
-            .expect("make_dns");
+        let dns_actor = make_dns(
+            &local_dns,
+            None,
+            Duration::from_millis(50),
+            Duration::ZERO,
+            &probe,
+        )
+        .await
+        .expect("make_dns");
 
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, _handle) = spawn_dns(dns_actor, event_tx);
@@ -992,13 +1003,18 @@ mod tests {
         let local_dns = LocalDns {
             server: server_addr,
             bindif: None,
-            refresh: 0,
         };
 
         let probe = FakeRouteProbe::noop();
-        let dns_actor = make_dns(&local_dns, None, Duration::from_millis(50), &probe)
-            .await
-            .expect("make_dns");
+        let dns_actor = make_dns(
+            &local_dns,
+            None,
+            Duration::from_millis(50),
+            Duration::ZERO,
+            &probe,
+        )
+        .await
+        .expect("make_dns");
 
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, join_handle) = spawn_dns(dns_actor, event_tx);

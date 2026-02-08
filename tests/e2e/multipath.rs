@@ -6,11 +6,11 @@
 //!
 //! Topology:
 //! - Node A: TUN with 10.0.0.1/24 and 10.0.1.1/24
-//!   - Peer B-bare (BareUDP): allowedIPs 10.0.0.0/24
-//!   - Peer B-h3 (HTTP/3): allowedIPs 10.0.1.0/24
+//!   - Peer B-bare (BareUDP): allowed_ips 10.0.0.0/24
+//!   - Peer B-h3 (HTTP/3): allowed_ips 10.0.1.0/24
 //! - Node B: TUN with 10.0.0.2/24 and 10.0.1.2/24
-//!   - Peer A-bare (BareUDP): allowedIPs 10.0.0.0/24
-//!   - Peer A-h3 (HTTP/3): allowedIPs 10.0.1.0/24
+//!   - Peer A-bare (BareUDP): allowed_ips 10.0.0.0/24
+//!   - Peer A-h3 (HTTP/3): allowed_ips 10.0.1.0/24
 //!
 //! Run with: `cargo test --test e2e -- --ignored --nocapture`
 
@@ -48,7 +48,7 @@ peers:
     bare:
       endpoint: "udp://node-b-mp.h3llo-test-net:5353"
     tun:
-      allowedIPs:
+      allowed_ips:
         - 10.0.0.0/24
   - id: node-b-mp-h3
     enabled: true
@@ -57,7 +57,7 @@ peers:
       token: multipath-token-12ch
       insecure: true
     tun:
-      allowedIPs:
+      allowed_ips:
         - 10.0.1.0/24
 "#
     )
@@ -89,7 +89,7 @@ peers:
     bare:
       endpoint: "udp://node-a-mp.h3llo-test-net:5353"
     tun:
-      allowedIPs:
+      allowed_ips:
         - 10.0.0.0/24
   - id: node-a-mp-h3
     enabled: true
@@ -98,7 +98,7 @@ peers:
       token: multipath-token-12ch
       insecure: true
     tun:
-      allowedIPs:
+      allowed_ips:
         - 10.0.1.0/24
 "#
     )

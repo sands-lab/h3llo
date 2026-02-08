@@ -5,7 +5,6 @@ use crate::config::{LocalTun, Peer};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::{extract_dst_ip, retry_on_interrupted};
 use crate::metrics::TransportCounters;
-use crate::PACKET_QUEUE_DEPTH;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use ipnet_trie::IpnetTrie;
 use std::collections::HashMap;
@@ -158,7 +157,7 @@ pub enum TunError {
 
 fn log_duplicate_allowed(peer_id: &str, cidr: &str) {
     warn!(
-        "duplicate allowedIPs '{}' for peer '{}'; keeping the first entry",
+        "duplicate allowed_ips '{}' for peer '{}'; keeping the first entry",
         cidr, peer_id
     );
 }
@@ -450,9 +449,10 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     mut tun: T,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
+    packet_queue_depth: usize,
 ) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(packet_queue_depth);
     let tun_name = tun.name().to_string();
 
     let handle = tokio::spawn(async move {
@@ -730,7 +730,8 @@ mod tests {
     async fn tun_tx_drops_oversize_and_reports_metrics() {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) = memory_tun("mem1", 4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (packet_tx, tun_tx_task) = spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(10));
+        let (packet_tx, tun_tx_task) =
+            spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(10), 256);
 
         packet_tx.send(vec![0, 1, 2, 3, 4, 5]).await.unwrap();
         packet_tx.send(vec![9, 9, 9]).await.unwrap();
@@ -781,7 +782,8 @@ mod tests {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) =
             memory_tun_with_errors("mem-interrupt", 16, vec![std::io::ErrorKind::Interrupted]);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (packet_tx, tun_tx_task) = spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(5));
+        let (packet_tx, tun_tx_task) =
+            spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(5), 256);
 
         packet_tx.send(vec![1, 2, 3]).await.unwrap();
 
@@ -1019,7 +1021,7 @@ mod tests {
         let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-lifecycle", 64);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (packet_tx, handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60));
+        let (packet_tx, handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
 
         // Verify packet_tx is functional by sending a packet
         assert!(packet_tx.send(vec![1, 2, 3]).await.is_ok());
@@ -1032,7 +1034,8 @@ mod tests {
         let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-shutdown", 64);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (packet_tx, join_handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60));
+        let (packet_tx, join_handle) =
+            spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
 
         // Drop sender to signal shutdown
         drop(packet_tx);
