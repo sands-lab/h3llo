@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 /// Resolves interface indexes from names.
-pub trait IfIndexResolver {
+pub trait IfIndexResolver: Send + Sync + 'static {
     /// Returns the interface index for `name`.
     ///
     /// # Errors
@@ -36,7 +36,7 @@ impl IfIndexResolver for PlatformIfIndexResolver {
 }
 
 /// Abstracts route operations for production and tests.
-pub trait RouteHandle: Send {
+pub trait RouteHandle: Send + 'static {
     /// Lists all routes on the host.
     fn list(&mut self) -> impl std::future::Future<Output = io::Result<Vec<Route>>> + Send;
     /// Adds a route.
@@ -90,21 +90,26 @@ pub enum RouteCommand {
 
 /// Route sync actor state.
 ///
-/// Created by [`make_route()`], consumed by [`spawn_route()`].
-pub struct RouteActor {
-    handle: RouteManagerHandle,
+/// Created by [`make_route()`] (production) or struct literal (tests),
+/// consumed by [`spawn_route()`].
+pub struct RouteActor<H: RouteHandle, R: IfIndexResolver> {
+    handle: H,
+    resolver: R,
 }
 
-/// Creates route sync actor state.
+/// Creates route sync actor state with production dependencies.
 ///
 /// Performs fallible I/O (netlink socket creation) during construction.
 ///
 /// # Errors
 ///
 /// Returns `io::Error` when the route manager handle cannot be created.
-pub fn make_route() -> io::Result<RouteActor> {
+pub fn make_route() -> io::Result<RouteActor<RouteManagerHandle, PlatformIfIndexResolver>> {
     let handle = RouteManagerHandle::new()?;
-    Ok(RouteActor { handle })
+    Ok(RouteActor {
+        handle,
+        resolver: PlatformIfIndexResolver,
+    })
 }
 
 /// Spawns the route sync actor task.
@@ -115,24 +120,27 @@ pub fn make_route() -> io::Result<RouteActor> {
 ///
 /// # Arguments
 ///
-/// * `actor` - Actor state created by [`make_route()`].
+/// * `actor` - Actor state created by [`make_route()`] or constructed directly in tests.
 /// * `tun_if` - TUN interface name, captured for the actor's lifetime.
-pub fn spawn_route(
-    actor: RouteActor,
+pub fn spawn_route<H: RouteHandle, R: IfIndexResolver>(
+    actor: RouteActor<H, R>,
     tun_if: String,
 ) -> (
     mpsc::UnboundedSender<RouteCommand>,
     JoinHandle<ActorExitResult>,
 ) {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-    let RouteActor { mut handle } = actor;
+    let RouteActor {
+        mut handle,
+        resolver,
+    } = actor;
 
     let join_handle = tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 RouteCommand::SyncRoutes { tun_addrs, allowed } => {
                     if let Err(err) =
-                        sync_tun_routes(&tun_if, &tun_addrs, &allowed, &mut handle).await
+                        sync_tun_routes(&tun_if, &tun_addrs, &allowed, &mut handle, &resolver).await
                     {
                         warn!(error = %err, "route sync failed");
                     }
@@ -172,18 +180,7 @@ pub enum RouteSyncError {
 /// - Any other route on the TUN interface is considered stale and will be deleted.
 /// - If a desired prefix already exists on another interface, a conflict warning is logged.
 /// - Failures when adding or deleting are logged as warnings.
-pub async fn sync_tun_routes<H: RouteHandle>(
-    tun_if: &str,
-    tun_addrs: &[IpNet],
-    allowed: &[IpNet],
-    handle: &mut H,
-) -> Result<(), RouteSyncError> {
-    let resolver = PlatformIfIndexResolver;
-    sync_tun_routes_with_resolver(tun_if, tun_addrs, allowed, handle, &resolver).await
-}
-
-/// Variant of `sync_tun_routes` that allows injecting an interface resolver (for tests).
-pub async fn sync_tun_routes_with_resolver<H: RouteHandle, R: IfIndexResolver>(
+pub async fn sync_tun_routes<H: RouteHandle, R: IfIndexResolver>(
     tun_if: &str,
     tun_addrs: &[IpNet],
     allowed: &[IpNet],
@@ -301,7 +298,6 @@ pub fn ipnet_from_route(route: &Route) -> Option<IpNet> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use tokio::sync::mpsc as tokio_mpsc;
     use tracing_test::traced_test;
 
     /// Builds a route for tests.
@@ -410,7 +406,7 @@ mod tests {
         ];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
         assert_eq!(handle.ops(), vec!["add 10.0.1.0/24"]);
@@ -428,7 +424,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec![];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
         assert_eq!(handle.ops(), vec!["del 10.5.0.0/16"]);
@@ -446,7 +442,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["192.168.0.0/24".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
         assert_eq!(handle.ops(), vec!["add 192.168.0.0/24"]);
@@ -464,7 +460,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["10.0.0.0/24".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
@@ -482,7 +478,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
@@ -506,7 +502,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
@@ -527,7 +523,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
@@ -551,7 +547,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["10.0.0.1/32".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
@@ -569,7 +565,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["2001:db8::/64".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
@@ -588,7 +584,7 @@ mod tests {
         let mut handle = FakeHandle::with_failures(vec![stale.clone()], true, true);
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
@@ -611,7 +607,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
@@ -629,7 +625,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
@@ -645,7 +641,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec!["10.0.0.1/24".parse().unwrap()];
         let allowed: Vec<IpNet> = vec!["192.168.1.0/24".parse().unwrap()];
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
@@ -666,7 +662,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
         let allowed: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
 
-        sync_tun_routes_with_resolver("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
             .await
             .unwrap();
 
@@ -674,36 +670,118 @@ mod tests {
         assert!(handle.ops().is_empty());
     }
 
+    /// Always fails interface resolution (for error path tests).
+    struct FailingResolver;
+
+    impl IfIndexResolver for FailingResolver {
+        fn resolve(&self, name: &str) -> Result<u32, RouteSyncError> {
+            Err(RouteSyncError::InterfaceLookup {
+                interface: name.to_string(),
+                error: "test failure".to_string(),
+            })
+        }
+    }
+
     // ========== Route actor lifecycle tests ==========
 
     #[tokio::test]
-    async fn route_actor_exits_when_sender_dropped() {
-        // Cannot create real RouteManagerHandle in test (requires CAP_NET_ADMIN),
-        // so we test the spawn_route channel pattern directly.
-        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel::<RouteCommand>();
+    #[traced_test]
+    async fn spawn_route_processes_command_and_exits_on_drop() {
+        let actor = RouteActor {
+            handle: FakeHandle::new(vec![]),
+            resolver: FakeResolver { idx: 7 },
+        };
+        let (cmd_tx, join_handle) = spawn_route(actor, "tun0".to_string());
+        cmd_tx
+            .send(RouteCommand::SyncRoutes {
+                tun_addrs: vec![],
+                allowed: vec!["10.0.0.0/24".parse().unwrap()],
+            })
+            .expect("send should succeed");
+        drop(cmd_tx);
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), join_handle).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "actor should shut down cleanly after processing command, got {result:?}"
+        );
+        assert!(!logs_contain("route sync failed"));
+    }
 
-        let join_handle = tokio::spawn(async move {
-            while let Some(_cmd) = cmd_rx.recv().await {
-                // In real actor, this would call sync_tun_routes
-            }
-            Ok::<(), crate::actor::ActorError>(())
-        });
+    #[tokio::test]
+    #[traced_test]
+    async fn spawn_route_logs_sync_failure() {
+        let actor = RouteActor {
+            handle: FakeHandle::new(vec![]),
+            resolver: FailingResolver,
+        };
+        let (cmd_tx, join_handle) = spawn_route(actor, "tun0".to_string());
+        cmd_tx
+            .send(RouteCommand::SyncRoutes {
+                tun_addrs: vec![],
+                allowed: vec!["10.0.0.0/24".parse().unwrap()],
+            })
+            .expect("send should succeed");
+        drop(cmd_tx);
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), join_handle).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "actor should shut down cleanly even after sync failure, got {result:?}"
+        );
+        assert!(logs_contain("route sync failed"));
+    }
 
-        // Verify command can be sent
+    #[tokio::test]
+    async fn spawn_route_exits_gracefully_on_sender_drop() {
+        let actor = RouteActor {
+            handle: FakeHandle::new(vec![]),
+            resolver: FakeResolver { idx: 7 },
+        };
+        let (cmd_tx, join_handle) = spawn_route(actor, "tun0".to_string());
+        drop(cmd_tx);
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), join_handle).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "actor should shut down cleanly after sender dropped, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_route_returns_working_cmd_tx() {
+        let actor = RouteActor {
+            handle: FakeHandle::new(vec![]),
+            resolver: FakeResolver { idx: 7 },
+        };
+        let (cmd_tx, _join_handle) = spawn_route(actor, "tun0".to_string());
         assert!(cmd_tx
             .send(RouteCommand::SyncRoutes {
                 tun_addrs: vec![],
                 allowed: vec!["10.0.0.0/24".parse().unwrap()],
             })
             .is_ok());
+    }
 
-        // Drop sender to signal shutdown
+    #[tokio::test]
+    #[traced_test]
+    async fn spawn_route_processes_multiple_commands_sequentially() {
+        let actor = RouteActor {
+            handle: FakeHandle::new(vec![]),
+            resolver: FakeResolver { idx: 7 },
+        };
+        let (cmd_tx, join_handle) = spawn_route(actor, "tun0".to_string());
+        for prefix in &["10.0.0.0/24", "10.0.1.0/24", "10.0.2.0/24"] {
+            cmd_tx
+                .send(RouteCommand::SyncRoutes {
+                    tun_addrs: vec![],
+                    allowed: vec![prefix.parse().unwrap()],
+                })
+                .expect("send should succeed");
+        }
         drop(cmd_tx);
-
-        let result = tokio::time::timeout(std::time::Duration::from_millis(200), join_handle).await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), join_handle).await;
         assert!(
             matches!(result, Ok(Ok(Ok(())))),
-            "actor should shut down cleanly after sender dropped"
+            "actor should process all commands and shut down cleanly, got {result:?}"
         );
+        assert!(!logs_contain("route sync failed"));
     }
 }
