@@ -33,6 +33,8 @@ const TRY_CONNECT_INTERVAL: Duration = Duration::from_secs(3);
 /// A single active connection bound to a peer.
 #[derive(Debug)]
 struct BoundState {
+    /// Unique identifier for detecting changes in preferred TX.
+    id: u64,
     /// Configured endpoint that originated this connection.
     ///
     /// `None` for listener-originated (inbound) connections.
@@ -54,6 +56,8 @@ struct PeerEntry {
     resolved_ips: HashSet<IpAddr>,
     /// Last time `try_connect` actually spawned connections.
     last_try_connect: Option<Instant>,
+    /// Monotonic counter for assigning unique bound IDs.
+    next_bound_id: u64,
 }
 
 impl PeerEntry {
@@ -64,12 +68,30 @@ impl PeerEntry {
             bounds: Vec::new(),
             resolved_ips: HashSet::new(),
             last_try_connect: None,
+            next_bound_id: 0,
         }
     }
 
     /// Returns the preferred TX channel (first bound) or `None` if no active connections.
     fn preferred_tx(&self) -> Option<&mpsc::Sender<Vec<u8>>> {
         self.bounds.first().map(|b| &b.tx)
+    }
+
+    /// Appends a new bound with an auto-assigned unique ID.
+    fn push_bound(
+        &mut self,
+        endpoint: Option<Endpoint>,
+        dest: SocketAddr,
+        tx: mpsc::Sender<Vec<u8>>,
+    ) {
+        let id = self.next_bound_id;
+        self.next_bound_id += 1;
+        self.bounds.push(BoundState {
+            id,
+            endpoint,
+            dest,
+            tx,
+        });
     }
 
     /// Returns the current config endpoint as an `Endpoint` enum, if configured.
@@ -90,7 +112,7 @@ impl PeerEntry {
     /// - Its endpoint is `Some` but differs from the current config endpoint (reconfig).
     /// - Its endpoint is `Some` and its dest IP is not in `resolved_ips` (DNS changed).
     fn prune(&mut self) -> bool {
-        let old_first_dest = self.bounds.first().map(|b| b.dest);
+        let old_first_id = self.bounds.first().map(|b| b.id);
         let config_ep = self.config_endpoint();
 
         self.bounds.retain(|bound| {
@@ -115,7 +137,7 @@ impl PeerEntry {
             true
         });
 
-        old_first_dest != self.bounds.first().map(|b| b.dest)
+        old_first_id != self.bounds.first().map(|b| b.id)
     }
 
     /// Spawns connections for resolved IPs not already covered by an existing bound.
@@ -714,7 +736,7 @@ impl Orchestrator {
             return;
         };
         let was_empty = entry.bounds.is_empty();
-        entry.bounds.push(BoundState { endpoint, dest, tx });
+        entry.push_bound(endpoint, dest, tx);
         let first_changed = entry.prune();
         if was_empty || first_changed {
             self.update_routing();
@@ -920,7 +942,7 @@ mod test_support {
         ) -> Self {
             if let Some(entry) = self.peers.get_mut(peer_id) {
                 let endpoint = entry.config_endpoint();
-                entry.bounds.push(BoundState { endpoint, dest, tx });
+                entry.push_bound(endpoint, dest, tx);
             }
             self
         }
@@ -1376,12 +1398,7 @@ mod tests {
         orch.peers
             .get_mut("peer1")
             .unwrap()
-            .bounds
-            .push(BoundState {
-                endpoint: None,
-                dest,
-                tx,
-            });
+            .push_bound(None, dest, tx);
 
         assert!(!orch.peers.get("peer1").unwrap().bounds.is_empty());
 
@@ -1724,11 +1741,7 @@ mod tests {
         entry.resolved_ips.insert("1.2.3.4".parse().unwrap());
 
         let (tx, rx) = mpsc::channel(1);
-        entry.bounds.push(BoundState {
-            endpoint: entry.config_endpoint(),
-            dest: "1.2.3.4:5353".parse().unwrap(),
-            tx,
-        });
+        entry.push_bound(entry.config_endpoint(), "1.2.3.4:5353".parse().unwrap(), tx);
 
         assert!(!entry.bounds.is_empty());
         // Drop receiver to close channel
@@ -1747,11 +1760,7 @@ mod tests {
         entry.resolved_ips.insert("5.6.7.8".parse().unwrap());
 
         let (tx, _rx) = mpsc::channel(1);
-        entry.bounds.push(BoundState {
-            endpoint: entry.config_endpoint(),
-            dest: "1.2.3.4:5353".parse().unwrap(),
-            tx,
-        });
+        entry.push_bound(entry.config_endpoint(), "1.2.3.4:5353".parse().unwrap(), tx);
 
         let changed = entry.prune();
         assert!(entry.bounds.is_empty());
@@ -1767,16 +1776,9 @@ mod tests {
 
         let (tx1, rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
-        entry.bounds.push(BoundState {
-            endpoint: entry.config_endpoint(),
-            dest: "1.2.3.4:5353".parse().unwrap(),
-            tx: tx1,
-        });
-        entry.bounds.push(BoundState {
-            endpoint: entry.config_endpoint(),
-            dest: "5.6.7.8:5353".parse().unwrap(),
-            tx: tx2,
-        });
+        let ep = entry.config_endpoint();
+        entry.push_bound(ep.clone(), "1.2.3.4:5353".parse().unwrap(), tx1);
+        entry.push_bound(ep, "5.6.7.8:5353".parse().unwrap(), tx2);
 
         // Drop first receiver -> first bound becomes invalid
         drop(rx1);
@@ -1791,17 +1793,34 @@ mod tests {
     }
 
     #[test]
+    fn prune_detects_change_with_same_dest() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let mut entry = PeerEntry::new(peer);
+        entry.resolved_ips.insert("1.2.3.4".parse().unwrap());
+
+        // Two bounds to the same dest but different TX channels
+        let (tx1, rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let ep = entry.config_endpoint();
+        entry.push_bound(ep.clone(), "1.2.3.4:5353".parse().unwrap(), tx1);
+        entry.push_bound(ep, "1.2.3.4:5353".parse().unwrap(), tx2);
+
+        // Drop first receiver -> first bound becomes invalid
+        drop(rx1);
+
+        let changed = entry.prune();
+        assert!(changed); // must detect change even though dest is identical
+        assert_eq!(entry.bounds.len(), 1);
+    }
+
+    #[test]
     fn prune_preserves_inbound_bounds() {
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
         let mut entry = PeerEntry::new(peer);
         // resolved_ips is EMPTY -- but inbound bounds (endpoint: None) should survive
 
         let (tx, _rx) = mpsc::channel(1);
-        entry.bounds.push(BoundState {
-            endpoint: None, // inbound
-            dest: "9.8.7.6:12345".parse().unwrap(),
-            tx,
-        });
+        entry.push_bound(None, "9.8.7.6:12345".parse().unwrap(), tx);
 
         let changed = entry.prune();
         assert!(!changed);
