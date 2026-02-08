@@ -415,11 +415,6 @@ impl Orchestrator {
         let manage_routes = config.local.table;
         let tun_addrs = config.local.tun.addrs.clone();
 
-        let metrics_interval = config.tuning.log_metrics_interval;
-        let packet_queue_depth = config.tuning.packet_queue_depth;
-        let dns_query_timeout = config.tuning.dns_query_timeout;
-        let dns_refresh_interval = config.tuning.dns_refresh_interval;
-
         // Note: NoTransportConfigured validation moved to Config::validate()
 
         // Setup TUN
@@ -436,14 +431,18 @@ impl Orchestrator {
         let routing = RoutingTable::new();
 
         // Spawn TUN actors - actors create their own command channels
-        let (tun_cmd_tx, tun_rx_handle) =
-            tun::spawn_tun_rx(tun_reader, routing, events_tx.clone(), metrics_interval);
+        let (tun_cmd_tx, tun_rx_handle) = tun::spawn_tun_rx(
+            tun_reader,
+            routing,
+            events_tx.clone(),
+            config.tuning.log_metrics_interval,
+        );
         // TUN-Tx actor creates its own packet channel; returns sender for transports to use
         let (tun_packet_tx, tun_tx_handle) = tun::spawn_tun_tx(
             tun_writer,
             events_tx.clone(),
-            metrics_interval,
-            packet_queue_depth,
+            config.tuning.log_metrics_interval,
+            config.tuning.packet_queue_depth,
         );
 
         join_set.spawn(tun_rx_handle);
@@ -462,7 +461,7 @@ impl Orchestrator {
                 std::collections::HashSet::new(),
                 tun_packet_tx.clone(),
                 events_tx.clone(),
-                metrics_interval,
+                config.tuning.log_metrics_interval,
             );
 
             join_set.spawn(bare_rx_handle);
@@ -525,8 +524,8 @@ impl Orchestrator {
         let dns_actor = make_dns(
             &config.local.dns,
             Some(tun_if.as_str()),
-            dns_query_timeout,
-            dns_refresh_interval,
+            config.tuning.dns_query_timeout,
+            config.tuning.dns_refresh_interval,
             &probe,
         )
         .await
