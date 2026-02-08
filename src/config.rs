@@ -231,6 +231,9 @@ pub enum ValidationError {
     /// Duplicate peer token.
     #[error("duplicate peer token for peer '{peer_id}'")]
     DuplicatePeerToken { peer_id: String },
+    /// Peer SNI is empty.
+    #[error("peer '{peer_id}' h3.sni must not be empty")]
+    PeerSniEmpty { peer_id: String },
     /// Peer SNI has leading or trailing whitespace.
     #[error("peer '{peer_id}' h3.sni must not have leading or trailing whitespace")]
     PeerSniHasWhitespace { peer_id: String },
@@ -353,7 +356,11 @@ impl Config {
                     });
                 }
                 if let Some(sni) = &h3.sni {
-                    if sni != sni.trim() {
+                    if sni.trim().is_empty() {
+                        errors.push(ValidationError::PeerSniEmpty {
+                            peer_id: peer.id.clone(),
+                        });
+                    } else if sni != sni.trim() {
                         errors.push(ValidationError::PeerSniHasWhitespace {
                             peer_id: peer.id.clone(),
                         });
@@ -1044,6 +1051,34 @@ peers:
         let config = sample_h3_config();
         assert!(config.peers[0].h3.as_ref().unwrap().sni.is_none());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_sni() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.sni = Some("".to_string());
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniEmpty { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_whitespace_only_sni() {
+        let mut config = sample_h3_config();
+        if let Some(h3) = config.peers[0].h3.as_mut() {
+            h3.sni = Some("   ".to_string());
+        }
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniEmpty { .. }))
+        ));
     }
 
     #[test]

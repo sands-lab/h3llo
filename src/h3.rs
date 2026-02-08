@@ -1403,6 +1403,71 @@ mod tests {
         drop(cmd_tx);
     }
 
+    #[tokio::test]
+    async fn handshake_success_with_sni_override() {
+        use crate::events::{ConnectionDirection, Event, TransportEvent};
+
+        let certs = TestCertBundle::generate();
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let peer_id = "sni-client";
+        let token = "sni-test-token-12ch";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+            .expect("make_h3_listener");
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
+            listener,
+            peer_tokens,
+            crate::config::default_mtu(),
+            events_tx,
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Create PeerH3 with sni override matching the cert SAN ("localhost")
+        let mut peer_h3 = test_peer_h3(bound_addr, token);
+        peer_h3.sni = Some("localhost".to_string());
+
+        let probe = FakeRouteProbe::noop();
+        let client_result = dial_h3(
+            &peer_h3,
+            bound_addr,
+            peer_id,
+            None,
+            crate::config::default_mtu(),
+            &probe,
+        )
+        .await;
+
+        assert!(
+            client_result.is_ok(),
+            "dial_h3 with SNI override failed: {:?}",
+            client_result.err()
+        );
+        let client_conn = client_result.unwrap();
+        assert_eq!(client_conn.peer_id, peer_id);
+
+        // Server should emit an H3Connected event
+        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events_rx.recv().await {
+                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                    return Some(connected);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timeout waiting for server connection")
+        .expect("no H3Connected event received");
+        assert_eq!(server_event.connection.peer_id, peer_id);
+        assert_eq!(server_event.direction, ConnectionDirection::Inbound);
+
+        drop(cmd_tx);
+    }
+
     // ========== H3Connection::into_actors Tests ==========
 
     #[tokio::test]
