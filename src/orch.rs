@@ -1503,6 +1503,7 @@ mod tests {
                 ca: None,
                 insecure: true,
                 bindif: None,
+                sni: None,
             }),
             bare: None,
             tun: PeerTun {

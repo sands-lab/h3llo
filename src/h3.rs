@@ -430,10 +430,17 @@ pub async fn dial_h3<P: RouteProbe>(
         .endpoint
         .as_ref()
         .ok_or_else(|| DialError::Socket("peer_h3.endpoint is None".to_string()))?;
-    let server_name = &endpoint.host;
+    let server_name = peer_h3.sni.as_deref().unwrap_or(&endpoint.host);
+    // Per HTTP semantics (RFC 9110 §7.2), :authority must include host:port
+    // when the port is not the default for the scheme (443 for https).
+    let authority = if endpoint.port == 443 {
+        endpoint.host.clone()
+    } else {
+        format!("{}:{}", endpoint.host, endpoint.port)
+    };
     let path = &endpoint.path;
 
-    debug!(%remote_addr, %server_name, %peer_id, "dialing H3 endpoint");
+    debug!(%remote_addr, %server_name, %authority, %peer_id, "dialing H3 endpoint");
 
     // Create UDP socket with route probing
     let socket = make_client_udp_socket(remote_addr, tun_if, peer_h3.bindif.as_deref(), probe)
@@ -485,7 +492,7 @@ pub async fn dial_h3<P: RouteProbe>(
         Header::new(b":method", b"CONNECT"),
         Header::new(b":protocol", b"connect-ip"),
         Header::new(b":scheme", b"https"),
-        Header::new(b":authority", server_name.as_bytes()),
+        Header::new(b":authority", authority.as_bytes()),
         Header::new(b":path", path.as_bytes()),
         Header::new(b"capsule-protocol", b"?1"),
         Header::new(b"authorization", auth_header.as_bytes()),
@@ -1224,6 +1231,7 @@ mod tests {
             ca: None,
             insecure: true,
             bindif: None,
+            sni: None,
         };
         let probe = FakeRouteProbe::noop();
 
@@ -1334,6 +1342,7 @@ mod tests {
             ca: None,
             insecure: true,
             bindif: None,
+            sni: None,
         }
     }
 
@@ -1405,6 +1414,71 @@ mod tests {
         assert_eq!(server_event.direction, ConnectionDirection::Inbound);
 
         // Clean shutdown
+        drop(cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn handshake_success_with_sni_override() {
+        use crate::events::{ConnectionDirection, Event, TransportEvent};
+
+        let certs = TestCertBundle::generate();
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let peer_id = "sni-client";
+        let token = "sni-test-token-12ch";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+            .expect("make_h3_listener");
+        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
+            listener,
+            peer_tokens,
+            crate::config::default_mtu(),
+            events_tx,
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Create PeerH3 with sni override matching the cert SAN ("localhost")
+        let mut peer_h3 = test_peer_h3(bound_addr, token);
+        peer_h3.sni = Some("localhost".to_string());
+
+        let probe = FakeRouteProbe::noop();
+        let client_result = dial_h3(
+            &peer_h3,
+            bound_addr,
+            peer_id,
+            None,
+            crate::config::default_mtu(),
+            &probe,
+        )
+        .await;
+
+        assert!(
+            client_result.is_ok(),
+            "dial_h3 with SNI override failed: {:?}",
+            client_result.err()
+        );
+        let client_conn = client_result.unwrap();
+        assert_eq!(client_conn.peer_id, peer_id);
+
+        // Server should emit an H3Connected event
+        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events_rx.recv().await {
+                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                    return Some(connected);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timeout waiting for server connection")
+        .expect("no H3Connected event received");
+        assert_eq!(server_event.connection.peer_id, peer_id);
+        assert_eq!(server_event.direction, ConnectionDirection::Inbound);
+
         drop(cmd_tx);
     }
 
