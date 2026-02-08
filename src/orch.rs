@@ -410,6 +410,7 @@ impl Orchestrator {
     ///
     /// Returns `OrchestratorError` when initialization fails.
     pub async fn new(config: Config) -> Result<Self, OrchestratorError> {
+        let tuning = &config.tuning;
         let tun_if = config.local.tun.ifname.clone();
         let mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
@@ -435,14 +436,14 @@ impl Orchestrator {
             tun_reader,
             routing,
             events_tx.clone(),
-            config.tuning.log_metrics_interval,
+            tuning.log_metrics_interval,
         );
         // TUN-Tx actor creates its own packet channel; returns sender for transports to use
         let (tun_packet_tx, tun_tx_handle) = tun::spawn_tun_tx(
             tun_writer,
             events_tx.clone(),
-            config.tuning.log_metrics_interval,
-            config.tuning.packet_queue_depth,
+            tuning.log_metrics_interval,
+            tuning.packet_queue_depth,
         );
 
         join_set.spawn(tun_rx_handle);
@@ -461,7 +462,7 @@ impl Orchestrator {
                 std::collections::HashSet::new(),
                 tun_packet_tx.clone(),
                 events_tx.clone(),
-                config.tuning.log_metrics_interval,
+                tuning.log_metrics_interval,
             );
 
             join_set.spawn(bare_rx_handle);
@@ -501,7 +502,7 @@ impl Orchestrator {
                     peer_tokens,
                     config.local.tun.mtu,
                     events_tx.clone(),
-                    &config.tuning,
+                    tuning,
                 );
 
                 join_set.spawn(listener_handle);
@@ -524,8 +525,8 @@ impl Orchestrator {
         let dns_actor = make_dns(
             &config.local.dns,
             Some(tun_if.as_str()),
-            config.tuning.dns_query_timeout,
-            config.tuning.dns_refresh_interval,
+            tuning.dns_query_timeout,
+            tuning.dns_refresh_interval,
             &probe,
         )
         .await
