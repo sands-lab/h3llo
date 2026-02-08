@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -147,10 +147,9 @@ impl PeerEntry {
         mtu: usize,
         tuning: &Tuning,
     ) {
-        let reconnect_interval = Duration::from_secs(tuning.reconnect_interval);
         // Rate limit
         if let Some(last) = self.last_try_connect {
-            if last.elapsed() < reconnect_interval {
+            if last.elapsed() < tuning.reconnect_interval {
                 return;
             }
         }
@@ -176,9 +175,6 @@ impl PeerEntry {
 
         self.last_try_connect = Some(Instant::now());
 
-        let metrics_interval = Duration::from_secs(tuning.log_metrics_interval);
-        let packet_queue_depth = tuning.packet_queue_depth;
-
         if let Some(bare) = self.config.bare.as_ref() {
             let port = bare.endpoint.port;
 
@@ -189,6 +185,8 @@ impl PeerEntry {
                 let peer_id = self.config.id.clone();
                 let bindif = bare.bindif.clone();
                 let endpoint = Endpoint::Udp(bare.endpoint.clone());
+                let metrics_interval = tuning.log_metrics_interval;
+                let packet_queue_depth = tuning.packet_queue_depth;
 
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
@@ -417,11 +415,10 @@ impl Orchestrator {
         let manage_routes = config.local.table;
         let tun_addrs = config.local.tun.addrs.clone();
 
-        // Derive Duration values from tuning config (local to init)
-        let metrics_interval = Duration::from_secs(config.tuning.log_metrics_interval);
+        let metrics_interval = config.tuning.log_metrics_interval;
         let packet_queue_depth = config.tuning.packet_queue_depth;
-        let dns_query_timeout = Duration::from_secs(config.tuning.dns_query_timeout);
-        let dns_refresh_interval = Duration::from_secs(config.tuning.dns_refresh_interval);
+        let dns_query_timeout = config.tuning.dns_query_timeout;
+        let dns_refresh_interval = config.tuning.dns_refresh_interval;
 
         // Note: NoTransportConfigured validation moved to Config::validate()
 
@@ -599,8 +596,7 @@ impl Orchestrator {
     pub async fn run(mut self) -> Result<(), OrchestratorError> {
         // Run maintenance at half the connect interval so closed channels and
         // newly resolved IPs are detected promptly.
-        let reconnect_interval = Duration::from_secs(self.tuning.reconnect_interval);
-        let mut maintenance_ticker = tokio::time::interval(reconnect_interval / 2);
+        let mut maintenance_ticker = tokio::time::interval(self.tuning.reconnect_interval / 2);
         loop {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {
@@ -831,21 +827,19 @@ impl Orchestrator {
         // Split connection into actor states
         let (rx_state, tx_state) = conn.into_actors();
 
-        let metrics_interval = Duration::from_secs(self.tuning.log_metrics_interval);
-
         // Spawn RX actor
         let rx_handle = spawn_h3_rx(
             rx_state,
             self.tun_packet_tx.clone(),
             self.events_tx.clone(),
-            metrics_interval,
+            self.tuning.log_metrics_interval,
         );
 
         // Spawn TX actor
         let (packet_tx, tx_handle) = spawn_h3_tx(
             tx_state,
             self.events_tx.clone(),
-            metrics_interval,
+            self.tuning.log_metrics_interval,
             self.tuning.packet_queue_depth,
         );
 

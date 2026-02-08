@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
@@ -156,39 +157,62 @@ pub struct PeerTun {
 ///
 /// All fields have sensible defaults. The entire section is optional in YAML.
 /// When partially specified, unset fields use their defaults.
+/// Duration fields are serialized as integer seconds in YAML.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Tuning {
     /// Data-plane packet queue depth for bounded backpressure channels (default: 256).
     pub packet_queue_depth: usize,
-    /// Minimum interval between reconnection attempts in seconds (default: 3).
-    pub reconnect_interval: u64,
-    /// Metrics logging interval in seconds (default: 30).
-    pub log_metrics_interval: u64,
-    /// DNS query timeout in seconds (default: 2).
-    pub dns_query_timeout: u64,
-    /// DNS refresh interval in seconds; 0 disables (default: 60).
-    pub dns_refresh_interval: u64,
-    /// HTTP/3 handshake timeout in seconds (default: 30).
-    pub h3_handshake_timeout: u64,
-    /// HTTP/3 max idle timeout in seconds (default: 60).
-    pub h3_max_idle_timeout: u64,
-    /// HTTP/3 keepalive interval in seconds (default: 20). Config parsing only; not yet implemented.
-    pub h3_keepalive_interval: u64,
+    /// Minimum interval between reconnection attempts (default: 3s).
+    #[serde(with = "serde_duration_secs")]
+    pub reconnect_interval: Duration,
+    /// Metrics logging interval (default: 30s).
+    #[serde(with = "serde_duration_secs")]
+    pub log_metrics_interval: Duration,
+    /// DNS query timeout (default: 2s).
+    #[serde(with = "serde_duration_secs")]
+    pub dns_query_timeout: Duration,
+    /// DNS refresh interval; 0 disables (default: 60s).
+    #[serde(with = "serde_duration_secs")]
+    pub dns_refresh_interval: Duration,
+    /// HTTP/3 handshake timeout (default: 30s).
+    #[serde(with = "serde_duration_secs")]
+    pub h3_handshake_timeout: Duration,
+    /// HTTP/3 max idle timeout (default: 60s).
+    #[serde(with = "serde_duration_secs")]
+    pub h3_max_idle_timeout: Duration,
+    /// HTTP/3 keepalive interval (default: 20s). Config parsing only; not yet implemented.
+    #[serde(with = "serde_duration_secs")]
+    pub h3_keepalive_interval: Duration,
 }
 
 impl Default for Tuning {
     fn default() -> Self {
         Self {
             packet_queue_depth: 256,
-            reconnect_interval: 3,
-            log_metrics_interval: 30,
-            dns_query_timeout: 2,
-            dns_refresh_interval: 60,
-            h3_handshake_timeout: 30,
-            h3_max_idle_timeout: 60,
-            h3_keepalive_interval: 20,
+            reconnect_interval: Duration::from_secs(3),
+            log_metrics_interval: Duration::from_secs(30),
+            dns_query_timeout: Duration::from_secs(2),
+            dns_refresh_interval: Duration::from_secs(60),
+            h3_handshake_timeout: Duration::from_secs(30),
+            h3_max_idle_timeout: Duration::from_secs(60),
+            h3_keepalive_interval: Duration::from_secs(20),
         }
+    }
+}
+
+/// Serde helper: serializes `Duration` as integer seconds in YAML.
+mod serde_duration_secs {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(d.as_secs())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let secs = u64::deserialize(d)?;
+        Ok(Duration::from_secs(secs))
     }
 }
 
@@ -655,6 +679,7 @@ pub fn parse_udp_uri(raw: &str) -> Result<UdpEndpoint, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn sample_h3_config() -> Config {
         Config {
@@ -1450,13 +1475,13 @@ peers:
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.tuning.packet_queue_depth, 256);
-        assert_eq!(cfg.tuning.reconnect_interval, 3);
-        assert_eq!(cfg.tuning.log_metrics_interval, 30);
-        assert_eq!(cfg.tuning.dns_query_timeout, 2);
-        assert_eq!(cfg.tuning.dns_refresh_interval, 60);
-        assert_eq!(cfg.tuning.h3_handshake_timeout, 30);
-        assert_eq!(cfg.tuning.h3_max_idle_timeout, 60);
-        assert_eq!(cfg.tuning.h3_keepalive_interval, 20);
+        assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(3));
+        assert_eq!(cfg.tuning.log_metrics_interval, Duration::from_secs(30));
+        assert_eq!(cfg.tuning.dns_query_timeout, Duration::from_secs(2));
+        assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(60));
+        assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.tuning.h3_keepalive_interval, Duration::from_secs(20));
     }
 
     #[test]
@@ -1480,9 +1505,9 @@ peers:
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.tuning.packet_queue_depth, 512);
-        assert_eq!(cfg.tuning.h3_max_idle_timeout, 120);
-        assert_eq!(cfg.tuning.reconnect_interval, 3);
-        assert_eq!(cfg.tuning.log_metrics_interval, 30);
+        assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(120));
+        assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(3));
+        assert_eq!(cfg.tuning.log_metrics_interval, Duration::from_secs(30));
     }
 
     #[test]

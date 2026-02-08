@@ -448,10 +448,8 @@ pub async fn dial_h3<P: RouteProbe>(
 
     // Configure QUIC settings
     let quic_udp_payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
-    let h3_handshake_timeout = Duration::from_secs(tuning.h3_handshake_timeout);
-    let h3_max_idle_timeout = Duration::from_secs(tuning.h3_max_idle_timeout);
     let mut quic_settings = QuicSettings::default();
-    quic_settings.max_idle_timeout = Some(h3_max_idle_timeout);
+    quic_settings.max_idle_timeout = Some(tuning.h3_max_idle_timeout);
     // Only disable verification when explicitly requested (testing only)
     if !peer_h3.insecure {
         quic_settings.verify_peer = true;
@@ -504,7 +502,7 @@ pub async fn dial_h3<P: RouteProbe>(
         .map_err(|e| DialError::Handshake(format!("send CONNECT failed: {:?}", e)))?;
 
     // Wait for response headers and NewFlow event with timeout
-    let handshake_result = time::timeout(h3_handshake_timeout, async {
+    let handshake_result = time::timeout(tuning.h3_handshake_timeout, async {
         let mut datagram_tx: Option<OutboundFrameSender> = None;
         let mut datagram_rx: Option<InboundFrameStream> = None;
         let mut flow_id: Option<u64> = None;
@@ -589,7 +587,7 @@ pub async fn dial_h3<P: RouteProbe>(
         Ok((datagram_tx, datagram_rx, flow_id))
     })
     .await
-    .map_err(|_| DialError::Timeout(h3_handshake_timeout))??;
+    .map_err(|_| DialError::Timeout(tuning.h3_handshake_timeout))??;
 
     let (datagram_tx, datagram_rx, flow_id) = handshake_result;
 
@@ -894,12 +892,9 @@ pub fn spawn_h3_listener(
         kind: CertificateKind::X509,
     };
 
-    let h3_max_idle_timeout = Duration::from_secs(tuning.h3_max_idle_timeout);
-    let h3_handshake_timeout = Duration::from_secs(tuning.h3_handshake_timeout);
-
     let quic_udp_payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
     let mut quic_settings = QuicSettings::default();
-    quic_settings.max_idle_timeout = Some(h3_max_idle_timeout);
+    quic_settings.max_idle_timeout = Some(tuning.h3_max_idle_timeout);
     quic_settings.max_send_udp_payload_size = quic_udp_payload_size;
     quic_settings.max_recv_udp_payload_size = quic_udp_payload_size;
 
@@ -915,6 +910,7 @@ pub fn spawn_h3_listener(
     .expect("listen on already-bound socket should not fail");
 
     let mut accept_stream = listeners.remove(0);
+    let h3_handshake_timeout = tuning.h3_handshake_timeout;
 
     let handle = tokio::spawn(async move {
         loop {
