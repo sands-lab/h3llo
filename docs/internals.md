@@ -1,6 +1,6 @@
 ## Internals
 
-Internals overview: runtime dependencies, guards against recursive routing and DNS resolution loops, actor-based concurrency model, route update strategy, and longest-prefix matching. Protocol/auth specifics live in `docs/protocol.md`.
+Internals overview: runtime dependencies, guards against recursive routing and DNS resolution loops, actor-based concurrency model, route update strategy, and longest-prefix matching. Protocol/auth specifics live in [docs/protocol.md](protocol.md).
 
 ### Dependencies
 
@@ -241,9 +241,12 @@ LPM summary: reuse WireGuard's longest-prefix-match behavior when choosing peers
 
 h3llo should use the same longest-prefix-match algorithm as WireGuard when matching entries in the internal routing table.
 
-### Multipath Support (Preliminary)
+### Multi-Path Support
 
-h3llo supports routing different subnets through different transport peers. Each peer can be configured with either BareUDP or H3 transport, and different `allowedIPs` prefixes can be assigned to different peers. The routing table uses longest-prefix matching to forward packets to the appropriate peer based on destination IP.
+h3llo provides two complementary multi-path capabilities: per-peer subnet routing and per-peer connection redundancy.
+
+- Per-peer subnet routing: different `allowedIPs` prefixes can be assigned to different peers regardless of transport type (H3 or BareUDP). The routing table uses longest-prefix matching to forward packets to the appropriate peer based on destination IP.
+- Per-peer connection redundancy: when a peer's hostname resolves to multiple IPs, h3llo establishes a connection to each resolved IP (`Vec<BoundState>`). The first bound is the preferred TX path; when it drops, prune promotes the next available bound automatically, providing failover without waiting for DNS or reconnection. See Connection management above for pruning and rate-limiting details.
 
 Route deduplication: when synchronizing system routes, if a TUN address prefix (from `local.tun.addrs`) exactly matches a desired route (from peer `allowedIPs`), h3llo avoids tracking it as a separate TUN address route since the desired route already covers it.
 

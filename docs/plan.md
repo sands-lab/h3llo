@@ -7,7 +7,7 @@ Iterative delivery of h3llo by building one module at a time, gating each step w
 Guiding rules for the plan execution and progress updates.
 
 - [x] Step 1: Implement one module at a time and gate progress with passing tests.
-- [x] Step 2: Prefer unit and mocked component tests aligned with `docs/test.md`.
+- [x] Step 2: Prefer unit and mocked component tests aligned with [docs/test.md](test.md).
 - [x] Step 3: Keep module interfaces minimal and explicit to simplify composition.
 - [x] Step 4: Keep progress visible by updating this plan when status changes.
 
@@ -38,7 +38,7 @@ Concrete implementation steps to ship a BareUDP-only VPN on top of the existing 
 - [x] Step 5: Wire `local.table` to system route sync using TUN addresses and `allowedIPs`.
 - [ ] Step 6: Add a metrics aggregation loop that periodically logs transport counters.
 - [ ] Step 7: Add a two-node BareUDP integration test (static IP) plus MTU boundary checks.
-- [ ] Step 8: Document a BareUDP-only quick start in `docs/configuration.md` and `README.md`.
+- [ ] Step 8: Document a BareUDP-only quick start in [docs/configuration.md](configuration.md) and [README.md](../README.md).
 
 ## Component Integration and Tests
 

@@ -12,7 +12,7 @@ h3llo is a lightweight overlay network that rides on standard HTTP/3 (MASQUE/CON
 - Zero-downtime updates: atomic peer/routing refresh without disrupting active traffic.
 - Two protocols: encrypted HTTP/3 by default; BareUDP as an opt-in, high-throughput plaintext path for trusted networks.
 - Routing aware: longest-prefix routing per peer; optional system route updates.
-- Preliminary multipath support: route different subnets through different transports (BareUDP for low-latency, H3 for encrypted paths).
+- Multi-path: route different subnets through different peers; DNS multi-answer builds multiple connections per peer for automatic failover.
 
 ## Quick Start
 
@@ -62,26 +62,26 @@ docker run -d --name h3llo --restart always --network host --cap-add=NET_ADMIN -
 
 ## Configuration Overview
 
-High-level connection/auth/routing summary; see `docs/protocol.md` for auth/transport semantics and `docs/internals.md` for runtime behavior.
+High-level connection/auth/routing summary; see [docs/protocol.md](docs/protocol.md) for auth/transport semantics and [docs/internals.md](docs/internals.md) for runtime behavior.
 
 ### Architecture
 
 - Client/server-style: One side only listens (`listen`); the other only dials via `endpoint`. Suitable for hub-and-spoke.
-- Peer-to-peer: Both sides listen and dial each other for symmetry; connection details live in `docs/internals.md`.
+- Peer-to-peer: Both sides listen and dial each other for symmetry; connection details live in [docs/internals.md](docs/internals.md).
 
 ### Authentication and Security
 
 - Identity: every peer needs a unique `id` (non-empty).
-- Bearer Token auth for CONNECT uses `Authorization: Bearer <token>` where token is `peers[target].h3.token`; the server matches the token against its `peers[].h3.token` collection to identify the peer. Every HTTP/3 peer entry must set `h3.token` (>= 12 chars) even when `endpoint` is absent, and tokens may differ per peer/direction. Control-plane GET/POST still use Basic Auth with `local.h3.admin` (`name`/`pass`). Full rules live in `docs/protocol.md`. QUIC/TLS certificates are required for HTTP/3.
+- Bearer Token auth for CONNECT uses `Authorization: Bearer <token>` where token is `peers[target].h3.token`; the server matches the token against its `peers[].h3.token` collection to identify the peer. Every HTTP/3 peer entry must set `h3.token` (>= 12 chars) even when `endpoint` is absent, and tokens may differ per peer/direction. Control-plane GET/POST still use Basic Auth with `local.h3.admin` (`name`/`pass`). Full rules live in [docs/protocol.md](docs/protocol.md). QUIC/TLS certificates are required for HTTP/3.
 
 ### Routing
 
 - System routes: optional table updates steer matching `allowedIPs` into the h3llo TUN.
-- Internal routing: longest-prefix matching across peers; route update flow is documented in `docs/internals.md`.
+- Internal routing: longest-prefix matching across peers; route update flow is documented in [docs/internals.md](docs/internals.md).
 
 ## BareUDP Mode
 
-BareUDP is an opt-in plaintext fast path for controlled networks where confidentiality is not required; security constraints, DNS handling, and MTU guidance are covered in `docs/protocol.md`.
+BareUDP is an opt-in plaintext fast path for controlled networks where confidentiality is not required; security constraints, DNS handling, and MTU guidance are covered in [docs/protocol.md](docs/protocol.md).
 
 ## Interoperability
 
@@ -98,6 +98,6 @@ BareUDP is an opt-in plaintext fast path for controlled networks where confident
 
 ## Further Reading
 
-- Protocol details: `docs/protocol.md`
-- Configuration examples: `docs/configuration.md`
-- Implementation notes: `docs/internals.md`
+- Protocol details: [docs/protocol.md](docs/protocol.md)
+- Configuration examples: [docs/configuration.md](docs/configuration.md)
+- Implementation notes: [docs/internals.md](docs/internals.md)

@@ -1,6 +1,6 @@
 ## Protocol
 
-Protocol overview: HTTP Bearer Token Auth with per-peer tokens for CONNECT-IP, HTTP/3 CONNECT-IP as the encrypted default path, BareUDP as an optional fast path, and POST-driven admin rotation plus peer refresh on the shared HTTP path. Runtime connection selection and binding behavior are detailed in `docs/internals.md`.
+Protocol overview: HTTP Bearer Token Auth with per-peer tokens for CONNECT-IP, HTTP/3 CONNECT-IP as the encrypted default path, BareUDP as an optional fast path, and POST-driven admin rotation plus peer refresh on the shared HTTP path. Runtime connection selection and binding behavior are detailed in [docs/internals.md](internals.md).
 
 h3llo uses HTTP Bearer Token Auth (per [RFC 6750](https://datatracker.ietf.org/doc/html/rfc6750)) for CONNECT-IP authentication and a subset of MASQUE/CONNECT-IP ([RFC 9484](https://datatracker.ietf.org/doc/html/rfc9484)) to encapsulate IP packets and deliver them to peers.
 
@@ -135,7 +135,7 @@ Reconfiguration summary: `GET` returns the current configuration, and `POST` acc
 
 Control-plane endpoints are available only when `local.h3.admin` is configured alongside `local.h3.listen`.
 
-`GET https://node1.example.com:443/path` returns the full configuration snapshot in YAML, matching the shape documented in `docs/configuration.md`, and requires Basic Auth with `username = local.h3.admin.name` and `password = local.h3.admin.pass`.
+`GET https://node1.example.com:443/path` returns the full configuration snapshot in YAML, matching the shape documented in [docs/configuration.md](configuration.md), and requires Basic Auth with `username = local.h3.admin.name` and `password = local.h3.admin.pass`.
 
 `POST https://node1.example.com:443/path` accepts YAML containing `local.h3.admin` (with nested `name` and `pass`) and `peers` (merged by `peers[].id`). All other top-level keys are rejected with `400 Bad Request`. Basic Auth is mandatory on the same HTTP path; set `username = local.h3.admin.name` and `password = local.h3.admin.pass`.
 

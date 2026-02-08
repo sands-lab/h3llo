@@ -4,9 +4,9 @@
 - 配置值（如布尔、数字）在文档描述中使用反引号标注，例如`true`、`1280`；代码块内不标注。 
 - 文档中暂未确定的设计细节可用“TBD”占位，后续补全。
 - mermaid 图内换行使用 `<br>`，不要使用 `\n`。
-- 文档详略分工：深度细节集中在 `docs/protocol.md`（认证、传输、动态配置）与 `docs/internals.md`（运行时连接选择、绑定、路由）；`README.md` 与 `docs/configuration.md` 仅保留概要并引用前述文档避免重复。
+- 文档详略分工：深度细节集中在 [docs/protocol.md](../protocol.md)（认证、传输、动态配置）与 [docs/internals.md](../internals.md)（运行时连接选择、绑定、路由）；[README.md](../../README.md) 与 [docs/configuration.md](../configuration.md) 仅保留概要并引用前述文档避免重复。
 - 依赖选择：优先使用 tokio 生态中仍活跃维护的成熟 crates（如 `serde`、`serde_yaml`、`thiserror`、`tokio` 等）。
-- 测试平台：非平台相关代码默认在 Linux 下测试；仅平台相关代码需要补充 macOS/Windows 测试，并在 `docs/test.md` 标记 TODO。
+- 测试平台：非平台相关代码默认在 Linux 下测试；仅平台相关代码需要补充 macOS/Windows 测试，并在 [docs/test.md](../test.md) 标记 TODO。
 - CI：使用 GitHub Actions（Linux）运行 `cargo fmt -- --check`、`cargo clippy -- -D warnings`、`cargo test`。
 - 性能准则：避免频繁跨线程共享引用计数更新，优先通过所有权转移或消息传递移动数据；小且高频状态可按线程/协程维护副本。
 - 许可证：MIT，存放于 `LICENSE`。
