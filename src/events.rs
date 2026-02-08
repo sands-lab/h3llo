@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
+use crate::actor::ActorExitResult;
 use crate::h3::H3Connection;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// Indicates connection establishment direction.
 ///
@@ -28,12 +31,51 @@ pub enum Event {
 }
 
 /// Describes transport-level events.
-#[derive(Debug)]
 pub enum TransportEvent {
     /// Latest cumulative metrics for a transport direction.
     Metrics(TransportMetrics),
     /// HTTP/3 connection established, ready for actor spawning.
     H3Connected(H3ConnectedEvent),
+    /// BareUDP TX connection established, ready for bound registration.
+    BareConnected(BareConnectedEvent),
+}
+
+impl std::fmt::Debug for TransportEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Metrics(m) => f.debug_tuple("Metrics").field(m).finish(),
+            Self::H3Connected(e) => f.debug_tuple("H3Connected").field(e).finish(),
+            Self::BareConnected(e) => f.debug_tuple("BareConnected").field(e).finish(),
+        }
+    }
+}
+
+/// BareUDP TX connection established event.
+///
+/// Emitted by the async connection task when `make_bare_tx` + `spawn_udp_tx`
+/// succeed. Carries the TX channel sender and actor JoinHandle for
+/// orchestrator registration.
+pub struct BareConnectedEvent {
+    /// Peer identifier from configuration.
+    pub peer_id: String,
+    /// Endpoint hostname (for DNS expiration matching).
+    pub hostname: String,
+    /// Destination socket address.
+    pub dest: SocketAddr,
+    /// TX channel for sending packets to the bare TX actor.
+    pub tx: mpsc::Sender<Vec<u8>>,
+    /// Join handle for the spawned bare TX actor.
+    pub tx_handle: JoinHandle<ActorExitResult>,
+}
+
+impl std::fmt::Debug for BareConnectedEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BareConnectedEvent")
+            .field("peer_id", &self.peer_id)
+            .field("dest", &self.dest)
+            .field("hostname", &self.hostname)
+            .finish_non_exhaustive()
+    }
 }
 
 /// HTTP/3 connection established event with full connection object.

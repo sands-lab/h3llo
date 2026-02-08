@@ -5,7 +5,9 @@ use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUd
 use crate::bind::DefaultRouteProbe;
 use crate::config::{Config, Peer};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
-use crate::events::{ConnectionDirection, DnsEvent, Event, H3ConnectedEvent, TransportEvent};
+use crate::events::{
+    BareConnectedEvent, ConnectionDirection, DnsEvent, Event, H3ConnectedEvent, TransportEvent,
+};
 use crate::h3::{
     dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
 };
@@ -486,6 +488,9 @@ impl Orchestrator {
             Event::Transport(TransportEvent::H3Connected(event)) => {
                 self.handle_h3_connection(event).await;
             }
+            Event::Transport(TransportEvent::BareConnected(event)) => {
+                self.handle_bare_connection(event);
+            }
             Event::Other(msg) => {
                 debug!("other event: {}", msg);
             }
@@ -525,33 +530,33 @@ impl Orchestrator {
 
                 if let Some(&ip) = available_ips.first() {
                     let destination = SocketAddr::new(ip, port);
-                    let probe = DefaultRouteProbe;
-                    let tx_socket = match make_bare_tx(
-                        destination,
-                        bindif.as_deref(),
-                        Some(&self.tun_if),
-                        &probe,
-                    )
-                    .await
-                    {
-                        Ok(s) => s,
-                        Err(err) => {
-                            warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
-                            continue;
+                    let events_tx = self.events_tx.clone();
+                    let tun_if = self.tun_if.clone();
+                    let peer_id = peer_id.clone();
+                    tokio::spawn(async move {
+                        let probe = DefaultRouteProbe;
+                        match make_bare_tx(destination, bindif.as_deref(), Some(&tun_if), &probe)
+                            .await
+                        {
+                            Ok(tx_socket) => {
+                                let (packet_tx, tx_handle) =
+                                    spawn_udp_tx(tx_socket, events_tx.clone(), METRICS_INTERVAL);
+                                let event = Event::Transport(TransportEvent::BareConnected(
+                                    BareConnectedEvent {
+                                        peer_id,
+                                        hostname: host,
+                                        dest: destination,
+                                        tx: packet_tx,
+                                        tx_handle,
+                                    },
+                                ));
+                                let _ = events_tx.send(event);
+                            }
+                            Err(err) => {
+                                warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
+                            }
                         }
-                    };
-
-                    let (packet_tx, tx_handle) =
-                        spawn_udp_tx(tx_socket, self.events_tx.clone(), METRICS_INTERVAL);
-
-                    entry.bound = Some(BoundState {
-                        hostname: Some(host.clone()),
-                        dest: destination,
-                        tx: packet_tx,
                     });
-
-                    self.join_set.spawn(tx_handle);
-                    bounds_changed = true;
                 }
             } else if let Some(h3) = entry.config.h3.as_ref() {
                 let Some(endpoint) = h3.endpoint.as_ref() else {
@@ -625,11 +630,52 @@ impl Orchestrator {
         }
     }
 
+    /// Registers a bound connection for a peer and updates routing.
+    ///
+    /// Returns `true` if the bound was set, `false` if the peer is unknown
+    /// or already connected (first-connection-wins).
+    fn update_bound(
+        &mut self,
+        peer_id: &str,
+        hostname: Option<String>,
+        dest: SocketAddr,
+        tx: mpsc::Sender<Vec<u8>>,
+    ) -> bool {
+        let Some(entry) = self.peers.get_mut(peer_id) else {
+            warn!(peer = %peer_id, addr = %dest, "connection for unknown peer");
+            return false;
+        };
+        if entry.is_connected() {
+            debug!(peer = %peer_id, addr = %dest, "already connected, rejecting");
+            return false;
+        }
+        entry.bound = Some(BoundState { hostname, dest, tx });
+        self.update_routing();
+        true
+    }
+
+    /// Handles a BareUDP TX connection event.
+    ///
+    /// Unconditionally registers the TX actor JoinHandle for lifecycle
+    /// monitoring, then attempts to bind the peer via [`update_bound`].
+    fn handle_bare_connection(&mut self, event: BareConnectedEvent) {
+        let BareConnectedEvent {
+            peer_id,
+            hostname,
+            dest,
+            tx,
+            tx_handle,
+        } = event;
+        // Always register: actor is already running, must be supervised
+        self.join_set.spawn(tx_handle);
+        self.update_bound(&peer_id, Some(hostname), dest, tx);
+    }
+
     /// Handles an H3 connection event (inbound or outbound).
     ///
     /// Unified handler for both listener and dialer connections.
     /// First connection wins - rejects if already connected.
-    /// Spawns RX/TX actors and updates routing.
+    /// Spawns RX/TX actors and updates routing via [`update_bound`].
     async fn handle_h3_connection(&mut self, event: H3ConnectedEvent) {
         let H3ConnectedEvent {
             connection: conn,
@@ -638,7 +684,7 @@ impl Orchestrator {
         let peer_id = conn.peer_id.clone();
         let remote_addr = conn.remote_addr;
 
-        // Check if peer is configured
+        // Pre-check before destructive conn.into_actors(): peer must exist
         if !self.peers.contains_key(&peer_id) {
             warn!(
                 peer = %peer_id,
@@ -649,7 +695,7 @@ impl Orchestrator {
             return;
         }
 
-        // First connection wins - reject if already connected
+        // Pre-check before destructive conn.into_actors(): first connection wins
         let entry = self.peers.get(&peer_id).unwrap();
         if entry.is_connected() {
             debug!(
@@ -695,17 +741,9 @@ impl Orchestrator {
         let (packet_tx, tx_handle) =
             spawn_h3_tx(tx_state, self.events_tx.clone(), METRICS_INTERVAL);
 
-        let entry = self.peers.get_mut(&peer_id).unwrap();
-        entry.bound = Some(BoundState {
-            hostname,
-            dest: remote_addr,
-            tx: packet_tx,
-        });
-
         self.join_set.spawn(rx_handle);
         self.join_set.spawn(tx_handle);
-
-        self.update_routing();
+        self.update_bound(&peer_id, hostname, remote_addr, packet_tx);
     }
 }
 
@@ -1548,5 +1586,115 @@ mod tests {
 
         // Routing should NOT be updated (no bounds change)
         assert!(handles.tun_cmd_rx.try_recv().is_err());
+    }
+
+    // ========== BareConnected event handling tests ==========
+
+    #[tokio::test]
+    async fn handle_dns_snapshot_does_not_block_on_bare_tx() {
+        use std::time::Instant;
+
+        let peer = bare_peer_at_host("bare-peer", "10.255.255.1", 5353, &["10.0.0.0/24"]);
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        let mut state = HashMap::new();
+        state.insert(
+            "10.255.255.1".to_string(),
+            vec!["10.255.255.1".parse().unwrap()],
+        );
+        let event = make_dns_snapshot_event(state);
+
+        let start = Instant::now();
+        orch.handle_event(event).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "handle_dns_snapshot blocked for {:?}, expected < 500ms",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_bare_connection_rejects_unknown_peer() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![])
+            .build();
+
+        let (tx, _rx) = mpsc::channel(1);
+        let tx_handle = tokio::spawn(async { Ok(()) });
+
+        let event = BareConnectedEvent {
+            peer_id: "unknown-peer".to_string(),
+            hostname: "example.com".to_string(),
+            dest: "1.2.3.4:5353".parse().unwrap(),
+            tx,
+            tx_handle,
+        };
+
+        orch.handle_bare_connection(event);
+        assert!(!orch.peers.contains_key("unknown-peer"));
+    }
+
+    #[tokio::test]
+    async fn handle_bare_connection_rejects_already_connected() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let (existing_tx, _existing_rx) = mpsc::channel(1);
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_tx("peer1", "1.2.3.4:5353".parse().unwrap(), existing_tx)
+            .build();
+
+        let (tx, _rx) = mpsc::channel(1);
+        let tx_handle = tokio::spawn(async { Ok(()) });
+
+        let event = BareConnectedEvent {
+            peer_id: "peer1".to_string(),
+            hostname: "example.com".to_string(),
+            dest: "5.6.7.8:5353".parse().unwrap(),
+            tx,
+            tx_handle,
+        };
+
+        orch.handle_bare_connection(event);
+
+        // Original bound preserved (first-connection-wins)
+        let bound = orch.peers.get("peer1").unwrap().bound.as_ref().unwrap();
+        assert_eq!(bound.dest, "1.2.3.4:5353".parse::<SocketAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn handle_bare_connection_sets_bound_and_updates_routing() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        let (tx, _rx) = mpsc::channel(1);
+        let tx_handle = tokio::spawn(async { Ok(()) });
+
+        let event = BareConnectedEvent {
+            peer_id: "peer1".to_string(),
+            hostname: "example.com".to_string(),
+            dest: "1.2.3.4:5353".parse().unwrap(),
+            tx,
+            tx_handle,
+        };
+
+        orch.handle_bare_connection(event);
+
+        // Bound should be set
+        assert!(orch.peers.get("peer1").unwrap().is_connected());
+        let bound = orch.peers.get("peer1").unwrap().bound.as_ref().unwrap();
+        assert_eq!(bound.dest, "1.2.3.4:5353".parse::<SocketAddr>().unwrap());
+        assert_eq!(bound.hostname.as_deref(), Some("example.com"));
+
+        // Routing should be updated (TUN command sent)
+        assert!(handles.tun_cmd_rx.try_recv().is_ok());
     }
 }
