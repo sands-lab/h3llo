@@ -18,7 +18,7 @@
 # Stage 1: Chef - Install cargo-chef with Debian (supports libclang dynamic loading)
 FROM rust:slim-trixie AS chef
 
-# Install boring-sys dependencies and curl/xz for downloading musl toolchain
+# Install boring-sys dependencies, curl/xz for downloading musl toolchain, and jq for parsing Cargo JSON output
 RUN apt-get update && apt-get install -y \
     curl xz-utils jq \
     cmake make perl golang-go git \
