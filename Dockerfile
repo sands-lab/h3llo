@@ -60,6 +60,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Build application and test binaries.
 # Cache mount contents are NOT stored in image layers — we must copy
 # artifacts to /app/out/ within this same RUN instruction.
+# Use --message-format=json to extract exact binary paths; glob-based
+# extraction breaks when stale artifacts accumulate in cache mounts.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
@@ -68,16 +70,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target,sharing=locked \
     set -e && \
     cargo build --release --target x86_64-unknown-linux-musl --bin h3llo && \
-    cargo test --test integration-container-tun --release --target x86_64-unknown-linux-musl --no-run && \
-    cargo test --test integration-container-route --release --target x86_64-unknown-linux-musl --no-run && \
+    TUN_BIN=$(cargo test --test integration-container-tun --release \
+        --target x86_64-unknown-linux-musl --no-run \
+        --message-format=json \
+        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1) && \
+    ROUTE_BIN=$(cargo test --test integration-container-route --release \
+        --target x86_64-unknown-linux-musl --no-run \
+        --message-format=json \
+        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1) && \
+    test -n "$TUN_BIN" && test -n "$ROUTE_BIN" && \
     mkdir -p /app/out && \
     cp /app/target/x86_64-unknown-linux-musl/release/h3llo /app/out/ && \
     strip /app/out/h3llo && \
-    DEPS=/app/target/x86_64-unknown-linux-musl/release/deps && \
-    test "$(find $DEPS -name 'integration_container_tun-*' -type f ! -name '*.d' | wc -l)" -eq 1 && \
-    find $DEPS -name 'integration_container_tun-*' -type f ! -name '*.d' -exec cp {} /app/out/integration-container-tun \; && \
-    test "$(find $DEPS -name 'integration_container_route-*' -type f ! -name '*.d' | wc -l)" -eq 1 && \
-    find $DEPS -name 'integration_container_route-*' -type f ! -name '*.d' -exec cp {} /app/out/integration-container-route \; && \
+    cp "$TUN_BIN" /app/out/integration-container-tun && \
+    cp "$ROUTE_BIN" /app/out/integration-container-route && \
     strip /app/out/*
 
 # Stage 4: Runtime - Minimal Alpine production image
