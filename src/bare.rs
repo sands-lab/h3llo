@@ -578,7 +578,7 @@ mod tests {
         let tx_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         tx_socket.connect(dest).await.unwrap();
 
-        let (events_tx, _) = mpsc::unbounded_channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         // Spawn TX first to get its packet_tx channel
         let (packet_tx, tx_handle) = spawn_udp_tx(
@@ -605,10 +605,11 @@ mod tests {
         sender.send_to(&[1, 2, 3], rx_addr).await.unwrap();
 
         let mut buf = [0u8; 64];
-        let (len, _) = tokio::time::timeout(Duration::from_secs(5), receiver.recv_from(&mut buf))
-            .await
-            .expect("timeout")
-            .expect("recv");
+        let (len, _) =
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
+                .await
+                .expect("timeout")
+                .expect("recv");
         assert_eq!(&buf[..len], &[1, 2, 3]);
 
         rx_handle.abort();
