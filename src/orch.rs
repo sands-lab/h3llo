@@ -176,16 +176,14 @@ impl PeerEntry {
 
         if let Some(bare) = self.config.bare.as_ref() {
             let port = bare.endpoint.port;
-            let bindif = bare.bindif.clone();
-            let endpoint = Endpoint::Udp(bare.endpoint.clone());
 
             for ip in &uncovered {
                 let destination = SocketAddr::new(*ip, port);
                 let events_tx = events_tx.clone();
                 let tun_if = tun_if.to_string();
                 let peer_id = self.config.id.clone();
-                let bindif = bindif.clone();
-                let endpoint = endpoint.clone();
+                let bindif = bare.bindif.clone();
+                let endpoint = Endpoint::Udp(bare.endpoint.clone());
 
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
@@ -216,7 +214,6 @@ impl PeerEntry {
                 return;
             };
             let port = h3_endpoint.port;
-            let peer_h3 = h3.clone();
             let tun_mtu = mtu as u16;
 
             for ip in &uncovered {
@@ -224,7 +221,7 @@ impl PeerEntry {
                 let events_tx = events_tx.clone();
                 let tun_if = tun_if.to_string();
                 let peer_id = self.config.id.clone();
-                let peer_h3 = peer_h3.clone();
+                let peer_h3 = h3.clone();
 
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
