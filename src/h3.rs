@@ -433,7 +433,13 @@ pub async fn dial_h3<P: RouteProbe>(
         .as_ref()
         .ok_or_else(|| DialError::Socket("peer_h3.endpoint is None".to_string()))?;
     let server_name = peer_h3.sni.as_deref().unwrap_or(&endpoint.host);
-    let authority = &endpoint.host;
+    // Per HTTP semantics (RFC 9110 §7.2), :authority must include host:port
+    // when the port is not the default for the scheme (443 for https).
+    let authority = if endpoint.port == 443 {
+        endpoint.host.clone()
+    } else {
+        format!("{}:{}", endpoint.host, endpoint.port)
+    };
     let path = &endpoint.path;
 
     debug!(%remote_addr, %server_name, %authority, %peer_id, "dialing H3 endpoint");

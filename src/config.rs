@@ -138,7 +138,8 @@ pub struct PeerH3 {
     ///
     /// When set, this value is used as the SNI during the QUIC/TLS handshake
     /// instead of the hostname from `endpoint`. The HTTP/3 `:authority`
-    /// pseudo-header still uses `endpoint.host`.
+    /// pseudo-header is derived from the `endpoint` authority (`host`, or
+    /// `host:port` when the port is not 443) and is not affected by `sni`.
     pub sni: Option<String>,
 }
 
