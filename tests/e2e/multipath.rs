@@ -35,7 +35,6 @@ local:
       - 10.0.1.1/24
   dns:
     server: udp://127.0.0.11:53
-    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
   h3:
@@ -59,6 +58,8 @@ peers:
     tun:
       allowed_ips:
         - 10.0.1.0/24
+tuning:
+  dns_refresh_interval: 1
 "#
     )
 }
@@ -76,7 +77,6 @@ local:
       - 10.0.1.2/24
   dns:
     server: udp://127.0.0.11:53
-    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
   h3:
@@ -100,6 +100,8 @@ peers:
     tun:
       allowed_ips:
         - 10.0.1.0/24
+tuning:
+  dns_refresh_interval: 1
 "#
     )
 }

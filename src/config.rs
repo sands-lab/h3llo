@@ -11,6 +11,7 @@ use url::Url;
 
 /// Top-level configuration loaded from YAML.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Local node settings.
     pub local: Local,
@@ -24,6 +25,7 @@ pub struct Config {
 
 /// Local node settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Local {
     /// Whether to manage system routes (default: true).
     #[serde(default = "default_true")]
@@ -43,6 +45,7 @@ pub struct Local {
 
 /// HTTP/3 settings for the local node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LocalH3 {
     /// HTTP/3 listen address (scheme/host/port/path); optional (dial-only when absent).
     #[serde(default)]
@@ -59,6 +62,7 @@ pub struct LocalH3 {
 
 /// Control-plane Basic Auth credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LocalAdmin {
     /// Stores the admin username (> 8 characters) enabling control-plane.
     pub name: String,
@@ -68,6 +72,7 @@ pub struct LocalAdmin {
 
 /// BareUDP settings for the local node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LocalBare {
     /// BareUDP listen address (required when BareUDP is configured).
     pub listen: UdpEndpoint,
@@ -75,6 +80,7 @@ pub struct LocalBare {
 
 /// DNS resolver settings for the local node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LocalDns {
     /// DNS server address as a UDP URI (IPv4/IPv6 literal), e.g., `udp://1.1.1.1:53`.
     /// Parsed as `SocketAddr` during deserialization; serialized back to `udp://` URI format.
@@ -90,6 +96,7 @@ pub struct LocalDns {
 
 /// TUN settings for the local node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LocalTun {
     /// TUN interface name (default: h3llo0).
     #[serde(default = "default_ifname")]
@@ -104,6 +111,7 @@ pub struct LocalTun {
 
 /// Peer configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Peer {
     /// Remote node identifier.
     pub id: String,
@@ -122,6 +130,7 @@ pub struct Peer {
 
 /// HTTP/3 options per peer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PeerH3 {
     /// Optional dialing endpoint (scheme/host/port/path); omit for listen-only posture.
     #[serde(default)]
@@ -146,6 +155,7 @@ pub struct PeerH3 {
 
 /// BareUDP options per peer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PeerBare {
     /// BareUDP dialing endpoint (required when BareUDP is configured).
     pub endpoint: UdpEndpoint,
@@ -155,6 +165,7 @@ pub struct PeerBare {
 
 /// Peer routing details.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PeerTun {
     /// Allowed IP prefixes routed via this peer. Parsed as `IpNet` during deserialization.
     pub allowed_ips: Vec<IpNet>,
@@ -166,7 +177,7 @@ pub struct PeerTun {
 /// When partially specified, unset fields use their defaults.
 /// Duration fields are serialized as integer seconds in YAML.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Tuning {
     /// Data-plane packet queue depth for bounded backpressure channels (default: 256).
     pub packet_queue_depth: usize,
@@ -282,12 +293,9 @@ pub enum ValidationError {
     /// `local.h3.admin` requires a listener.
     #[error("local.h3.admin requires local.h3.listen to be set")]
     LocalAdminMissingListener,
-    // Note: LocalDnsRefreshTooShort removed - u64 has no values between 0 and 1.
-    // Note: LocalDnsServerInvalid removed - parsing now happens during deserialization.
     /// TUN addresses are missing.
     #[error("local.tun.addrs must include at least one address")]
     MissingLocalTunAddrs,
-    // Note: InvalidLocalTunAddr removed - parsing now happens during deserialization.
     /// No transport configured (neither H3 nor BareUDP).
     #[error("at least one transport must be configured (local.h3 or local.bare)")]
     NoTransportConfigured,
@@ -324,7 +332,6 @@ pub enum ValidationError {
     /// Allowed IP list missing.
     #[error("peer '{peer_id}' must include at least one allowed_ips entry")]
     PeerMissingAllowedIps { peer_id: String },
-    // Note: PeerInvalidAllowedIp removed - parsing now happens during deserialization.
     /// Allowed IP entry duplicates another entry on the same peer.
     #[error("peer '{peer_id}' has duplicate allowed_ips entry '{cidr}'")]
     PeerDuplicateAllowedIp { peer_id: String, cidr: String },
@@ -403,13 +410,9 @@ impl Config {
             }
         }
 
-        // Note: local.bare.listen URI validation now happens during deserialization
-
         if self.local.tun.addrs.is_empty() {
             errors.push(ValidationError::MissingLocalTunAddrs);
         }
-        // Note: local.tun.addrs and local.dns.server parsing now happens during deserialization
-
         for peer in &self.peers {
             // Peer ID validation: must be non-empty and have no leading/trailing whitespace
             if peer.id.trim().is_empty() {
@@ -472,7 +475,6 @@ impl Config {
                         peer_id: peer.id.clone(),
                     })
                 }
-                // Note: peer endpoint URI validation now happens during deserialization
                 (Some(_), None) | (None, Some(_)) => {}
             }
 
@@ -482,7 +484,6 @@ impl Config {
                 });
             }
 
-            // Check for duplicate allowed_ips (parsing already happened during deserialization)
             let mut seen_allowed = HashSet::new();
             for net in &peer.tun.allowed_ips {
                 if !seen_allowed.insert(*net) {
@@ -915,12 +916,6 @@ mod tests {
         ));
     }
 
-    // Note: rejects_missing_local_bare_listener test removed - LocalBare.listen is now
-    // UdpEndpoint type which requires a valid URI at deserialization time.
-
-    // Note: rejects_invalid_local_bare_listen_uri test removed - URI validation now
-    // happens during deserialization (see rejects_invalid_endpoint_uri_at_parse_time).
-
     #[test]
     fn rejects_peer_transport_conflict() {
         let mut config = sample_h3_config();
@@ -937,12 +932,6 @@ mod tests {
             ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerTransportConflict { .. }))
         ));
     }
-
-    // Note: rejects_missing_bare_endpoint test removed - PeerBare.endpoint is now
-    // UdpEndpoint type which requires a valid URI at deserialization time.
-
-    // Note: rejects_invalid_bare_endpoint_uri test removed - URI validation now
-    // happens during deserialization (see rejects_invalid_endpoint_uri_at_parse_time).
 
     #[test]
     fn rejects_short_peer_token() {
@@ -1018,17 +1007,66 @@ mod tests {
         ));
     }
 
-    // Note: dns.refresh minimum validation test removed - for u64 type, there
-    // are no invalid values between 0 (disabled) and 1 (minimum).
+    #[test]
+    fn rejects_unknown_fields_at_parse_time() {
+        // Unknown field at top level
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+unknown_top_level: true
+"#;
+        let result = Config::load_from_str(yaml);
+        assert!(matches!(result, Err(ConfigError::Parse(_))));
 
-    // Note: rejects_invalid_dns_server_uri test removed - validation now happens at parse time.
-    // See rejects_invalid_dns_server_at_parse_time for the deserialization test.
+        // Unknown field in nested struct (local.dns)
+        let yaml = r#"
+local:
+  h3: {}
+  dns:
+    server: udp://1.1.1.1:53
+    refresh: 1
+  tun:
+    addrs:
+      - 192.168.180.1/32
+"#;
+        let result = Config::load_from_str(yaml);
+        assert!(matches!(result, Err(ConfigError::Parse(_))));
 
-    // Note: rejects_dns_server_without_port test removed - validation now happens at parse time.
-    // See rejects_invalid_dns_server_at_parse_time for the deserialization test.
+        // Unknown field in tuning
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  nonexistent_param: 42
+"#;
+        let result = Config::load_from_str(yaml);
+        assert!(matches!(result, Err(ConfigError::Parse(_))));
 
-    // Note: rejects_local_tun_prefix_instead_of_host test removed - validation now happens at parse time.
-    // See rejects_cidr_in_tun_addrs_at_parse_time for the deserialization test.
+        // Unknown field in peer
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+peers:
+- id: node-2
+  h3:
+    token: example-node-2-token
+  tun:
+    allowed_ips:
+      - 192.168.180.2/32
+  stale_field: true
+"#;
+        let result = Config::load_from_str(yaml);
+        assert!(matches!(result, Err(ConfigError::Parse(_))));
+    }
 
     #[test]
     fn rejects_empty_allowed_ips() {
@@ -1220,9 +1258,6 @@ peers:
                 if errs.iter().any(|e| matches!(e, ValidationError::PeerBindifHasWhitespace { .. }))
         ));
     }
-
-    // Note: rejects_invalid_allowed_ip test removed - validation now happens at parse time.
-    // See rejects_invalid_allowed_ip_at_parse_time for the deserialization test.
 
     #[test]
     fn rejects_duplicate_allowed_ip_for_peer() {

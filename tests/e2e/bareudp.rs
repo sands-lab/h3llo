@@ -15,7 +15,7 @@ use super::common::{require_image_and_network, TEST_IMAGE, TEST_NETWORK, TEST_TA
 
 /// Test configuration for node A (server role).
 /// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
-/// Short DNS refresh (1s) allows h3llo to handle startup order automatically.
+/// Short `tuning.dns_refresh_interval` (1s) handles startup order automatically.
 const NODE_A_CONFIG: &str = r#"
 local:
   id: node-a-local
@@ -25,7 +25,6 @@ local:
       - 10.0.0.1/32
   dns:
     server: udp://127.0.0.11:53
-    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -36,11 +35,13 @@ peers:
     tun:
       allowed_ips:
         - 10.0.0.2/32
+tuning:
+  dns_refresh_interval: 1
 "#;
 
 /// Test configuration for node B (client role).
 /// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
-/// Short DNS refresh (1s) allows h3llo to handle startup order automatically.
+/// Short `tuning.dns_refresh_interval` (1s) handles startup order automatically.
 const NODE_B_CONFIG: &str = r#"
 local:
   id: node-b-local
@@ -50,7 +51,6 @@ local:
       - 10.0.0.2/32
   dns:
     server: udp://127.0.0.11:53
-    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -61,6 +61,8 @@ peers:
     tun:
       allowed_ips:
         - 10.0.0.1/32
+tuning:
+  dns_refresh_interval: 1
 "#;
 
 /// Integration test: Two-node BareUDP tunnel connectivity.
@@ -182,7 +184,6 @@ local:
       - 10.0.0.3/32
   dns:
     server: udp://127.0.0.11:53
-    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -193,6 +194,8 @@ peers:
     tun:
       allowed_ips:
         - 10.0.0.1/32
+tuning:
+  dns_refresh_interval: 1
 "#;
 
     // Node A only allows 10.0.0.2, not 10.0.0.3
@@ -205,7 +208,6 @@ local:
       - 10.0.0.1/32
   dns:
     server: udp://127.0.0.11:53
-    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -216,6 +218,8 @@ peers:
     tun:
       allowed_ips:
         - 10.0.0.2/32
+tuning:
+  dns_refresh_interval: 1
 "#;
 
     let node_a_config_path = temp_dir.path().join("node-a-filter.yaml");
@@ -291,7 +295,7 @@ async fn test_mtu_boundary_drop() {
     require_image_and_network();
 
     // Dedicated configs with container names matching the endpoints.
-    // Short DNS refresh (1s) allows h3llo to handle startup order automatically.
+    // Short `tuning.dns_refresh_interval` (1s) handles startup order automatically.
     let node_a_mtu_config = r#"
 local:
   id: node-a-mtu-local
@@ -301,7 +305,6 @@ local:
       - 10.0.0.1/32
   dns:
     server: udp://127.0.0.11:53
-    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -312,6 +315,8 @@ peers:
     tun:
       allowed_ips:
         - 10.0.0.2/32
+tuning:
+  dns_refresh_interval: 1
 "#;
 
     let node_b_mtu_config = r#"
@@ -323,7 +328,6 @@ local:
       - 10.0.0.2/32
   dns:
     server: udp://127.0.0.11:53
-    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -334,6 +338,8 @@ peers:
     tun:
       allowed_ips:
         - 10.0.0.1/32
+tuning:
+  dns_refresh_interval: 1
 "#;
 
     let temp_dir = tempfile::tempdir().expect("create temp dir");
