@@ -326,12 +326,6 @@ pub struct Orchestrator {
     mtu: usize,
     /// Tuning parameters from config.
     tuning: Tuning,
-    /// Metrics reporting interval (derived from tuning).
-    metrics_interval: Duration,
-    /// Reconnect interval for rate-limiting try_connect (derived from tuning).
-    reconnect_interval: Duration,
-    /// Data-plane packet queue depth (from tuning).
-    packet_queue_depth: usize,
     /// Unified peer state: config + active bound.
     peers: HashMap<String, PeerEntry>,
     tun_cmd_tx: mpsc::UnboundedSender<TunRxCommand>,
@@ -423,9 +417,8 @@ impl Orchestrator {
         let manage_routes = config.local.table;
         let tun_addrs = config.local.tun.addrs.clone();
 
-        // Derive Duration values from tuning config
+        // Derive Duration values from tuning config (local to init)
         let metrics_interval = Duration::from_secs(config.tuning.log_metrics_interval);
-        let reconnect_interval = Duration::from_secs(config.tuning.reconnect_interval);
         let packet_queue_depth = config.tuning.packet_queue_depth;
         let dns_query_timeout = Duration::from_secs(config.tuning.dns_query_timeout);
         let dns_refresh_interval = Duration::from_secs(config.tuning.dns_refresh_interval);
@@ -584,9 +577,6 @@ impl Orchestrator {
             tun_if,
             mtu,
             tuning: config.tuning,
-            metrics_interval,
-            reconnect_interval,
-            packet_queue_depth,
             peers,
             tun_cmd_tx,
             bare_rx_cmd_tx,
@@ -609,7 +599,8 @@ impl Orchestrator {
     pub async fn run(mut self) -> Result<(), OrchestratorError> {
         // Run maintenance at half the connect interval so closed channels and
         // newly resolved IPs are detected promptly.
-        let mut maintenance_ticker = tokio::time::interval(self.reconnect_interval / 2);
+        let reconnect_interval = Duration::from_secs(self.tuning.reconnect_interval);
+        let mut maintenance_ticker = tokio::time::interval(reconnect_interval / 2);
         loop {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {
@@ -840,20 +831,22 @@ impl Orchestrator {
         // Split connection into actor states
         let (rx_state, tx_state) = conn.into_actors();
 
+        let metrics_interval = Duration::from_secs(self.tuning.log_metrics_interval);
+
         // Spawn RX actor
         let rx_handle = spawn_h3_rx(
             rx_state,
             self.tun_packet_tx.clone(),
             self.events_tx.clone(),
-            self.metrics_interval,
+            metrics_interval,
         );
 
         // Spawn TX actor
         let (packet_tx, tx_handle) = spawn_h3_tx(
             tx_state,
             self.events_tx.clone(),
-            self.metrics_interval,
-            self.packet_queue_depth,
+            metrics_interval,
+            self.tuning.packet_queue_depth,
         );
 
         self.join_set.spawn(rx_handle);
@@ -1003,21 +996,13 @@ mod test_support {
             let (tun_packet_tx, _tun_packet_rx) = mpsc::channel(1);
             let (route_cmd_tx, route_cmd_rx) = mpsc::unbounded_channel();
 
-            let tuning = Tuning::default();
-            let metrics_interval = Duration::from_secs(tuning.log_metrics_interval);
-            let reconnect_interval = Duration::from_secs(tuning.reconnect_interval);
-            let packet_queue_depth = tuning.packet_queue_depth;
-
             let orch = Orchestrator {
                 events_rx,
                 events_tx: events_tx.clone(),
                 join_set: JoinSet::new(),
                 tun_if: self.tun_if,
                 mtu: self.mtu,
-                tuning,
-                metrics_interval,
-                reconnect_interval,
-                packet_queue_depth,
+                tuning: Tuning::default(),
                 peers: self.peers,
                 tun_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
