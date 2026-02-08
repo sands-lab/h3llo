@@ -20,7 +20,7 @@ FROM rust:slim-trixie AS chef
 
 # Install boring-sys dependencies and curl/xz for downloading musl toolchain
 RUN apt-get update && apt-get install -y \
-    curl xz-utils \
+    curl xz-utils jq \
     cmake make perl golang-go git \
     clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -73,11 +73,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     TUN_BIN=$(cargo test --test integration-container-tun --release \
         --target x86_64-unknown-linux-musl --no-run \
         --message-format=json \
-        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1) && \
+        | jq -r 'select(.target.name == "integration-container-tun") | .executable // empty') && \
     ROUTE_BIN=$(cargo test --test integration-container-route --release \
         --target x86_64-unknown-linux-musl --no-run \
         --message-format=json \
-        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1) && \
+        | jq -r 'select(.target.name == "integration-container-route") | .executable // empty') && \
     test -n "$TUN_BIN" && test -n "$ROUTE_BIN" && \
     mkdir -p /app/out && \
     cp /app/target/x86_64-unknown-linux-musl/release/h3llo /app/out/ && \
