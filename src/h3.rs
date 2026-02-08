@@ -34,13 +34,14 @@ use tokio_quiche::http3::driver::{
     OutboundFrame, OutboundFrameSender, ServerH3Driver, ServerH3Event,
 };
 use tokio_quiche::http3::settings::Http3Settings;
+use tokio_quiche::listen;
 use tokio_quiche::metrics::DefaultMetrics;
+use tokio_quiche::quic::QuicCommand;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::quiche::h3::{Header, NameValue};
 use tokio_quiche::settings::{
     CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
 };
-use tokio_quiche::{listen, QuicConnection};
 use tracing::{debug, error, warn};
 
 /// Context ID for IP payloads per RFC 9484 (always 0 for CONNECT-IP).
@@ -148,20 +149,21 @@ fn validate_connect_ip_headers(headers: &[Header]) -> Result<(), &'static str> {
 /// after `h3_handshake_timeout` to prevent resource exhaustion from stalled clients.
 async fn handle_h3_connection(
     mut controller: tokio_quiche::http3::driver::ServerH3Controller,
-    quic_conn: QuicConnection,
     remote_addr: SocketAddr,
     tokens: HashMap<String, String>,
     events_tx: mpsc::UnboundedSender<Event>,
     h3_handshake_timeout: Duration,
 ) {
     let handshake = async {
+        // Extract cmd_sender before the handshake loop consumes event_receiver_mut().
+        let quic_cmd_tx = controller.cmd_sender();
+
         // State for auth/flow handshake. Each handshake expects exactly one
         // Headers event and one NewFlow event. Duplicates are detected via
         // Option presence and cause immediate connection rejection.
         let mut pending_auth: Option<String> = None;
         let mut pending_flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
         let mut pending_sender: Option<OutboundFrameSender> = None;
-        let mut quic_conn = Some(quic_conn);
 
         while let Some(event) = controller.event_receiver_mut().recv().await {
             match event {
@@ -227,21 +229,14 @@ async fn handle_h3_connection(
             // Must check references first, because take() in pattern matching
             // would consume values even if the whole pattern doesn't match.
             if matches!(
-                (&pending_auth, &pending_flow, &pending_sender, &quic_conn),
-                (Some(_), Some(_), Some(_), Some(_))
+                (&pending_auth, &pending_flow, &pending_sender),
+                (Some(_), Some(_), Some(_))
             ) {
-                let (
-                    Some(peer_id),
-                    Some((dgram_tx, dgram_rx, flow_id)),
-                    Some(mut sender),
-                    Some(quic),
-                ) = (
+                let (Some(peer_id), Some((dgram_tx, dgram_rx, flow_id)), Some(mut sender)) = (
                     pending_auth.take(),
                     pending_flow.take(),
                     pending_sender.take(),
-                    quic_conn.take(),
-                )
-                else {
+                ) else {
                     error!(%remote_addr, "internal error: handshake state inconsistent");
                     return;
                 };
@@ -250,13 +245,23 @@ async fn handle_h3_connection(
                     return;
                 }
                 debug!(%peer_id, %remote_addr, "H3 connection established");
+
+                let cmd_tx = quic_cmd_tx.clone();
+                let keepalive_tx: KeepaliveSender = Box::new(move || {
+                    cmd_tx
+                        .send(QuicCommand::Custom(Box::new(|conn| {
+                            conn.send_ack_eliciting().ok();
+                        })))
+                        .is_ok()
+                });
+
                 let conn = H3Connection {
                     peer_id,
                     remote_addr,
                     datagram_tx: dgram_tx,
                     datagram_rx: dgram_rx,
                     flow_id,
-                    quic_conn: quic,
+                    keepalive_tx,
                 };
                 let event = Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
                     connection: conn,
@@ -343,6 +348,9 @@ pub enum ListenerError {
 
 // ========== Connection Handle ==========
 
+/// Callback that sends a QUIC PING frame. Returns `false` when the channel is closed.
+pub type KeepaliveSender = Box<dyn Fn() -> bool + Send + Sync>;
+
 /// Established HTTP/3 CONNECT-IP connection with datagram channels.
 ///
 /// Holds the peer identifier, remote address, and tokio-quiche datagram
@@ -358,9 +366,8 @@ pub struct H3Connection {
     pub datagram_rx: InboundFrameStream,
     /// DATAGRAM flow ID for this connection.
     pub flow_id: u64,
-    /// QUIC connection metadata (holds peer_addr, local_addr, etc.).
-    #[allow(dead_code)] // May be used for connection management
-    pub quic_conn: QuicConnection,
+    /// Sends keepalive PING; returns `false` when the cmd channel is closed.
+    pub keepalive_tx: KeepaliveSender,
 }
 
 impl std::fmt::Debug for H3Connection {
@@ -387,6 +394,7 @@ impl H3Connection {
             peer_id: self.peer_id,
             datagram_tx: self.datagram_tx,
             flow_id: self.flow_id,
+            keepalive_tx: self.keepalive_tx,
         };
         (rx, tx)
     }
@@ -470,6 +478,10 @@ pub async fn dial_h3<P: RouteProbe>(
     // Create H3 driver and controller
     let (h3_driver, mut controller) = ClientH3Driver::new(Http3Settings::default());
 
+    // Extract cmd_sender before the handshake loop consumes the controller's
+    // event receiver (cmd_sender() borrows &self, handshake takes &mut self).
+    let quic_cmd_tx = controller.cmd_sender();
+
     // Establish QUIC connection with H3 driver
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut socket: tokio_quiche::socket::Socket<_, _> = socket
@@ -479,7 +491,7 @@ pub async fn dial_h3<P: RouteProbe>(
     #[cfg(target_os = "linux")]
     socket.apply_max_capabilities();
 
-    let quic_conn =
+    let _quic_conn =
         tokio_quiche::quic::connect_with_config(socket, Some(server_name), &params, h3_driver)
             .await
             .map_err(|e| DialError::Handshake(format!("QUIC connect failed: {}", e)))?;
@@ -598,13 +610,21 @@ pub async fn dial_h3<P: RouteProbe>(
 
     let (datagram_tx, datagram_rx, flow_id) = handshake_result;
 
+    let keepalive_tx: KeepaliveSender = Box::new(move || {
+        quic_cmd_tx
+            .send(QuicCommand::Custom(Box::new(|conn| {
+                conn.send_ack_eliciting().ok();
+            })))
+            .is_ok()
+    });
+
     Ok(H3Connection {
         peer_id: peer_id.to_string(),
         remote_addr,
         datagram_tx,
         datagram_rx,
         flow_id,
-        quic_conn,
+        keepalive_tx,
     })
 }
 
@@ -706,8 +726,7 @@ pub fn spawn_h3_rx(
 
 /// H3 transmit actor state.
 ///
-/// Holds the datagram sender and flow ID for the transmit loop.
-#[derive(Debug)]
+/// Holds the datagram sender, flow ID, and keepalive callback for the transmit loop.
 pub struct H3Tx {
     /// Peer identifier for logging and metrics.
     pub peer_id: String,
@@ -715,6 +734,17 @@ pub struct H3Tx {
     pub datagram_tx: OutboundFrameSender,
     /// DATAGRAM flow ID for this connection.
     pub flow_id: u64,
+    /// Sends keepalive PING; returns `false` when the cmd channel is closed.
+    pub keepalive_tx: KeepaliveSender,
+}
+
+impl std::fmt::Debug for H3Tx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("H3Tx")
+            .field("peer_id", &self.peer_id)
+            .field("flow_id", &self.flow_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Spawns the HTTP/3 send loop for a single connection.
@@ -735,6 +765,7 @@ pub fn spawn_h3_tx(
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
     packet_queue_depth: usize,
+    keepalive_interval: Duration,
 ) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
     let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(packet_queue_depth);
 
@@ -742,12 +773,15 @@ pub fn spawn_h3_tx(
         peer_id,
         mut datagram_tx,
         flow_id,
+        keepalive_tx,
     } = tx;
     let peer = peer_id.clone();
 
     let handle = tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::Http3, Direction::Tx);
         let mut ticker = time::interval(interval);
+        let mut keepalive_ticker = time::interval(keepalive_interval);
+        keepalive_ticker.tick().await; // Skip first immediate tick
 
         loop {
             tokio::select! {
@@ -776,6 +810,12 @@ pub fn spawn_h3_tx(
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), None);
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(metrics))).is_err() {
+                        return Ok(());
+                    }
+                }
+                _ = keepalive_ticker.tick() => {
+                    if !(keepalive_tx)() {
+                        debug!(peer = %peer, "keepalive: cmd channel closed");
                         return Ok(());
                     }
                 }
@@ -940,10 +980,10 @@ pub fn spawn_h3_listener(
                                 ServerH3Driver::new(Http3Settings::default());
                             let quic_conn = initial_conn.start(driver);
                             let remote_addr = quic_conn.peer_addr();
+                            drop(quic_conn);
 
                             tokio::spawn(handle_h3_connection(
                                 controller,
-                                quic_conn,
                                 remote_addr,
                                 peer_tokens.clone(),
                                 events_tx.clone(),
@@ -1437,6 +1477,7 @@ mod tests {
             peer_tokens,
             crate::config::default_mtu(),
             events_tx,
+            &Tuning::default(),
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1453,6 +1494,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
+            &Tuning::default(),
         )
         .await;
 
@@ -1706,8 +1748,13 @@ mod tests {
         let (_client_rx, client_tx) = client_conn.into_actors();
 
         // Client TX actor
-        let (client_packet_tx, _client_tx_handle) =
-            spawn_h3_tx(client_tx, events_tx.clone(), metrics_interval, 256);
+        let (client_packet_tx, _client_tx_handle) = spawn_h3_tx(
+            client_tx,
+            events_tx.clone(),
+            metrics_interval,
+            256,
+            Duration::from_secs(20),
+        );
 
         // Split server connection for RX
         let (server_rx, _server_tx) = server_event.connection.into_actors();
@@ -1795,7 +1842,13 @@ mod tests {
         let (client_rx, client_tx) = client_conn.into_actors();
 
         // Client TX -> Server RX
-        let (client_send_tx, _) = spawn_h3_tx(client_tx, events_tx.clone(), metrics_interval, 256);
+        let (client_send_tx, _) = spawn_h3_tx(
+            client_tx,
+            events_tx.clone(),
+            metrics_interval,
+            256,
+            Duration::from_secs(20),
+        );
 
         let (server_to_client_tx, mut client_packet_rx) = mpsc::channel(16);
         let _client_rx_handle = spawn_h3_rx(
@@ -1809,7 +1862,13 @@ mod tests {
         let (server_rx, server_tx) = server_event.connection.into_actors();
 
         // Server TX -> Client RX
-        let (server_send_tx, _) = spawn_h3_tx(server_tx, events_tx.clone(), metrics_interval, 256);
+        let (server_send_tx, _) = spawn_h3_tx(
+            server_tx,
+            events_tx.clone(),
+            metrics_interval,
+            256,
+            Duration::from_secs(20),
+        );
 
         let (client_to_server_tx, mut server_packet_rx) = mpsc::channel(16);
         let _server_rx_handle =

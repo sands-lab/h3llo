@@ -841,6 +841,7 @@ impl Orchestrator {
             self.events_tx.clone(),
             self.tuning.log_metrics_interval,
             self.tuning.packet_queue_depth,
+            self.tuning.h3_keepalive_interval,
         );
 
         self.join_set.spawn(rx_handle);

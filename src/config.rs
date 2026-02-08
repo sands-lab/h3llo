@@ -188,7 +188,7 @@ pub struct Tuning {
     /// HTTP/3 max idle timeout (default: 60s).
     #[serde(with = "serde_duration_secs")]
     pub h3_max_idle_timeout: Duration,
-    /// HTTP/3 keepalive interval (default: 20s). Config parsing only; not yet implemented.
+    /// HTTP/3 keepalive interval (default: 20s). Sends QUIC PING frames to prevent idle timeout.
     #[serde(with = "serde_duration_secs")]
     pub h3_keepalive_interval: Duration,
 }
@@ -260,6 +260,17 @@ pub enum ValidationError {
     /// `tuning.packet_queue_depth` must be > 0 (mpsc::channel(0) panics).
     #[error("tuning.packet_queue_depth must be greater than 0")]
     TuningPacketQueueDepthZero,
+    /// `tuning.h3_keepalive_interval` must be strictly less than `tuning.h3_max_idle_timeout`.
+    #[error(
+        "tuning.h3_keepalive_interval ({keepalive:?}) must be less than \
+         tuning.h3_max_idle_timeout ({idle_timeout:?})"
+    )]
+    H3KeepaliveExceedsIdleTimeout {
+        /// Configured keepalive interval.
+        keepalive: Duration,
+        /// Configured idle timeout.
+        idle_timeout: Duration,
+    },
     /// `local.h3.cert` and `local.h3.key` are required when `local.h3.listen` is set.
     #[error("local.h3.cert and local.h3.key must be set when local.h3.listen is configured")]
     LocalH3CredentialsMissing,
@@ -341,6 +352,12 @@ impl Config {
         // Tuning validation
         if self.tuning.packet_queue_depth == 0 {
             errors.push(ValidationError::TuningPacketQueueDepthZero);
+        }
+        if self.tuning.h3_keepalive_interval >= self.tuning.h3_max_idle_timeout {
+            errors.push(ValidationError::H3KeepaliveExceedsIdleTimeout {
+                keepalive: self.tuning.h3_keepalive_interval,
+                idle_timeout: self.tuning.h3_max_idle_timeout,
+            });
         }
 
         let mut seen_peer_ids = HashSet::new();
@@ -1669,5 +1686,38 @@ peers:
             Err(ConfigError::Validation(ValidationErrors(ref errs)))
                 if errs.contains(&ValidationError::TuningPacketQueueDepthZero)
         ));
+    }
+
+    #[test]
+    fn rejects_keepalive_equal_to_idle_timeout() {
+        let mut config = sample_h3_config();
+        config.tuning.h3_keepalive_interval = Duration::from_secs(60);
+        config.tuning.h3_max_idle_timeout = Duration::from_secs(60);
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.iter().any(|e| matches!(e, ValidationError::H3KeepaliveExceedsIdleTimeout { .. }))
+        ));
+    }
+
+    #[test]
+    fn rejects_keepalive_greater_than_idle_timeout() {
+        let mut config = sample_h3_config();
+        config.tuning.h3_keepalive_interval = Duration::from_secs(120);
+        config.tuning.h3_max_idle_timeout = Duration::from_secs(60);
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.iter().any(|e| matches!(e, ValidationError::H3KeepaliveExceedsIdleTimeout { .. }))
+        ));
+    }
+
+    #[test]
+    fn accepts_keepalive_less_than_idle_timeout() {
+        let config = sample_h3_config();
+        // Default: keepalive=20s, idle_timeout=60s
+        assert!(config.validate().is_ok());
     }
 }

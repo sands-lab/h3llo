@@ -30,7 +30,7 @@ tuning: # optional, all fields have defaults
   dns_refresh_interval: 60 # optional, default: 60 (seconds; 0 disables)
   h3_handshake_timeout: 30 # optional, default: 30 (seconds)
   h3_max_idle_timeout: 60 # optional, default: 60 (seconds)
-  h3_keepalive_interval: 20 # optional, default: 20 (seconds; not yet implemented)
+  h3_keepalive_interval: 20 # optional, default: 20 (seconds; must be < h3_max_idle_timeout)
 peers: # optional, default: []
 - id: example-node-1
   enabled: true # optional, default: true
@@ -72,7 +72,7 @@ peers: # optional, default: []
 - `tuning.dns_refresh_interval` (default `60`): DNS refresh timer in seconds (`0` disables). The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)).
 - `tuning.h3_handshake_timeout` (default `30`): Seconds to wait for an HTTP/3 handshake to complete.
 - `tuning.h3_max_idle_timeout` (default `60`): QUIC idle timeout in seconds; connections idle longer than this are closed.
-- `tuning.h3_keepalive_interval` (default `20`): QUIC keepalive interval in seconds (not yet implemented).
+- `tuning.h3_keepalive_interval` (default `20`): QUIC keepalive interval in seconds; sends PING frames to prevent idle timeout. Must be less than `h3_max_idle_timeout`.
 - `peers[]`: Remote peer entries.
 - `peers[].id`: Remote peer identifier; must be unique within the configuration and non-empty.
 - `peers[].h3.token`: Remote peer authentication token; required (and must be at least 12 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. Must be unique across all peers. Bearer Token auth for CONNECT uses `Authorization: Bearer <token>`; server matches tokens to identify peers.
