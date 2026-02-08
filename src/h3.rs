@@ -14,12 +14,11 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_bearer_auth, validate_connect_auth};
 use crate::bind::{make_client_udp_socket, RouteProbe};
-use crate::config::PeerH3;
+use crate::config::{PeerH3, Tuning};
 use crate::events::{
     ConnectionDirection, Direction, Event, H3ConnectedEvent, TransportEvent, TransportKind,
 };
 use crate::metrics::TransportCounters;
-use crate::PACKET_QUEUE_DEPTH;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -103,9 +102,6 @@ async fn send_response_headers(
         .map_err(|_| "failed to send response headers")
 }
 
-/// Handshake timeout for H3 CONNECT-IP connections.
-const H3_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Validates CONNECT-IP protocol headers per RFC 9484.
 ///
 /// Checks that the request uses Extended CONNECT with:
@@ -149,13 +145,14 @@ fn validate_connect_ip_headers(headers: &[Header]) -> Result<(), &'static str> {
 /// Waits for exactly one Headers event and one NewFlow event (in either order),
 /// then sends 200 OK and emits the established connection. Rejects duplicate
 /// Headers or NewFlow events by closing the connection immediately. Times out
-/// after [`H3_HANDSHAKE_TIMEOUT`] to prevent resource exhaustion from stalled clients.
+/// after `h3_handshake_timeout` to prevent resource exhaustion from stalled clients.
 async fn handle_h3_connection(
     mut controller: tokio_quiche::http3::driver::ServerH3Controller,
     quic_conn: QuicConnection,
     remote_addr: SocketAddr,
     tokens: HashMap<String, String>,
     events_tx: mpsc::UnboundedSender<Event>,
+    h3_handshake_timeout: Duration,
 ) {
     let handshake = async {
         // State for auth/flow handshake. Each handshake expects exactly one
@@ -278,7 +275,7 @@ async fn handle_h3_connection(
         }
     };
 
-    if time::timeout(H3_HANDSHAKE_TIMEOUT, handshake)
+    if time::timeout(h3_handshake_timeout, handshake)
         .await
         .is_err()
     {
@@ -426,6 +423,7 @@ pub async fn dial_h3<P: RouteProbe>(
     tun_if: Option<&str>,
     tun_mtu: u16,
     probe: &P,
+    tuning: &Tuning,
 ) -> Result<H3Connection, DialError> {
     // Extract endpoint fields - return error if None (listen-only peer)
     let endpoint = peer_h3
@@ -450,8 +448,10 @@ pub async fn dial_h3<P: RouteProbe>(
 
     // Configure QUIC settings
     let quic_udp_payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
+    let h3_handshake_timeout = Duration::from_secs(tuning.h3_handshake_timeout);
+    let h3_max_idle_timeout = Duration::from_secs(tuning.h3_max_idle_timeout);
     let mut quic_settings = QuicSettings::default();
-    quic_settings.max_idle_timeout = Some(H3_HANDSHAKE_TIMEOUT);
+    quic_settings.max_idle_timeout = Some(h3_max_idle_timeout);
     // Only disable verification when explicitly requested (testing only)
     if !peer_h3.insecure {
         quic_settings.verify_peer = true;
@@ -504,7 +504,7 @@ pub async fn dial_h3<P: RouteProbe>(
         .map_err(|e| DialError::Handshake(format!("send CONNECT failed: {:?}", e)))?;
 
     // Wait for response headers and NewFlow event with timeout
-    let handshake_result = time::timeout(H3_HANDSHAKE_TIMEOUT, async {
+    let handshake_result = time::timeout(h3_handshake_timeout, async {
         let mut datagram_tx: Option<OutboundFrameSender> = None;
         let mut datagram_rx: Option<InboundFrameStream> = None;
         let mut flow_id: Option<u64> = None;
@@ -589,7 +589,7 @@ pub async fn dial_h3<P: RouteProbe>(
         Ok((datagram_tx, datagram_rx, flow_id))
     })
     .await
-    .map_err(|_| DialError::Timeout(H3_HANDSHAKE_TIMEOUT))??;
+    .map_err(|_| DialError::Timeout(h3_handshake_timeout))??;
 
     let (datagram_tx, datagram_rx, flow_id) = handshake_result;
 
@@ -729,8 +729,9 @@ pub fn spawn_h3_tx(
     tx: H3Tx,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
+    packet_queue_depth: usize,
 ) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(PACKET_QUEUE_DEPTH);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(packet_queue_depth);
 
     let H3Tx {
         peer_id,
@@ -869,6 +870,7 @@ pub fn spawn_h3_listener(
     mut peer_tokens: HashMap<String, String>,
     tun_mtu: u16,
     events_tx: mpsc::UnboundedSender<Event>,
+    tuning: &Tuning,
 ) -> (
     mpsc::UnboundedSender<H3ListenerCommand>,
     JoinHandle<ActorExitResult>,
@@ -892,8 +894,12 @@ pub fn spawn_h3_listener(
         kind: CertificateKind::X509,
     };
 
+    let h3_max_idle_timeout = Duration::from_secs(tuning.h3_max_idle_timeout);
+    let h3_handshake_timeout = Duration::from_secs(tuning.h3_handshake_timeout);
+
     let quic_udp_payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
     let mut quic_settings = QuicSettings::default();
+    quic_settings.max_idle_timeout = Some(h3_max_idle_timeout);
     quic_settings.max_send_udp_payload_size = quic_udp_payload_size;
     quic_settings.max_recv_udp_payload_size = quic_udp_payload_size;
 
@@ -938,6 +944,7 @@ pub fn spawn_h3_listener(
                                 remote_addr,
                                 peer_tokens.clone(),
                                 events_tx.clone(),
+                                h3_handshake_timeout,
                             ));
                         }
                         Some(Err(e)) => {
@@ -1231,6 +1238,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
+            &Tuning::default(),
         )
         .await;
 
@@ -1265,6 +1273,7 @@ mod tests {
             HashMap::new(),
             crate::config::default_mtu(),
             events_tx,
+            &Tuning::default(),
         );
 
         // Verify bound address is valid
@@ -1297,6 +1306,7 @@ mod tests {
             peer_tokens,
             crate::config::default_mtu(),
             events_tx,
+            &Tuning::default(),
         );
 
         // Verify command channel is functional
@@ -1356,6 +1366,7 @@ mod tests {
             peer_tokens,
             crate::config::default_mtu(),
             events_tx,
+            &Tuning::default(),
         );
 
         // Give listener time to bind
@@ -1370,6 +1381,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
+            &Tuning::default(),
         )
         .await;
 
@@ -1422,6 +1434,7 @@ mod tests {
             peer_tokens,
             crate::config::default_mtu(),
             events_tx,
+            &Tuning::default(),
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1435,6 +1448,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
+            &Tuning::default(),
         )
         .await
         .expect("dial");
@@ -1476,6 +1490,7 @@ mod tests {
             peer_tokens,
             crate::config::default_mtu(),
             events_tx,
+            &Tuning::default(),
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1490,6 +1505,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
+            &Tuning::default(),
         )
         .await;
 
@@ -1534,6 +1550,7 @@ mod tests {
             peer_tokens,
             crate::config::default_mtu(),
             events_tx,
+            &Tuning::default(),
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1547,6 +1564,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
+            &Tuning::default(),
         )
         .await;
 
@@ -1580,6 +1598,7 @@ mod tests {
             peer_tokens,
             crate::config::default_mtu(),
             listener_events_tx,
+            &Tuning::default(),
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1593,6 +1612,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
+            &Tuning::default(),
         )
         .await
         .expect("dial failed");
@@ -1617,7 +1637,7 @@ mod tests {
 
         // Client TX actor
         let (client_packet_tx, _client_tx_handle) =
-            spawn_h3_tx(client_tx, events_tx.clone(), metrics_interval);
+            spawn_h3_tx(client_tx, events_tx.clone(), metrics_interval, 256);
 
         // Split server connection for RX
         let (server_rx, _server_tx) = server_event.connection.into_actors();
@@ -1667,6 +1687,7 @@ mod tests {
             peer_tokens,
             crate::config::default_mtu(),
             listener_events_tx,
+            &Tuning::default(),
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1680,6 +1701,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
+            &Tuning::default(),
         )
         .await
         .expect("dial failed");
@@ -1703,7 +1725,7 @@ mod tests {
         let (client_rx, client_tx) = client_conn.into_actors();
 
         // Client TX -> Server RX
-        let (client_send_tx, _) = spawn_h3_tx(client_tx, events_tx.clone(), metrics_interval);
+        let (client_send_tx, _) = spawn_h3_tx(client_tx, events_tx.clone(), metrics_interval, 256);
 
         let (server_to_client_tx, mut client_packet_rx) = mpsc::channel(16);
         let _client_rx_handle = spawn_h3_rx(
@@ -1717,7 +1739,7 @@ mod tests {
         let (server_rx, server_tx) = server_event.connection.into_actors();
 
         // Server TX -> Client RX
-        let (server_send_tx, _) = spawn_h3_tx(server_tx, events_tx.clone(), metrics_interval);
+        let (server_send_tx, _) = spawn_h3_tx(server_tx, events_tx.clone(), metrics_interval, 256);
 
         let (client_to_server_tx, mut server_packet_rx) = mpsc::channel(16);
         let _server_rx_handle =
@@ -1766,6 +1788,7 @@ mod tests {
             peer_tokens,
             crate::config::default_mtu(),
             events_tx,
+            &Tuning::default(),
         );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1779,6 +1802,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
+            &Tuning::default(),
         )
         .await
         .expect("dial failed");

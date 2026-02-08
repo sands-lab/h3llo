@@ -7,7 +7,6 @@ local:
   table: true # optional, default: true (manage system routes)
   dns: # optional
     server: udp://1.1.1.1:53 # optional, default: udp://1.1.1.1:53
-    refresh: 60 # optional, default: 60 (seconds; 0 disables; minimum 1s, recommended 30s+)
     bindif: eth0 # optional, default: auto-detect; warn and fallback to unbound on failure
   h3: # optional; enables HTTP/3 transport
     listen: https://[::]:443/path # optional; omit for dial-only H3 mode
@@ -23,6 +22,15 @@ local:
     addrs: # required (CIDR notation with prefix length)
       - 192.168.180.2/24 # required; supports subnets (e.g., /24) or host addresses (/32, /128)
     mtu: 1393 # optional, default: 1393 (see docs/protocol.md for MTU sizing)
+tuning: # optional, all fields have defaults
+  packet_queue_depth: 256 # optional, default: 256
+  reconnect_interval: 3 # optional, default: 3 (seconds)
+  log_metrics_interval: 30 # optional, default: 30 (seconds)
+  dns_query_timeout: 2 # optional, default: 2 (seconds)
+  dns_refresh_interval: 60 # optional, default: 60 (seconds; 0 disables)
+  h3_handshake_timeout: 30 # optional, default: 30 (seconds)
+  h3_max_idle_timeout: 60 # optional, default: 60 (seconds)
+  h3_keepalive_interval: 20 # optional, default: 20 (seconds; not yet implemented)
 peers: # optional, default: []
 - id: example-node-1
   enabled: true # optional, default: true
@@ -36,7 +44,7 @@ peers: # optional, default: []
     endpoint: udp://node1.example.com:6635 # required when peers.bare is set
     bindif: eth0 # optional; auto-detect when absent; warn and fallback to unbound on failure
   tun: # required
-    allowedIPs: # required
+    allowed_ips: # required
       - 192.168.180.1/32 # required
 ```
 
@@ -48,14 +56,22 @@ peers: # optional, default: []
 - `local.table` (default `true`): Update the system routing table to steer matching traffic into the h3llo TUN. When `false`, h3llo does not touch system routes; the OS still installs host routes (`/32` or `/128`) for `local.tun.addrs`.
 - `local.h3.admin.name` / `local.h3.admin.pass` (optional; both longer than 8 characters): Control-plane Basic Auth credentials bound to HTTP/3. Enable GET/POST APIs only when both are set; authentication matrix is described in [docs/protocol.md](protocol.md).
 - `local.dns.server` (default `udp://1.1.1.1:53`): DNS server address as a UDP URI with an IP literal and port; outbound binding/recursive-routing guards are detailed in [docs/internals.md](internals.md).
-- `local.dns.refresh` (default `60`): DNS refresh timer in seconds (`0` disables). Minimum is `1` second; `30`+ recommended for production to avoid excessive queries. The resolver batches hostnames per tick (see [docs/internals.md](internals.md)).
 - `local.dns.bindif` (optional): Outbound interface for DNS resolution; prefer it when present in probe results, otherwise warn and fall back to a probed interface. Auto-detects at most one interface when omitted. Binding behavior and fallbacks are in [docs/internals.md](internals.md).
 - `local.h3.listen`: HTTP/3 listen address (scheme/host/port/path) for inbound peers when H3 is enabled; required when `local.h3` is set.
 - `local.h3.cert` / `local.h3.key`: Certificate and private key for QUIC/TLS, enabling encryption and peer authentication.
 - `local.bare.listen`: BareUDP listen address when using the plaintext fast path; required to start BareUDP and optional alongside `local.h3`.
 - `local.tun.ifname` (default `h3llo0`): Name of the TUN interface created by h3llo.
-- `local.tun.addrs` (required): IP prefixes in CIDR notation (e.g., `192.168.180.1/24`, `2001:db8::1/64`) for the TUN interface. Supports IPv4, IPv6, dual-stack, and multiple prefixes. Extra system routes come from `peers[].tun.allowedIPs` when `local.table=true`.
+- `local.tun.addrs` (required): IP prefixes in CIDR notation (e.g., `192.168.180.1/24`, `2001:db8::1/64`) for the TUN interface. Supports IPv4, IPv6, dual-stack, and multiple prefixes. Extra system routes come from `peers[].tun.allowed_ips` when `local.table=true`.
 - `local.tun.mtu` (default `1393`): MTU for the TUN interface; see [docs/protocol.md](protocol.md) for sizing guidance.
+- `tuning` (optional): All fields have defaults; omit the entire section to use defaults.
+- `tuning.packet_queue_depth` (default `256`): Bounded channel capacity for data-plane packet queues between actors.
+- `tuning.reconnect_interval` (default `3`): Minimum seconds between `try_connect` attempts per peer.
+- `tuning.log_metrics_interval` (default `30`): Seconds between periodic metric log emissions.
+- `tuning.dns_query_timeout` (default `2`): Seconds before a DNS query is considered timed out and retried.
+- `tuning.dns_refresh_interval` (default `60`): DNS refresh timer in seconds (`0` disables). The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)).
+- `tuning.h3_handshake_timeout` (default `30`): Seconds to wait for an HTTP/3 handshake to complete.
+- `tuning.h3_max_idle_timeout` (default `60`): QUIC idle timeout in seconds; connections idle longer than this are closed.
+- `tuning.h3_keepalive_interval` (default `20`): QUIC keepalive interval in seconds (not yet implemented).
 - `peers[]`: Remote peer entries.
 - `peers[].id`: Remote peer identifier; must be unique within the configuration and non-empty.
 - `peers[].h3.token`: Remote peer authentication token; required (and must be at least 12 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. Must be unique across all peers. Bearer Token auth for CONNECT uses `Authorization: Bearer <token>`; server matches tokens to identify peers.
@@ -66,7 +82,7 @@ peers: # optional, default: []
 - `peers[].h3.insecure` (default `false`): Skip TLS certificate validation (not recommended; prefer `ca`).
 - `peers[].bare.endpoint`: BareUDP dialing address; mutually exclusive with peers[].h3. DNS handling, source-IP filtering, and multi-answer behavior are detailed in [docs/protocol.md](protocol.md).
 - `peers[].bare.bindif` (optional): Interface for BareUDP dialing. Auto-detect when absent; binding and fallback behavior is in [docs/internals.md](internals.md).
-- `peers[].tun.allowedIPs` (required): Prefixes routed via this peer; longest-prefix wins when multiple peers overlap.
+- `peers[].tun.allowed_ips` (required): Prefixes routed via this peer; longest-prefix wins when multiple peers overlap.
 
 ## Notes
 
