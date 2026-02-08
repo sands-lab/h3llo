@@ -1812,7 +1812,7 @@ mod tests {
     async fn try_connect_rate_limited() {
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
         let mut entry = PeerEntry::new(peer);
-        entry.resolved_ips.insert("1.2.3.4".parse().unwrap());
+        entry.resolved_ips.insert("127.0.0.1".parse().unwrap());
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
