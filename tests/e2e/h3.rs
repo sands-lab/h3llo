@@ -94,7 +94,7 @@ peers:
       token: {peer_token}
       insecure: true
     tun:
-      allowedIPs:
+      allowed_ips:
         - {peer_allowed_ip}
 "#
     )
