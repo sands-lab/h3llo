@@ -7,7 +7,7 @@
 //!
 //! Run with:
 //! ```bash
-//! docker build --target test -t h3llo:test .  # build image with embedded binaries
+//! docker buildx build --target test -t h3llo:test --load .  # build image with embedded binaries
 //! cargo test --test integration -- route --ignored --nocapture
 //! ```
 
@@ -30,7 +30,7 @@ async fn route_container_integration() {
     if !ensure_image_exists(TEST_IMAGE, TEST_TAG) {
         panic!(
             "Docker image {TEST_IMAGE}:{TEST_TAG} not found. Build with:\n  \
-             docker build --target test -t {TEST_IMAGE}:{TEST_TAG} ."
+             docker buildx build --target test -t {TEST_IMAGE}:{TEST_TAG} --load ."
         );
     }
 

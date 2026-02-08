@@ -70,10 +70,14 @@ Multi-node BareUDP testing using Docker containers with real TUN devices.
 ### Prerequisites
 
 1. Docker daemon running
-2. Build the test image:
+2. Docker Buildx installed (`docker buildx version` to verify)
+3. Build the test image:
    ```bash
-   docker build --target test -t h3llo:test .
+   docker buildx build --target test -t h3llo:test --load .
    ```
+   **Rebuild required**: The test image embeds compiled h3llo and test binaries.
+   You must rebuild after any change to `src/`, `tests/integration/container/`,
+   `Cargo.toml`, or `Cargo.lock`.
 
 ### Running Tests
 
@@ -164,7 +168,7 @@ or port conflicts.
 When tests with real side effects are needed:
 1. Write test as standalone binary in `tests/integration/container/`
 2. Add `[[test]]` entry with `harness = false` in Cargo.toml
-3. Test binaries are built into the Docker `test` image during `docker build`
+3. Test binaries are built into the Docker `test` image during `docker buildx build`
 4. Native orchestrator in `tests/integration/native/` runs the pre-built binary
 5. Uses `WaitFor::Exit` to wait for container exit and verify exit code
 
@@ -195,7 +199,7 @@ Data-path test uses a userspace ICMP echo responder:
 
 ```bash
 # Build test image with embedded binaries
-docker build --target test -t h3llo:test .
+docker buildx build --target test -t h3llo:test --load .
 
 # Run TUN integration tests
 cargo test --test integration -- tun --ignored --nocapture
@@ -216,7 +220,7 @@ Scenarios:
 
 ```bash
 # Build test image with embedded binaries
-docker build --target test -t h3llo:test .
+docker buildx build --target test -t h3llo:test --load .
 
 # Run route integration tests
 cargo test --test integration -- route --ignored --nocapture

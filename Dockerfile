@@ -1,13 +1,19 @@
-# Multi-stage Dockerfile for h3llo BareUDP VPN
-# Debian builder + Alpine runtime for static musl binaries
+# syntax=docker/dockerfile:1
+# Multi-stage Dockerfile for h3llo BareUDP VPN (requires Docker Buildx)
+# Debian builder + Alpine runtime for static musl binaries.
+# Uses cargo-chef for Docker layer caching of dependencies, plus BuildKit
+# cache mounts to persist cargo registry and compilation artifacts across
+# builds on the same host. The two mechanisms are complementary:
+#   - cargo-chef: separates dependency compilation into a cached Docker layer
+#   - cache mounts: persist compiled artifacts across layer cache misses
 #
 # Targets:
 #   runtime (default) - Minimal Alpine production image
 #   test              - Adds diagnostic tools for integration tests
 #
 # Usage:
-#   docker build --target runtime -t h3llo:latest .
-#   docker build --target test -t h3llo:test .
+#   docker buildx build --target runtime -t h3llo:latest --load .
+#   docker buildx build --target test -t h3llo:test --load .
 
 # Stage 1: Chef - Install cargo-chef with Debian (supports libclang dynamic loading)
 FROM rust:slim-trixie AS chef
@@ -47,25 +53,43 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies (cached as long as recipe.json unchanged)
-RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
-# Build application and test binaries
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+# Build application and test binaries.
+# Cache mount contents are NOT stored in image layers — we must copy
+# artifacts to /app/out/ within this same RUN instruction.
+# Use --message-format=json to extract exact binary paths; glob-based
+# extraction breaks when stale artifacts accumulate in cache mounts.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
-RUN cargo build --release --target x86_64-unknown-linux-musl --bin h3llo && \
-    cargo test --test integration-container-tun --release --target x86_64-unknown-linux-musl --no-run && \
-    cargo test --test integration-container-route --release --target x86_64-unknown-linux-musl --no-run && \
-    strip /app/target/x86_64-unknown-linux-musl/release/h3llo
-# Copy test binaries to known location (they have hash suffixes in deps/)
-RUN mkdir -p /app/test-binaries && \
-    find /app/target/x86_64-unknown-linux-musl/release/deps -name 'integration_container_tun-*' -type f ! -name '*.d' -exec cp {} /app/test-binaries/integration-container-tun \; && \
-    find /app/target/x86_64-unknown-linux-musl/release/deps -name 'integration_container_route-*' -type f ! -name '*.d' -exec cp {} /app/test-binaries/integration-container-route \; && \
-    strip /app/test-binaries/*
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    set -e && \
+    cargo build --release --target x86_64-unknown-linux-musl --bin h3llo && \
+    TUN_BIN=$(cargo test --test integration-container-tun --release \
+        --target x86_64-unknown-linux-musl --no-run \
+        --message-format=json \
+        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1) && \
+    ROUTE_BIN=$(cargo test --test integration-container-route --release \
+        --target x86_64-unknown-linux-musl --no-run \
+        --message-format=json \
+        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1) && \
+    test -n "$TUN_BIN" && test -n "$ROUTE_BIN" && \
+    mkdir -p /app/out && \
+    cp /app/target/x86_64-unknown-linux-musl/release/h3llo /app/out/ && \
+    strip /app/out/h3llo && \
+    cp "$TUN_BIN" /app/out/integration-container-tun && \
+    cp "$ROUTE_BIN" /app/out/integration-container-route && \
+    strip /app/out/*
 
 # Stage 4: Runtime - Minimal Alpine production image
 FROM alpine:3.21 AS runtime
 RUN apk add --no-cache ca-certificates
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/h3llo /usr/local/bin/h3llo
+COPY --from=builder /app/out/h3llo /usr/local/bin/h3llo
 RUN mkdir -p /etc/h3llo
 WORKDIR /etc/h3llo
 ENTRYPOINT ["/usr/local/bin/h3llo"]
@@ -75,5 +99,5 @@ CMD ["-c", "/etc/h3llo/config.yaml"]
 FROM runtime AS test
 RUN apk add --no-cache iproute2 iputils-ping iperf3
 # Include pre-built test binaries for Container Test Pattern
-COPY --from=builder /app/test-binaries/integration-container-tun /usr/local/bin/
-COPY --from=builder /app/test-binaries/integration-container-route /usr/local/bin/
+COPY --from=builder /app/out/integration-container-tun /usr/local/bin/
+COPY --from=builder /app/out/integration-container-route /usr/local/bin/
