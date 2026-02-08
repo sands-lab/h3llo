@@ -466,16 +466,18 @@ pub async fn dial_h3<P: RouteProbe>(
     let (h3_driver, mut controller) = ClientH3Driver::new(Http3Settings::default());
 
     // Establish QUIC connection with H3 driver
-    let quic_conn = tokio_quiche::quic::connect_with_config(
-        socket
-            .try_into()
-            .map_err(|e: std::io::Error| DialError::Socket(e.to_string()))?,
-        Some(server_name),
-        &params,
-        h3_driver,
-    )
-    .await
-    .map_err(|e| DialError::Handshake(format!("QUIC connect failed: {}", e)))?;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut socket: tokio_quiche::socket::Socket<_, _> = socket
+        .try_into()
+        .map_err(|e: std::io::Error| DialError::Socket(e.to_string()))?;
+    // Enable GSO/GRO on Linux for better UDP throughput.
+    #[cfg(target_os = "linux")]
+    socket.apply_max_capabilities();
+
+    let quic_conn =
+        tokio_quiche::quic::connect_with_config(socket, Some(server_name), &params, h3_driver)
+            .await
+            .map_err(|e| DialError::Handshake(format!("QUIC connect failed: {}", e)))?;
 
     // Build auth header
     let auth_header = generate_bearer_auth(&peer_h3.token);
