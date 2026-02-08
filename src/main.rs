@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use tracing::error;
 use tracing_subscriber::{fmt, EnvFilter};
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
     init_logging();
 

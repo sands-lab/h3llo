@@ -28,7 +28,6 @@ local:
       - 10.0.0.1/32
   dns:
     server: udp://127.0.0.11:53
-    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -39,6 +38,8 @@ peers:
     tun:
       allowed_ips:
         - 10.0.0.2/32
+tuning:
+  dns_refresh_interval: 1
 "#;
 
 /// BareUDP node B config for throughput testing.
@@ -51,7 +52,6 @@ local:
       - 10.0.0.2/32
   dns:
     server: udp://127.0.0.11:53
-    refresh: 1
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
@@ -62,6 +62,8 @@ peers:
     tun:
       allowed_ips:
         - 10.0.0.1/32
+tuning:
+  dns_refresh_interval: 1
 "#;
 
 /// Runs iperf3 between two containers and returns measured throughput in bps.

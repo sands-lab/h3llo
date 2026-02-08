@@ -81,7 +81,6 @@ local:
       - {tun_addr}
   dns:
     server: udp://127.0.0.11:53
-    refresh: 1
   h3:
     listen: "https://0.0.0.0:443/"
     cert: {cert_path}
@@ -96,6 +95,8 @@ peers:
     tun:
       allowed_ips:
         - {peer_allowed_ip}
+tuning:
+  dns_refresh_interval: 1
 "#
     )
 }
