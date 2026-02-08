@@ -195,25 +195,30 @@ When configuration changes arrive (external controller POST or initialization), 
 
 **Terminology**: "Accepted sources" refers to the BareUDP RX source IP filter. "Allowed IPs" refers to TUN routing prefixes (`peers[].tun.allowedIPs`).
 
-H3 connection management:
-- For each peer, dial all DNS-resolved IPs in parallel when a new IP is resolved and no connection exists.
-- First successful connection wins and becomes the active connection for the peer.
-- When the active connection disconnects or its IP expires, the connection is removed. Reconnection is not yet implemented.
-- Each peer has at most one active connection at any time.
+Connection management:
+- Each peer maintains multiple active connections (`Vec<BoundState>`), one per resolved IP.
+- The first element in the bounds Vec is the preferred TX path for outbound data.
+- When DNS answers change or an endpoint is reconfigured, stale bounds are pruned and new connections are attempted via `try_connect`.
+- `try_connect` is rate-limited to one attempt per 3 seconds per peer (only updates timestamp when connections are actually spawned).
+- Listener-originated (inbound) connections have `endpoint: None` and are never pruned by DNS or endpoint changes.
+- When a restartable actor fails, all peers are pruned (closed TX channels detected via `tx.is_closed()`), and routing is updated if the preferred TX changed.
+
+Connection pruning rules (`PeerEntry::prune`):
+- TX channel closed (actor exited) — always pruned.
+- Outbound connection whose endpoint differs from current config — pruned (dynamic reconfig).
+- Outbound connection whose dest IP is not in `resolved_ips` — pruned (DNS changed).
+- Inbound connections (`endpoint: None`) are never pruned by endpoint/DNS checks.
 
 DNS lifecycle management:
 - The DNS module owns the refresh timer internally; every `local.dns.refresh` seconds (when nonzero), it re-queries all registered hostnames.
 - The DNS module maintains unified state tracking each hostname's resolved IPs with TTL-based expiration (minimum 60 seconds). A dirty flag tracks whether state changed since the last snapshot emission.
 - On any state change (new IP, IP expiration, hostname add/remove), the dirty flag is set. On the next tick, if dirty, the DNS module emits a single state snapshot containing all hostname→IP mappings and clears the flag.
-- The orchestrator iterates over all peers when a snapshot arrives:
-  - For each peer, check the endpoint hostname against the new snapshot
-  - If no active connection: create connection using first available IP (BareUDP) or dial all IPs (H3)
-  - If active connection exists: check if destination IP is still in the snapshot for that hostname
-    - If expired: remove bound and immediately attempt reconnection if new IPs available
-    - If still valid: do nothing
-  - After processing all peers:
-    - Always update accepted-source filter (DNS may resolve new IPs without bounds change)
-    - Update routing only when bounds actually changed (new connections or disconnections)
+- The orchestrator processes DNS snapshots synchronously in three steps:
+  1. Update each peer's `resolved_ips: HashSet<IpAddr>` from the snapshot.
+  2. Prune stale bounds and attempt reconnection for each peer.
+  3. Update accepted-source filter (unconditionally, from `resolved_ips` of bare peers).
+  - Routing is updated only when prune detects a change in the preferred TX (first bound).
+- A periodic maintenance timer (every 1.5 seconds) runs prune + try_connect for all peers, ensuring self-healing even without DNS events.
 - Refreshing an existing IP extends its TTL without changing the snapshot (no duplicate events).
 - DNS warnings (NXDOMAIN, truncation, recursion refusal) are logged via `warn!` at the DNS module (origin) rather than propagating through events.
 
