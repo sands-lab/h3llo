@@ -53,7 +53,6 @@ pub(super) fn generate_test_certs(
 ///
 /// # Arguments
 ///
-/// * `local_id` - Node identifier (must match peer's `peer_id`)
 /// * `tun_addr` - VPN tunnel IP address (e.g., "10.0.0.1")
 /// * `peer_id` - Remote peer identifier
 /// * `peer_endpoint` - HTTPS endpoint URL for peer (FQDN format)
@@ -62,7 +61,6 @@ pub(super) fn generate_test_certs(
 /// * `cert_path` - Container path to TLS certificate
 /// * `key_path` - Container path to TLS private key
 pub(super) fn h3_node_config(
-    local_id: &str,
     tun_addr: &str,
     peer_id: &str,
     peer_endpoint: &str,
@@ -74,7 +72,6 @@ pub(super) fn h3_node_config(
     format!(
         r#"
 local:
-  id: {local_id}
   tun:
     ifname: tun0
     addrs:
@@ -120,13 +117,10 @@ async fn test_two_node_h3_tunnel() {
     let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), "node-b-h3");
 
     // Create config files
-    // Note: local_id must match the peer_id configured on the remote node
-    // (i.e., node-a's local_id = node-b's peer_id for node-a)
     // The token must match cross-wise: Node_A.peers[B].token == Node_B.peers[A].token
     // This is because client sends peers[target].token, server validates with peers[client].token
     let shared_secret = "shared-tunnel-secret";
     let node_a_config = h3_node_config(
-        "node-a-h3",
         "10.0.0.1/32",
         "node-b-h3",
         "https://node-b-h3.h3llo-test-net:443/",
@@ -137,7 +131,6 @@ async fn test_two_node_h3_tunnel() {
     );
 
     let node_b_config = h3_node_config(
-        "node-b-h3",
         "10.0.0.2/32",
         "node-a-h3",
         "https://node-a-h3.h3llo-test-net:443/",
