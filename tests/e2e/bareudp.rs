@@ -18,7 +18,6 @@ use super::common::{require_image_and_network, TEST_IMAGE, TEST_NETWORK, TEST_TA
 /// Short `tuning.dns_refresh_interval` (1s) handles startup order automatically.
 const NODE_A_CONFIG: &str = r#"
 local:
-  id: node-a-local
   tun:
     ifname: tun0
     addrs:
@@ -44,7 +43,6 @@ tuning:
 /// Short `tuning.dns_refresh_interval` (1s) handles startup order automatically.
 const NODE_B_CONFIG: &str = r#"
 local:
-  id: node-b-local
   tun:
     ifname: tun0
     addrs:
@@ -177,7 +175,6 @@ async fn test_source_ip_filtering() {
     // Node C has a different VPN IP (10.0.0.3) not in node-a's allowed_ips
     let node_c_config = r#"
 local:
-  id: node-c-local
   tun:
     ifname: tun0
     addrs:
@@ -201,7 +198,6 @@ tuning:
     // Node A only allows 10.0.0.2, not 10.0.0.3
     let node_a_config = r#"
 local:
-  id: node-a-filter-local
   tun:
     ifname: tun0
     addrs:
@@ -298,7 +294,6 @@ async fn test_mtu_boundary_drop() {
     // Short `tuning.dns_refresh_interval` (1s) handles startup order automatically.
     let node_a_mtu_config = r#"
 local:
-  id: node-a-mtu-local
   tun:
     ifname: tun0
     addrs:
@@ -321,7 +316,6 @@ tuning:
 
     let node_b_mtu_config = r#"
 local:
-  id: node-b-mtu-local
   tun:
     ifname: tun0
     addrs:

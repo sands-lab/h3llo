@@ -27,7 +27,6 @@ fn node_a_multipath_config(cert_path: &str, key_path: &str) -> String {
     format!(
         r#"
 local:
-  id: node-a-mp
   tun:
     ifname: tun0
     addrs:
@@ -69,7 +68,6 @@ fn node_b_multipath_config(cert_path: &str, key_path: &str) -> String {
     format!(
         r#"
 local:
-  id: node-b-mp
   tun:
     ifname: tun0
     addrs:

@@ -21,7 +21,6 @@ const IPERF_DURATION_SECS: u32 = 5;
 /// BareUDP node A config for throughput testing.
 const THROUGHPUT_NODE_A_CONFIG: &str = r#"
 local:
-  id: node-a-tp
   tun:
     ifname: tun0
     addrs:
@@ -45,7 +44,6 @@ tuning:
 /// BareUDP node B config for throughput testing.
 const THROUGHPUT_NODE_B_CONFIG: &str = r#"
 local:
-  id: node-b-tp
   tun:
     ifname: tun0
     addrs:
@@ -198,7 +196,6 @@ async fn test_h3_tcp_throughput() {
 
     let shared_secret = "throughput-test-secret";
     let node_a_config = h3_node_config(
-        "node-a-tp-h3",
         "10.0.0.1/32",
         "node-b-tp-h3",
         "https://node-b-tp-h3.h3llo-test-net:443/",
@@ -208,7 +205,6 @@ async fn test_h3_tcp_throughput() {
         "/certs/key.pem",
     );
     let node_b_config = h3_node_config(
-        "node-b-tp-h3",
         "10.0.0.2/32",
         "node-a-tp-h3",
         "https://node-a-tp-h3.h3llo-test-net:443/",
