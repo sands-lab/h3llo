@@ -33,9 +33,20 @@ pub trait TunRx: Send + 'static {
         buf: &mut [u8],
     ) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 
-    /// Returns true when this device supports batch receive (GSO/GRO offload).
-    fn supports_offload(&self) -> bool {
-        false
+    /// Maximum number of packets receivable in a single batch.
+    ///
+    /// Returns 1 by default (no batching). Offload-capable devices override this
+    /// to return `IDEAL_BATCH_SIZE`.
+    fn batch_size(&self) -> usize {
+        1
+    }
+
+    /// Required scratch buffer size for [`recv_batch`](Self::recv_batch).
+    ///
+    /// Defaults to [`mtu()`](Self::mtu). Offload-capable devices override this
+    /// to return `VIRTIO_NET_HDR_LEN + 65535`.
+    fn scratch_buf_size(&self) -> usize {
+        self.mtu()
     }
 
     /// Receives multiple packets in batch, returning the packet count.
@@ -46,7 +57,8 @@ pub trait TunRx: Send + 'static {
     ///
     /// # Arguments
     ///
-    /// * `scratch` - Scratch buffer for the raw kernel read (sized for VIRTIO_NET_HDR + 64K).
+    /// * `scratch` - Scratch buffer for the raw kernel read (sized via
+    ///   [`scratch_buf_size`](Self::scratch_buf_size)).
     /// * `bufs` - Pre-allocated packet buffers to receive into.
     /// * `sizes` - Output lengths for each received packet.
     fn recv_batch(
@@ -72,16 +84,28 @@ pub trait TunTx: Send + 'static {
     /// Sends a packet from `buf`, returning the number of bytes written.
     fn send(&mut self, buf: &[u8]) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 
-    /// Returns true when this device supports batch send (GRO coalescing).
-    fn supports_offload(&self) -> bool {
-        false
+    /// Maximum number of packets sendable in a single batch.
+    ///
+    /// Returns 1 by default (no batching). Offload-capable devices override this
+    /// to return `IDEAL_BATCH_SIZE`.
+    fn batch_size(&self) -> usize {
+        1
+    }
+
+    /// Byte offset prepended to each buffer for transport headers (e.g., virtio_net_hdr).
+    ///
+    /// Returns 0 by default. Offload-capable devices override this to return
+    /// `VIRTIO_NET_HDR_LEN`.
+    fn hdr_offset(&self) -> usize {
+        0
     }
 
     /// Sends multiple packets in batch using GRO coalescing.
     ///
     /// Each buffer in `bufs` must have `offset` zero-bytes prepended for the
     /// virtio_net_hdr. Returns the number of packets successfully sent.
-    /// On non-offload devices, falls back to sending each packet individually.
+    /// On non-offload devices, falls back to sending each packet individually
+    /// with transient-error retry.
     fn send_batch(
         &mut self,
         bufs: &mut [Vec<u8>],
@@ -95,7 +119,7 @@ pub trait TunTx: Send + 'static {
                         "send_batch: buffer shorter than offset",
                     ));
                 }
-                self.send(&buf[offset..]).await?;
+                retry_on_transient!(self.send(&buf[offset..]).await)?;
             }
             Ok(bufs.len())
         }
@@ -201,8 +225,13 @@ impl TunRx for TunReader {
     }
 
     #[cfg(target_os = "linux")]
-    fn supports_offload(&self) -> bool {
-        true
+    fn batch_size(&self) -> usize {
+        IDEAL_BATCH_SIZE
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scratch_buf_size(&self) -> usize {
+        VIRTIO_NET_HDR_LEN + 65535
     }
 
     #[cfg(target_os = "linux")]
@@ -239,8 +268,13 @@ impl TunTx for TunWriter {
     }
 
     #[cfg(target_os = "linux")]
-    fn supports_offload(&self) -> bool {
-        true
+    fn batch_size(&self) -> usize {
+        IDEAL_BATCH_SIZE
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hdr_offset(&self) -> usize {
+        VIRTIO_NET_HDR_LEN
     }
 
     #[cfg(target_os = "linux")]
@@ -489,28 +523,15 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
     // Actor creates and owns its command channel receiver
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     let tun_name = tun.name().to_string();
-    let use_batch = tun.supports_offload();
+    let batch_size = tun.batch_size();
+    let scratch_buf_size = tun.scratch_buf_size();
 
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
         let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
         let mut ticker = time::interval(interval);
 
-        // Allocate buffers based on offload capability.
-        #[cfg(target_os = "linux")]
-        let batch_size = if use_batch { IDEAL_BATCH_SIZE } else { 1 };
-        #[cfg(not(target_os = "linux"))]
-        let batch_size = 1;
-        let _ = use_batch; // suppress unused warning on non-Linux
-
-        #[cfg(target_os = "linux")]
-        let mut scratch = if use_batch {
-            vec![0u8; VIRTIO_NET_HDR_LEN + 65535]
-        } else {
-            vec![0u8; mtu]
-        };
-        #[cfg(not(target_os = "linux"))]
-        let mut scratch = vec![0u8; mtu];
+        let mut scratch = vec![0u8; scratch_buf_size];
         let mut bufs = vec![vec![0u8; mtu]; batch_size];
         let mut sizes = vec![0usize; batch_size];
 
@@ -586,24 +607,12 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     // Actor creates and owns its data-plane channel receiver
     let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(packet_queue_depth);
     let tun_name = tun.name().to_string();
-    let use_batch = tun.supports_offload();
+    let hdr_offset = tun.hdr_offset();
 
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
         let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Tx);
         let mut ticker = time::interval(interval);
-
-        // Determine header offset and batch capacity based on offload support.
-        #[cfg(target_os = "linux")]
-        let hdr_offset = if use_batch { VIRTIO_NET_HDR_LEN } else { 0 };
-        #[cfg(not(target_os = "linux"))]
-        let hdr_offset = 0usize;
-        let _ = use_batch; // suppress unused warning on non-Linux
-
-        #[cfg(target_os = "linux")]
-        let batch_capacity = if use_batch { IDEAL_BATCH_SIZE } else { 1 };
-        #[cfg(not(target_os = "linux"))]
-        let batch_capacity = 1usize;
 
         loop {
             tokio::select! {
@@ -618,52 +627,21 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                         continue;
                     }
 
-                    if batch_capacity > 1 {
-                        // Offload path: drain-batch and send_multiple.
-                        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_capacity);
-                        let mut hdr_pkt = vec![0u8; hdr_offset + packet.len()];
-                        hdr_pkt[hdr_offset..].copy_from_slice(&packet);
-                        batch.push(hdr_pkt);
+                    let mut hdr_pkt = vec![0u8; hdr_offset + packet.len()];
+                    hdr_pkt[hdr_offset..].copy_from_slice(&packet);
+                    let mut batch = vec![hdr_pkt];
 
-                        while batch.len() < batch_capacity {
-                            match packet_rx.try_recv() {
-                                Ok(pkt) => {
-                                    if pkt.len() > mtu {
-                                        counters.record_drop(DropReason::Oversize, pkt.len());
-                                        continue;
-                                    }
-                                    let mut h = vec![0u8; hdr_offset + pkt.len()];
-                                    h[hdr_offset..].copy_from_slice(&pkt);
-                                    batch.push(h);
-                                }
-                                Err(_) => break,
+                    match tun.send_batch(&mut batch, hdr_offset).await {
+                        Ok(_) => {
+                            for b in &batch {
+                                counters.record_success(b.len().saturating_sub(hdr_offset));
                             }
                         }
-
-                        // No retry_on_transient: send_multiple internally absorbs
-                        // non-EBADFD errors per-packet; retrying the whole batch
-                        // would double-send already-delivered packets.
-                        match tun.send_batch(&mut batch, hdr_offset).await {
-                            Ok(_) => {
-                                for b in &batch {
-                                    counters.record_success(b.len().saturating_sub(hdr_offset));
-                                }
-                            }
-                            Err(err) => {
-                                let total: usize =
-                                    batch.iter().map(|b| b.len().saturating_sub(hdr_offset)).sum();
-                                counters.record_drop(DropReason::SendError, total);
-                                return Err(ActorError::TunTxSend { name: tun_name, source: err });
-                            }
-                        }
-                    } else {
-                        // Non-offload path: single-packet send.
-                        match retry_on_transient!(tun.send(&packet).await) {
-                            Ok(written) => counters.record_success(written),
-                            Err(err) => {
-                                counters.record_drop(DropReason::SendError, packet.len());
-                                return Err(ActorError::TunTxSend { name: tun_name, source: err });
-                            }
+                        Err(err) => {
+                            let total: usize =
+                                batch.iter().map(|b| b.len().saturating_sub(hdr_offset)).sum();
+                            counters.record_drop(DropReason::SendError, total);
+                            return Err(ActorError::TunTxSend { name: tun_name, source: err });
                         }
                     }
                 }
@@ -1238,10 +1216,12 @@ mod tests {
     // ========== Offload / Batch Tests ==========
 
     #[test]
-    fn memory_tun_does_not_support_offload() {
-        let (rx, tx, _inject, _output) = memory_tun("mem-offload-check", 1500);
-        assert!(!rx.supports_offload());
-        assert!(!tx.supports_offload());
+    fn memory_tun_batch_size_is_one() {
+        let (rx, tx, _inject, _output) = memory_tun("mem-batch-check", 1500);
+        assert_eq!(rx.batch_size(), 1);
+        assert_eq!(rx.scratch_buf_size(), 1500);
+        assert_eq!(tx.batch_size(), 1);
+        assert_eq!(tx.hdr_offset(), 0);
     }
 
     #[tokio::test]
