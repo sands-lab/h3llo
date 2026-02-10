@@ -188,7 +188,6 @@ async fn check_send_recv() -> Result<(), String> {
         let mut scratch = vec![0u8; scratch_size];
         let mut bufs = vec![vec![0u8; mtu]; 1];
         let mut sizes = vec![0usize; 1];
-        let hdr_offset = writer.hdr_offset();
         loop {
             match reader.recv_batch(&mut scratch, &mut bufs, &mut sizes).await {
                 Ok(count) if count > 0 && sizes[0] >= 28 => {}
@@ -240,10 +239,9 @@ async fn check_send_recv() -> Result<(), String> {
             packet[10] = (ip_cksum >> 8) as u8;
             packet[11] = (ip_cksum & 0xFF) as u8;
 
-            let mut send_buf = vec![0u8; hdr_offset + len];
-            send_buf[hdr_offset..].copy_from_slice(&packet[..len]);
-            let mut send_bufs = vec![send_buf];
-            let _ = writer.send_batch(&mut send_bufs, hdr_offset).await;
+            let pkt_buf = tokio_quiche::buf_factory::BufFactory::buf_from_slice(&packet[..len]);
+            let mut send_bufs = [h3llo::tun::TunBuf::from(pkt_buf)];
+            let _ = writer.send_batch(&mut send_bufs).await;
         }
     });
 

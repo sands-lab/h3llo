@@ -34,6 +34,14 @@ use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 /// so downstream consumers (H3 TX, TUN TX) can prepend headers in-place.
 pub(crate) const HEADROOM: usize = 10;
 
+// Compile-time guard: TunBuf::prepend_hdr relies on HEADROOM being sufficient
+// to prepend a zeroed virtio_net_hdr via add_prefix without allocation.
+#[cfg(target_os = "linux")]
+const _: () = assert!(
+    HEADROOM >= VIRTIO_NET_HDR_LEN,
+    "HEADROOM must be >= VIRTIO_NET_HDR_LEN for zero-copy TUN TX"
+);
+
 /// Allocates a pooled buffer with headroom for in-place header prepending.
 ///
 /// Data starts at offset `HEADROOM`, leaving room for downstream consumers
@@ -44,6 +52,71 @@ pub(crate) fn alloc_packet_buf(data: &[u8]) -> PooledBuf {
     buf.truncate(data.len());
     buf[..data.len()].copy_from_slice(data);
     buf
+}
+
+/// Zero-copy wrapper around [`PooledBuf`] for TUN TX.
+///
+/// On Linux, implements tun-rs [`ExpandBuffer`] for direct use with
+/// `AsyncDevice::send_multiple`. The virtio_net_hdr is prepended inside
+/// [`TunTx::send_batch`] — callers never deal with header details.
+pub struct TunBuf(PooledBuf);
+
+impl TunBuf {
+    /// Prepends a zeroed virtio_net_hdr using headroom when available,
+    /// falling back to alloc + copy otherwise. Called by `send_batch`
+    /// implementations, not by the TUN TX actor.
+    #[cfg(target_os = "linux")]
+    fn prepend_hdr(&mut self) {
+        let zeroed = [0u8; VIRTIO_NET_HDR_LEN];
+        if !self.0.add_prefix(&zeroed) {
+            let mut buf = alloc_packet_buf(&self.0);
+            let ok = buf.add_prefix(&zeroed);
+            debug_assert!(ok, "alloc_packet_buf guarantees HEADROOM bytes");
+            self.0 = buf;
+        }
+    }
+}
+
+impl From<PooledBuf> for TunBuf {
+    fn from(packet: PooledBuf) -> Self {
+        Self(packet)
+    }
+}
+
+impl AsRef<[u8]> for TunBuf {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsMut<[u8]> for TunBuf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl tun_rs::ExpandBuffer for TunBuf {
+    fn buf_capacity(&self) -> usize {
+        // Conservative: return visible length, not true capacity.
+        // This intentionally yields GroResult::Noop (no coalescing),
+        // which is correct for single-packet sends.
+        self.0.len()
+    }
+
+    fn buf_resize(&mut self, new_len: usize, val: u8) {
+        let current = self.0.len();
+        if new_len <= current {
+            self.0.truncate(new_len);
+        } else {
+            // ConsumeBuffer only has Extend<&u8>; iterate bytes.
+            self.0.extend(std::iter::repeat_n(&val, new_len - current));
+        }
+    }
+
+    fn buf_extend_from_slice(&mut self, src: &[u8]) {
+        self.0.extend(src.iter());
+    }
 }
 
 /// Provides receive-only access to a TUN device for a single coroutine.
@@ -104,22 +177,13 @@ pub trait TunTx: Send + 'static {
         1
     }
 
-    /// Byte offset prepended to each buffer for transport headers (e.g., virtio_net_hdr).
-    ///
-    /// Returns 0 by default. Offload-capable devices override this to return
-    /// `VIRTIO_NET_HDR_LEN`.
-    fn hdr_offset(&self) -> usize {
-        0
-    }
-
     /// Sends one or more packets in a single call.
     ///
-    /// Each buffer in `bufs` must have `offset` zero-bytes prepended for the
-    /// transport header (e.g., virtio_net_hdr on Linux). Returns the number of packets sent.
+    /// Implementations prepend any required transport header (e.g.,
+    /// `virtio_net_hdr` on Linux) internally.
     fn send_batch(
         &mut self,
-        bufs: &mut [Vec<u8>],
-        offset: usize,
+        bufs: &mut [TunBuf],
     ) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 }
 
@@ -270,29 +334,21 @@ impl TunTx for TunWriter {
         IDEAL_BATCH_SIZE
     }
 
-    #[cfg(target_os = "linux")]
-    fn hdr_offset(&self) -> usize {
-        VIRTIO_NET_HDR_LEN
-    }
-
-    async fn send_batch(&mut self, bufs: &mut [Vec<u8>], offset: usize) -> io::Result<usize> {
+    async fn send_batch(&mut self, bufs: &mut [TunBuf]) -> io::Result<usize> {
         #[cfg(target_os = "linux")]
         {
+            for buf in bufs.iter_mut() {
+                buf.prepend_hdr();
+            }
             self.device
-                .send_multiple(&mut self.gro_table, bufs, offset)
+                .send_multiple(&mut self.gro_table, bufs, VIRTIO_NET_HDR_LEN)
                 .await?;
             Ok(bufs.len())
         }
         #[cfg(not(target_os = "linux"))]
         {
             for buf in bufs.iter() {
-                if offset > buf.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "send_batch: buffer shorter than offset",
-                    ));
-                }
-                retry_on_transient!(self.device.send(&buf[offset..]).await)?;
+                retry_on_transient!(self.device.send(buf.as_ref()).await)?;
             }
             Ok(bufs.len())
         }
@@ -620,7 +676,6 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     // Actor creates and owns its data-plane channel receiver
     let (packet_tx, mut packet_rx) = mpsc::channel::<PooledBuf>(packet_queue_depth);
     let tun_name = tun.name().to_string();
-    let hdr_offset = tun.hdr_offset();
 
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
@@ -640,20 +695,15 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                         continue;
                     }
 
-                    let mut hdr_pkt = vec![0u8; hdr_offset + packet.len()];
-                    hdr_pkt[hdr_offset..].copy_from_slice(&packet);
-                    let mut batch = vec![hdr_pkt];
+                    let pkt_len = packet.len();
+                    let mut batch = [TunBuf::from(packet)];
 
-                    match tun.send_batch(&mut batch, hdr_offset).await {
+                    match tun.send_batch(&mut batch).await {
                         Ok(_) => {
-                            for b in &batch {
-                                counters.record_success(b.len().saturating_sub(hdr_offset));
-                            }
+                            counters.record_success(pkt_len);
                         }
                         Err(err) => {
-                            let total: usize =
-                                batch.iter().map(|b| b.len().saturating_sub(hdr_offset)).sum();
-                            counters.record_drop(DropReason::SendError, total);
+                            counters.record_drop(DropReason::SendError, pkt_len);
                             return Err(ActorError::TunTxSend { name: tun_name, source: err });
                         }
                     }
@@ -679,7 +729,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
 /// Available when compiled with `--features test-utils` or in test builds.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support {
-    use super::{TunRx, TunTx};
+    use super::{TunBuf, TunRx, TunTx};
     use crate::helpers::retry_on_transient;
     use std::collections::VecDeque;
     use std::io;
@@ -801,22 +851,14 @@ pub mod test_support {
             &self.name
         }
 
-        async fn send_batch(&mut self, bufs: &mut [Vec<u8>], offset: usize) -> io::Result<usize> {
+        async fn send_batch(&mut self, bufs: &mut [TunBuf]) -> io::Result<usize> {
             for buf in bufs.iter() {
-                if offset > buf.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "send_batch: buffer shorter than offset",
-                    ));
-                }
-                // retry_on_transient re-evaluates the block on transient errors;
-                // pop_front consumes the injected error, so retry falls through to the real send.
                 retry_on_transient!({
                     if let Some(kind) = self.send_errors.pop_front() {
                         Err(io::Error::new(kind, "injected send error"))
                     } else {
                         self.packet_tx
-                            .send(buf[offset..].to_vec())
+                            .send(buf.as_ref().to_vec())
                             .await
                             .map_err(|_| {
                                 io::Error::new(io::ErrorKind::BrokenPipe, "packet_tx closed")
@@ -1252,7 +1294,6 @@ mod tests {
         assert_eq!(rx.batch_size(), 1);
         assert_eq!(rx.scratch_buf_size(), 1500);
         assert_eq!(tx.batch_size(), 1);
-        assert_eq!(tx.hdr_offset(), 0);
     }
 
     #[tokio::test]
@@ -1310,27 +1351,10 @@ mod tests {
     #[tokio::test]
     async fn memory_tun_tx_send_batch_delivers_packet() {
         let (_rx, mut tx, _inject, mut output) = memory_tun("mem-tx-batch", 64);
-        let mut batch = vec![vec![4, 5, 6]];
-        tx.send_batch(&mut batch, 0).await.unwrap();
+        let mut batch = [TunBuf::from(BufFactory::buf_from_slice(&[4, 5, 6]))];
+        tx.send_batch(&mut batch).await.unwrap();
         let received = output.recv().await.unwrap();
         assert_eq!(received, vec![4, 5, 6]);
-    }
-
-    #[tokio::test]
-    async fn memory_tun_tx_send_batch_strips_offset() {
-        let (_rx, mut tx, _inject, mut output) = memory_tun("mem-tx-offset", 64);
-        let mut bufs = vec![vec![0, 0, 0, 1, 2, 3]];
-        tx.send_batch(&mut bufs, 3).await.unwrap();
-        let received = output.recv().await.unwrap();
-        assert_eq!(received, vec![1, 2, 3]);
-    }
-
-    #[tokio::test]
-    async fn memory_tun_tx_send_batch_rejects_short_buffer() {
-        let (_rx, mut tx, _inject, _output) = memory_tun("mem-tx-short", 64);
-        let mut bufs = vec![vec![1, 2]];
-        let result = tx.send_batch(&mut bufs, 5).await;
-        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1342,5 +1366,44 @@ mod tests {
         let mut sizes = vec![0usize; 1];
         let result = rx.recv_batch(&mut scratch, &mut bufs, &mut sizes).await;
         assert!(result.is_err());
+    }
+
+    // ========== TunBuf Tests ==========
+
+    #[test]
+    fn tun_buf_from_wraps_unchanged() {
+        let buf = BufFactory::buf_from_slice(&[10, 20]);
+        let tun_buf = TunBuf::from(buf);
+        assert_eq!(tun_buf.as_ref(), &[10, 20]);
+    }
+
+    #[test]
+    fn tun_buf_as_mut_modifies_payload() {
+        let buf = BufFactory::buf_from_slice(&[10, 20, 30]);
+        let mut tun_buf = TunBuf::from(buf);
+        tun_buf.as_mut()[0] = 99;
+        assert_eq!(tun_buf.as_ref()[0], 99);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_buf_prepend_hdr_zero_copy_with_headroom() {
+        let buf = alloc_packet_buf(&[1, 2, 3, 4]);
+        let mut tun_buf = TunBuf::from(buf);
+        tun_buf.prepend_hdr();
+        let data = tun_buf.as_ref();
+        assert_eq!(&data[..VIRTIO_NET_HDR_LEN], &[0u8; VIRTIO_NET_HDR_LEN]);
+        assert_eq!(&data[VIRTIO_NET_HDR_LEN..], &[1, 2, 3, 4]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_buf_prepend_hdr_fallback_without_headroom() {
+        let buf = BufFactory::buf_from_slice(&[5, 6, 7]);
+        let mut tun_buf = TunBuf::from(buf);
+        tun_buf.prepend_hdr();
+        let data = tun_buf.as_ref();
+        assert_eq!(&data[..VIRTIO_NET_HDR_LEN], &[0u8; VIRTIO_NET_HDR_LEN]);
+        assert_eq!(&data[VIRTIO_NET_HDR_LEN..], &[5, 6, 7]);
     }
 }
