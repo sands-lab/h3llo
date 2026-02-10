@@ -1,9 +1,7 @@
 //! BareUDP transport: socket setup, source-IP filtering, and send/receive loops.
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::bind::{
-    make_server_udp_socket, make_udp_socket_raw, select_bind_interface, RouteProbe, UdpError,
-};
+use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::metrics::TransportCounters;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
@@ -53,10 +51,9 @@ pub fn make_bare_rx(listen: SocketAddr, mtu: usize) -> Result<BareUdpRx, UdpErro
     Ok(BareUdpRx { socket, state, mtu })
 }
 
-/// Provides send-only access to a BareUDP socket with quinn-udp GSO support.
+/// Provides send-only access to an unconnected BareUDP socket with quinn-udp GSO support.
 ///
-/// The socket is unconnected; quinn-udp's `Transmit.destination` provides explicit
-/// addressing via `sendmsg`, avoiding macOS `EISCONN` errors on connected sockets.
+/// See [`make_bare_tx`] for socket creation and rationale.
 #[derive(Debug)]
 pub struct BareUdpTx {
     socket: UdpSocket,
@@ -86,20 +83,7 @@ pub async fn make_bare_tx<P: RouteProbe>(
     tun_if: Option<&str>,
     probe: &P,
 ) -> Result<BareUdpTx, UdpError> {
-    let domain = match destination {
-        SocketAddr::V4(_) => socket2::Domain::IPV4,
-        SocketAddr::V6(_) => socket2::Domain::IPV6,
-    };
-
-    // Skip interface probing for localhost targets (matches make_client_udp_socket behavior)
-    let selected_interface = if destination.ip().is_loopback() {
-        None
-    } else {
-        select_bind_interface(destination.ip(), tun_if, bindif, probe).await
-    };
-
-    let socket = make_udp_socket_raw(domain, None, selected_interface.as_deref())
-        .map_err(|e| UdpError::Socket(e.to_string()))?;
+    let socket = make_unbound_udp_socket(destination, tun_if, bindif, probe).await?;
     let state = UdpSocketState::new(UdpSockRef::from(&socket))
         .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
     Ok(BareUdpTx {
@@ -259,7 +243,7 @@ pub fn spawn_udp_tx(
                             ActorError::BareTxSend { dest: dest_str.clone(), source: err }
                         })?;
                         match socket.try_io(Interest::WRITABLE, || {
-                            state.send(UdpSockRef::from(&socket), &transmit)
+                            state.try_send(UdpSockRef::from(&socket), &transmit)
                         }) {
                             Ok(()) => {
                                 counters.record_success(packet.len());

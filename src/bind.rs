@@ -92,14 +92,49 @@ pub fn make_server_udp_socket(listen: SocketAddr) -> Result<UdpSocket, UdpError>
     make_udp_socket_raw(domain, Some(listen), None).map_err(|e| UdpError::Socket(e.to_string()))
 }
 
-/// Creates a connected UDP socket for sending packets to a target.
+/// Creates an unbound UDP socket with route-probed interface selection.
 ///
 /// Probes the routing table to select an appropriate interface for reaching `target`,
 /// excluding the TUN interface to avoid routing loops. Skips interface binding for
 /// localhost targets (127.x.x.x, ::1) to support Docker DNS and other localhost services.
 ///
-/// The socket is automatically connected to `target`, allowing use of `send()`/`recv()`
-/// instead of `send_to()`/`recv_from()`.
+/// The socket is **not** connected; the caller decides whether to call `connect()`.
+///
+/// # Arguments
+/// - `target`: Destination address used for domain selection and route probing.
+/// - `tun_if`: Optional TUN interface name to exclude from probing.
+/// - `bind_interface`: Optional preferred interface; treated as a filter during probing.
+/// - `probe`: Route probe implementation for testability.
+///
+/// # Errors
+/// Returns `UdpError::Socket` when socket creation or interface binding fails.
+pub async fn make_unbound_udp_socket<P: RouteProbe>(
+    target: SocketAddr,
+    tun_if: Option<&str>,
+    bind_interface: Option<&str>,
+    probe: &P,
+) -> Result<UdpSocket, UdpError> {
+    let domain = match target {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+
+    // Skip interface probing for localhost targets
+    let selected_interface = if target.ip().is_loopback() {
+        None
+    } else {
+        select_bind_interface(target.ip(), tun_if, bind_interface, probe).await
+    };
+
+    make_udp_socket_raw(domain, None, selected_interface.as_deref())
+        .map_err(|e| UdpError::Socket(e.to_string()))
+}
+
+/// Creates a connected UDP socket for sending packets to a target.
+///
+/// Calls [`make_unbound_udp_socket`] for route-probed interface selection, then
+/// connects the socket to `target`, allowing use of `send()`/`recv()` instead of
+/// `send_to()`/`recv_from()`.
 ///
 /// # Arguments
 /// - `target`: Remote socket address to connect to.
@@ -131,22 +166,7 @@ pub async fn make_client_udp_socket<P: RouteProbe>(
     bind_interface: Option<&str>,
     probe: &P,
 ) -> Result<UdpSocket, UdpError> {
-    let domain = match target {
-        SocketAddr::V4(_) => Domain::IPV4,
-        SocketAddr::V6(_) => Domain::IPV6,
-    };
-
-    // Skip interface probing for localhost targets
-    let selected_interface = if target.ip().is_loopback() {
-        None
-    } else {
-        select_bind_interface(target.ip(), tun_if, bind_interface, probe).await
-    };
-
-    // No explicit bind address - just bind to interface.
-    // OS will auto-assign ephemeral port when connect() is called.
-    let socket = make_udp_socket_raw(domain, None, selected_interface.as_deref())
-        .map_err(|e| UdpError::Socket(e.to_string()))?;
+    let socket = make_unbound_udp_socket(target, tun_if, bind_interface, probe).await?;
 
     socket
         .connect(target)
