@@ -1,14 +1,16 @@
 //! BareUDP transport: socket setup, source-IP filtering, and send/receive loops.
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe, UdpError};
+use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
-use crate::helpers::retry_on_interrupted;
 use crate::metrics::TransportCounters;
+use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::collections::HashSet;
 use std::io;
+use std::io::IoSliceMut;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -24,10 +26,11 @@ pub enum BareUdpRxCommand {
     UpdateAcceptedSources(HashSet<IpAddr>),
 }
 
-/// Provides receive-only access to a BareUDP socket.
+/// Provides receive-only access to a BareUDP socket with quinn-udp GRO support.
 #[derive(Debug)]
 pub struct BareUdpRx {
     socket: UdpSocket,
+    state: UdpSocketState,
     mtu: usize,
 }
 
@@ -43,18 +46,26 @@ pub struct BareUdpRx {
 /// Returns `UdpError::Socket` when socket binding fails.
 pub fn make_bare_rx(listen: SocketAddr, mtu: usize) -> Result<BareUdpRx, UdpError> {
     let socket = make_server_udp_socket(listen)?;
-    Ok(BareUdpRx { socket, mtu })
+    let state = UdpSocketState::new(UdpSockRef::from(&socket))
+        .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
+    Ok(BareUdpRx { socket, state, mtu })
 }
 
-/// Provides send-only access to a BareUDP socket.
+/// Provides send-only access to an unconnected BareUDP socket with quinn-udp GSO support.
+///
+/// See [`make_bare_tx`] for socket creation and rationale.
 #[derive(Debug)]
 pub struct BareUdpTx {
     socket: UdpSocket,
+    state: UdpSocketState,
+    destination: SocketAddr,
 }
 
-/// Creates a BareUDP TX actor state from resolved destination.
+/// Creates a BareUDP TX actor state with an unconnected socket.
 ///
-/// Returns a connected socket, allowing use of `send()` instead of `send_to()`.
+/// The socket is unconnected; quinn-udp's `Transmit.destination` provides explicit
+/// addressing via `sendmsg`. This avoids macOS `EISCONN` errors that occur when
+/// `sendmsg` specifies a destination on a connected socket.
 ///
 /// # Arguments
 ///
@@ -65,15 +76,21 @@ pub struct BareUdpTx {
 ///
 /// # Errors
 ///
-/// Returns `UdpError::Socket` when socket creation, binding, or connect fails.
+/// Returns `UdpError::Socket` when socket creation or binding fails.
 pub async fn make_bare_tx<P: RouteProbe>(
     destination: SocketAddr,
     bindif: Option<&str>,
     tun_if: Option<&str>,
     probe: &P,
 ) -> Result<BareUdpTx, UdpError> {
-    let socket = make_client_udp_socket(destination, tun_if, bindif, probe).await?;
-    Ok(BareUdpTx { socket })
+    let socket = make_unbound_udp_socket(destination, tun_if, bindif, probe).await?;
+    let state = UdpSocketState::new(UdpSockRef::from(&socket))
+        .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
+    Ok(BareUdpTx {
+        socket,
+        state,
+        destination,
+    })
 }
 
 /// Spawns the BareUDP receive loop.
@@ -100,36 +117,55 @@ pub fn spawn_udp_rx(
     // Actor creates and owns its command channel receiver
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-    let BareUdpRx { socket, mtu } = rx;
+    let BareUdpRx { socket, state, mtu } = rx;
     let local_addr = socket
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
 
     let handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; mtu];
+        let gro_segments = state.gro_segments();
+        let mut buf = vec![0u8; mtu * gro_segments];
         let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Rx);
         let mut ticker = time::interval(interval);
+        let mut meta = RecvMeta::default();
 
         loop {
             tokio::select! {
-                result = socket.recv_from(&mut buf) => {
+                _ = socket.readable() => {
+                    let result = socket.try_io(Interest::READABLE, || {
+                        state.recv(
+                            UdpSockRef::from(&socket),
+                            &mut [IoSliceMut::new(&mut buf)],
+                            std::slice::from_mut(&mut meta),
+                        )
+                    });
                     match result {
-                        Ok((len, remote)) => {
-                            if len == 0 {
+                        Ok(0) => continue,
+                        Ok(_) => {
+                            if meta.len == 0 {
                                 continue;
                             }
-                            if !accepted_sources.contains(&remote.ip()) {
-                                counters.record_drop(DropReason::DisallowedSource, len);
-                                continue;
+                            let remote = meta.addr;
+                            let stride = meta.stride.min(meta.len);
+
+                            for chunk in buf[..meta.len].chunks(stride) {
+                                if chunk.is_empty() {
+                                    continue;
+                                }
+                                if !accepted_sources.contains(&remote.ip()) {
+                                    counters.record_drop(DropReason::DisallowedSource, chunk.len());
+                                    continue;
+                                }
+                                let packet = chunk.to_vec();
+                                if packet_tx.send(packet).await.is_err() {
+                                    counters.record_drop(DropReason::ChannelClosed, chunk.len());
+                                    return Ok(());
+                                }
+                                counters.record_success(chunk.len());
                             }
-                            let packet = buf[..len].to_vec();
-                            if packet_tx.send(packet).await.is_err() {
-                                counters.record_drop(DropReason::ChannelClosed, len);
-                                return Ok(()); // Downstream closed, exit gracefully
-                            }
-                            counters.record_success(len);
                         }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(err) => {
                             return Err(ActorError::BareRxRecv { addr: local_addr, source: err });
@@ -156,18 +192,17 @@ pub fn spawn_udp_rx(
     (cmd_tx, handle)
 }
 
-/// Spawns the BareUDP send loop, emitting metrics while forwarding packets.
+/// Spawns the BareUDP send loop using quinn-udp for GSO offload.
 ///
-/// The socket must be connected (created via `make_bare_tx`), allowing
-/// use of `send()` instead of `send_to()`.
-///
-/// Creates a bounded packet channel internally (actor owns the receiver).
-/// Returns the packet sender and join handle.
+/// The socket is unconnected; each packet is sent via `sendmsg` with explicit
+/// destination from `Transmit.destination`. Creates a bounded packet channel
+/// internally (actor owns the receiver). Returns the packet sender and join handle.
 ///
 /// # Arguments
-/// - `tx`: Send-only connected socket.
+/// - `tx`: Send-only socket with quinn-udp state and destination.
 /// - `events_tx`: Unbounded channel for emitting transmit metrics.
 /// - `interval`: Metrics emission interval.
+/// - `packet_queue_depth`: Bounded channel capacity.
 pub fn spawn_udp_tx(
     tx: BareUdpTx,
     events_tx: mpsc::UnboundedSender<Event>,
@@ -176,13 +211,13 @@ pub fn spawn_udp_tx(
 ) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
     let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(packet_queue_depth);
-    let dest_str = tx
-        .socket
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+    let dest_str = tx.destination.to_string();
 
-    let BareUdpTx { socket } = tx;
+    let BareUdpTx {
+        socket,
+        state,
+        destination,
+    } = tx;
 
     let handle = tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Tx);
@@ -196,11 +231,29 @@ pub fn spawn_udp_tx(
                         None => return Ok(()), // Channel closed, exit gracefully
                     };
 
-                    match retry_on_interrupted!(socket.send(&packet).await) {
-                        Ok(written) => counters.record_success(written),
-                        Err(err) => {
-                            counters.record_drop(DropReason::SendError, packet.len());
-                            return Err(ActorError::BareTxSend { dest: dest_str, source: err });
+                    let transmit = Transmit {
+                        destination,
+                        ecn: None,
+                        contents: &packet,
+                        segment_size: None,
+                        src_ip: None,
+                    };
+                    loop {
+                        socket.writable().await.map_err(|err| {
+                            ActorError::BareTxSend { dest: dest_str.clone(), source: err }
+                        })?;
+                        match socket.try_io(Interest::WRITABLE, || {
+                            state.try_send(UdpSockRef::from(&socket), &transmit)
+                        }) {
+                            Ok(()) => {
+                                counters.record_success(packet.len());
+                                break;
+                            }
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                            Err(err) => {
+                                counters.record_drop(DropReason::SendError, packet.len());
+                                return Err(ActorError::BareTxSend { dest: dest_str, source: err });
+                            }
                         }
                     }
                 }
@@ -222,6 +275,22 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
+    /// Creates a `BareUdpRx` directly from a socket for testing.
+    fn test_bare_rx(socket: UdpSocket, mtu: usize) -> BareUdpRx {
+        let state = UdpSocketState::new(UdpSockRef::from(&socket)).unwrap();
+        BareUdpRx { socket, state, mtu }
+    }
+
+    /// Creates a `BareUdpTx` with an unconnected socket for testing.
+    fn test_bare_tx(socket: UdpSocket, destination: SocketAddr) -> BareUdpTx {
+        let state = UdpSocketState::new(UdpSockRef::from(&socket)).unwrap();
+        BareUdpTx {
+            socket,
+            state,
+            destination,
+        }
+    }
+
     // ========== make_bare_rx Tests ==========
 
     #[tokio::test]
@@ -236,16 +305,17 @@ mod tests {
     // ========== make_bare_tx Tests ==========
 
     #[tokio::test]
-    async fn make_bare_tx_creates_connected_socket() {
+    async fn make_bare_tx_creates_unconnected_socket() {
         use crate::bind::test_support::FakeRouteProbe;
 
-        // Create a destination to connect to
         let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
         let probe = FakeRouteProbe::noop();
         let result = make_bare_tx(dest, None, None, &probe).await;
         assert!(result.is_ok());
+        let tx = result.unwrap();
+        assert_eq!(tx.destination, dest);
     }
 
     #[tokio::test]
@@ -259,7 +329,7 @@ mod tests {
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
         let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))]);
         let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
-        let context = BareUdpRx { socket, mtu: 64 };
+        let context = test_bare_rx(socket, 64);
         let (_cmd_tx, handle) = spawn_udp_rx(
             context,
             accepted,
@@ -291,7 +361,7 @@ mod tests {
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
         let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
-        let context = BareUdpRx { socket, mtu: 64 };
+        let context = test_bare_rx(socket, 64);
         let (cmd_tx, handle) = spawn_udp_rx(
             context,
             HashSet::new(),
@@ -338,14 +408,10 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
-        // Create a connected socket for the sender
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender_socket.connect(dest).await.unwrap();
 
         let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
-        let context = BareUdpTx {
-            socket: sender_socket,
-        };
+        let context = test_bare_tx(sender_socket, dest);
         let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200), 256);
 
         packet_tx.send(vec![9, 8, 7]).await.unwrap();
@@ -370,7 +436,7 @@ mod tests {
 
         let (packet_tx, mut packet_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let context = BareUdpRx { socket, mtu: 128 };
+        let context = test_bare_rx(socket, 128);
         let (_cmd_tx, handle) = spawn_udp_rx(
             context,
             HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]),
@@ -418,14 +484,10 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
-        // Create a connected socket for the sender
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender_socket.connect(dest).await.unwrap();
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let context = BareUdpTx {
-            socket: sender_socket,
-        };
+        let context = test_bare_tx(sender_socket, dest);
         let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(10), 256);
 
         packet_tx.send(vec![5, 4, 3, 2]).await.unwrap();
@@ -469,7 +531,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (packet_tx, _packet_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let context = BareUdpRx { socket, mtu: 64 };
+        let context = test_bare_rx(socket, 64);
 
         let (cmd_tx, handle) = spawn_udp_rx(
             context,
@@ -494,7 +556,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (packet_tx, _packet_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let context = BareUdpRx { socket, mtu: 64 };
+        let context = test_bare_rx(socket, 64);
 
         let (cmd_tx, join_handle) = spawn_udp_rx(
             context,
@@ -521,14 +583,10 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
-        // Create a connected socket for the sender
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender_socket.connect(dest).await.unwrap();
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let context = BareUdpTx {
-            socket: sender_socket,
-        };
+        let context = test_bare_tx(sender_socket, dest);
 
         let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_secs(60), 256);
 
@@ -543,14 +601,10 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
-        // Create a connected socket for the sender
         let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender_socket.connect(dest).await.unwrap();
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let context = BareUdpTx {
-            socket: sender_socket,
-        };
+        let context = test_bare_tx(sender_socket, dest);
 
         let (packet_tx, join_handle) =
             spawn_udp_tx(context, events_tx, Duration::from_secs(60), 256);
@@ -577,13 +631,12 @@ mod tests {
         let rx_addr = rx_socket.local_addr().unwrap();
 
         let tx_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        tx_socket.connect(dest).await.unwrap();
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         // Spawn TX first to get its packet_tx channel
         let (packet_tx, tx_handle) = spawn_udp_tx(
-            BareUdpTx { socket: tx_socket },
+            test_bare_tx(tx_socket, dest),
             events_tx.clone(),
             Duration::from_secs(60),
             256,
@@ -592,10 +645,7 @@ mod tests {
         // Spawn RX with TX's packet channel as output (direct wiring, no forwarder)
         let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
         let (_cmd_tx, rx_handle) = spawn_udp_rx(
-            BareUdpRx {
-                socket: rx_socket,
-                mtu: 64,
-            },
+            test_bare_rx(rx_socket, 64),
             accepted,
             packet_tx,
             events_tx,
