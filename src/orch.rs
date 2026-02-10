@@ -37,8 +37,8 @@ struct BoundState {
     endpoint: Option<Endpoint>,
     /// Destination socket address.
     dest: SocketAddr,
-    /// TX channel for sending packets.
-    tx: mpsc::Sender<PooledBuf>,
+    /// TX channel for sending packet batches.
+    tx: mpsc::Sender<Vec<PooledBuf>>,
 }
 
 /// Entry for a single peer in the unified pool.
@@ -69,7 +69,7 @@ impl PeerEntry {
     }
 
     /// Returns the preferred TX channel (first bound) or `None` if no active connections.
-    fn preferred_tx(&self) -> Option<&mpsc::Sender<PooledBuf>> {
+    fn preferred_tx(&self) -> Option<&mpsc::Sender<Vec<PooledBuf>>> {
         self.bounds.first().map(|b| &b.tx)
     }
 
@@ -78,7 +78,7 @@ impl PeerEntry {
         &mut self,
         endpoint: Option<Endpoint>,
         dest: SocketAddr,
-        tx: mpsc::Sender<PooledBuf>,
+        tx: mpsc::Sender<Vec<PooledBuf>>,
     ) {
         let id = self.next_bound_id;
         self.next_bound_id += 1;
@@ -333,7 +333,7 @@ pub struct Orchestrator {
     #[allow(dead_code)]
     h3_listener_cmd_tx: Option<mpsc::UnboundedSender<H3ListenerCommand>>,
     /// Packet sender to TUN TX (for H3 RX actors).
-    tun_packet_tx: mpsc::Sender<PooledBuf>,
+    tun_packet_tx: mpsc::Sender<Vec<PooledBuf>>,
 
     /// DNS resolver command sender for SetHostnames (used for future reconfiguration).
     #[allow(dead_code)]
@@ -389,7 +389,7 @@ impl Orchestrator {
     }
 
     /// Returns map of peer ID to preferred TX channel (for routing table).
-    fn peer_txs(&self) -> HashMap<String, mpsc::Sender<PooledBuf>> {
+    fn peer_txs(&self) -> HashMap<String, mpsc::Sender<Vec<PooledBuf>>> {
         self.peers
             .iter()
             .filter_map(|(id, e)| e.preferred_tx().map(|tx| (id.clone(), tx.clone())))
@@ -750,7 +750,7 @@ impl Orchestrator {
         peer_id: &str,
         endpoint: Option<Endpoint>,
         dest: SocketAddr,
-        tx: mpsc::Sender<PooledBuf>,
+        tx: mpsc::Sender<Vec<PooledBuf>>,
     ) {
         let Some(entry) = self.peers.get_mut(peer_id) else {
             warn!(peer = %peer_id, addr = %dest, "connection for unknown peer");
@@ -964,7 +964,7 @@ mod test_support {
             mut self,
             peer_id: &str,
             dest: SocketAddr,
-            tx: mpsc::Sender<PooledBuf>,
+            tx: mpsc::Sender<Vec<PooledBuf>>,
         ) -> Self {
             if let Some(entry) = self.peers.get_mut(peer_id) {
                 let endpoint = entry.config_endpoint();

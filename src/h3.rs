@@ -634,7 +634,7 @@ pub struct H3Rx {
 /// * `interval` - Metrics emission interval.
 pub fn spawn_h3_rx(
     rx: H3Rx,
-    packet_tx: mpsc::Sender<PooledBuf>,
+    packet_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<ActorExitResult> {
@@ -668,8 +668,8 @@ pub fn spawn_h3_rx(
                             }
                             dgram.pop_front(1);
                             let len = dgram.len();
-                            // Zero-copy: send PooledDgram directly (same type as PooledBuf)
-                            if packet_tx.send(dgram).await.is_err() {
+                            // H3 delivers one datagram at a time; wrap in single-element batch
+                            if packet_tx.send(vec![dgram]).await.is_err() {
                                 counters.record_drop(
                                     crate::events::DropReason::ChannelClosed,
                                     len,
@@ -748,8 +748,8 @@ pub fn spawn_h3_tx(
     interval: Duration,
     packet_queue_depth: usize,
     keepalive_interval: Duration,
-) -> (mpsc::Sender<PooledBuf>, JoinHandle<ActorExitResult>) {
-    let (packet_tx, mut packet_rx) = mpsc::channel::<PooledBuf>(packet_queue_depth);
+) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
+    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
 
     let H3Tx {
         peer_id,
@@ -767,28 +767,30 @@ pub fn spawn_h3_tx(
 
         loop {
             tokio::select! {
-                maybe_packet = packet_rx.recv() => {
-                    let mut packet = match maybe_packet {
-                        Some(p) => p,
+                maybe_batch = packet_rx.recv() => {
+                    let packets = match maybe_batch {
+                        Some(batch) => batch,
                         None => return Ok(()), // Channel closed, exit gracefully
                     };
 
-                    let len = packet.len();
-                    // Zero-copy: prepend Context ID using reserved headroom.
-                    if !packet.add_prefix(&[CONTEXT_ID_IP]) {
-                        counters.record_drop(crate::events::DropReason::NoHeadroom, len);
-                        continue;
-                    }
-                    let frame = OutboundFrame::Datagram(packet, flow_id);
+                    for mut packet in packets {
+                        let len = packet.len();
+                        // Zero-copy: prepend Context ID using reserved headroom.
+                        if !packet.add_prefix(&[CONTEXT_ID_IP]) {
+                            counters.record_drop(crate::events::DropReason::NoHeadroom, len);
+                            continue;
+                        }
+                        let frame = OutboundFrame::Datagram(packet, flow_id);
 
-                    if datagram_tx.send(frame).await.is_err() {
-                        counters.record_drop(crate::events::DropReason::SendError, len);
-                        return Err(ActorError::H3TxSend {
-                            peer_id: peer.clone(),
-                            reason: "datagram channel closed".to_string(),
-                        });
+                        if datagram_tx.send(frame).await.is_err() {
+                            counters.record_drop(crate::events::DropReason::SendError, len);
+                            return Err(ActorError::H3TxSend {
+                                peer_id: peer.clone(),
+                                reason: "datagram channel closed".to_string(),
+                            });
+                        }
+                        counters.record_success(len);
                     }
-                    counters.record_success(len);
                 }
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), None);
@@ -1760,7 +1762,7 @@ mod tests {
         let (server_rx, _server_tx) = server_event.connection.into_actors();
 
         // Server RX actor
-        let (server_packet_tx, mut server_packet_rx) = mpsc::channel::<PooledBuf>(16);
+        let (server_packet_tx, mut server_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _server_rx_handle =
             spawn_h3_rx(server_rx, server_packet_tx, events_tx, metrics_interval);
 
@@ -1768,15 +1770,16 @@ mod tests {
         use crate::tun::alloc_packet_buf;
         let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
         let pkt = alloc_packet_buf(&test_packet);
-        client_packet_tx.send(pkt).await.expect("send failed");
+        client_packet_tx.send(vec![pkt]).await.expect("send failed");
 
         // Verify receipt
-        let received = tokio::time::timeout(Duration::from_secs(5), server_packet_rx.recv())
+        let batch = tokio::time::timeout(Duration::from_secs(5), server_packet_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
 
-        assert_eq!(&received[..], &test_packet[..]);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], &test_packet[..]);
 
         drop(cmd_tx);
     }
@@ -1851,7 +1854,7 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (server_to_client_tx, mut client_packet_rx) = mpsc::channel::<PooledBuf>(16);
+        let (server_to_client_tx, mut client_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _client_rx_handle = spawn_h3_rx(
             client_rx,
             server_to_client_tx,
@@ -1871,35 +1874,37 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (client_to_server_tx, mut server_packet_rx) = mpsc::channel::<PooledBuf>(16);
+        let (client_to_server_tx, mut server_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _server_rx_handle =
             spawn_h3_rx(server_rx, client_to_server_tx, events_tx, metrics_interval);
 
         // Test client -> server
         let packet_c2s = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
         client_send_tx
-            .send(alloc_packet_buf(&packet_c2s))
+            .send(vec![alloc_packet_buf(&packet_c2s)])
             .await
             .unwrap();
 
-        let received_c2s = tokio::time::timeout(Duration::from_secs(5), server_packet_rx.recv())
+        let batch_c2s = tokio::time::timeout(Duration::from_secs(5), server_packet_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
-        assert_eq!(&received_c2s[..], &packet_c2s[..]);
+        assert_eq!(batch_c2s.len(), 1);
+        assert_eq!(&batch_c2s[0][..], &packet_c2s[..]);
 
         // Test server -> client
         let packet_s2c = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
         server_send_tx
-            .send(alloc_packet_buf(&packet_s2c))
+            .send(vec![alloc_packet_buf(&packet_s2c)])
             .await
             .unwrap();
 
-        let received_s2c = tokio::time::timeout(Duration::from_secs(5), client_packet_rx.recv())
+        let batch_s2c = tokio::time::timeout(Duration::from_secs(5), client_packet_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
-        assert_eq!(&received_s2c[..], &packet_s2c[..]);
+        assert_eq!(batch_s2c.len(), 1);
+        assert_eq!(&batch_s2c[0][..], &packet_s2c[..]);
 
         drop(cmd_tx);
     }

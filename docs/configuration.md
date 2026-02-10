@@ -65,7 +65,7 @@ peers: # optional, default: []
 - `local.tun.addrs` (required): IP prefixes in CIDR notation (e.g., `192.168.180.1/24`, `2001:db8::1/64`) for the TUN interface. Supports IPv4, IPv6, dual-stack, and multiple prefixes. Extra system routes come from `peers[].tun.allowed_ips` when `local.table=true`.
 - `local.tun.mtu` (default `1393`): MTU for the TUN interface; see [docs/protocol.md](protocol.md) for sizing guidance.
 - `tuning` (optional): All fields have defaults; omit the entire section to use defaults.
-- `tuning.packet_queue_depth` (default `256`): Bounded channel capacity for data-plane packet queues between actors.
+- `tuning.packet_queue_depth` (default `256`): Bounded channel capacity for data-plane packet queues between actors. Counts batch messages, not individual packets; each batch carries one device I/O operation's worth of packets.
 - `tuning.reconnect_interval` (default `3`): Minimum seconds between `try_connect` attempts per peer.
 - `tuning.log_metrics_interval` (default `30`): Seconds between periodic metric log emissions.
 - `tuning.dns_query_timeout` (default `2`): Seconds before a DNS query is considered timed out and retried.
