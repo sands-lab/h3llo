@@ -76,7 +76,10 @@ pub struct BareUdpTx {
 ///
 /// # Errors
 ///
-/// Returns `UdpError::Socket` when socket creation or binding fails.
+/// Returns `UdpError::Socket` if socket creation fails.
+///
+/// Note: interface binding is best-effort; failures are logged and the
+/// socket continues unbound.
 pub async fn make_bare_tx<P: RouteProbe>(
     destination: SocketAddr,
     bindif: Option<&str>,
@@ -250,6 +253,7 @@ pub fn spawn_udp_tx(
                                 break;
                             }
                             Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                             Err(err) => {
                                 counters.record_drop(DropReason::SendError, packet.len());
                                 return Err(ActorError::BareTxSend { dest: dest_str, source: err });
