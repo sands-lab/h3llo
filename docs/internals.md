@@ -67,7 +67,9 @@ The orchestrator calls `make` then `spawn` sequentially, never performs actor-sp
 Actors use two channel categories with different capacity policies:
 
 - **Control plane (unbounded)**: Command queues (orchestrator-to-child) and event queues (child-to-orchestrator) use `mpsc::unbounded_channel()`. This prevents deadlocks from message cycles between actors—a bounded channel can deadlock when actors block on `send()` waiting for each other.
-- **Data plane (bounded)**: Packet queues for forwarding IP datagrams use `mpsc::channel(tuning.packet_queue_depth)` (default 256). Bounded channels provide backpressure, preventing memory exhaustion when producers outpace consumers.
+- **Data plane (bounded)**: Packet queues for forwarding IP datagrams use `mpsc::channel::<PooledBuf>(tuning.packet_queue_depth)` (default 256). Bounded channels provide backpressure, preventing memory exhaustion when producers outpace consumers. Buffers are allocated from tokio-quiche's `BufFactory` pool; dropped buffers return to the pool for reuse, reducing allocator pressure.
+
+**Buffer allocation strategy**: Data-plane buffers are allocated via `alloc_packet_buf()` (`BufFactory::get_max_buf()` + `pop_front(HEADROOM)`) with 10 bytes of headroom reserved (9 bytes DGRAM_PREFIX + 1 byte Context ID). This headroom enables zero-copy H3 datagram encoding via `add_prefix(&[CONTEXT_ID_IP])` without allocating a new buffer. H3 datagram decoding uses `pop_front(1)` to strip the Context ID in-place. BareUDP RX uses `BufFactory::buf_from_slice()` (no headroom needed since bare packets are written directly to TUN, not re-encoded for H3).
 
 Reference: [Alice Ryhl - Actors with Tokio](https://ryhl.io/blog/actors-with-tokio/)
 
