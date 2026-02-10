@@ -24,7 +24,10 @@ use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 /// Headroom reserved in PooledBuf for H3 datagram framing.
 ///
-/// 9 bytes tokio-quiche DGRAM_PREFIX (flow ID encoding) + 1 byte Context ID.
+/// 9 bytes tokio-quiche DGRAM_PREFIX (flow ID + flow context encoding) +
+/// 1 byte CONNECT-IP Context ID (0x00). If tokio-quiche `DGRAM_PREFIX`
+/// changes, this value must be updated accordingly.
+///
 /// TUN RX buffers reserve this headroom so H3 TX can prepend the Context ID
 /// via `add_prefix` without allocation.
 pub(crate) const HEADROOM: usize = 10;

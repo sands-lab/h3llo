@@ -775,10 +775,14 @@ pub fn spawn_h3_tx(
 
                     let len = packet.len();
                     // Zero-copy: prepend Context ID using reserved headroom.
-                    assert!(
-                        packet.add_prefix(&[CONTEXT_ID_IP]),
-                        "PooledBuf must have headroom for Context ID"
-                    );
+                    // Buffers entering this path must be allocated via
+                    // alloc_packet_buf() with HEADROOM. BareUDP-originated
+                    // buffers go to TUN TX, not here.
+                    if !packet.add_prefix(&[CONTEXT_ID_IP]) {
+                        warn!(peer = %peer, "PooledBuf lacks headroom for Context ID, dropping");
+                        counters.record_drop(crate::events::DropReason::InvalidFraming, len);
+                        continue;
+                    }
                     let frame = OutboundFrame::Datagram(packet, flow_id);
 
                     if datagram_tx.send(frame).await.is_err() {
