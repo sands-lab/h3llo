@@ -192,6 +192,8 @@ pub async fn make_tun(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), Tu
         device: device.clone(),
         mtu,
         name: name.clone(),
+        #[cfg(target_os = "linux")]
+        recv_scratch: vec![0u8; VIRTIO_NET_HDR_LEN + mtu],
     };
     let writer = TunWriter {
         device,
@@ -209,6 +211,9 @@ pub struct TunReader {
     device: Arc<AsyncDevice>,
     mtu: usize,
     name: String,
+    /// Scratch buffer for stripping virtio_net_hdr from single-packet recv on offload devices.
+    #[cfg(target_os = "linux")]
+    recv_scratch: Vec<u8>,
 }
 
 impl TunRx for TunReader {
@@ -220,8 +225,25 @@ impl TunRx for TunReader {
         &self.name
     }
 
+    /// Receives a single IP packet, stripping the virtio_net_hdr on offload-enabled devices.
     async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.device.recv(buf).await
+        #[cfg(target_os = "linux")]
+        {
+            let n = self.device.recv(&mut self.recv_scratch).await?;
+            if n <= VIRTIO_NET_HDR_LEN {
+                return Ok(0);
+            }
+            let payload_len = n - VIRTIO_NET_HDR_LEN;
+            let copy_len = payload_len.min(buf.len());
+            buf[..copy_len].copy_from_slice(
+                &self.recv_scratch[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + copy_len],
+            );
+            Ok(copy_len)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.device.recv(buf).await
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -263,8 +285,19 @@ impl TunTx for TunWriter {
         &self.name
     }
 
+    /// Sends a single IP packet, prepending a zeroed virtio_net_hdr on offload-enabled devices.
     async fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.device.send(buf).await
+        #[cfg(target_os = "linux")]
+        {
+            let mut hdr_buf = vec![0u8; VIRTIO_NET_HDR_LEN + buf.len()];
+            hdr_buf[VIRTIO_NET_HDR_LEN..].copy_from_slice(buf);
+            let n = self.device.send(&hdr_buf).await?;
+            Ok(n.saturating_sub(VIRTIO_NET_HDR_LEN))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.device.send(buf).await
+        }
     }
 
     #[cfg(target_os = "linux")]
