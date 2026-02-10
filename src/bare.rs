@@ -113,7 +113,7 @@ pub async fn make_bare_tx<P: RouteProbe>(
 pub fn spawn_udp_rx(
     rx: BareUdpRx,
     mut accepted_sources: HashSet<IpAddr>,
-    packet_tx: mpsc::Sender<PooledBuf>,
+    packet_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> (
@@ -155,20 +155,35 @@ pub fn spawn_udp_rx(
                             let remote = meta.addr;
                             let stride = meta.stride.min(meta.len);
 
+                            // All GRO chunks share the same source addr;
+                            // check IP filter once for the entire batch.
+                            if !accepted_sources.contains(&remote.ip()) {
+                                for chunk in buf[..meta.len].chunks(stride) {
+                                    if !chunk.is_empty() {
+                                        counters.record_drop(DropReason::DisallowedSource, chunk.len());
+                                    }
+                                }
+                                continue;
+                            }
+
+                            let mut batch = Vec::new();
                             for chunk in buf[..meta.len].chunks(stride) {
-                                if chunk.is_empty() {
-                                    continue;
+                                if !chunk.is_empty() {
+                                    batch.push(alloc_packet_buf(chunk));
                                 }
-                                if !accepted_sources.contains(&remote.ip()) {
-                                    counters.record_drop(DropReason::DisallowedSource, chunk.len());
-                                    continue;
-                                }
-                                let packet = alloc_packet_buf(chunk);
-                                if packet_tx.send(packet).await.is_err() {
-                                    counters.record_drop(DropReason::ChannelClosed, chunk.len());
-                                    return Ok(());
-                                }
-                                counters.record_success(chunk.len());
+                            }
+
+                            if batch.is_empty() {
+                                continue;
+                            }
+
+                            // Pre-send metrics (Option 3A): channel send failure
+                            // means shutdown, so pre-recording is acceptable.
+                            for pkt in &batch {
+                                counters.record_success(pkt.len());
+                            }
+                            if packet_tx.send(batch).await.is_err() {
+                                return Ok(());
                             }
                         }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
@@ -214,9 +229,9 @@ pub fn spawn_udp_tx(
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
     packet_queue_depth: usize,
-) -> (mpsc::Sender<PooledBuf>, JoinHandle<ActorExitResult>) {
+) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
-    let (packet_tx, mut packet_rx) = mpsc::channel::<PooledBuf>(packet_queue_depth);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
     let dest_str = tx.destination.to_string();
 
     let BareUdpTx {
@@ -231,31 +246,33 @@ pub fn spawn_udp_tx(
 
         loop {
             tokio::select! {
-                maybe_packet = packet_rx.recv() => {
-                    let packet = match maybe_packet {
-                        Some(packet) => packet,
+                maybe_batch = packet_rx.recv() => {
+                    let packets = match maybe_batch {
+                        Some(batch) => batch,
                         None => return Ok(()), // Channel closed, exit gracefully
                     };
 
-                    let transmit = Transmit {
-                        destination,
-                        ecn: None,
-                        contents: &packet,
-                        segment_size: None,
-                        src_ip: None,
-                    };
-                    match retry_on_transient!({
-                        socket.writable().await.map_err(|err| {
-                            ActorError::BareTxSend { dest: dest_str.clone(), source: err }
-                        })?;
-                        socket.try_io(Interest::WRITABLE, || {
-                            state.try_send(UdpSockRef::from(&socket), &transmit)
-                        })
-                    }) {
-                        Ok(()) => counters.record_success(packet.len()),
-                        Err(err) => {
-                            counters.record_drop(DropReason::SendError, packet.len());
-                            return Err(ActorError::BareTxSend { dest: dest_str, source: err });
+                    for packet in packets {
+                        let transmit = Transmit {
+                            destination,
+                            ecn: None,
+                            contents: &packet,
+                            segment_size: None,
+                            src_ip: None,
+                        };
+                        match retry_on_transient!({
+                            socket.writable().await.map_err(|err| {
+                                ActorError::BareTxSend { dest: dest_str.clone(), source: err }
+                            })?;
+                            socket.try_io(Interest::WRITABLE, || {
+                                state.try_send(UdpSockRef::from(&socket), &transmit)
+                            })
+                        }) {
+                            Ok(()) => counters.record_success(packet.len()),
+                            Err(err) => {
+                                counters.record_drop(DropReason::SendError, packet.len());
+                                return Err(ActorError::BareTxSend { dest: dest_str, source: err });
+                            }
                         }
                     }
                 }
@@ -397,11 +414,12 @@ mod tests {
             .await
             .expect("second send should succeed");
 
-        let second = tokio::time::timeout(Duration::from_millis(100), packet_rx.recv())
+        let batch = tokio::time::timeout(Duration::from_millis(100), packet_rx.recv())
             .await
             .expect("packet should arrive after update")
             .expect("channel should carry packet");
-        assert_eq!(&second[..], &[7, 8, 9]);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], &[7, 8, 9]);
 
         handle.abort();
     }
@@ -418,7 +436,7 @@ mod tests {
         let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200), 256);
 
         packet_tx
-            .send(BufFactory::buf_from_slice(&[9, 8, 7]))
+            .send(vec![BufFactory::buf_from_slice(&[9, 8, 7])])
             .await
             .unwrap();
 
@@ -458,8 +476,9 @@ mod tests {
             .expect("send should succeed");
 
         // Drain the forwarded packet to avoid channel backpressure.
-        let forwarded = packet_rx.recv().await.expect("packet should be forwarded");
-        assert_eq!(&forwarded[..], &[1, 2, 3, 4]);
+        let batch = packet_rx.recv().await.expect("packet should be forwarded");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], &[1, 2, 3, 4]);
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
@@ -497,7 +516,7 @@ mod tests {
         let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(10), 256);
 
         packet_tx
-            .send(BufFactory::buf_from_slice(&[5, 4, 3, 2]))
+            .send(vec![BufFactory::buf_from_slice(&[5, 4, 3, 2])])
             .await
             .unwrap();
 
@@ -599,9 +618,9 @@ mod tests {
 
         let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_secs(60), 256);
 
-        // Verify packet_tx is functional by sending a packet
+        // Verify packet_tx is functional by sending a batch
         assert!(packet_tx
-            .send(BufFactory::buf_from_slice(&[1, 2, 3]))
+            .send(vec![BufFactory::buf_from_slice(&[1, 2, 3])])
             .await
             .is_ok());
 

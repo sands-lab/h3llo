@@ -76,8 +76,8 @@ pub struct BareConnectedEvent {
     pub endpoint: Endpoint,
     /// Destination socket address.
     pub dest: SocketAddr,
-    /// TX channel for sending packets to the bare TX actor.
-    pub tx: mpsc::Sender<PooledBuf>,
+    /// TX channel for sending packet batches to the bare TX actor.
+    pub tx: mpsc::Sender<Vec<PooledBuf>>,
     /// Join handle for the spawned bare TX actor.
     pub tx_handle: JoinHandle<ActorExitResult>,
 }
