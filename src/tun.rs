@@ -1327,4 +1327,57 @@ mod tests {
 
         tun_rx_task.abort();
     }
+
+    #[tokio::test]
+    async fn memory_tun_rx_recv_batch_returns_packet() {
+        let (mut rx, _tx, inject, _output) = memory_tun("mem-rx-batch", 64);
+        let mut scratch = vec![0u8; rx.scratch_buf_size()];
+        let mut bufs = vec![vec![0u8; 64]; 1];
+        let mut sizes = vec![0usize; 1];
+        inject.send(vec![10, 20, 30]).await.unwrap();
+        let count = rx
+            .recv_batch(&mut scratch, &mut bufs, &mut sizes)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(sizes[0], 3);
+        assert_eq!(&bufs[0][..3], &[10, 20, 30]);
+    }
+
+    #[tokio::test]
+    async fn memory_tun_tx_send_batch_delivers_packet() {
+        let (_rx, mut tx, _inject, mut output) = memory_tun("mem-tx-batch", 64);
+        let mut batch = vec![vec![4, 5, 6]];
+        tx.send_batch(&mut batch, 0).await.unwrap();
+        let received = output.recv().await.unwrap();
+        assert_eq!(received, vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn memory_tun_tx_send_batch_strips_offset() {
+        let (_rx, mut tx, _inject, mut output) = memory_tun("mem-tx-offset", 64);
+        let mut bufs = vec![vec![0, 0, 0, 1, 2, 3]];
+        tx.send_batch(&mut bufs, 3).await.unwrap();
+        let received = output.recv().await.unwrap();
+        assert_eq!(received, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn memory_tun_tx_send_batch_rejects_short_buffer() {
+        let (_rx, mut tx, _inject, _output) = memory_tun("mem-tx-short", 64);
+        let mut bufs = vec![vec![1, 2]];
+        let result = tx.send_batch(&mut bufs, 5).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_tun_rx_recv_batch_channel_closed() {
+        let (mut rx, _tx, inject, _output) = memory_tun("mem-rx-close", 64);
+        drop(inject);
+        let mut scratch = vec![0u8; rx.scratch_buf_size()];
+        let mut bufs = vec![vec![0u8; 64]; 1];
+        let mut sizes = vec![0usize; 1];
+        let result = rx.recv_batch(&mut scratch, &mut bufs, &mut sizes).await;
+        assert!(result.is_err());
+    }
 }

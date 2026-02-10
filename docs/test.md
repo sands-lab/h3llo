@@ -192,8 +192,8 @@ configuration, and actual data transmission (send/receive) using
 
 Data-path test uses a userspace ICMP echo responder:
 1. Creates a TUN device via `make_tun()` and routes a remote IP through it
-2. Spawns an async task that reads ICMP echo requests via `TunRx::recv()`
-3. Crafts ICMP echo replies (swap IPs, fix checksums) and writes them back via `TunTx::send()`
+2. Spawns an async task that reads ICMP echo requests via `TunRx::recv_batch()`
+3. Crafts ICMP echo replies (swap IPs, fix checksums) and writes them back via `TunTx::send_batch()`
 4. Runs `ping` targeting the routed address
 5. Successful ping confirms bidirectional TUN send/receive works
 
