@@ -239,6 +239,7 @@ pub fn spawn_udp_tx(
     let handle = tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Tx);
         let mut ticker = time::interval(interval);
+        let mut gso_buf = Vec::new();
 
         loop {
             tokio::select! {
@@ -248,14 +249,33 @@ pub fn spawn_udp_tx(
                         None => return Ok(()), // Channel closed, exit gracefully
                     };
 
-                    for packet in packets {
+                    if packets.is_empty() {
+                        continue;
+                    }
+
+                    let max_segs = state.max_gso_segments();
+                    // TUN GSO guarantees all non-tail packets in a batch share
+                    // the same size; segment_size from the first packet is safe.
+                    let segment_size = packets[0].len();
+
+                    for chunk in packets.chunks(max_segs) {
+                        gso_buf.clear();
+                        for pkt in chunk {
+                            gso_buf.extend_from_slice(pkt);
+                        }
+
+                        // segment_size tells the kernel to split contents into
+                        // datagrams. When chunk has a single packet or
+                        // max_gso_segments == 1, quinn-udp's prepare_msg skips
+                        // the GSO cmsg automatically (segment_size >= contents.len()).
                         let transmit = Transmit {
                             destination,
                             ecn: None,
-                            contents: &packet,
-                            segment_size: None,
+                            contents: &gso_buf,
+                            segment_size: Some(segment_size),
                             src_ip: None,
                         };
+
                         match retry_on_transient!({
                             socket.writable().await.map_err(|err| {
                                 ActorError::BareTxSend { dest: dest_str.clone(), source: err }
@@ -264,9 +284,15 @@ pub fn spawn_udp_tx(
                                 state.try_send(UdpSockRef::from(&socket), &transmit)
                             })
                         }) {
-                            Ok(()) => counters.record_success(packet.len()),
+                            Ok(()) => {
+                                for pkt in chunk {
+                                    counters.record_success(pkt.len());
+                                }
+                            }
                             Err(err) => {
-                                counters.record_drop(DropReason::SendError, packet.len());
+                                for pkt in chunk {
+                                    counters.record_drop(DropReason::SendError, pkt.len());
+                                }
                                 return Err(ActorError::BareTxSend { dest: dest_str, source: err });
                             }
                         }
@@ -719,13 +745,11 @@ mod tests {
         let mut received = Vec::new();
         for _ in 0..3 {
             let mut buf = vec![0u8; 64];
-            let (len, _) = tokio::time::timeout(
-                Duration::from_millis(200),
-                receiver.recv_from(&mut buf),
-            )
-            .await
-            .expect("should receive packet")
-            .expect("recv_from");
+            let (len, _) =
+                tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
+                    .await
+                    .expect("should receive packet")
+                    .expect("recv_from");
             received.push(buf[..len].to_vec());
         }
         received.sort();
@@ -761,13 +785,11 @@ mod tests {
         let mut received = Vec::new();
         for _ in 0..3 {
             let mut buf = vec![0u8; 64];
-            let (len, _) = tokio::time::timeout(
-                Duration::from_millis(200),
-                receiver.recv_from(&mut buf),
-            )
-            .await
-            .expect("should receive packet")
-            .expect("recv_from");
+            let (len, _) =
+                tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
+                    .await
+                    .expect("should receive packet")
+                    .expect("recv_from");
             received.push(buf[..len].to_vec());
         }
         received.sort();
