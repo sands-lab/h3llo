@@ -16,8 +16,10 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
-use tracing::warn;
+use tracing::{info, warn};
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
+#[cfg(target_os = "linux")]
+use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 /// Provides receive-only access to a TUN device for a single coroutine.
 pub trait TunRx: Send + 'static {
@@ -30,6 +32,35 @@ pub trait TunRx: Send + 'static {
         &mut self,
         buf: &mut [u8],
     ) -> impl std::future::Future<Output = io::Result<usize>> + Send;
+
+    /// Returns true when this device supports batch receive (GSO/GRO offload).
+    fn supports_offload(&self) -> bool {
+        false
+    }
+
+    /// Receives multiple packets in batch, returning the packet count.
+    ///
+    /// On offload-capable devices, reads a single large segment from the kernel
+    /// and splits it into individual packets stored in `bufs[0..n]` with their
+    /// lengths in `sizes[0..n]`. On non-offload devices, falls back to single `recv`.
+    ///
+    /// # Arguments
+    ///
+    /// * `scratch` - Scratch buffer for the raw kernel read (sized for VIRTIO_NET_HDR + 64K).
+    /// * `bufs` - Pre-allocated packet buffers to receive into.
+    /// * `sizes` - Output lengths for each received packet.
+    fn recv_batch(
+        &mut self,
+        _scratch: &mut [u8],
+        bufs: &mut [Vec<u8>],
+        sizes: &mut [usize],
+    ) -> impl std::future::Future<Output = io::Result<usize>> + Send {
+        async {
+            let len = self.recv(&mut bufs[0]).await?;
+            sizes[0] = len;
+            Ok(1)
+        }
+    }
 }
 
 /// Provides send-only access to a TUN device for a single coroutine.
@@ -40,6 +71,34 @@ pub trait TunTx: Send + 'static {
     fn name(&self) -> &str;
     /// Sends a packet from `buf`, returning the number of bytes written.
     fn send(&mut self, buf: &[u8]) -> impl std::future::Future<Output = io::Result<usize>> + Send;
+
+    /// Returns true when this device supports batch send (GRO coalescing).
+    fn supports_offload(&self) -> bool {
+        false
+    }
+
+    /// Sends multiple packets in batch using GRO coalescing.
+    ///
+    /// Each buffer in `bufs` must have `offset` zero-bytes prepended for the
+    /// virtio_net_hdr. Returns the number of packets sent.
+    /// On non-offload devices, falls back to sending each packet individually.
+    fn send_batch(
+        &mut self,
+        bufs: &mut [Vec<u8>],
+        offset: usize,
+    ) -> impl std::future::Future<Output = io::Result<usize>> + Send {
+        async move {
+            for buf in bufs.iter() {
+                let payload = if offset <= buf.len() {
+                    &buf[offset..]
+                } else {
+                    buf
+                };
+                self.send(payload).await?;
+            }
+            Ok(bufs.len())
+        }
+    }
 }
 
 /// Creates TUN device state from configuration.
@@ -59,6 +118,12 @@ pub async fn make_tun(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), Tu
         .mtu(local_tun.mtu)
         .enable(true)
         .layer(Layer::L3);
+
+    // Enable GSO/GRO offload on Linux for batched TUN I/O.
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.offload(true);
+    }
 
     if let Some(first_v4) = v4_addrs.first() {
         builder = builder.ipv4(first_v4.addr(), first_v4.prefix_len(), None);
@@ -89,13 +154,27 @@ pub async fn make_tun(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), Tu
         .map(|m| m as usize)
         .unwrap_or(local_tun.mtu as usize);
 
+    #[cfg(target_os = "linux")]
+    info!(
+        tun = %name,
+        tcp_gso = device.tcp_gso(),
+        udp_gso = device.udp_gso(),
+        "TUN offload enabled"
+    );
+
     let device = Arc::new(device);
     let reader = TunReader {
         device: device.clone(),
         mtu,
         name: name.clone(),
     };
-    let writer = TunWriter { device, mtu, name };
+    let writer = TunWriter {
+        device,
+        mtu,
+        name,
+        #[cfg(target_os = "linux")]
+        gro_table: GROTable::default(),
+    };
 
     Ok((reader, writer))
 }
@@ -119,6 +198,21 @@ impl TunRx for TunReader {
     async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.device.recv(buf).await
     }
+
+    #[cfg(target_os = "linux")]
+    fn supports_offload(&self) -> bool {
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn recv_batch(
+        &mut self,
+        scratch: &mut [u8],
+        bufs: &mut [Vec<u8>],
+        sizes: &mut [usize],
+    ) -> io::Result<usize> {
+        self.device.recv_multiple(scratch, bufs, sizes, 0).await
+    }
 }
 
 /// Provides a send-only handle for a TUN device.
@@ -126,6 +220,8 @@ pub struct TunWriter {
     device: Arc<AsyncDevice>,
     mtu: usize,
     name: String,
+    #[cfg(target_os = "linux")]
+    gro_table: GROTable,
 }
 
 impl TunTx for TunWriter {
@@ -139,6 +235,18 @@ impl TunTx for TunWriter {
 
     async fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.device.send(buf).await
+    }
+
+    #[cfg(target_os = "linux")]
+    fn supports_offload(&self) -> bool {
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn send_batch(&mut self, bufs: &mut [Vec<u8>], offset: usize) -> io::Result<usize> {
+        self.device
+            .send_multiple(&mut self.gro_table, bufs, offset)
+            .await
     }
 }
 
@@ -379,39 +487,60 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
     // Actor creates and owns its command channel receiver
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     let tun_name = tun.name().to_string();
+    let use_batch = tun.supports_offload();
 
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
         let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
         let mut ticker = time::interval(interval);
-        let mut buf = vec![0u8; mtu];
+
+        // Allocate buffers based on offload capability.
+        #[cfg(target_os = "linux")]
+        let batch_size = if use_batch { IDEAL_BATCH_SIZE } else { 1 };
+        #[cfg(not(target_os = "linux"))]
+        let batch_size = 1;
+        let _ = use_batch; // suppress unused warning on non-Linux
+
+        #[cfg(target_os = "linux")]
+        let mut scratch = if use_batch {
+            vec![0u8; VIRTIO_NET_HDR_LEN + 65535]
+        } else {
+            vec![0u8; mtu]
+        };
+        #[cfg(not(target_os = "linux"))]
+        let mut scratch = vec![0u8; mtu];
+        let mut bufs = vec![vec![0u8; mtu]; batch_size];
+        let mut sizes = vec![0usize; batch_size];
 
         loop {
             tokio::select! {
-                result = tun.recv(&mut buf) => {
+                result = tun.recv_batch(&mut scratch, &mut bufs, &mut sizes) => {
                     match result {
-                        Ok(len) => {
-                            if len == 0 {
-                                continue;
-                            }
-                            let packet = buf[..len].to_vec();
+                        Ok(count) => {
+                            for i in 0..count {
+                                let len = sizes[i];
+                                if len == 0 {
+                                    continue;
+                                }
+                                let packet = bufs[i][..len].to_vec();
 
-                            // Inline routing dispatch
-                            let Some(dest) = extract_dst_ip(&packet) else {
-                                counters.record_drop(DropReason::InvalidIpVersion, len);
-                                continue;
-                            };
+                                // Inline routing dispatch
+                                let Some(dest) = extract_dst_ip(&packet) else {
+                                    counters.record_drop(DropReason::InvalidIpVersion, len);
+                                    continue;
+                                };
 
-                            let Some(route) = routing.lookup(dest) else {
-                                counters.record_drop(DropReason::NoRoute, len);
-                                continue;
-                            };
+                                let Some(route) = routing.lookup(dest) else {
+                                    counters.record_drop(DropReason::NoRoute, len);
+                                    continue;
+                                };
 
-                            // Send directly via embedded TX channel
-                            if route.tx.send(packet).await.is_err() {
-                                counters.record_drop(DropReason::ChannelClosed, len);
-                            } else {
-                                counters.record_success(len);
+                                // Send directly via embedded TX channel
+                                if route.tx.send(packet).await.is_err() {
+                                    counters.record_drop(DropReason::ChannelClosed, len);
+                                } else {
+                                    counters.record_success(len);
+                                }
                             }
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -454,11 +583,24 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     // Actor creates and owns its data-plane channel receiver
     let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(packet_queue_depth);
     let tun_name = tun.name().to_string();
+    let use_batch = tun.supports_offload();
 
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
         let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Tx);
         let mut ticker = time::interval(interval);
+
+        // Determine header offset and batch capacity based on offload support.
+        #[cfg(target_os = "linux")]
+        let hdr_offset = if use_batch { VIRTIO_NET_HDR_LEN } else { 0 };
+        #[cfg(not(target_os = "linux"))]
+        let hdr_offset = 0usize;
+        let _ = use_batch; // suppress unused warning on non-Linux
+
+        #[cfg(target_os = "linux")]
+        let batch_capacity = if use_batch { IDEAL_BATCH_SIZE } else { 1 };
+        #[cfg(not(target_os = "linux"))]
+        let batch_capacity = 1usize;
 
         loop {
             tokio::select! {
@@ -473,11 +615,49 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                         continue;
                     }
 
-                    match retry_on_transient!(tun.send(&packet).await) {
-                        Ok(written) => counters.record_success(written),
-                        Err(err) => {
-                            counters.record_drop(DropReason::SendError, packet.len());
-                            return Err(ActorError::TunTxSend { name: tun_name, source: err });
+                    if batch_capacity > 1 {
+                        // Offload path: drain-batch and send_multiple.
+                        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_capacity);
+                        let mut hdr_pkt = vec![0u8; hdr_offset + packet.len()];
+                        hdr_pkt[hdr_offset..].copy_from_slice(&packet);
+                        batch.push(hdr_pkt);
+
+                        while batch.len() < batch_capacity {
+                            match packet_rx.try_recv() {
+                                Ok(pkt) => {
+                                    if pkt.len() > mtu {
+                                        counters.record_drop(DropReason::Oversize, pkt.len());
+                                        continue;
+                                    }
+                                    let mut h = vec![0u8; hdr_offset + pkt.len()];
+                                    h[hdr_offset..].copy_from_slice(&pkt);
+                                    batch.push(h);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+
+                        match retry_on_transient!(tun.send_batch(&mut batch, hdr_offset).await) {
+                            Ok(_) => {
+                                for b in &batch {
+                                    counters.record_success(b.len().saturating_sub(hdr_offset));
+                                }
+                            }
+                            Err(err) => {
+                                let total: usize =
+                                    batch.iter().map(|b| b.len().saturating_sub(hdr_offset)).sum();
+                                counters.record_drop(DropReason::SendError, total);
+                                return Err(ActorError::TunTxSend { name: tun_name, source: err });
+                            }
+                        }
+                    } else {
+                        // Non-offload path: single-packet send.
+                        match retry_on_transient!(tun.send(&packet).await) {
+                            Ok(written) => counters.record_success(written),
+                            Err(err) => {
+                                counters.record_drop(DropReason::SendError, packet.len());
+                                return Err(ActorError::TunTxSend { name: tun_name, source: err });
+                            }
                         }
                     }
                 }
@@ -1047,5 +1227,50 @@ mod tests {
             "tun_tx actor should shut down cleanly after sender dropped, got {:?}",
             result
         );
+    }
+
+    // ========== Offload / Batch Tests ==========
+
+    #[test]
+    fn memory_tun_does_not_support_offload() {
+        let (rx, tx, _inject, _output) = memory_tun("mem-offload-check", 1500);
+        assert!(!rx.supports_offload());
+        assert!(!tx.supports_offload());
+    }
+
+    #[tokio::test]
+    async fn tun_rx_batch_fallback_dispatches_correctly() {
+        // Verifies that the batch-aware spawn_tun_rx loop works
+        // correctly when recv_batch falls back to single-packet recv.
+        let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem-batch-fb", 64);
+        let (peer_tx, mut peer_rx) = mpsc::channel(4);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+
+        let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
+
+        let peer_config = Peer {
+            id: "peer1".to_string(),
+            enabled: true,
+            h3: None,
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
+            },
+        };
+        let mut peer_txs = HashMap::new();
+        peer_txs.insert("peer1".to_string(), peer_tx);
+        let routing = RoutingTable::from_peers(&[peer_config], &peer_txs).unwrap();
+
+        let (_cmd_tx, tun_rx_task) =
+            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_millis(10));
+
+        inject_tx.send(ipv4_packet.clone()).await.unwrap();
+        let packet = peer_rx
+            .recv()
+            .await
+            .expect("packet should be routed via batch fallback");
+        assert_eq!(packet, ipv4_packet);
+
+        tun_rx_task.abort();
     }
 }
