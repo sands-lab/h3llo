@@ -144,8 +144,8 @@ async fn check_multi_address() -> Result<(), String> {
 /// Verifies actual data transmission through a TUN device using ICMP echo (ping).
 ///
 /// Creates a TUN device via `make_tun()`, disables rp_filter, adds a route for
-/// a remote IP through the TUN, spawns a userspace ICMP echo responder, and runs
-/// `ping` to verify round-trip data flow through `TunRx::recv()` and `TunTx::send()`.
+/// a remote IP through the TUN, spawns a userspace ICMP echo responder using batch API,
+/// and runs `ping` to verify round-trip data flow through `TunRx::recv_batch()` and `TunTx::send_batch()`.
 async fn check_send_recv() -> Result<(), String> {
     use h3llo::tun::{TunRx, TunTx};
 
@@ -181,18 +181,23 @@ async fn check_send_recv() -> Result<(), String> {
         ));
     }
 
-    // Spawn ICMP echo responder
+    // Spawn ICMP echo responder using batch API
     let responder = tokio::spawn(async move {
         let mtu = reader.mtu();
-        let mut buf = vec![0u8; mtu];
+        let scratch_size = reader.scratch_buf_size();
+        let mut scratch = vec![0u8; scratch_size];
+        let mut bufs = vec![vec![0u8; mtu]; 1];
+        let mut sizes = vec![0usize; 1];
+        let hdr_offset = writer.hdr_offset();
         loop {
-            let len = match reader.recv(&mut buf).await {
-                Ok(n) if n >= 28 => n,
+            match reader.recv_batch(&mut scratch, &mut bufs, &mut sizes).await {
+                Ok(count) if count > 0 && sizes[0] >= 28 => {}
                 Ok(_) => continue,
                 Err(_) => break,
             };
+            let len = sizes[0];
 
-            let packet = &mut buf[..len];
+            let packet = &mut bufs[0][..len];
             // IPv4 only
             if packet[0] >> 4 != 4 {
                 continue;
@@ -235,7 +240,10 @@ async fn check_send_recv() -> Result<(), String> {
             packet[10] = (ip_cksum >> 8) as u8;
             packet[11] = (ip_cksum & 0xFF) as u8;
 
-            let _ = writer.send(&packet[..len]).await;
+            let mut send_buf = vec![0u8; hdr_offset + len];
+            send_buf[hdr_offset..].copy_from_slice(&packet[..len]);
+            let mut send_bufs = vec![send_buf];
+            let _ = writer.send_batch(&mut send_bufs, hdr_offset).await;
         }
     });
 

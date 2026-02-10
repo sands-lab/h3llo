@@ -3,7 +3,9 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::{LocalTun, Peer};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
-use crate::helpers::{extract_dst_ip, retry_on_transient};
+use crate::helpers::extract_dst_ip;
+#[cfg(not(target_os = "linux"))]
+use crate::helpers::retry_on_transient;
 use crate::metrics::TransportCounters;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use ipnet_trie::IpnetTrie;
@@ -50,11 +52,6 @@ pub trait TunRx: Send + 'static {
     fn mtu(&self) -> usize;
     /// Returns the interface name.
     fn name(&self) -> &str;
-    /// Receives a packet into `buf`, returning the number of bytes read.
-    fn recv(
-        &mut self,
-        buf: &mut [u8],
-    ) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 
     /// Maximum number of packets receivable in a single batch.
     ///
@@ -72,11 +69,11 @@ pub trait TunRx: Send + 'static {
         self.mtu()
     }
 
-    /// Receives multiple packets in batch, returning the packet count.
+    /// Receives one or more packets in a single call, returning the packet count.
     ///
     /// On offload-capable devices, reads a single large segment from the kernel
     /// and splits it into individual packets stored in `bufs[0..n]` with their
-    /// lengths in `sizes[0..n]`. On non-offload devices, falls back to single `recv`.
+    /// lengths in `sizes[0..n]`. On non-offload devices, reads one packet per call.
     ///
     /// # Arguments
     ///
@@ -86,16 +83,10 @@ pub trait TunRx: Send + 'static {
     /// * `sizes` - Output lengths for each received packet.
     fn recv_batch(
         &mut self,
-        _scratch: &mut [u8],
+        scratch: &mut [u8],
         bufs: &mut [Vec<u8>],
         sizes: &mut [usize],
-    ) -> impl std::future::Future<Output = io::Result<usize>> + Send {
-        async {
-            let len = self.recv(&mut bufs[0]).await?;
-            sizes[0] = len;
-            Ok(1)
-        }
-    }
+    ) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 }
 
 /// Provides send-only access to a TUN device for a single coroutine.
@@ -104,8 +95,6 @@ pub trait TunTx: Send + 'static {
     fn mtu(&self) -> usize;
     /// Returns the interface name.
     fn name(&self) -> &str;
-    /// Sends a packet from `buf`, returning the number of bytes written.
-    fn send(&mut self, buf: &[u8]) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 
     /// Maximum number of packets sendable in a single batch.
     ///
@@ -123,30 +112,15 @@ pub trait TunTx: Send + 'static {
         0
     }
 
-    /// Sends multiple packets in batch using GRO coalescing.
+    /// Sends one or more packets in a single call.
     ///
     /// Each buffer in `bufs` must have `offset` zero-bytes prepended for the
-    /// virtio_net_hdr. Returns the number of packets successfully sent.
-    /// On non-offload devices, falls back to sending each packet individually
-    /// with transient-error retry.
+    /// transport header (e.g., virtio_net_hdr on Linux). Returns the number of packets sent.
     fn send_batch(
         &mut self,
         bufs: &mut [Vec<u8>],
         offset: usize,
-    ) -> impl std::future::Future<Output = io::Result<usize>> + Send {
-        async move {
-            for buf in bufs.iter() {
-                if offset > buf.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "send_batch: buffer shorter than offset",
-                    ));
-                }
-                retry_on_transient!(self.send(&buf[offset..]).await)?;
-            }
-            Ok(bufs.len())
-        }
-    }
+    ) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 }
 
 /// Creates TUN device state from configuration.
@@ -215,8 +189,6 @@ pub async fn make_tun(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), Tu
         device: device.clone(),
         mtu,
         name: name.clone(),
-        #[cfg(target_os = "linux")]
-        recv_scratch: vec![0u8; VIRTIO_NET_HDR_LEN + mtu],
     };
     let writer = TunWriter {
         device,
@@ -234,9 +206,6 @@ pub struct TunReader {
     device: Arc<AsyncDevice>,
     mtu: usize,
     name: String,
-    /// Scratch buffer for stripping virtio_net_hdr from single-packet recv on offload devices.
-    #[cfg(target_os = "linux")]
-    recv_scratch: Vec<u8>,
 }
 
 impl TunRx for TunReader {
@@ -246,27 +215,6 @@ impl TunRx for TunReader {
 
     fn name(&self) -> &str {
         &self.name
-    }
-
-    /// Receives a single IP packet, stripping the virtio_net_hdr on offload-enabled devices.
-    async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        #[cfg(target_os = "linux")]
-        {
-            let n = self.device.recv(&mut self.recv_scratch).await?;
-            if n <= VIRTIO_NET_HDR_LEN {
-                return Ok(0);
-            }
-            let payload_len = n - VIRTIO_NET_HDR_LEN;
-            let copy_len = payload_len.min(buf.len());
-            buf[..copy_len].copy_from_slice(
-                &self.recv_scratch[VIRTIO_NET_HDR_LEN..VIRTIO_NET_HDR_LEN + copy_len],
-            );
-            Ok(copy_len)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            self.device.recv(buf).await
-        }
     }
 
     #[cfg(target_os = "linux")]
@@ -279,14 +227,23 @@ impl TunRx for TunReader {
         VIRTIO_NET_HDR_LEN + 65535
     }
 
-    #[cfg(target_os = "linux")]
     async fn recv_batch(
         &mut self,
         scratch: &mut [u8],
         bufs: &mut [Vec<u8>],
         sizes: &mut [usize],
     ) -> io::Result<usize> {
-        self.device.recv_multiple(scratch, bufs, sizes, 0).await
+        #[cfg(target_os = "linux")]
+        {
+            self.device.recv_multiple(scratch, bufs, sizes, 0).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = scratch;
+            let len = self.device.recv(&mut bufs[0]).await?;
+            sizes[0] = len;
+            Ok(1)
+        }
     }
 }
 
@@ -308,21 +265,6 @@ impl TunTx for TunWriter {
         &self.name
     }
 
-    /// Sends a single IP packet, prepending a zeroed virtio_net_hdr on offload-enabled devices.
-    async fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
-        #[cfg(target_os = "linux")]
-        {
-            let mut hdr_buf = vec![0u8; VIRTIO_NET_HDR_LEN + buf.len()];
-            hdr_buf[VIRTIO_NET_HDR_LEN..].copy_from_slice(buf);
-            let n = self.device.send(&hdr_buf).await?;
-            Ok(n.saturating_sub(VIRTIO_NET_HDR_LEN))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            self.device.send(buf).await
-        }
-    }
-
     #[cfg(target_os = "linux")]
     fn batch_size(&self) -> usize {
         IDEAL_BATCH_SIZE
@@ -333,12 +275,27 @@ impl TunTx for TunWriter {
         VIRTIO_NET_HDR_LEN
     }
 
-    #[cfg(target_os = "linux")]
     async fn send_batch(&mut self, bufs: &mut [Vec<u8>], offset: usize) -> io::Result<usize> {
-        self.device
-            .send_multiple(&mut self.gro_table, bufs, offset)
-            .await?;
-        Ok(bufs.len())
+        #[cfg(target_os = "linux")]
+        {
+            self.device
+                .send_multiple(&mut self.gro_table, bufs, offset)
+                .await?;
+            Ok(bufs.len())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            for buf in bufs.iter() {
+                if offset > buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "send_batch: buffer shorter than offset",
+                    ));
+                }
+                retry_on_transient!(self.device.send(&buf[offset..]).await)?;
+            }
+            Ok(bufs.len())
+        }
     }
 }
 
@@ -723,6 +680,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support {
     use super::{TunRx, TunTx};
+    use crate::helpers::retry_on_transient;
     use std::collections::VecDeque;
     use std::io;
     use tokio::sync::mpsc;
@@ -765,23 +723,7 @@ pub mod test_support {
         mpsc::Sender<Vec<u8>>,
         mpsc::Receiver<Vec<u8>>,
     ) {
-        let (inject_tx, packet_rx) = mpsc::channel(16);
-        let (packet_tx, output_rx) = mpsc::channel(16);
-        (
-            MemoryTunRx {
-                name: name.to_string(),
-                mtu,
-                packet_rx,
-            },
-            MemoryTunTx {
-                name: name.to_string(),
-                mtu,
-                packet_tx,
-                send_errors: VecDeque::new(),
-            },
-            inject_tx,
-            output_rx,
-        )
+        memory_tun_with_errors(name, mtu, vec![])
     }
 
     /// Creates a MemoryTun with pre-configured send errors for fault injection.
@@ -829,12 +771,18 @@ pub mod test_support {
             &self.name
         }
 
-        async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        async fn recv_batch(
+            &mut self,
+            _scratch: &mut [u8],
+            bufs: &mut [Vec<u8>],
+            sizes: &mut [usize],
+        ) -> io::Result<usize> {
             match self.packet_rx.recv().await {
                 Some(packet) => {
-                    let len = packet.len().min(buf.len());
-                    buf[..len].copy_from_slice(&packet[..len]);
-                    Ok(len)
+                    let len = packet.len().min(bufs[0].len());
+                    bufs[0][..len].copy_from_slice(&packet[..len]);
+                    sizes[0] = len;
+                    Ok(1)
                 }
                 None => Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -853,15 +801,30 @@ pub mod test_support {
             &self.name
         }
 
-        async fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
-            if let Some(kind) = self.send_errors.pop_front() {
-                return Err(io::Error::new(kind, "injected send error"));
+        async fn send_batch(&mut self, bufs: &mut [Vec<u8>], offset: usize) -> io::Result<usize> {
+            for buf in bufs.iter() {
+                if offset > buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "send_batch: buffer shorter than offset",
+                    ));
+                }
+                // retry_on_transient re-evaluates the block on transient errors;
+                // pop_front consumes the injected error, so retry falls through to the real send.
+                retry_on_transient!({
+                    if let Some(kind) = self.send_errors.pop_front() {
+                        Err(io::Error::new(kind, "injected send error"))
+                    } else {
+                        self.packet_tx
+                            .send(buf[offset..].to_vec())
+                            .await
+                            .map_err(|_| {
+                                io::Error::new(io::ErrorKind::BrokenPipe, "packet_tx closed")
+                            })
+                    }
+                })?;
             }
-            self.packet_tx
-                .send(buf.to_vec())
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "packet_tx closed"))?;
-            Ok(buf.len())
+            Ok(bufs.len())
         }
     }
 }
@@ -1326,5 +1289,58 @@ mod tests {
         assert_eq!(&packet[..], &ipv4_packet[..]);
 
         tun_rx_task.abort();
+    }
+
+    #[tokio::test]
+    async fn memory_tun_rx_recv_batch_returns_packet() {
+        let (mut rx, _tx, inject, _output) = memory_tun("mem-rx-batch", 64);
+        let mut scratch = vec![0u8; rx.scratch_buf_size()];
+        let mut bufs = vec![vec![0u8; 64]; 1];
+        let mut sizes = vec![0usize; 1];
+        inject.send(vec![10, 20, 30]).await.unwrap();
+        let count = rx
+            .recv_batch(&mut scratch, &mut bufs, &mut sizes)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(sizes[0], 3);
+        assert_eq!(&bufs[0][..3], &[10, 20, 30]);
+    }
+
+    #[tokio::test]
+    async fn memory_tun_tx_send_batch_delivers_packet() {
+        let (_rx, mut tx, _inject, mut output) = memory_tun("mem-tx-batch", 64);
+        let mut batch = vec![vec![4, 5, 6]];
+        tx.send_batch(&mut batch, 0).await.unwrap();
+        let received = output.recv().await.unwrap();
+        assert_eq!(received, vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn memory_tun_tx_send_batch_strips_offset() {
+        let (_rx, mut tx, _inject, mut output) = memory_tun("mem-tx-offset", 64);
+        let mut bufs = vec![vec![0, 0, 0, 1, 2, 3]];
+        tx.send_batch(&mut bufs, 3).await.unwrap();
+        let received = output.recv().await.unwrap();
+        assert_eq!(received, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn memory_tun_tx_send_batch_rejects_short_buffer() {
+        let (_rx, mut tx, _inject, _output) = memory_tun("mem-tx-short", 64);
+        let mut bufs = vec![vec![1, 2]];
+        let result = tx.send_batch(&mut bufs, 5).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_tun_rx_recv_batch_channel_closed() {
+        let (mut rx, _tx, inject, _output) = memory_tun("mem-rx-close", 64);
+        drop(inject);
+        let mut scratch = vec![0u8; rx.scratch_buf_size()];
+        let mut bufs = vec![vec![0u8; 64]; 1];
+        let mut sizes = vec![0usize; 1];
+        let result = rx.recv_batch(&mut scratch, &mut bufs, &mut sizes).await;
+        assert!(result.is_err());
     }
 }
