@@ -80,7 +80,7 @@ pub trait TunTx: Send + 'static {
     /// Sends multiple packets in batch using GRO coalescing.
     ///
     /// Each buffer in `bufs` must have `offset` zero-bytes prepended for the
-    /// virtio_net_hdr. Returns the number of packets sent.
+    /// virtio_net_hdr. Returns the number of packets successfully sent.
     /// On non-offload devices, falls back to sending each packet individually.
     fn send_batch(
         &mut self,
@@ -89,12 +89,13 @@ pub trait TunTx: Send + 'static {
     ) -> impl std::future::Future<Output = io::Result<usize>> + Send {
         async move {
             for buf in bufs.iter() {
-                let payload = if offset <= buf.len() {
-                    &buf[offset..]
-                } else {
-                    buf
-                };
-                self.send(payload).await?;
+                if offset > buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "send_batch: buffer shorter than offset",
+                    ));
+                }
+                self.send(&buf[offset..]).await?;
             }
             Ok(bufs.len())
         }
@@ -159,7 +160,7 @@ pub async fn make_tun(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), Tu
         tun = %name,
         tcp_gso = device.tcp_gso(),
         udp_gso = device.udp_gso(),
-        "TUN offload enabled"
+        "TUN offload status"
     );
 
     let device = Arc::new(device);
@@ -246,7 +247,8 @@ impl TunTx for TunWriter {
     async fn send_batch(&mut self, bufs: &mut [Vec<u8>], offset: usize) -> io::Result<usize> {
         self.device
             .send_multiple(&mut self.gro_table, bufs, offset)
-            .await
+            .await?;
+        Ok(bufs.len())
     }
 }
 
@@ -517,6 +519,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                 result = tun.recv_batch(&mut scratch, &mut bufs, &mut sizes) => {
                     match result {
                         Ok(count) => {
+                            let count = count.min(batch_size);
                             for i in 0..count {
                                 let len = sizes[i];
                                 if len == 0 {
@@ -637,7 +640,10 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                             }
                         }
 
-                        match retry_on_transient!(tun.send_batch(&mut batch, hdr_offset).await) {
+                        // No retry_on_transient: send_multiple internally absorbs
+                        // non-EBADFD errors per-packet; retrying the whole batch
+                        // would double-send already-delivered packets.
+                        match tun.send_batch(&mut batch, hdr_offset).await {
                             Ok(_) => {
                                 for b in &batch {
                                     counters.record_success(b.len().saturating_sub(hdr_offset));
