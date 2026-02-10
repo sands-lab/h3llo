@@ -8,6 +8,7 @@ use crate::config::{H3Endpoint, UdpEndpoint};
 use crate::h3::H3Connection;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_quiche::buf_factory::PooledBuf;
 
 /// Endpoint type discriminator for bound connections.
 ///
@@ -76,7 +77,7 @@ pub struct BareConnectedEvent {
     /// Destination socket address.
     pub dest: SocketAddr,
     /// TX channel for sending packets to the bare TX actor.
-    pub tx: mpsc::Sender<Vec<u8>>,
+    pub tx: mpsc::Sender<PooledBuf>,
     /// Join handle for the spawned bare TX actor.
     pub tx_handle: JoinHandle<ActorExitResult>,
 }
@@ -142,6 +143,8 @@ pub enum DropReason {
     NoRoute,
     /// No peer channel available for the route.
     NoPeerChannel,
+    /// PooledBuf lacked headroom for datagram prefix insertion.
+    NoHeadroom,
 }
 
 /// Aggregates packet counters by outcome.

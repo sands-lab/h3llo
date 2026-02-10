@@ -67,7 +67,9 @@ The orchestrator calls `make` then `spawn` sequentially, never performs actor-sp
 Actors use two channel categories with different capacity policies:
 
 - **Control plane (unbounded)**: Command queues (orchestrator-to-child) and event queues (child-to-orchestrator) use `mpsc::unbounded_channel()`. This prevents deadlocks from message cycles between actors—a bounded channel can deadlock when actors block on `send()` waiting for each other.
-- **Data plane (bounded)**: Packet queues for forwarding IP datagrams use `mpsc::channel(tuning.packet_queue_depth)` (default 256). Bounded channels provide backpressure, preventing memory exhaustion when producers outpace consumers.
+- **Data plane (bounded)**: Packet queues for forwarding IP datagrams use `mpsc::channel::<PooledBuf>(tuning.packet_queue_depth)` (default 256). Bounded channels provide backpressure, preventing memory exhaustion when producers outpace consumers. Buffers are allocated from tokio-quiche's `BufFactory` pool; dropped buffers return to the pool for reuse, reducing allocator pressure.
+
+**Buffer allocation strategy**: All data-plane buffers are allocated via `alloc_packet_buf()` (`BufFactory::get_max_buf()` + `pop_front(HEADROOM)`) with 10 bytes of headroom reserved (9 bytes DGRAM_PREFIX + 1 byte Context ID). This headroom enables downstream consumers (H3 TX, TUN TX) to prepend headers in-place via `add_prefix` without reallocation. H3 datagram decoding uses `pop_front(1)` to strip the Context ID in-place.
 
 Reference: [Alice Ryhl - Actors with Tokio](https://ryhl.io/blog/actors-with-tokio/)
 

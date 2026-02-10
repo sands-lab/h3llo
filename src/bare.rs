@@ -5,6 +5,7 @@ use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, U
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_transient;
 use crate::metrics::TransportCounters;
+use crate::tun::alloc_packet_buf;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::collections::HashSet;
 use std::io;
@@ -16,6 +17,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
+use tokio_quiche::buf_factory::PooledBuf;
 
 /// Commands accepted by the BareUDP receive loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +113,7 @@ pub async fn make_bare_tx<P: RouteProbe>(
 pub fn spawn_udp_rx(
     rx: BareUdpRx,
     mut accepted_sources: HashSet<IpAddr>,
-    packet_tx: mpsc::Sender<Vec<u8>>,
+    packet_tx: mpsc::Sender<PooledBuf>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> (
@@ -161,7 +163,7 @@ pub fn spawn_udp_rx(
                                     counters.record_drop(DropReason::DisallowedSource, chunk.len());
                                     continue;
                                 }
-                                let packet = chunk.to_vec();
+                                let packet = alloc_packet_buf(chunk);
                                 if packet_tx.send(packet).await.is_err() {
                                     counters.record_drop(DropReason::ChannelClosed, chunk.len());
                                     return Ok(());
@@ -212,9 +214,9 @@ pub fn spawn_udp_tx(
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
     packet_queue_depth: usize,
-) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
+) -> (mpsc::Sender<PooledBuf>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(packet_queue_depth);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<PooledBuf>(packet_queue_depth);
     let dest_str = tx.destination.to_string();
 
     let BareUdpTx {
@@ -274,6 +276,7 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::time::Duration;
+    use tokio_quiche::buf_factory::BufFactory;
 
     /// Creates a `BareUdpRx` directly from a socket for testing.
     fn test_bare_rx(socket: UdpSocket, mtu: usize) -> BareUdpRx {
@@ -398,7 +401,7 @@ mod tests {
             .await
             .expect("packet should arrive after update")
             .expect("channel should carry packet");
-        assert_eq!(second, vec![7, 8, 9]);
+        assert_eq!(&second[..], &[7, 8, 9]);
 
         handle.abort();
     }
@@ -414,7 +417,10 @@ mod tests {
         let context = test_bare_tx(sender_socket, dest);
         let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200), 256);
 
-        packet_tx.send(vec![9, 8, 7]).await.unwrap();
+        packet_tx
+            .send(BufFactory::buf_from_slice(&[9, 8, 7]))
+            .await
+            .unwrap();
 
         let mut buf = vec![0u8; 64];
         let (len, _) = receiver
@@ -453,7 +459,7 @@ mod tests {
 
         // Drain the forwarded packet to avoid channel backpressure.
         let forwarded = packet_rx.recv().await.expect("packet should be forwarded");
-        assert_eq!(forwarded, vec![1, 2, 3, 4]);
+        assert_eq!(&forwarded[..], &[1, 2, 3, 4]);
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
@@ -490,7 +496,10 @@ mod tests {
         let context = test_bare_tx(sender_socket, dest);
         let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(10), 256);
 
-        packet_tx.send(vec![5, 4, 3, 2]).await.unwrap();
+        packet_tx
+            .send(BufFactory::buf_from_slice(&[5, 4, 3, 2]))
+            .await
+            .unwrap();
 
         let mut buf = vec![0u8; 16];
         let _ = receiver
@@ -591,7 +600,10 @@ mod tests {
         let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_secs(60), 256);
 
         // Verify packet_tx is functional by sending a packet
-        assert!(packet_tx.send(vec![1, 2, 3]).await.is_ok());
+        assert!(packet_tx
+            .send(BufFactory::buf_from_slice(&[1, 2, 3]))
+            .await
+            .is_ok());
 
         handle.abort();
     }
