@@ -16,10 +16,30 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
+use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
 use tracing::{info, warn};
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
+
+/// Headroom reserved in PooledBuf for H3 datagram framing.
+///
+/// 9 bytes tokio-quiche DGRAM_PREFIX (flow ID encoding) + 1 byte Context ID.
+/// TUN RX buffers reserve this headroom so H3 TX can prepend the Context ID
+/// via `add_prefix` without allocation.
+pub(crate) const HEADROOM: usize = 10;
+
+/// Allocates a pooled buffer with headroom for H3 datagram encoding.
+///
+/// Data starts at offset `HEADROOM`, allowing `add_prefix(&[CONTEXT_ID_IP])`
+/// to prepend the Context ID in-place without allocation.
+pub(crate) fn alloc_packet_buf(data: &[u8]) -> PooledBuf {
+    let mut buf = BufFactory::get_max_buf();
+    buf.pop_front(HEADROOM);
+    buf.truncate(data.len());
+    buf[..data.len()].copy_from_slice(data);
+    buf
+}
 
 /// Provides receive-only access to a TUN device for a single coroutine.
 pub trait TunRx: Send + 'static {
@@ -345,7 +365,7 @@ pub struct RouteEntry {
     /// Identifier of the peer owning the prefix.
     pub peer_id: String,
     /// Channel to send packets to this peer.
-    pub tx: mpsc::Sender<Vec<u8>>,
+    pub tx: mpsc::Sender<PooledBuf>,
 }
 
 impl std::fmt::Debug for RouteEntry {
@@ -372,7 +392,7 @@ pub struct RouteMatch<'a> {
     /// Identifier of the peer selected by the lookup.
     pub peer_id: &'a str,
     /// Channel to send packets to this peer.
-    pub tx: &'a mpsc::Sender<Vec<u8>>,
+    pub tx: &'a mpsc::Sender<PooledBuf>,
 }
 
 /// In-memory routing table supporting IPv4 and IPv6 longest-prefix matches.
@@ -415,7 +435,7 @@ impl RoutingTable {
     /// Returns `RoutingError::ConflictingPrefix` when a prefix conflicts with an existing peer.
     pub fn from_peers(
         peers: &[Peer],
-        peer_txs: &HashMap<String, mpsc::Sender<Vec<u8>>>,
+        peer_txs: &HashMap<String, mpsc::Sender<PooledBuf>>,
     ) -> Result<Self, RoutingError> {
         let mut table = RoutingTable::new();
 
@@ -579,7 +599,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                                 if len == 0 {
                                     continue;
                                 }
-                                let packet = bufs[i][..len].to_vec();
+                                let packet = alloc_packet_buf(&bufs[i][..len]);
 
                                 // Inline routing dispatch
                                 let Some(dest) = extract_dst_ip(&packet) else {
@@ -636,9 +656,9 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
     packet_queue_depth: usize,
-) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
+) -> (mpsc::Sender<PooledBuf>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(packet_queue_depth);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<PooledBuf>(packet_queue_depth);
     let tun_name = tun.name().to_string();
     let hdr_offset = tun.hdr_offset();
 
@@ -897,7 +917,7 @@ mod tests {
             .recv()
             .await
             .expect("packet should be routed to peer");
-        assert_eq!(packet, ipv4_packet);
+        assert_eq!(&packet[..], &ipv4_packet[..]);
 
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
@@ -930,8 +950,14 @@ mod tests {
         let (packet_tx, tun_tx_task) =
             spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(10), 256);
 
-        packet_tx.send(vec![0, 1, 2, 3, 4, 5]).await.unwrap();
-        packet_tx.send(vec![9, 9, 9]).await.unwrap();
+        packet_tx
+            .send(BufFactory::buf_from_slice(&[0, 1, 2, 3, 4, 5]))
+            .await
+            .unwrap();
+        packet_tx
+            .send(BufFactory::buf_from_slice(&[9, 9, 9]))
+            .await
+            .unwrap();
 
         // First packet should be dropped; second should be emitted.
         let received = output_rx.recv().await.expect("should receive one packet");
@@ -982,10 +1008,13 @@ mod tests {
         let (packet_tx, tun_tx_task) =
             spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(5), 256);
 
-        packet_tx.send(vec![1, 2, 3]).await.unwrap();
+        packet_tx
+            .send(BufFactory::buf_from_slice(&[1, 2, 3]))
+            .await
+            .unwrap();
 
         let received = output_rx.recv().await.expect("should receive after retry");
-        assert_eq!(received, vec![1, 2, 3]);
+        assert_eq!(received, vec![1, 2, 3]); // output_rx is Vec<u8> from MemoryTunTx
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
@@ -1036,7 +1065,7 @@ mod tests {
     }
 
     /// Creates dummy peer TX channels for routing table tests.
-    fn dummy_peer_txs(peer_ids: &[&str]) -> HashMap<String, mpsc::Sender<Vec<u8>>> {
+    fn dummy_peer_txs(peer_ids: &[&str]) -> HashMap<String, mpsc::Sender<PooledBuf>> {
         peer_ids
             .iter()
             .map(|id| {
@@ -1135,7 +1164,7 @@ mod tests {
         // Send packet - should go to peer1
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
         let packet = peer1_rx.recv().await.expect("packet should route to peer1");
-        assert_eq!(packet, ipv4_packet);
+        assert_eq!(&packet[..], &ipv4_packet[..]);
 
         // Update routing: 192.0.2.0/24 -> peer2
         let peer2_config = Peer {
@@ -1163,7 +1192,7 @@ mod tests {
         // Send another packet - should now go to peer2
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
         let packet = peer2_rx.recv().await.expect("packet should route to peer2");
-        assert_eq!(packet, ipv4_packet);
+        assert_eq!(&packet[..], &ipv4_packet[..]);
 
         // Verify peer1 did not receive the second packet
         assert!(peer1_rx.try_recv().is_err());
@@ -1221,7 +1250,10 @@ mod tests {
         let (packet_tx, handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
 
         // Verify packet_tx is functional by sending a packet
-        assert!(packet_tx.send(vec![1, 2, 3]).await.is_ok());
+        assert!(packet_tx
+            .send(BufFactory::buf_from_slice(&[1, 2, 3]))
+            .await
+            .is_ok());
 
         handle.abort();
     }
@@ -1288,7 +1320,7 @@ mod tests {
             .recv()
             .await
             .expect("packet should be routed via batch fallback");
-        assert_eq!(packet, ipv4_packet);
+        assert_eq!(&packet[..], &ipv4_packet[..]);
 
         tun_rx_task.abort();
     }

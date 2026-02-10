@@ -28,7 +28,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
+#[cfg(test)]
 use tokio_quiche::buf_factory::BufFactory;
+use tokio_quiche::buf_factory::PooledBuf;
 use tokio_quiche::http3::driver::{
     ClientH3Driver, ClientH3Event, H3Event, InboundFrame, InboundFrameStream, NewClientRequest,
     OutboundFrame, OutboundFrameSender, ServerH3Driver, ServerH3Event,
@@ -286,28 +288,6 @@ async fn handle_h3_connection(
     {
         warn!(%remote_addr, "H3 handshake timeout");
     }
-}
-
-// ========== Datagram Encoding ==========
-
-/// Prepends Context ID (0x00) to a payload for CONNECT-IP datagram encoding.
-#[inline]
-pub fn encode_datagram(payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + payload.len());
-    buf.push(CONTEXT_ID_IP);
-    buf.extend_from_slice(payload);
-    buf
-}
-
-/// Strips Context ID from a received datagram, returning the payload.
-///
-/// Returns `None` if the datagram is empty or has an unexpected Context ID.
-#[inline]
-pub fn decode_datagram(data: &[u8]) -> Option<&[u8]> {
-    if data.is_empty() || data[0] != CONTEXT_ID_IP {
-        return None;
-    }
-    Some(&data[1..])
 }
 
 // ========== Error Types ==========
@@ -654,7 +634,7 @@ pub struct H3Rx {
 /// * `interval` - Metrics emission interval.
 pub fn spawn_h3_rx(
     rx: H3Rx,
-    packet_tx: mpsc::Sender<Vec<u8>>,
+    packet_tx: mpsc::Sender<PooledBuf>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<ActorExitResult> {
@@ -678,16 +658,18 @@ pub fn spawn_h3_rx(
 
                     match inbound_frame {
                         InboundFrame::Datagram(pooled_dgram) => {
-                            let data = pooled_dgram.as_ref();
-                            let Some(payload) = decode_datagram(data) else {
+                            let mut dgram = pooled_dgram;
+                            if dgram.is_empty() || dgram[0] != CONTEXT_ID_IP {
                                 counters.record_drop(
                                     crate::events::DropReason::InvalidFraming,
-                                    data.len(),
+                                    dgram.len(),
                                 );
                                 continue;
-                            };
-                            let len = payload.len();
-                            if packet_tx.send(payload.to_vec()).await.is_err() {
+                            }
+                            dgram.pop_front(1);
+                            let len = dgram.len();
+                            // Zero-copy: send PooledDgram directly (same type as PooledBuf)
+                            if packet_tx.send(dgram).await.is_err() {
                                 counters.record_drop(
                                     crate::events::DropReason::ChannelClosed,
                                     len,
@@ -766,8 +748,8 @@ pub fn spawn_h3_tx(
     interval: Duration,
     packet_queue_depth: usize,
     keepalive_interval: Duration,
-) -> (mpsc::Sender<Vec<u8>>, JoinHandle<ActorExitResult>) {
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(packet_queue_depth);
+) -> (mpsc::Sender<PooledBuf>, JoinHandle<ActorExitResult>) {
+    let (packet_tx, mut packet_rx) = mpsc::channel::<PooledBuf>(packet_queue_depth);
 
     let H3Tx {
         peer_id,
@@ -786,17 +768,18 @@ pub fn spawn_h3_tx(
         loop {
             tokio::select! {
                 maybe_packet = packet_rx.recv() => {
-                    let packet = match maybe_packet {
+                    let mut packet = match maybe_packet {
                         Some(p) => p,
                         None => return Ok(()), // Channel closed, exit gracefully
                     };
 
                     let len = packet.len();
-                    let encoded = encode_datagram(&packet);
-
-                    // Wrap in OutboundFrame::Datagram with flow_id
-                    let pooled_dgram = BufFactory::dgram_from_vec(encoded);
-                    let frame = OutboundFrame::Datagram(pooled_dgram, flow_id);
+                    // Zero-copy: prepend Context ID using reserved headroom.
+                    assert!(
+                        packet.add_prefix(&[CONTEXT_ID_IP]),
+                        "PooledBuf must have headroom for Context ID"
+                    );
+                    let frame = OutboundFrame::Datagram(packet, flow_id);
 
                     if datagram_tx.send(frame).await.is_err() {
                         counters.record_drop(crate::events::DropReason::SendError, len);
@@ -1052,40 +1035,57 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ========== Datagram Encoding Tests ==========
+    // ========== PooledBuf Datagram Encoding Tests ==========
 
     #[test]
-    fn encode_prepends_context_id() {
+    fn pooled_buf_headroom_encode_prepends_context_id() {
+        use crate::tun::alloc_packet_buf;
+
         let payload = b"test payload";
-        let encoded = encode_datagram(payload);
-        assert_eq!(encoded[0], 0x00);
-        assert_eq!(&encoded[1..], payload);
+        let mut buf = alloc_packet_buf(payload);
+        assert_eq!(&buf[..], payload);
+
+        // Encode: prepend Context ID using headroom
+        assert!(buf.add_prefix(&[CONTEXT_ID_IP]));
+        assert_eq!(buf[0], 0x00);
+        assert_eq!(&buf[1..], payload);
     }
 
     #[test]
-    fn decode_strips_context_id() {
+    fn pooled_buf_decode_strips_context_id() {
         let data = [0x00, 1, 2, 3, 4];
-        let payload = decode_datagram(&data).unwrap();
-        assert_eq!(payload, &[1, 2, 3, 4]);
+        let mut dgram = BufFactory::dgram_from_vec(data.to_vec());
+        assert!(!dgram.is_empty() && dgram[0] == CONTEXT_ID_IP);
+        dgram.pop_front(1);
+        assert_eq!(&dgram[..], &[1, 2, 3, 4]);
     }
 
     #[test]
-    fn decode_rejects_empty_data() {
-        assert!(decode_datagram(&[]).is_none());
+    fn pooled_buf_decode_rejects_empty() {
+        let dgram = BufFactory::dgram_from_vec(vec![]);
+        assert!(dgram.is_empty());
     }
 
     #[test]
-    fn decode_rejects_wrong_context_id() {
-        let data = [0x01, 1, 2, 3];
-        assert!(decode_datagram(&data).is_none());
+    fn pooled_buf_decode_rejects_wrong_context_id() {
+        let dgram = BufFactory::dgram_from_vec(vec![0x01, 1, 2, 3]);
+        assert!(dgram[0] != CONTEXT_ID_IP);
     }
 
     #[test]
-    fn roundtrip_encode_decode() {
+    fn pooled_buf_roundtrip_encode_decode() {
+        use crate::tun::alloc_packet_buf;
+
         let original = b"ip packet data";
-        let encoded = encode_datagram(original);
-        let decoded = decode_datagram(&encoded).unwrap();
-        assert_eq!(decoded, original);
+        let mut buf = alloc_packet_buf(original);
+
+        // Encode: prepend Context ID
+        assert!(buf.add_prefix(&[CONTEXT_ID_IP]));
+
+        // Decode: strip Context ID
+        assert_eq!(buf[0], CONTEXT_ID_IP);
+        buf.pop_front(1);
+        assert_eq!(&buf[..], original);
     }
 
     // ========== CONNECT-IP Header Validation Tests ==========
@@ -1760,16 +1760,15 @@ mod tests {
         let (server_rx, _server_tx) = server_event.connection.into_actors();
 
         // Server RX actor
-        let (server_packet_tx, mut server_packet_rx) = mpsc::channel(16);
+        let (server_packet_tx, mut server_packet_rx) = mpsc::channel::<PooledBuf>(16);
         let _server_rx_handle =
             spawn_h3_rx(server_rx, server_packet_tx, events_tx, metrics_interval);
 
-        // Send test packet
+        // Send test packet (allocate with headroom for H3 TX encoding)
+        use crate::tun::alloc_packet_buf;
         let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
-        client_packet_tx
-            .send(test_packet.clone())
-            .await
-            .expect("send failed");
+        let pkt = alloc_packet_buf(&test_packet);
+        client_packet_tx.send(pkt).await.expect("send failed");
 
         // Verify receipt
         let received = tokio::time::timeout(Duration::from_secs(5), server_packet_rx.recv())
@@ -1777,7 +1776,7 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-        assert_eq!(received, test_packet);
+        assert_eq!(&received[..], &test_packet[..]);
 
         drop(cmd_tx);
     }
@@ -1841,6 +1840,8 @@ mod tests {
         // Split client connection
         let (client_rx, client_tx) = client_conn.into_actors();
 
+        use crate::tun::alloc_packet_buf;
+
         // Client TX -> Server RX
         let (client_send_tx, _) = spawn_h3_tx(
             client_tx,
@@ -1850,7 +1851,7 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (server_to_client_tx, mut client_packet_rx) = mpsc::channel(16);
+        let (server_to_client_tx, mut client_packet_rx) = mpsc::channel::<PooledBuf>(16);
         let _client_rx_handle = spawn_h3_rx(
             client_rx,
             server_to_client_tx,
@@ -1870,29 +1871,35 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (client_to_server_tx, mut server_packet_rx) = mpsc::channel(16);
+        let (client_to_server_tx, mut server_packet_rx) = mpsc::channel::<PooledBuf>(16);
         let _server_rx_handle =
             spawn_h3_rx(server_rx, client_to_server_tx, events_tx, metrics_interval);
 
         // Test client -> server
         let packet_c2s = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
-        client_send_tx.send(packet_c2s.clone()).await.unwrap();
+        client_send_tx
+            .send(alloc_packet_buf(&packet_c2s))
+            .await
+            .unwrap();
 
         let received_c2s = tokio::time::timeout(Duration::from_secs(5), server_packet_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
-        assert_eq!(received_c2s, packet_c2s);
+        assert_eq!(&received_c2s[..], &packet_c2s[..]);
 
         // Test server -> client
         let packet_s2c = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
-        server_send_tx.send(packet_s2c.clone()).await.unwrap();
+        server_send_tx
+            .send(alloc_packet_buf(&packet_s2c))
+            .await
+            .unwrap();
 
         let received_s2c = tokio::time::timeout(Duration::from_secs(5), client_packet_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
-        assert_eq!(received_s2c, packet_s2c);
+        assert_eq!(&received_s2c[..], &packet_s2c[..]);
 
         drop(cmd_tx);
     }
