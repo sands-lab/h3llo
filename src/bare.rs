@@ -159,18 +159,14 @@ pub fn spawn_udp_rx(
                             // check IP filter once for the entire batch.
                             if !accepted_sources.contains(&remote.ip()) {
                                 for chunk in buf[..meta.len].chunks(stride) {
-                                    if !chunk.is_empty() {
-                                        counters.record_drop(DropReason::DisallowedSource, chunk.len());
-                                    }
+                                    counters.record_drop(DropReason::DisallowedSource, chunk.len());
                                 }
                                 continue;
                             }
 
                             let mut batch = Vec::new();
                             for chunk in buf[..meta.len].chunks(stride) {
-                                if !chunk.is_empty() {
-                                    batch.push(alloc_packet_buf(chunk));
-                                }
+                                batch.push(alloc_packet_buf(chunk));
                             }
 
                             if batch.is_empty() {
