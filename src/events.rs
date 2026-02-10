@@ -143,6 +143,8 @@ pub enum DropReason {
     NoRoute,
     /// No peer channel available for the route.
     NoPeerChannel,
+    /// PooledBuf lacked headroom for datagram prefix insertion.
+    NoHeadroom,
 }
 
 /// Aggregates packet counters by outcome.

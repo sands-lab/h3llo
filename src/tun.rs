@@ -22,20 +22,20 @@ use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
-/// Headroom reserved in PooledBuf for H3 datagram framing.
+/// Headroom reserved in every datapath PooledBuf.
 ///
 /// 9 bytes tokio-quiche DGRAM_PREFIX (flow ID + flow context encoding) +
 /// 1 byte CONNECT-IP Context ID (0x00). If tokio-quiche `DGRAM_PREFIX`
 /// changes, this value must be updated accordingly.
 ///
-/// TUN RX buffers reserve this headroom so H3 TX can prepend the Context ID
-/// via `add_prefix` without allocation.
+/// All packet-producing paths (TUN RX, BareUDP RX) reserve this headroom
+/// so downstream consumers (H3 TX, TUN TX) can prepend headers in-place.
 pub(crate) const HEADROOM: usize = 10;
 
-/// Allocates a pooled buffer with headroom for H3 datagram encoding.
+/// Allocates a pooled buffer with headroom for in-place header prepending.
 ///
-/// Data starts at offset `HEADROOM`, allowing `add_prefix(&[CONTEXT_ID_IP])`
-/// to prepend the Context ID in-place without allocation.
+/// Data starts at offset `HEADROOM`, leaving room for downstream consumers
+/// to prepend headers via `add_prefix` without reallocation.
 pub(crate) fn alloc_packet_buf(data: &[u8]) -> PooledBuf {
     let mut buf = BufFactory::get_max_buf();
     buf.pop_front(HEADROOM);

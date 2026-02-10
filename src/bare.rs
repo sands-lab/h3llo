@@ -5,6 +5,7 @@ use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, U
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_transient;
 use crate::metrics::TransportCounters;
+use crate::tun::alloc_packet_buf;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::collections::HashSet;
 use std::io;
@@ -16,7 +17,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
-use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
+use tokio_quiche::buf_factory::PooledBuf;
 
 /// Commands accepted by the BareUDP receive loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +163,7 @@ pub fn spawn_udp_rx(
                                     counters.record_drop(DropReason::DisallowedSource, chunk.len());
                                     continue;
                                 }
-                                let packet = BufFactory::buf_from_slice(chunk);
+                                let packet = alloc_packet_buf(chunk);
                                 if packet_tx.send(packet).await.is_err() {
                                     counters.record_drop(DropReason::ChannelClosed, chunk.len());
                                     return Ok(());
@@ -275,6 +276,7 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::time::Duration;
+    use tokio_quiche::buf_factory::BufFactory;
 
     /// Creates a `BareUdpRx` directly from a socket for testing.
     fn test_bare_rx(socket: UdpSocket, mtu: usize) -> BareUdpRx {
