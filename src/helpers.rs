@@ -2,17 +2,19 @@
 
 use std::net::IpAddr;
 
-/// Retries an async I/O expression, looping on `io::ErrorKind::Interrupted`.
+/// Retries an async I/O expression on transient errors (`Interrupted`, `WouldBlock`).
 ///
-/// The expression should evaluate to `io::Result<usize>` and already include `.await`
-/// for async operations.
-macro_rules! retry_on_interrupted {
+/// The expression is re-evaluated on each iteration, so it may include readiness
+/// waits (e.g. `socket.writable().await`) before the actual I/O call.
+macro_rules! retry_on_transient {
     ($expr:expr) => {{
         loop {
             match $expr {
-                Ok(written) => break Ok(written),
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                    // Yield to avoid spinning when syscalls are repeatedly interrupted.
+                Ok(val) => break Ok(val),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::Interrupted
+                        || err.kind() == std::io::ErrorKind::WouldBlock =>
+                {
                     tokio::task::yield_now().await;
                     continue;
                 }
@@ -22,7 +24,7 @@ macro_rules! retry_on_interrupted {
     }};
 }
 
-pub(crate) use retry_on_interrupted;
+pub(crate) use retry_on_transient;
 
 /// Extracts the destination IP address from an IP packet.
 ///
@@ -94,7 +96,7 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_clone = attempts.clone();
 
-        let result = retry_on_interrupted!({
+        let result = retry_on_transient!({
             let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
             if count == 0 {
                 Err(io::Error::new(
@@ -109,6 +111,28 @@ mod tests {
 
         assert_eq!(result, 5);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_on_would_block_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result = retry_on_transient!({
+            let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
+            if count < 2 {
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "injected would-block",
+                ))
+            } else {
+                Ok(42)
+            }
+        })
+        .expect("retry should eventually succeed");
+
+        assert_eq!(result, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[test]

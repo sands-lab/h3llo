@@ -107,7 +107,8 @@ pub fn make_server_udp_socket(listen: SocketAddr) -> Result<UdpSocket, UdpError>
 /// - `probe`: Route probe implementation for testability.
 ///
 /// # Errors
-/// Returns `UdpError::Socket` when socket creation or interface binding fails.
+/// Returns `UdpError::Socket` when socket creation fails. Interface binding is
+/// best-effort: failures are logged and the socket is returned unbound.
 pub async fn make_unbound_udp_socket<P: RouteProbe>(
     target: SocketAddr,
     tun_if: Option<&str>,

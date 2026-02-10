@@ -3,6 +3,7 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
+use crate::helpers::retry_on_transient;
 use crate::metrics::TransportCounters;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::collections::HashSet;
@@ -76,7 +77,10 @@ pub struct BareUdpTx {
 ///
 /// # Errors
 ///
-/// Returns `UdpError::Socket` when socket creation or binding fails.
+/// Returns `UdpError::Socket` if socket creation fails.
+///
+/// Note: interface binding is best-effort; failures are logged and the
+/// socket continues unbound.
 pub async fn make_bare_tx<P: RouteProbe>(
     destination: SocketAddr,
     bindif: Option<&str>,
@@ -238,22 +242,18 @@ pub fn spawn_udp_tx(
                         segment_size: None,
                         src_ip: None,
                     };
-                    loop {
+                    match retry_on_transient!({
                         socket.writable().await.map_err(|err| {
                             ActorError::BareTxSend { dest: dest_str.clone(), source: err }
                         })?;
-                        match socket.try_io(Interest::WRITABLE, || {
+                        socket.try_io(Interest::WRITABLE, || {
                             state.try_send(UdpSockRef::from(&socket), &transmit)
-                        }) {
-                            Ok(()) => {
-                                counters.record_success(packet.len());
-                                break;
-                            }
-                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                            Err(err) => {
-                                counters.record_drop(DropReason::SendError, packet.len());
-                                return Err(ActorError::BareTxSend { dest: dest_str, source: err });
-                            }
+                        })
+                    }) {
+                        Ok(()) => counters.record_success(packet.len()),
+                        Err(err) => {
+                            counters.record_drop(DropReason::SendError, packet.len());
+                            return Err(ActorError::BareTxSend { dest: dest_str, source: err });
                         }
                     }
                 }

@@ -3,7 +3,7 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::{LocalTun, Peer};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
-use crate::helpers::{extract_dst_ip, retry_on_interrupted};
+use crate::helpers::{extract_dst_ip, retry_on_transient};
 use crate::metrics::TransportCounters;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use ipnet_trie::IpnetTrie;
@@ -473,7 +473,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                         continue;
                     }
 
-                    match retry_on_interrupted!(tun.send(&packet).await) {
+                    match retry_on_transient!(tun.send(&packet).await) {
                         Ok(written) => counters.record_success(written),
                         Err(err) => {
                             counters.record_drop(DropReason::SendError, packet.len());
