@@ -258,6 +258,7 @@ Observability summary: interface loops emit cumulative metrics (packets/bytes, d
 
 - Metric shape: every emit carries labels `{kind: Tun|BareUdp|Http3, direction: Rx|Tx, peer_id?: string, ip_addr?: IP}` plus total succeeded and dropped counters and a drop-reason map keyed by `DropReason` (e.g., `Oversize`, `DisallowedSource`, `SendError`, `ChannelClosed`).
 - Drop accounting: TUN TX counts oversize and send failures; TUN RX counts channel-closed drops when forwarding to the writer queue fails; BareUDP RX counts disallowed sources; BareUDP TX counts send failures. All counters saturate to avoid panics.
+- GSO batch sending: BareUDP TX concatenates packets from each `Vec<PooledBuf>` batch into a contiguous buffer and sends via a single `sendmsg` with `segment_size` set (UDP GSO). Batches are chunked by `max_gso_segments()` (typically 64 on Linux). On platforms without GSO support (`max_gso_segments() == 1`), `chunks(1)` naturally degrades to per-packet sending. Per-packet metrics are preserved by iterating over chunk packets after each send.
 - Reporting: only the orchestrator prints periodic drop summaries (when counters change); transport loops stay silent, including oversized TUN drops.
 
 ### Logging and Warning Handling

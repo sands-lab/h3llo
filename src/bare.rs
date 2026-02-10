@@ -694,4 +694,132 @@ mod tests {
         rx_handle.abort();
         tx_handle.abort();
     }
+
+    /// Verifies that a multi-packet batch is delivered correctly via GSO
+    /// (or per-packet fallback on non-GSO platforms).
+    #[tokio::test]
+    async fn udp_tx_batch_gso_delivers_all_packets() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let context = test_bare_tx(sender_socket, dest);
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200), 256);
+
+        // Send a batch of 3 equal-sized packets (simulates TUN GSO output)
+        let batch = vec![
+            BufFactory::buf_from_slice(&[1, 2, 3, 4]),
+            BufFactory::buf_from_slice(&[5, 6, 7, 8]),
+            BufFactory::buf_from_slice(&[9, 10, 11, 12]),
+        ];
+        packet_tx.send(batch).await.unwrap();
+
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let mut buf = vec![0u8; 64];
+            let (len, _) = tokio::time::timeout(
+                Duration::from_millis(200),
+                receiver.recv_from(&mut buf),
+            )
+            .await
+            .expect("should receive packet")
+            .expect("recv_from");
+            received.push(buf[..len].to_vec());
+        }
+        received.sort();
+        assert_eq!(
+            received,
+            vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10, 11, 12]]
+        );
+
+        handle.abort();
+    }
+
+    /// Verifies that a batch with a shorter last packet (common in TCP flows)
+    /// is delivered correctly.
+    #[tokio::test]
+    async fn udp_tx_batch_gso_short_last_packet() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let context = test_bare_tx(sender_socket, dest);
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200), 256);
+
+        // Last packet is shorter (e.g., TCP stream tail)
+        let batch = vec![
+            BufFactory::buf_from_slice(&[1, 2, 3, 4]),
+            BufFactory::buf_from_slice(&[5, 6, 7, 8]),
+            BufFactory::buf_from_slice(&[9, 10]),
+        ];
+        packet_tx.send(batch).await.unwrap();
+
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let mut buf = vec![0u8; 64];
+            let (len, _) = tokio::time::timeout(
+                Duration::from_millis(200),
+                receiver.recv_from(&mut buf),
+            )
+            .await
+            .expect("should receive packet")
+            .expect("recv_from");
+            received.push(buf[..len].to_vec());
+        }
+        received.sort();
+        assert_eq!(
+            received,
+            vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10]]
+        );
+
+        handle.abort();
+    }
+
+    /// Verifies that metrics count each packet individually in a GSO batch.
+    #[tokio::test]
+    async fn udp_tx_gso_batch_metrics() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let context = test_bare_tx(sender_socket, dest);
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(10), 256);
+
+        let batch = vec![
+            BufFactory::buf_from_slice(&[1, 2, 3]),
+            BufFactory::buf_from_slice(&[4, 5, 6]),
+        ];
+        packet_tx.send(batch).await.unwrap();
+
+        // Drain packets
+        let mut buf = vec![0u8; 64];
+        for _ in 0..2 {
+            let _ = receiver.recv_from(&mut buf).await.unwrap();
+        }
+
+        let metrics = tokio::time::timeout(Duration::from_millis(100), async {
+            while let Some(event) = events_rx.recv().await {
+                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                    if m.labels.direction == Direction::Tx && m.stats.succeeded.packets >= 2 {
+                        return Some(m);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .expect("tx metrics should arrive")
+        .expect("tx metrics should not be None");
+
+        assert_eq!(metrics.stats.succeeded.packets, 2);
+        assert_eq!(metrics.stats.succeeded.bytes, 6);
+
+        handle.abort();
+    }
 }
