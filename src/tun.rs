@@ -610,51 +610,40 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                     match result {
                         Ok(count) => {
                             let count = count.min(batch_size);
+                            if count == 0 {
+                                continue;
+                            }
+
                             // First-packet routing: GSO guarantees all packets in
                             // a batch belong to the same flow (same 5-tuple).
-                            let first_idx = (0..count).find(|&i| sizes[i] > 0);
-                            let Some(first_idx) = first_idx else {
-                                continue;
-                            };
-
-                            let first_packet = alloc_packet_buf(&bufs[first_idx][..sizes[first_idx]]);
+                            let first_packet = alloc_packet_buf(&bufs[0][..sizes[0]]);
                             let Some(dest) = extract_dst_ip(&first_packet) else {
                                 for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_drop(DropReason::InvalidIpVersion, sz);
-                                    }
+                                    counters.record_drop(DropReason::InvalidIpVersion, sz);
                                 }
                                 continue;
                             };
 
                             let Some(route) = routing.lookup(dest) else {
                                 for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_drop(DropReason::NoRoute, sz);
-                                    }
+                                    counters.record_drop(DropReason::NoRoute, sz);
                                 }
                                 continue;
                             };
 
                             let mut batch = Vec::with_capacity(count);
                             batch.push(first_packet);
-                            for i in 0..count {
-                                if i != first_idx && sizes[i] > 0 {
-                                    batch.push(alloc_packet_buf(&bufs[i][..sizes[i]]));
-                                }
+                            for i in 1..count {
+                                batch.push(alloc_packet_buf(&bufs[i][..sizes[i]]));
                             }
 
                             if route.tx.send(batch).await.is_err() {
                                 for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_drop(DropReason::ChannelClosed, sz);
-                                    }
+                                    counters.record_drop(DropReason::ChannelClosed, sz);
                                 }
                             } else {
                                 for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_success(sz);
-                                    }
+                                    counters.record_success(sz);
                                 }
                             }
                         }
