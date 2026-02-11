@@ -137,7 +137,7 @@ pub trait TunRx: Send + 'static {
     /// Required scratch buffer size for [`recv_batch`](Self::recv_batch).
     ///
     /// Defaults to [`mtu()`](Self::mtu). Offload-capable devices override this
-    /// to return `VIRTIO_NET_HDR_LEN + 65535`.
+    /// to return `VIRTIO_NET_HDR_LEN + u16::MAX`.
     fn scratch_buf_size(&self) -> usize {
         self.mtu()
     }
@@ -288,7 +288,7 @@ impl TunRx for TunReader {
 
     #[cfg(target_os = "linux")]
     fn scratch_buf_size(&self) -> usize {
-        VIRTIO_NET_HDR_LEN + 65535
+        VIRTIO_NET_HDR_LEN + u16::MAX as usize
     }
 
     async fn recv_batch(

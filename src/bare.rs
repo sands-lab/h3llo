@@ -239,7 +239,7 @@ pub fn spawn_udp_tx(
     let handle = tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Tx);
         let mut ticker = time::interval(interval);
-        let mut gso_buf = Vec::new();
+        let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
 
         loop {
             tokio::select! {
