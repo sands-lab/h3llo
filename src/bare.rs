@@ -259,7 +259,13 @@ pub fn spawn_udp_tx(
                     let segment_size = packets[0].len();
                     debug_assert!(segment_size > 0, "TUN GSO must not produce empty packets");
 
-                    for chunk in packets.chunks(max_segs) {
+                    // Cap segments per sendmsg so the total payload fits in
+                    // one UDP message (u16::MAX bytes). Without this, large
+                    // batches (e.g. 64 × 1393 = 89 KB) exceed the limit and
+                    // the kernel returns EMSGSIZE.
+                    let max_segs = max_segs.min(u16::MAX as usize / segment_size);
+
+                    for chunk in packets.chunks(max_segs.max(1)) {
                         gso_buf.clear();
                         for pkt in chunk {
                             gso_buf.extend_from_slice(pkt);
