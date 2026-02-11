@@ -71,6 +71,8 @@ Actors use two channel categories with different capacity policies:
 
 **Buffer allocation strategy**: All data-plane buffers are allocated via `alloc_packet_buf()` (`BufFactory::get_max_buf()` + `pop_front(HEADROOM)`) with 10 bytes of headroom reserved (9 bytes DGRAM_PREFIX + 1 byte Context ID). This headroom serves dual purposes: (1) zero-copy H3 datagram encoding via `add_prefix(&[CONTEXT_ID_IP])`, and (2) zero-copy TUN TX via `TunBuf`, which prepends a zeroed `virtio_net_hdr` (also 10 bytes) using `add_prefix` without allocation. A compile-time assertion guards the HEADROOM >= VIRTIO_NET_HDR_LEN invariant. H3 datagram decoding uses `pop_front(1)` to strip the Context ID in-place, restoring the headroom for TUN TX. BareUDP RX uses `BufFactory::buf_from_slice()` (no headroom); `TunBuf` falls back to alloc + copy for these buffers.
 
+**GSO batch sending**: BareUDP TX concatenates packets from each `Vec<PooledBuf>` batch into a contiguous buffer and sends via a single `sendmsg` with `segment_size` set (UDP GSO). Batches are chunked by `max_gso_segments()` (typically 64 on Linux). On platforms without GSO support (`max_gso_segments() == 1`), `chunks(1)` naturally degrades to per-packet sending. Per-packet metrics are preserved by iterating over chunk packets after each send.
+
 Reference: [Alice Ryhl - Actors with Tokio](https://ryhl.io/blog/actors-with-tokio/)
 
 **Inbound Datapath**
@@ -258,7 +260,6 @@ Observability summary: interface loops emit cumulative metrics (packets/bytes, d
 
 - Metric shape: every emit carries labels `{kind: Tun|BareUdp|Http3, direction: Rx|Tx, peer_id?: string, ip_addr?: IP}` plus total succeeded and dropped counters and a drop-reason map keyed by `DropReason` (e.g., `Oversize`, `DisallowedSource`, `SendError`, `ChannelClosed`).
 - Drop accounting: TUN TX counts oversize and send failures; TUN RX counts channel-closed drops when forwarding to the writer queue fails; BareUDP RX counts disallowed sources; BareUDP TX counts send failures. All counters saturate to avoid panics.
-- GSO batch sending: BareUDP TX concatenates packets from each `Vec<PooledBuf>` batch into a contiguous buffer and sends via a single `sendmsg` with `segment_size` set (UDP GSO). Batches are chunked by `max_gso_segments()` (typically 64 on Linux). On platforms without GSO support (`max_gso_segments() == 1`), `chunks(1)` naturally degrades to per-packet sending. Per-packet metrics are preserved by iterating over chunk packets after each send.
 - Reporting: only the orchestrator prints periodic drop summaries (when counters change); transport loops stay silent, including oversized TUN drops.
 
 ### Logging and Warning Handling

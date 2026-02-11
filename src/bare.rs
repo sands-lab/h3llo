@@ -257,6 +257,7 @@ pub fn spawn_udp_tx(
                     // TUN GSO guarantees all non-tail packets in a batch share
                     // the same size; segment_size from the first packet is safe.
                     let segment_size = packets[0].len();
+                    debug_assert!(segment_size > 0, "TUN GSO must not produce empty packets");
 
                     for chunk in packets.chunks(max_segs) {
                         gso_buf.clear();
@@ -290,6 +291,10 @@ pub fn spawn_udp_tx(
                                 }
                             }
                             Err(err) => {
+                                // quinn-udp may internally disable GSO
+                                // (max_gso_segments -> 1) on EIO/EINVAL before
+                                // returning the error. The actor terminates here;
+                                // on respawn, max_gso_segments == 1 avoids GSO.
                                 for pkt in chunk {
                                     counters.record_drop(DropReason::SendError, pkt.len());
                                 }
