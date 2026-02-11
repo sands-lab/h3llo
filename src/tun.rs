@@ -568,19 +568,6 @@ fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
     (v4, v6)
 }
 
-/// Counts non-zero packets and total bytes from a sizes slice.
-fn aggregate_sizes(sizes: &[usize]) -> (u64, u64) {
-    let mut count = 0u64;
-    let mut bytes = 0u64;
-    for &sz in sizes {
-        if sz > 0 {
-            count += 1;
-            bytes += sz as u64;
-        }
-    }
-    (count, bytes)
-}
-
 /// Spawns the TUN read loop.
 ///
 /// Creates an unbounded command channel internally (actor owns the receiver).
@@ -631,15 +618,14 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             };
 
                             let first_packet = alloc_packet_buf(&bufs[first_idx][..sizes[first_idx]]);
+                            let total_bytes: u64 = sizes[..count].iter().map(|&s| s as u64).sum();
                             let Some(dest) = extract_dst_ip(&first_packet) else {
-                                let (cnt, bytes) = aggregate_sizes(&sizes[..count]);
-                                counters.record_drop(DropReason::InvalidIpVersion, cnt, bytes);
+                                counters.record_drop(DropReason::InvalidIpVersion, count as u64, total_bytes);
                                 continue;
                             };
 
                             let Some(route) = routing.lookup(dest) else {
-                                let (cnt, bytes) = aggregate_sizes(&sizes[..count]);
-                                counters.record_drop(DropReason::NoRoute, cnt, bytes);
+                                counters.record_drop(DropReason::NoRoute, count as u64, total_bytes);
                                 continue;
                             };
 
@@ -652,11 +638,9 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             }
 
                             if route.tx.send(batch).await.is_err() {
-                                let (cnt, bytes) = aggregate_sizes(&sizes[..count]);
-                                counters.record_drop(DropReason::ChannelClosed, cnt, bytes);
+                                counters.record_drop(DropReason::ChannelClosed, count as u64, total_bytes);
                             } else {
-                                let (cnt, bytes) = aggregate_sizes(&sizes[..count]);
-                                counters.record_success(cnt, bytes);
+                                counters.record_success(count as u64, total_bytes);
                             }
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
