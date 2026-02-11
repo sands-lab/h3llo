@@ -98,10 +98,11 @@ impl AsMut<[u8]> for TunBuf {
 #[cfg(target_os = "linux")]
 impl tun_rs::ExpandBuffer for TunBuf {
     fn buf_capacity(&self) -> usize {
-        // Conservative: return visible length, not true capacity.
-        // This intentionally yields GroResult::Noop (no coalescing),
-        // which is correct for single-packet sends.
-        self.0.len()
+        // PooledBuf is backed by a growable Vec<u8>, so GRO can always
+        // extend it via buf_extend_from_slice(). Return usize::MAX to
+        // let the GRO coalescing logic merge same-flow packets into GSO
+        // super-packets (capped at ~65535 bytes by IP total length).
+        usize::MAX
     }
 
     fn buf_resize(&mut self, new_len: usize, val: u8) {
