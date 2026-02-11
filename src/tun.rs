@@ -568,6 +568,19 @@ fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
     (v4, v6)
 }
 
+/// Counts non-zero packets and total bytes from a sizes slice.
+fn aggregate_sizes(sizes: &[usize]) -> (u64, u64) {
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    for &sz in sizes {
+        if sz > 0 {
+            count += 1;
+            bytes += sz as u64;
+        }
+    }
+    (count, bytes)
+}
+
 /// Spawns the TUN read loop.
 ///
 /// Creates an unbounded command channel internally (actor owns the receiver).
@@ -619,20 +632,14 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
 
                             let first_packet = alloc_packet_buf(&bufs[first_idx][..sizes[first_idx]]);
                             let Some(dest) = extract_dst_ip(&first_packet) else {
-                                for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_drop(DropReason::InvalidIpVersion, sz);
-                                    }
-                                }
+                                let (cnt, bytes) = aggregate_sizes(&sizes[..count]);
+                                counters.record_drop(DropReason::InvalidIpVersion, cnt, bytes);
                                 continue;
                             };
 
                             let Some(route) = routing.lookup(dest) else {
-                                for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_drop(DropReason::NoRoute, sz);
-                                    }
-                                }
+                                let (cnt, bytes) = aggregate_sizes(&sizes[..count]);
+                                counters.record_drop(DropReason::NoRoute, cnt, bytes);
                                 continue;
                             };
 
@@ -645,17 +652,11 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             }
 
                             if route.tx.send(batch).await.is_err() {
-                                for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_drop(DropReason::ChannelClosed, sz);
-                                    }
-                                }
+                                let (cnt, bytes) = aggregate_sizes(&sizes[..count]);
+                                counters.record_drop(DropReason::ChannelClosed, cnt, bytes);
                             } else {
-                                for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_success(sz);
-                                    }
-                                }
+                                let (cnt, bytes) = aggregate_sizes(&sizes[..count]);
+                                counters.record_success(cnt, bytes);
                             }
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -716,7 +717,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                     let mut pkt_lens: Vec<usize> = Vec::with_capacity(packets.len());
                     for packet in packets {
                         if packet.len() > mtu {
-                            counters.record_drop(DropReason::Oversize, packet.len());
+                            counters.record_drop(DropReason::Oversize, 1, packet.len() as u64);
                             continue;
                         }
                         pkt_lens.push(packet.len());
@@ -729,14 +730,14 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
 
                     match tun.send_batch(&mut tun_bufs).await {
                         Ok(_) => {
-                            for &len in &pkt_lens {
-                                counters.record_success(len);
-                            }
+                            let count = pkt_lens.len() as u64;
+                            let total_bytes: u64 = pkt_lens.iter().map(|&l| l as u64).sum();
+                            counters.record_success(count, total_bytes);
                         }
                         Err(err) => {
-                            for &len in &pkt_lens {
-                                counters.record_drop(DropReason::SendError, len);
-                            }
+                            let count = pkt_lens.len() as u64;
+                            let total_bytes: u64 = pkt_lens.iter().map(|&l| l as u64).sum();
+                            counters.record_drop(DropReason::SendError, count, total_bytes);
                             return Err(ActorError::TunTxSend { name: tun_name, source: err });
                         }
                     }

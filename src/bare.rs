@@ -158,9 +158,8 @@ pub fn spawn_udp_rx(
                             // All GRO chunks share the same source addr;
                             // check IP filter once for the entire batch.
                             if !accepted_sources.contains(&remote.ip()) {
-                                for chunk in buf[..meta.len].chunks(stride) {
-                                    counters.record_drop(DropReason::DisallowedSource, chunk.len());
-                                }
+                                let chunk_count = meta.len.div_ceil(stride);
+                                counters.record_drop(DropReason::DisallowedSource, chunk_count as u64, meta.len as u64);
                                 continue;
                             }
 
@@ -175,9 +174,9 @@ pub fn spawn_udp_rx(
 
                             // Pre-send metrics (Option 3A): channel send failure
                             // means shutdown, so pre-recording is acceptable.
-                            for pkt in &batch {
-                                counters.record_success(pkt.len());
-                            }
+                            let count = batch.len() as u64;
+                            let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
+                            counters.record_success(count, total_bytes);
                             if packet_tx.send(batch).await.is_err() {
                                 return Ok(());
                             }
@@ -292,18 +291,14 @@ pub fn spawn_udp_tx(
                             })
                         }) {
                             Ok(()) => {
-                                for pkt in chunk {
-                                    counters.record_success(pkt.len());
-                                }
+                                counters.record_success(chunk.len() as u64, gso_buf.len() as u64);
                             }
                             Err(err) => {
                                 // quinn-udp may internally disable GSO
                                 // (max_gso_segments -> 1) on EIO/EINVAL before
                                 // returning the error. The actor terminates here;
                                 // on respawn, max_gso_segments == 1 avoids GSO.
-                                for pkt in chunk {
-                                    counters.record_drop(DropReason::SendError, pkt.len());
-                                }
+                                counters.record_drop(DropReason::SendError, chunk.len() as u64, gso_buf.len() as u64);
                                 return Err(ActorError::BareTxSend { dest: dest_str, source: err });
                             }
                         }

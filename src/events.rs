@@ -157,10 +157,44 @@ pub struct PktCounters {
 }
 
 impl PktCounters {
-    /// Records a packet with length `len`, saturating on overflow.
-    pub fn record(&mut self, len: usize) {
-        self.packets = self.packets.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(len as u64);
+    /// Records a batch of packets, saturating on overflow.
+    ///
+    /// For single-packet recording, pass `count = 1`.
+    pub fn record(&mut self, count: u64, total_bytes: u64) {
+        self.packets = self.packets.saturating_add(count);
+        self.bytes = self.bytes.saturating_add(total_bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkt_counters_record_batch() {
+        let mut c = PktCounters::default();
+        c.record(3, 150);
+        assert_eq!(c.packets, 3);
+        assert_eq!(c.bytes, 150);
+    }
+
+    #[test]
+    fn pkt_counters_record_single() {
+        let mut c = PktCounters::default();
+        c.record(1, 64);
+        assert_eq!(c.packets, 1);
+        assert_eq!(c.bytes, 64);
+    }
+
+    #[test]
+    fn pkt_counters_saturates() {
+        let mut c = PktCounters {
+            packets: u64::MAX - 1,
+            bytes: u64::MAX - 1,
+        };
+        c.record(5, 100);
+        assert_eq!(c.packets, u64::MAX);
+        assert_eq!(c.bytes, u64::MAX);
     }
 }
 

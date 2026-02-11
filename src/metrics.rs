@@ -22,19 +22,23 @@ impl TransportCounters {
         }
     }
 
-    /// Records a successfully handled packet length with saturation.
-    pub(crate) fn record_success(&mut self, len: usize) {
-        self.stats.succeeded.record(len);
+    /// Records successfully handled packets with saturation.
+    ///
+    /// For single-packet recording, pass `count = 1`.
+    pub(crate) fn record_success(&mut self, count: u64, total_bytes: u64) {
+        self.stats.succeeded.record(count, total_bytes);
     }
 
-    /// Records a dropped packet length for `reason` with saturation.
-    pub(crate) fn record_drop(&mut self, reason: DropReason, len: usize) {
-        self.stats.dropped.record(len);
+    /// Records dropped packets for `reason` with saturation.
+    ///
+    /// For single-packet recording, pass `count = 1`.
+    pub(crate) fn record_drop(&mut self, reason: DropReason, count: u64, total_bytes: u64) {
+        self.stats.dropped.record(count, total_bytes);
         self.stats
             .drop_reasons
             .entry(reason)
             .or_default()
-            .record(len);
+            .record(count, total_bytes);
     }
 
     /// Generates a metrics snapshot with optional peer and IP labels.
