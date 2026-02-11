@@ -6,7 +6,18 @@
 # Example: sudo ./scripts/bench-wireguard.sh -t 30
 #          sudo ./scripts/bench-wireguard.sh -u -b 1G
 #          sudo ./scripts/bench-wireguard.sh -J
+#
+# Environment variables:
+#   TUN_MTU  - WireGuard interface MTU (default: 1393)
 set -euo pipefail
+
+# --- Configuration ---
+TUN_MTU="${TUN_MTU:-1393}"
+# WireGuard IPv4 overhead: 20 (IPv4) + 8 (UDP) + 16 (header) + 16 (AEAD tag) = 60 bytes
+VETH_MTU=$((TUN_MTU + 60))
+
+NS_A="wg-bench-a"
+NS_B="wg-bench-b"
 
 # --- Prerequisites ---
 if [[ $EUID -ne 0 ]]; then echo "Error: must run as root" >&2; exit 1; fi
@@ -26,10 +37,7 @@ KEY_A_PUB="xopHDYsmeG7tk7UdovGv7RUBaiD1sADUrIlujSYHVFY="
 KEY_B_PRIV="0AMR6oqMwHg1NDZMRMtRXi/xd3Ot6Camb1euWJY1lWI="
 KEY_B_PUB="mqgf3siT/qS86WCoYmZFaXHUx5JRGSFVfjU4avuNanM="
 
-# --- Namespaces and interfaces ---
-NS_A="wg-bench-a"
-NS_B="wg-bench-b"
-
+# --- Cleanup ---
 cleanup() {
     # Namespace deletion also kills all processes within the namespace.
     # Deleting one veth end auto-destroys its peer; this handles the window
@@ -50,8 +58,8 @@ ip link set veth-a netns "$NS_A"
 ip link set veth-b netns "$NS_B"
 ip netns exec "$NS_A" ip addr add 192.168.100.1/24 dev veth-a
 ip netns exec "$NS_B" ip addr add 192.168.100.2/24 dev veth-b
-ip netns exec "$NS_A" ip link set veth-a up
-ip netns exec "$NS_B" ip link set veth-b up
+ip netns exec "$NS_A" ip link set veth-a mtu "$VETH_MTU" up
+ip netns exec "$NS_B" ip link set veth-b mtu "$VETH_MTU" up
 
 # WireGuard interfaces
 ip netns exec "$NS_A" ip link add wg0 type wireguard
@@ -62,15 +70,16 @@ ip netns exec "$NS_B" wg set wg0 listen-port 51820 private-key <(echo "$KEY_B_PR
     peer "$KEY_A_PUB" allowed-ips 10.0.0.1/32 endpoint 192.168.100.1:51820
 ip netns exec "$NS_A" ip addr add 10.0.0.1/24 dev wg0
 ip netns exec "$NS_B" ip addr add 10.0.0.2/24 dev wg0
-# Match h3llo default TUN MTU (1393) for fair comparison.
-ip netns exec "$NS_A" ip link set wg0 mtu 1393 up
-ip netns exec "$NS_B" ip link set wg0 mtu 1393 up
+ip netns exec "$NS_A" ip link set wg0 mtu "$TUN_MTU" up
+ip netns exec "$NS_B" ip link set wg0 mtu "$TUN_MTU" up
 
 # --- Verify connectivity ---
 ip netns exec "$NS_A" ping -c 1 -W 2 10.0.0.2 >/dev/null || { echo "Error: WireGuard ping failed" >&2; exit 1; }
 
 # --- Benchmark ---
 echo "=== WireGuard Throughput Baseline ==="
+echo "  TUN MTU:   $TUN_MTU"
+echo "  Veth MTU:  $VETH_MTU"
 ip netns exec "$NS_B" iperf3 -s -1 -D
 sleep 0.5  # Wait for iperf3 daemon to bind; increase if "connection refused" on slow hosts
 ip netns exec "$NS_A" iperf3 -c 10.0.0.2 "$@"
