@@ -49,6 +49,21 @@ use tracing::{debug, error, warn};
 /// Context ID for IP payloads per RFC 9484 (always 0 for CONNECT-IP).
 const CONTEXT_ID_IP: u8 = 0x00;
 
+/// Maximum packets per batch before flush.
+///
+/// Matches TUN device `IDEAL_BATCH_SIZE` (128 on Linux) for optimal
+/// GRO coalescing throughput in the downstream TUN TX path.
+const BATCH_MAX_PACKETS: usize = 128;
+
+/// Maximum total payload bytes per batch before flush (64 KiB).
+const BATCH_MAX_BYTES: usize = 64 * 1024;
+
+/// Packets smaller than this threshold trigger an immediate batch flush.
+///
+/// Small packets indicate interactive traffic (SSH, DNS, ACKs) where
+/// latency matters more than batching efficiency.
+const GSO_FLUSH_THRESHOLD: usize = 1000;
+
 /// Conservative CONNECT-IP encapsulation overhead in bytes per
 /// [RFC 9484 Section 7.2](https://datatracker.ietf.org/doc/html/rfc9484#section-7.2).
 ///
@@ -647,11 +662,24 @@ pub fn spawn_h3_rx(
     tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::Http3, Direction::Rx);
         let mut ticker = time::interval(interval);
+        // TODO: idle timeout flush — large same-size packets (>= GSO_FLUSH_THRESHOLD) accumulate
+        // without triggering any flush condition until the next arrival or stream close.
+        // Add a short timer (e.g., 1ms) to flush stale batches for latency-sensitive flows.
+        let mut batch: Vec<PooledBuf> = Vec::with_capacity(BATCH_MAX_PACKETS);
+        let mut batch_bytes: usize = 0;
+        let mut prev_len: usize = 0;
 
         loop {
             tokio::select! {
                 frame = datagram_rx.recv() => {
                     let Some(inbound_frame) = frame else {
+                        if !batch.is_empty() {
+                            let count = batch.len() as u64;
+                            let bytes = batch_bytes as u64;
+                            counters.record_success(count, bytes);
+                            // Best-effort flush; channel may already be closed during shutdown.
+                            let _ = packet_tx.send(std::mem::take(&mut batch)).await;
+                        }
                         debug!(peer = %peer, "datagram stream closed");
                         return Ok(());
                     };
@@ -669,16 +697,32 @@ pub fn spawn_h3_rx(
                             }
                             dgram.pop_front(1);
                             let len = dgram.len();
-                            // H3 delivers one datagram at a time; wrap in single-element batch
-                            if packet_tx.send(vec![dgram]).await.is_err() {
-                                counters.record_drop(
-                                    crate::events::DropReason::ChannelClosed,
-                                    1,
-                                    len as u64,
-                                );
-                                return Ok(());
+
+                            let size_changed = !batch.is_empty() && len != prev_len;
+                            let small_packet = len < GSO_FLUSH_THRESHOLD;
+
+                            batch.push(dgram);
+                            batch_bytes += len;
+                            prev_len = len;
+
+                            if batch.len() >= BATCH_MAX_PACKETS
+                                || batch_bytes >= BATCH_MAX_BYTES
+                                || size_changed
+                                || small_packet
+                            {
+                                let count = batch.len() as u64;
+                                let bytes = batch_bytes as u64;
+                                // Pre-send metrics: channel send failure means shutdown,
+                                // so pre-recording is acceptable (consistent with BareUDP RX).
+                                counters.record_success(count, bytes);
+                                if packet_tx.send(std::mem::take(&mut batch)).await.is_err() {
+                                    return Ok(());
+                                }
+                                batch = Vec::with_capacity(BATCH_MAX_PACKETS);
+                                batch_bytes = 0;
+                                // prev_len intentionally NOT reset — carries across batches
+                                // so size-change detection works against the last packet.
                             }
-                            counters.record_success(1, len as u64);
                         }
                         InboundFrame::Body(pooled_buf, _fin) => {
                             // Body frames are unexpected for CONNECT-IP per RFC 9484;
