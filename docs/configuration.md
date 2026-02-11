@@ -24,7 +24,7 @@ local:
     mtu: 1393 # optional, default: 1393 (see docs/protocol.md for MTU sizing)
 tuning: # optional, all fields have defaults
   packet_queue_depth: 256 # optional, default: 256
-  socket_buffer_size: 16 # optional, default: 16 (megabytes; 0 to use system default)
+  socket_buffer_size: 16 # optional, default: 16 (MiB; 0 to use system default)
   reconnect_interval: 3 # optional, default: 3 (seconds)
   log_metrics_interval: 30 # optional, default: 30 (seconds)
   dns_query_timeout: 2 # optional, default: 2 (seconds)
