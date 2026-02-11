@@ -93,7 +93,6 @@ BareUDP is an opt-in plaintext fast path for controlled networks where confident
 - Requires end-to-end HTTP/3; no HTTP/2 or HTTP/1.1 fallback.
 - MASQUE optional Capsule Types are not implemented (`ROUTE_ADVERTISEMENT`, `ADDRESS_REQUEST`, `ADDRESS_ASSIGN`), and URI templates for `target` / `ipproto` are unsupported.
 - BareUDP is plaintext; only use in trusted environments.
-- BareUDP + NIC checksum offload: on certain NICs (observed on Mellanox ConnectX / BlueField mlx5, firmware 32.46.x), hardware UDP TX checksum offload may produce incorrect checksums for BareUDP traffic. The symptom is high `InCsumErrors` in `/proc/net/snmp` and severe TCP retransmits inside the tunnel (throughput drops to ~1/30 of expected). The suspected cause is the NIC hardware parser misidentifying the raw IP payload inside the UDP datagram as an encapsulated tunnel packet, which confuses the TX checksum calculation. HTTP/3 traffic is unaffected because QUIC encryption makes the payload opaque to the parser. Workaround: disable hardware UDP segmentation offload on the affected interface (`ethtool -K <iface> tx-udp-segmentation off`); the kernel software GSO path computes checksums correctly and can still achieve multi-Gbps throughput.
 - CDN Layer-7 forwarding without HTTP/3 origin fetch is unsupported; Cloudflare WARP auth is incompatible.
 - Platform tiers: Linux is first-class and the primary target; macOS and Windows are second-tier with best-effort support; BSD derivatives are third-tier with planned extensions only.
 
