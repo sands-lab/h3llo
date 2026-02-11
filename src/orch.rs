@@ -188,10 +188,18 @@ impl PeerEntry {
                 let endpoint = Endpoint::Udp(bare.endpoint.clone());
                 let metrics_interval = tuning.log_metrics_interval;
                 let packet_queue_depth = tuning.packet_queue_depth;
+                let socket_buffer_bytes = tuning.socket_buffer_bytes();
 
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
-                    match make_bare_tx(destination, bindif.as_deref(), Some(&tun_if), &probe).await
+                    match make_bare_tx(
+                        destination,
+                        bindif.as_deref(),
+                        Some(&tun_if),
+                        &probe,
+                        socket_buffer_bytes,
+                    )
+                    .await
                     {
                         Ok(tx_socket) => {
                             let (packet_tx, tx_handle) = spawn_udp_tx(
@@ -455,7 +463,7 @@ impl Orchestrator {
             // Endpoint already parsed during config deserialization
             let listen_addr = resolve_listen_addr(&local_bare.listen.host, local_bare.listen.port)?;
 
-            let bare_rx = make_bare_rx(listen_addr, mtu)
+            let bare_rx = make_bare_rx(listen_addr, mtu, tuning.socket_buffer_bytes())
                 .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
 
             let (cmd_tx, bare_rx_handle) = spawn_udp_rx(
@@ -494,8 +502,13 @@ impl Orchestrator {
                     .collect();
 
                 // make: fallible I/O (socket bind, TLS config)
-                let listener = make_h3_listener(listen_addr, cert_path, key_path)
-                    .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
+                let listener = make_h3_listener(
+                    listen_addr,
+                    cert_path,
+                    key_path,
+                    tuning.socket_buffer_bytes(),
+                )
+                .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
 
                 // spawn: infallible task creation; listener sends events through events_tx
                 let (cmd_tx, listener_handle, _bound_addr) = spawn_h3_listener(
@@ -529,6 +542,7 @@ impl Orchestrator {
             tuning.dns_query_timeout,
             tuning.dns_refresh_interval,
             &probe,
+            tuning.socket_buffer_bytes(),
         )
         .await
         .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;

@@ -24,6 +24,7 @@ local:
     mtu: 1393 # optional, default: 1393 (see docs/protocol.md for MTU sizing)
 tuning: # optional, all fields have defaults
   packet_queue_depth: 256 # optional, default: 256
+  socket_buffer_size: 16 # optional, default: 16 (MiB; 0 to use system default)
   reconnect_interval: 3 # optional, default: 3 (seconds)
   log_metrics_interval: 30 # optional, default: 30 (seconds)
   dns_query_timeout: 2 # optional, default: 2 (seconds)
@@ -66,6 +67,7 @@ peers: # optional, default: []
 - `local.tun.mtu` (default `1393`): MTU for the TUN interface; see [docs/protocol.md](protocol.md) for sizing guidance.
 - `tuning` (optional): All fields have defaults; omit the entire section to use defaults.
 - `tuning.packet_queue_depth` (default `256`): Bounded channel capacity for data-plane packet queues between actors. Counts batch messages, not individual packets; each batch carries one device I/O operation's worth of packets.
+- `tuning.socket_buffer_size` (default `16`): Socket buffer size in megabytes, applied to all UDP sockets via SO_RCVBUF and SO_SNDBUF. Set to `0` to skip buffer configuration and use system defaults. On Linux, the effective buffer size may be clamped by `net.core.rmem_max` / `net.core.wmem_max`; setting failures are logged as warnings without aborting.
 - `tuning.reconnect_interval` (default `3`): Minimum seconds between `try_connect` attempts per peer.
 - `tuning.log_metrics_interval` (default `30`): Seconds between periodic metric log emissions.
 - `tuning.dns_query_timeout` (default `2`): Seconds before a DNS query is considered timed out and retried.

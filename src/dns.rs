@@ -202,6 +202,7 @@ pub struct DnsActor {
 /// * `timeout` - Query timeout duration.
 /// * `refresh_interval` - Periodic re-query interval; `Duration::ZERO` disables.
 /// * `probe` - Route probe for interface selection.
+/// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
 /// # Errors
 ///
@@ -212,13 +213,20 @@ pub async fn make_dns<P: RouteProbe>(
     timeout: Duration,
     refresh_interval: Duration,
     probe: &P,
+    socket_buffer_bytes: usize,
 ) -> Result<DnsActor, ResolveInitError> {
     // server is pre-parsed as SocketAddr during config deserialization
     let server = local_dns.server;
 
-    let socket = make_client_udp_socket(server, tun_if, local_dns.bindif.as_deref(), probe)
-        .await
-        .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
+    let socket = make_client_udp_socket(
+        server,
+        tun_if,
+        local_dns.bindif.as_deref(),
+        probe,
+        socket_buffer_bytes,
+    )
+    .await
+    .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
 
     Ok(DnsActor {
         server,
@@ -660,6 +668,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::ZERO,
             &probe,
+            0,
         )
         .await
         .expect("make_dns failed");
@@ -982,6 +991,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::ZERO,
             &probe,
+            0,
         )
         .await
         .expect("make_dns");
@@ -1012,6 +1022,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::ZERO,
             &probe,
+            0,
         )
         .await
         .expect("make_dns");

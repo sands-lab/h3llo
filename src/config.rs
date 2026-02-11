@@ -181,6 +181,11 @@ pub struct PeerTun {
 pub struct Tuning {
     /// Data-plane packet queue depth for bounded backpressure channels (default: 256).
     pub packet_queue_depth: usize,
+    /// Socket buffer size in megabytes for SO_RCVBUF and SO_SNDBUF (default: 16).
+    ///
+    /// Applied to all UDP sockets. Set to 0 to skip buffer configuration and use
+    /// system defaults. Actual kernel buffer may be clamped by OS limits.
+    pub socket_buffer_size: usize,
     /// Minimum interval between reconnection attempts (default: 3s).
     #[serde(with = "serde_duration_secs")]
     pub reconnect_interval: Duration,
@@ -208,6 +213,7 @@ impl Default for Tuning {
     fn default() -> Self {
         Self {
             packet_queue_depth: 256,
+            socket_buffer_size: 16,
             reconnect_interval: Duration::from_secs(3),
             log_metrics_interval: Duration::from_secs(30),
             dns_query_timeout: Duration::from_secs(2),
@@ -216,6 +222,13 @@ impl Default for Tuning {
             h3_max_idle_timeout: Duration::from_secs(60),
             h3_keepalive_interval: Duration::from_secs(20),
         }
+    }
+}
+
+impl Tuning {
+    /// Returns socket buffer size in bytes, or 0 to skip configuration.
+    pub fn socket_buffer_bytes(&self) -> usize {
+        self.socket_buffer_size.saturating_mul(1024 * 1024)
     }
 }
 
@@ -1662,6 +1675,7 @@ peers:
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.tuning.packet_queue_depth, 256);
+        assert_eq!(cfg.tuning.socket_buffer_size, 16);
         assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(3));
         assert_eq!(cfg.tuning.log_metrics_interval, Duration::from_secs(30));
         assert_eq!(cfg.tuning.dns_query_timeout, Duration::from_secs(2));
@@ -1754,5 +1768,40 @@ peers:
         let config = sample_h3_config();
         // Default: keepalive=20s, idle_timeout=60s
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn tuning_socket_buffer_size_override() {
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  socket_buffer_size: 32
+peers:
+- id: example-node-2
+  h3:
+    token: example-node-2-token
+  tun:
+    allowed_ips:
+      - 192.168.180.2/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert_eq!(cfg.tuning.socket_buffer_size, 32);
+    }
+
+    #[test]
+    fn socket_buffer_bytes_conversion() {
+        let tuning = Tuning::default();
+        assert_eq!(tuning.socket_buffer_bytes(), 16 * 1024 * 1024);
+
+        let mut tuning = Tuning::default();
+        tuning.socket_buffer_size = 0;
+        assert_eq!(tuning.socket_buffer_bytes(), 0);
+
+        tuning.socket_buffer_size = 1;
+        assert_eq!(tuning.socket_buffer_bytes(), 1024 * 1024);
     }
 }
