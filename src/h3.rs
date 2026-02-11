@@ -49,6 +49,18 @@ use tracing::{debug, error, warn};
 /// Context ID for IP payloads per RFC 9484 (always 0 for CONNECT-IP).
 const CONTEXT_ID_IP: u8 = 0x00;
 
+/// Maximum packets per H3 RX batch before flush.
+///
+/// Matches TUN device `IDEAL_BATCH_SIZE` (128 on Linux) for optimal
+/// GRO coalescing throughput in the downstream TUN TX path.
+const BATCH_MAX_PACKETS: usize = 128;
+
+/// Maximum total payload bytes per H3 RX batch before flush.
+///
+/// Matches TUN GRO max coalesced payload (65535 bytes) so the batch
+/// fits in a single write syscall.
+const BATCH_MAX_BYTES: usize = 65535;
+
 /// Conservative CONNECT-IP encapsulation overhead in bytes per
 /// [RFC 9484 Section 7.2](https://datatracker.ietf.org/doc/html/rfc9484#section-7.2).
 ///
@@ -624,7 +636,10 @@ pub struct H3Rx {
 /// Spawns the HTTP/3 receive loop for a single connection.
 ///
 /// Receives datagrams from the inbound channel and forwards IP packets
-/// (after stripping Context ID 0) to the TUN-Tx queue.
+/// (after stripping Context ID 0) to the TUN-Tx queue.  Uses a
+/// `recv()` + `try_recv()` drain pattern to batch all immediately-ready
+/// frames into a single `Vec<PooledBuf>`, mirroring tokio-quiche's
+/// synchronous `gather_data_from_quiche_conn` loop.
 ///
 /// # Arguments
 ///
@@ -632,11 +647,13 @@ pub struct H3Rx {
 /// * `packet_tx` - Bounded channel to push received packets into (data plane).
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
+/// * `mtu` - TUN MTU for computing per-batch byte limit.
 pub fn spawn_h3_rx(
     rx: H3Rx,
     packet_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
+    mtu: usize,
 ) -> JoinHandle<ActorExitResult> {
     let H3Rx {
         peer_id,
@@ -647,54 +664,47 @@ pub fn spawn_h3_rx(
     tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::Http3, Direction::Rx);
         let mut ticker = time::interval(interval);
+        let batch_byte_limit = BATCH_MAX_BYTES - mtu;
 
         loop {
             tokio::select! {
                 frame = datagram_rx.recv() => {
-                    let Some(inbound_frame) = frame else {
+                    let Some(first) = frame else {
                         debug!(peer = %peer, "datagram stream closed");
                         return Ok(());
                     };
 
-                    match inbound_frame {
-                        InboundFrame::Datagram(pooled_dgram) => {
-                            let mut dgram = pooled_dgram;
-                            if dgram.is_empty() || dgram[0] != CONTEXT_ID_IP {
-                                counters.record_drop(
-                                    crate::events::DropReason::InvalidFraming,
-                                    1,
-                                    dgram.len() as u64,
-                                );
-                                continue;
-                            }
-                            dgram.pop_front(1);
-                            let len = dgram.len();
-                            // H3 delivers one datagram at a time; wrap in single-element batch
-                            if packet_tx.send(vec![dgram]).await.is_err() {
-                                counters.record_drop(
-                                    crate::events::DropReason::ChannelClosed,
-                                    1,
-                                    len as u64,
-                                );
-                                return Ok(());
-                            }
-                            counters.record_success(1, len as u64);
-                        }
-                        InboundFrame::Body(pooled_buf, _fin) => {
-                            // Body frames are unexpected for CONNECT-IP per RFC 9484;
-                            // IP payloads should arrive as DATAGRAM frames. Drop immediately.
-                            warn!(
-                                peer = %peer,
-                                len = pooled_buf.len(),
-                                "received unexpected Body frame on CONNECT-IP stream"
-                            );
-                            counters.record_drop(
-                                crate::events::DropReason::InvalidFraming,
-                                1,
-                                pooled_buf.len() as u64,
-                            );
-                        }
+                    let mut batch: Vec<PooledBuf> = Vec::with_capacity(BATCH_MAX_PACKETS);
+                    let mut ok_pkts: u64 = 0;
+                    let mut ok_bytes: u64 = 0;
+
+                    // Process the first frame that woke us.
+                    handle_inbound_frame(
+                        &peer, first,
+                        &mut batch, &mut ok_pkts, &mut ok_bytes,
+                        &mut counters,
+                    );
+
+                    // Drain all immediately-ready frames without awaiting.
+                    while batch.len() < BATCH_MAX_PACKETS
+                        && (ok_bytes as usize) < batch_byte_limit
+                    {
+                        let Some(f) = datagram_rx.try_recv().ok() else { break };
+                        handle_inbound_frame(
+                            &peer, f,
+                            &mut batch, &mut ok_pkts, &mut ok_bytes,
+                            &mut counters,
+                        );
                     }
+
+                    if packet_tx.send(batch).await.is_err() {
+                        counters.record_drop(
+                            crate::events::DropReason::ChannelClosed,
+                            ok_pkts, ok_bytes,
+                        );
+                        return Ok(());
+                    }
+                    counters.record_success(ok_pkts, ok_bytes);
                 }
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), None);
@@ -705,6 +715,48 @@ pub fn spawn_h3_rx(
             }
         }
     })
+}
+
+/// Processes a single inbound H3 frame: strips Context ID, pushes valid
+/// IP datagrams into the batch, and records metrics for invalid frames.
+#[inline]
+fn handle_inbound_frame(
+    peer: &str,
+    inbound_frame: InboundFrame,
+    batch: &mut Vec<PooledBuf>,
+    ok_pkts: &mut u64,
+    ok_bytes: &mut u64,
+    counters: &mut TransportCounters,
+) {
+    match inbound_frame {
+        InboundFrame::Datagram(mut dgram) => {
+            if dgram.is_empty() || dgram[0] != CONTEXT_ID_IP {
+                counters.record_drop(
+                    crate::events::DropReason::InvalidFraming,
+                    1,
+                    dgram.len() as u64,
+                );
+                return;
+            }
+            dgram.pop_front(1);
+            let len = dgram.len() as u64;
+            batch.push(dgram);
+            *ok_pkts += 1;
+            *ok_bytes += len;
+        }
+        InboundFrame::Body(pooled_buf, _fin) => {
+            warn!(
+                peer = %peer,
+                len = pooled_buf.len(),
+                "received unexpected Body frame on CONNECT-IP stream"
+            );
+            counters.record_drop(
+                crate::events::DropReason::InvalidFraming,
+                1,
+                pooled_buf.len() as u64,
+            );
+        }
+    }
 }
 
 // ========== Transmit Loop ==========
@@ -1766,8 +1818,13 @@ mod tests {
 
         // Server RX actor
         let (server_packet_tx, mut server_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
-        let _server_rx_handle =
-            spawn_h3_rx(server_rx, server_packet_tx, events_tx, metrics_interval);
+        let _server_rx_handle = spawn_h3_rx(
+            server_rx,
+            server_packet_tx,
+            events_tx,
+            metrics_interval,
+            crate::config::default_mtu() as usize,
+        );
 
         // Send test packet (allocate with headroom for H3 TX encoding)
         use crate::tun::alloc_packet_buf;
@@ -1863,6 +1920,7 @@ mod tests {
             server_to_client_tx,
             events_tx.clone(),
             metrics_interval,
+            crate::config::default_mtu() as usize,
         );
 
         // Split server connection
@@ -1878,8 +1936,13 @@ mod tests {
         );
 
         let (client_to_server_tx, mut server_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
-        let _server_rx_handle =
-            spawn_h3_rx(server_rx, client_to_server_tx, events_tx, metrics_interval);
+        let _server_rx_handle = spawn_h3_rx(
+            server_rx,
+            client_to_server_tx,
+            events_tx,
+            metrics_interval,
+            crate::config::default_mtu() as usize,
+        );
 
         // Test client -> server
         let packet_c2s = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
