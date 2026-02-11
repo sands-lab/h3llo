@@ -202,6 +202,7 @@ pub struct DnsActor {
 /// * `timeout` - Query timeout duration.
 /// * `refresh_interval` - Periodic re-query interval; `Duration::ZERO` disables.
 /// * `probe` - Route probe for interface selection.
+/// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
 /// # Errors
 ///
