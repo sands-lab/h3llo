@@ -41,9 +41,10 @@ pub enum UdpError {
 /// - `domain`: Socket domain (IPv4 or IPv6).
 /// - `bind_addr`: Local address to bind, or `None` for ephemeral port.
 /// - `bind_interface`: Optional interface name for binding.
+/// - `socket_buffer_bytes`: SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
 /// # Returns
-/// A tokio `UdpSocket`. Interface binding warnings are logged directly.
+/// A tokio `UdpSocket`. Interface and buffer sizing warnings are logged directly.
 ///
 /// # Errors
 /// Returns an `io::Error` when socket creation or binding fails.
@@ -51,10 +52,28 @@ pub fn make_udp_socket_raw(
     domain: Domain,
     bind_addr: Option<SocketAddr>,
     bind_interface: Option<&str>,
+    socket_buffer_bytes: usize,
 ) -> io::Result<UdpSocket> {
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
+
+    if socket_buffer_bytes > 0 {
+        if let Err(e) = socket.set_recv_buffer_size(socket_buffer_bytes) {
+            warn!(
+                requested = socket_buffer_bytes,
+                error = %e,
+                "SO_RCVBUF set failed, using system default"
+            );
+        }
+        if let Err(e) = socket.set_send_buffer_size(socket_buffer_bytes) {
+            warn!(
+                requested = socket_buffer_bytes,
+                error = %e,
+                "SO_SNDBUF set failed, using system default"
+            );
+        }
+    }
 
     if let Some(interface) = bind_interface {
         if let Err(e) = bind_to_device(&socket, domain, interface) {
@@ -81,15 +100,20 @@ pub fn make_udp_socket_raw(
 ///
 /// # Arguments
 /// - `listen`: Local socket address to bind.
+/// - `socket_buffer_bytes`: SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
 /// # Errors
 /// Returns `UdpError::Socket` when socket creation or binding fails.
-pub fn make_server_udp_socket(listen: SocketAddr) -> Result<UdpSocket, UdpError> {
+pub fn make_server_udp_socket(
+    listen: SocketAddr,
+    socket_buffer_bytes: usize,
+) -> Result<UdpSocket, UdpError> {
     let domain = match listen {
         SocketAddr::V4(_) => Domain::IPV4,
         SocketAddr::V6(_) => Domain::IPV6,
     };
-    make_udp_socket_raw(domain, Some(listen), None).map_err(|e| UdpError::Socket(e.to_string()))
+    make_udp_socket_raw(domain, Some(listen), None, socket_buffer_bytes)
+        .map_err(|e| UdpError::Socket(e.to_string()))
 }
 
 /// Creates an unbound UDP socket with route-probed interface selection.
@@ -105,6 +129,7 @@ pub fn make_server_udp_socket(listen: SocketAddr) -> Result<UdpSocket, UdpError>
 /// - `tun_if`: Optional TUN interface name to exclude from probing.
 /// - `bind_interface`: Optional preferred interface; treated as a filter during probing.
 /// - `probe`: Route probe implementation for testability.
+/// - `socket_buffer_bytes`: SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
 /// # Errors
 /// Returns `UdpError::Socket` when socket creation fails. Interface binding is
@@ -114,6 +139,7 @@ pub async fn make_unbound_udp_socket<P: RouteProbe>(
     tun_if: Option<&str>,
     bind_interface: Option<&str>,
     probe: &P,
+    socket_buffer_bytes: usize,
 ) -> Result<UdpSocket, UdpError> {
     let domain = match target {
         SocketAddr::V4(_) => Domain::IPV4,
@@ -127,8 +153,13 @@ pub async fn make_unbound_udp_socket<P: RouteProbe>(
         select_bind_interface(target.ip(), tun_if, bind_interface, probe).await
     };
 
-    make_udp_socket_raw(domain, None, selected_interface.as_deref())
-        .map_err(|e| UdpError::Socket(e.to_string()))
+    make_udp_socket_raw(
+        domain,
+        None,
+        selected_interface.as_deref(),
+        socket_buffer_bytes,
+    )
+    .map_err(|e| UdpError::Socket(e.to_string()))
 }
 
 /// Creates a connected UDP socket for sending packets to a target.
@@ -142,6 +173,7 @@ pub async fn make_unbound_udp_socket<P: RouteProbe>(
 /// - `tun_if`: Optional TUN interface name to exclude from probing.
 /// - `bind_interface`: Optional preferred interface; treated as a filter during probing.
 /// - `probe`: Route probe implementation for testability.
+/// - `socket_buffer_bytes`: SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
 /// # Returns
 /// A connected UDP socket. The OS assigns an ephemeral port during `connect()`.
@@ -157,6 +189,7 @@ pub async fn make_unbound_udp_socket<P: RouteProbe>(
 ///     Some("tun0"),
 ///     None,
 ///     &probe,
+///     16 * 1024 * 1024,
 /// ).await?;
 /// // Socket is already connected - use send()/recv()
 /// socket.send(&query).await?;
@@ -166,8 +199,10 @@ pub async fn make_client_udp_socket<P: RouteProbe>(
     tun_if: Option<&str>,
     bind_interface: Option<&str>,
     probe: &P,
+    socket_buffer_bytes: usize,
 ) -> Result<UdpSocket, UdpError> {
-    let socket = make_unbound_udp_socket(target, tun_if, bind_interface, probe).await?;
+    let socket =
+        make_unbound_udp_socket(target, tun_if, bind_interface, probe, socket_buffer_bytes).await?;
 
     socket
         .connect(target)
@@ -763,7 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn make_udp_socket_raw_with_none_bind_addr() {
-        let socket = make_udp_socket_raw(Domain::IPV4, None, None);
+        let socket = make_udp_socket_raw(Domain::IPV4, None, None, 0);
         assert!(
             socket.is_ok(),
             "socket creation without bind should succeed"
@@ -773,7 +808,7 @@ mod tests {
     #[tokio::test]
     async fn make_udp_socket_raw_with_ipv4_domain() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let socket = make_udp_socket_raw(Domain::IPV4, Some(addr), None);
+        let socket = make_udp_socket_raw(Domain::IPV4, Some(addr), None, 0);
         assert!(
             socket.is_ok(),
             "socket creation with IPv4 bind should succeed"
@@ -787,7 +822,7 @@ mod tests {
     #[tokio::test]
     async fn make_udp_socket_raw_with_ipv6_domain() {
         let addr: SocketAddr = "[::]:0".parse().unwrap();
-        let result = make_udp_socket_raw(Domain::IPV6, Some(addr), None);
+        let result = make_udp_socket_raw(Domain::IPV6, Some(addr), None, 0);
         // May fail on systems without IPv6, which is acceptable
         if let Ok(socket) = result {
             assert!(socket.local_addr().unwrap().is_ipv6());
@@ -801,7 +836,7 @@ mod tests {
     #[tokio::test]
     async fn make_server_udp_socket_binds_to_address() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let socket = make_server_udp_socket(addr);
+        let socket = make_server_udp_socket(addr, 0);
         assert!(socket.is_ok(), "make_server_udp_socket should succeed");
 
         let socket = socket.unwrap();
@@ -815,7 +850,7 @@ mod tests {
         // This test may pass without assertions on systems without IPv6.
         // The important behavior is that it doesn't panic.
         let addr: SocketAddr = "[::]:0".parse().unwrap();
-        let result = make_server_udp_socket(addr);
+        let result = make_server_udp_socket(addr, 0);
         if let Ok(socket) = result {
             assert!(socket.local_addr().unwrap().is_ipv6());
         }
@@ -832,6 +867,7 @@ mod tests {
             None,
             None,
             &probe,
+            0,
         )
         .await;
         assert!(
@@ -853,6 +889,7 @@ mod tests {
             None,
             None,
             &probe,
+            0,
         )
         .await;
         assert!(result.is_ok());
@@ -868,9 +905,14 @@ mod tests {
     #[tokio::test]
     async fn make_client_udp_socket_ipv4_creates_ipv4_socket() {
         let probe = FakeRouteProbe::noop();
-        let result =
-            make_client_udp_socket(SocketAddr::from(([127, 0, 0, 1], 53)), None, None, &probe)
-                .await;
+        let result = make_client_udp_socket(
+            SocketAddr::from(([127, 0, 0, 1], 53)),
+            None,
+            None,
+            &probe,
+            0,
+        )
+        .await;
         assert!(result.is_ok());
         let socket = result.unwrap();
         assert!(socket.local_addr().unwrap().is_ipv4());
@@ -884,6 +926,7 @@ mod tests {
             None,
             None,
             &probe,
+            0,
         )
         .await;
         // May fail on systems without IPv6, which is acceptable

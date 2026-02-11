@@ -43,12 +43,17 @@ pub struct BareUdpRx {
 ///
 /// * `listen` - Resolved socket address to bind.
 /// * `mtu` - MTU for buffer sizing.
+/// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
 /// # Errors
 ///
 /// Returns `UdpError::Socket` when socket binding fails.
-pub fn make_bare_rx(listen: SocketAddr, mtu: usize) -> Result<BareUdpRx, UdpError> {
-    let socket = make_server_udp_socket(listen)?;
+pub fn make_bare_rx(
+    listen: SocketAddr,
+    mtu: usize,
+    socket_buffer_bytes: usize,
+) -> Result<BareUdpRx, UdpError> {
+    let socket = make_server_udp_socket(listen, socket_buffer_bytes)?;
     let state = UdpSocketState::new(UdpSockRef::from(&socket))
         .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
     Ok(BareUdpRx { socket, state, mtu })
@@ -76,6 +81,7 @@ pub struct BareUdpTx {
 /// * `bindif` - Optional interface name to bind.
 /// * `tun_if` - Optional TUN interface name to exclude from routing.
 /// * `probe` - Route probe for interface selection.
+/// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
 /// # Errors
 ///
@@ -88,8 +94,10 @@ pub async fn make_bare_tx<P: RouteProbe>(
     bindif: Option<&str>,
     tun_if: Option<&str>,
     probe: &P,
+    socket_buffer_bytes: usize,
 ) -> Result<BareUdpTx, UdpError> {
-    let socket = make_unbound_udp_socket(destination, tun_if, bindif, probe).await?;
+    let socket =
+        make_unbound_udp_socket(destination, tun_if, bindif, probe, socket_buffer_bytes).await?;
     let state = UdpSocketState::new(UdpSockRef::from(&socket))
         .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
     Ok(BareUdpTx {
@@ -344,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn make_bare_rx_creates_valid_state() {
         let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let result = make_bare_rx(listen, 1500);
+        let result = make_bare_rx(listen, 1500, 0);
         assert!(result.is_ok());
         let rx = result.unwrap();
         assert_eq!(rx.mtu, 1500);
@@ -360,7 +368,7 @@ mod tests {
         let dest = receiver.local_addr().unwrap();
 
         let probe = FakeRouteProbe::noop();
-        let result = make_bare_tx(dest, None, None, &probe).await;
+        let result = make_bare_tx(dest, None, None, &probe, 0).await;
         assert!(result.is_ok());
         let tx = result.unwrap();
         assert_eq!(tx.destination, dest);

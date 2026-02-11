@@ -13,7 +13,7 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_bearer_auth, validate_connect_auth};
-use crate::bind::{make_client_udp_socket, RouteProbe};
+use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::{
     ConnectionDirection, Direction, Event, H3ConnectedEvent, TransportEvent, TransportKind,
@@ -443,9 +443,15 @@ pub async fn dial_h3<P: RouteProbe>(
     debug!(%remote_addr, %server_name, %authority, %peer_id, "dialing H3 endpoint");
 
     // Create UDP socket with route probing
-    let socket = make_client_udp_socket(remote_addr, tun_if, peer_h3.bindif.as_deref(), probe)
-        .await
-        .map_err(|e| DialError::Socket(e.to_string()))?;
+    let socket = make_client_udp_socket(
+        remote_addr,
+        tun_if,
+        peer_h3.bindif.as_deref(),
+        probe,
+        tuning.socket_buffer_bytes(),
+    )
+    .await
+    .map_err(|e| DialError::Socket(e.to_string()))?;
 
     // TODO: Implement custom CA certificate support for server verification.
     // Currently using system roots via tokio-quiche defaults.
@@ -895,13 +901,15 @@ pub enum H3ListenerCommand {
 /// Creates H3 listener state from configuration.
 ///
 /// Performs all fallible I/O: socket binding, path validation.
-/// Does NOT spawn any tasks.
+/// Does NOT spawn any tasks. Uses the unified socket path via
+/// `make_server_udp_socket` for consistent buffer sizing.
 ///
 /// # Arguments
 ///
 /// * `listen_addr` - Address to listen on.
 /// * `cert_path` - Path to TLS certificate.
 /// * `key_path` - Path to TLS private key.
+/// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
 /// # Errors
 ///
@@ -910,10 +918,13 @@ pub fn make_h3_listener(
     listen_addr: SocketAddr,
     cert_path: &Path,
     key_path: &Path,
+    socket_buffer_bytes: usize,
 ) -> Result<H3Listener, ListenerError> {
-    // Bind socket
-    let socket =
-        std::net::UdpSocket::bind(listen_addr).map_err(|e| ListenerError::Bind(e.to_string()))?;
+    // Bind socket via unified path (applies SO_RCVBUF/SO_SNDBUF)
+    let socket = make_server_udp_socket(listen_addr, socket_buffer_bytes)
+        .map_err(|e| ListenerError::Bind(e.to_string()))?
+        .into_std()
+        .map_err(|e| ListenerError::Bind(format!("tokio-to-std conversion: {e}")))?;
 
     let bound_addr = socket
         .local_addr()
@@ -1348,12 +1359,12 @@ mod tests {
 
     // ========== make_h3_listener Tests ==========
 
-    #[test]
-    fn make_h3_listener_binds_socket() {
+    #[tokio::test]
+    async fn make_h3_listener_binds_socket() {
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        let result = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path());
+        let result = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0);
 
         assert!(result.is_ok());
         let listener = result.unwrap();
@@ -1365,7 +1376,7 @@ mod tests {
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
@@ -1400,7 +1411,7 @@ mod tests {
         let peer_tokens = HashMap::from([("test-peer".to_string(), "test-token-12ch".to_string())]);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
         let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(
             listener,
@@ -1461,7 +1472,7 @@ mod tests {
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
-        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
@@ -1527,7 +1538,7 @@ mod tests {
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
-        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
@@ -1596,7 +1607,7 @@ mod tests {
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
-        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make listener");
         let (cmd_tx, _handle, bound_addr) = spawn_h3_listener(
             listener,
@@ -1652,7 +1663,7 @@ mod tests {
             HashMap::from([("test-client".to_string(), "correct-token-12".to_string())]);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
-        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
@@ -1712,7 +1723,7 @@ mod tests {
             HashMap::from([("known-peer".to_string(), "token-12chars-x".to_string())]);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
@@ -1760,7 +1771,7 @@ mod tests {
 
         let (listener_events_tx, mut listener_events_rx) = mpsc::unbounded_channel();
 
-        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
@@ -1859,7 +1870,7 @@ mod tests {
 
         let (listener_events_tx, mut listener_events_rx) = mpsc::unbounded_channel();
 
-        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
@@ -1988,7 +1999,7 @@ mod tests {
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
-        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path())
+        let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
         let (cmd_tx, listener_handle, bound_addr) = spawn_h3_listener(
             listener,

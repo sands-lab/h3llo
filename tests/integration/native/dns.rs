@@ -100,7 +100,7 @@ async fn spawn_resolver(
     };
 
     let probe = FakeRouteProbe::noop();
-    let dns_actor = make_dns(&local_dns, None, timeout, Duration::ZERO, &probe)
+    let dns_actor = make_dns(&local_dns, None, timeout, Duration::ZERO, &probe, 0)
         .await
         .expect("make_dns failed");
 
