@@ -239,6 +239,7 @@ pub fn spawn_udp_tx(
     let handle = tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Tx);
         let mut ticker = time::interval(interval);
+        let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
 
         loop {
             tokio::select! {
@@ -248,14 +249,34 @@ pub fn spawn_udp_tx(
                         None => return Ok(()), // Channel closed, exit gracefully
                     };
 
-                    for packet in packets {
+                    if packets.is_empty() {
+                        continue;
+                    }
+
+                    let max_segs = state.max_gso_segments();
+                    // TUN GSO guarantees all non-tail packets in a batch share
+                    // the same size; segment_size from the first packet is safe.
+                    let segment_size = packets[0].len();
+                    debug_assert!(segment_size > 0, "TUN GSO must not produce empty packets");
+
+                    for chunk in packets.chunks(max_segs) {
+                        gso_buf.clear();
+                        for pkt in chunk {
+                            gso_buf.extend_from_slice(pkt);
+                        }
+
+                        // segment_size tells the kernel to split contents into
+                        // datagrams. When chunk has a single packet or
+                        // max_gso_segments == 1, quinn-udp's prepare_msg skips
+                        // the GSO cmsg automatically (segment_size >= contents.len()).
                         let transmit = Transmit {
                             destination,
                             ecn: None,
-                            contents: &packet,
-                            segment_size: None,
+                            contents: &gso_buf,
+                            segment_size: Some(segment_size),
                             src_ip: None,
                         };
+
                         match retry_on_transient!({
                             socket.writable().await.map_err(|err| {
                                 ActorError::BareTxSend { dest: dest_str.clone(), source: err }
@@ -264,9 +285,19 @@ pub fn spawn_udp_tx(
                                 state.try_send(UdpSockRef::from(&socket), &transmit)
                             })
                         }) {
-                            Ok(()) => counters.record_success(packet.len()),
+                            Ok(()) => {
+                                for pkt in chunk {
+                                    counters.record_success(pkt.len());
+                                }
+                            }
                             Err(err) => {
-                                counters.record_drop(DropReason::SendError, packet.len());
+                                // quinn-udp may internally disable GSO
+                                // (max_gso_segments -> 1) on EIO/EINVAL before
+                                // returning the error. The actor terminates here;
+                                // on respawn, max_gso_segments == 1 avoids GSO.
+                                for pkt in chunk {
+                                    counters.record_drop(DropReason::SendError, pkt.len());
+                                }
                                 return Err(ActorError::BareTxSend { dest: dest_str, source: err });
                             }
                         }
@@ -693,5 +724,129 @@ mod tests {
 
         rx_handle.abort();
         tx_handle.abort();
+    }
+
+    /// Verifies that a multi-packet batch is delivered correctly via GSO
+    /// (or per-packet fallback on non-GSO platforms).
+    #[tokio::test]
+    async fn udp_tx_batch_gso_delivers_all_packets() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let context = test_bare_tx(sender_socket, dest);
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200), 256);
+
+        // Send a batch of 3 equal-sized packets (simulates TUN GSO output)
+        let batch = vec![
+            BufFactory::buf_from_slice(&[1, 2, 3, 4]),
+            BufFactory::buf_from_slice(&[5, 6, 7, 8]),
+            BufFactory::buf_from_slice(&[9, 10, 11, 12]),
+        ];
+        packet_tx.send(batch).await.unwrap();
+
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let mut buf = vec![0u8; 64];
+            let (len, _) =
+                tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
+                    .await
+                    .expect("should receive packet")
+                    .expect("recv_from");
+            received.push(buf[..len].to_vec());
+        }
+        received.sort();
+        assert_eq!(
+            received,
+            vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10, 11, 12]]
+        );
+
+        handle.abort();
+    }
+
+    /// Verifies that a batch with a shorter last packet (common in TCP flows)
+    /// is delivered correctly.
+    #[tokio::test]
+    async fn udp_tx_batch_gso_short_last_packet() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let context = test_bare_tx(sender_socket, dest);
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200), 256);
+
+        // Last packet is shorter (e.g., TCP stream tail)
+        let batch = vec![
+            BufFactory::buf_from_slice(&[1, 2, 3, 4]),
+            BufFactory::buf_from_slice(&[5, 6, 7, 8]),
+            BufFactory::buf_from_slice(&[9, 10]),
+        ];
+        packet_tx.send(batch).await.unwrap();
+
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let mut buf = vec![0u8; 64];
+            let (len, _) =
+                tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
+                    .await
+                    .expect("should receive packet")
+                    .expect("recv_from");
+            received.push(buf[..len].to_vec());
+        }
+        received.sort();
+        assert_eq!(
+            received,
+            vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10]]
+        );
+
+        handle.abort();
+    }
+
+    /// Verifies that metrics count each packet individually in a GSO batch.
+    #[tokio::test]
+    async fn udp_tx_gso_batch_metrics() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let context = test_bare_tx(sender_socket, dest);
+        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(10), 256);
+
+        let batch = vec![
+            BufFactory::buf_from_slice(&[1, 2, 3]),
+            BufFactory::buf_from_slice(&[4, 5, 6]),
+        ];
+        packet_tx.send(batch).await.unwrap();
+
+        // Drain packets
+        let mut buf = vec![0u8; 64];
+        for _ in 0..2 {
+            let _ = receiver.recv_from(&mut buf).await.unwrap();
+        }
+
+        let metrics = tokio::time::timeout(Duration::from_millis(100), async {
+            while let Some(event) = events_rx.recv().await {
+                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                    if m.labels.direction == Direction::Tx && m.stats.succeeded.packets >= 2 {
+                        return Some(m);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .expect("tx metrics should arrive")
+        .expect("tx metrics should not be None");
+
+        assert_eq!(metrics.stats.succeeded.packets, 2);
+        assert_eq!(metrics.stats.succeeded.bytes, 6);
+
+        handle.abort();
     }
 }
