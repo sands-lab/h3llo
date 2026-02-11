@@ -662,7 +662,8 @@ pub fn spawn_h3_rx(
                             if dgram.is_empty() || dgram[0] != CONTEXT_ID_IP {
                                 counters.record_drop(
                                     crate::events::DropReason::InvalidFraming,
-                                    dgram.len(),
+                                    1,
+                                    dgram.len() as u64,
                                 );
                                 continue;
                             }
@@ -672,11 +673,12 @@ pub fn spawn_h3_rx(
                             if packet_tx.send(vec![dgram]).await.is_err() {
                                 counters.record_drop(
                                     crate::events::DropReason::ChannelClosed,
-                                    len,
+                                    1,
+                                    len as u64,
                                 );
                                 return Ok(());
                             }
-                            counters.record_success(len);
+                            counters.record_success(1, len as u64);
                         }
                         InboundFrame::Body(pooled_buf, _fin) => {
                             // Body frames are unexpected for CONNECT-IP per RFC 9484;
@@ -688,7 +690,8 @@ pub fn spawn_h3_rx(
                             );
                             counters.record_drop(
                                 crate::events::DropReason::InvalidFraming,
-                                pooled_buf.len(),
+                                1,
+                                pooled_buf.len() as u64,
                             );
                         }
                     }
@@ -777,19 +780,19 @@ pub fn spawn_h3_tx(
                         let len = packet.len();
                         // Zero-copy: prepend Context ID using reserved headroom.
                         if !packet.add_prefix(&[CONTEXT_ID_IP]) {
-                            counters.record_drop(crate::events::DropReason::NoHeadroom, len);
+                            counters.record_drop(crate::events::DropReason::NoHeadroom, 1, len as u64);
                             continue;
                         }
                         let frame = OutboundFrame::Datagram(packet, flow_id);
 
                         if datagram_tx.send(frame).await.is_err() {
-                            counters.record_drop(crate::events::DropReason::SendError, len);
+                            counters.record_drop(crate::events::DropReason::SendError, 1, len as u64);
                             return Err(ActorError::H3TxSend {
                                 peer_id: peer.clone(),
                                 reason: "datagram channel closed".to_string(),
                             });
                         }
-                        counters.record_success(len);
+                        counters.record_success(1, len as u64);
                     }
                 }
                 _ = ticker.tick() => {

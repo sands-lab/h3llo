@@ -98,10 +98,11 @@ impl AsMut<[u8]> for TunBuf {
 #[cfg(target_os = "linux")]
 impl tun_rs::ExpandBuffer for TunBuf {
     fn buf_capacity(&self) -> usize {
-        // Conservative: return visible length, not true capacity.
-        // This intentionally yields GroResult::Noop (no coalescing),
-        // which is correct for single-packet sends.
-        self.0.len()
+        // PooledBuf is backed by a growable Vec<u8>, so GRO can always
+        // extend it via buf_extend_from_slice(). Return usize::MAX to
+        // let the GRO coalescing logic merge same-flow packets into GSO
+        // super-packets (capped at ~65535 bytes by IP total length).
+        usize::MAX
     }
 
     fn buf_resize(&mut self, new_len: usize, val: u8) {
@@ -618,21 +619,14 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             };
 
                             let first_packet = alloc_packet_buf(&bufs[first_idx][..sizes[first_idx]]);
+                            let total_bytes: u64 = sizes[..count].iter().map(|&s| s as u64).sum();
                             let Some(dest) = extract_dst_ip(&first_packet) else {
-                                for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_drop(DropReason::InvalidIpVersion, sz);
-                                    }
-                                }
+                                counters.record_drop(DropReason::InvalidIpVersion, count as u64, total_bytes);
                                 continue;
                             };
 
                             let Some(route) = routing.lookup(dest) else {
-                                for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_drop(DropReason::NoRoute, sz);
-                                    }
-                                }
+                                counters.record_drop(DropReason::NoRoute, count as u64, total_bytes);
                                 continue;
                             };
 
@@ -645,17 +639,9 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             }
 
                             if route.tx.send(batch).await.is_err() {
-                                for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_drop(DropReason::ChannelClosed, sz);
-                                    }
-                                }
+                                counters.record_drop(DropReason::ChannelClosed, count as u64, total_bytes);
                             } else {
-                                for &sz in &sizes[..count] {
-                                    if sz > 0 {
-                                        counters.record_success(sz);
-                                    }
-                                }
+                                counters.record_success(count as u64, total_bytes);
                             }
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -716,7 +702,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                     let mut pkt_lens: Vec<usize> = Vec::with_capacity(packets.len());
                     for packet in packets {
                         if packet.len() > mtu {
-                            counters.record_drop(DropReason::Oversize, packet.len());
+                            counters.record_drop(DropReason::Oversize, 1, packet.len() as u64);
                             continue;
                         }
                         pkt_lens.push(packet.len());
@@ -729,14 +715,14 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
 
                     match tun.send_batch(&mut tun_bufs).await {
                         Ok(_) => {
-                            for &len in &pkt_lens {
-                                counters.record_success(len);
-                            }
+                            let count = pkt_lens.len() as u64;
+                            let total_bytes: u64 = pkt_lens.iter().map(|&l| l as u64).sum();
+                            counters.record_success(count, total_bytes);
                         }
                         Err(err) => {
-                            for &len in &pkt_lens {
-                                counters.record_drop(DropReason::SendError, len);
-                            }
+                            let count = pkt_lens.len() as u64;
+                            let total_bytes: u64 = pkt_lens.iter().map(|&l| l as u64).sum();
+                            counters.record_drop(DropReason::SendError, count, total_bytes);
                             return Err(ActorError::TunTxSend { name: tun_name, source: err });
                         }
                     }
