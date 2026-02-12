@@ -87,12 +87,12 @@ peers:
     h3:
       endpoint: {peer_endpoint}
       token: {peer_token}
-      insecure: true
     tun:
       allowed_ips:
         - {peer_allowed_ip}
 tuning:
   dns_refresh_interval: 1
+  h3_insecure_skip_verify: true
 "#
     )
 }

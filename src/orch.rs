@@ -1515,8 +1515,6 @@ mod tests {
                     path: "/".to_string(),
                 }),
                 token: "test-token-12chars".to_string(),
-                ca: None,
-                insecure: true,
                 bindif: None,
                 sni: None,
             }),

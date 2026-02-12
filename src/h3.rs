@@ -414,7 +414,7 @@ impl H3Connection {
 ///
 /// # Arguments
 ///
-/// * `peer_h3` - Peer HTTP/3 configuration (endpoint, token, ca, insecure, bindif).
+/// * `peer_h3` - Peer HTTP/3 configuration (endpoint, token, bindif).
 /// * `remote_addr` - Resolved target socket address (from DNS resolution).
 /// * `peer_id` - Remote peer ID.
 /// * `tun_if` - Optional TUN interface name to exclude from route probing.
@@ -465,16 +465,10 @@ pub async fn dial_h3<P: RouteProbe>(
     .await
     .map_err(|e| DialError::Socket(e.to_string()))?;
 
-    // TODO: Implement custom CA certificate support for server verification.
-    // Currently using system roots via tokio-quiche defaults.
-    if peer_h3.ca.is_some() {
-        warn!("ca_cert_path is configured but not yet implemented; using system roots");
-    }
-
     // Configure QUIC settings
     let mut quic_settings = make_quic_settings(tuning, tun_mtu);
     // Only disable verification when explicitly requested (testing only)
-    if !peer_h3.insecure {
+    if !tuning.h3_insecure_skip_verify {
         quic_settings.verify_peer = true;
     }
 
@@ -1334,8 +1328,6 @@ mod tests {
         let peer_h3 = PeerH3 {
             endpoint: None,
             token: "test-token-12ch".to_string(),
-            ca: None,
-            insecure: true,
             bindif: None,
             sni: None,
         };
@@ -1435,7 +1427,15 @@ mod tests {
 
     // ========== Test Helper: build PeerH3 for dial tests ==========
 
-    /// Creates a test `PeerH3` for integration tests with insecure TLS.
+    /// Returns `Tuning` with `h3_insecure_skip_verify: true` for tests using self-signed certs.
+    fn insecure_tuning() -> Tuning {
+        Tuning {
+            h3_insecure_skip_verify: true,
+            ..Default::default()
+        }
+    }
+
+    /// Creates a test `PeerH3` for integration tests.
     fn test_peer_h3(bound_addr: SocketAddr, token: &str) -> crate::config::PeerH3 {
         use crate::config::{H3Endpoint, PeerH3};
         PeerH3 {
@@ -1445,8 +1445,6 @@ mod tests {
                 path: "/.well-known/masque/udp/*/*/".to_string(),
             }),
             token: token.to_string(),
-            ca: None,
-            insecure: true,
             bindif: None,
             sni: None,
         }
@@ -1492,7 +1490,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
-            &Tuning::default(),
+            &insecure_tuning(),
         )
         .await;
 
@@ -1560,7 +1558,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
-            &Tuning::default(),
+            &insecure_tuning(),
         )
         .await;
 
@@ -1626,7 +1624,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
-            &Tuning::default(),
+            &insecure_tuning(),
         )
         .await
         .expect("dial");
@@ -1683,7 +1681,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
-            &Tuning::default(),
+            &insecure_tuning(),
         )
         .await;
 
@@ -1742,7 +1740,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
-            &Tuning::default(),
+            &insecure_tuning(),
         )
         .await;
 
@@ -1790,7 +1788,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
-            &Tuning::default(),
+            &insecure_tuning(),
         )
         .await
         .expect("dial failed");
@@ -1884,7 +1882,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
-            &Tuning::default(),
+            &insecure_tuning(),
         )
         .await
         .expect("dial failed");
@@ -2007,7 +2005,7 @@ mod tests {
             None,
             crate::config::default_mtu(),
             &probe,
-            &Tuning::default(),
+            &insecure_tuning(),
         )
         .await
         .expect("dial failed");
