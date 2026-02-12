@@ -209,7 +209,7 @@ pub struct Tuning {
     pub h3_keepalive_interval: Duration,
     /// QUIC congestion control algorithm (default: `"cubic"`).
     ///
-    /// Accepted values: `"reno"`, `"cubic"`, `"bbr"`, `"bbr2"`.
+    /// Accepted values: `"reno"`, `"cubic"`, `"bbr"`, `"bbr2"`, `"none"`.
     /// Applied to both client (dial) and server (listener) QUIC connections.
     pub h3_cc_algorithm: String,
     /// Enable QUIC packet pacing (default: `false`).
@@ -364,7 +364,7 @@ pub enum ValidationError {
     /// `tuning.h3_cc_algorithm` is not a recognized congestion control algorithm.
     #[error(
         "tuning.h3_cc_algorithm '{algorithm}' is not recognized \
-         (accepted: reno, cubic, bbr, bbr2)"
+         (accepted: reno, cubic, bbr, bbr2, none)"
     )]
     InvalidCcAlgorithm {
         /// The unrecognized algorithm name.
@@ -404,7 +404,7 @@ impl Config {
 
         // Subset of quiche::CongestionControlAlgorithm::from_str();
         // excludes internal aliases (bbr2_gcongestion).
-        const VALID_CC_ALGORITHMS: &[&str] = &["reno", "cubic", "bbr", "bbr2"];
+        const VALID_CC_ALGORITHMS: &[&str] = &["reno", "cubic", "bbr", "bbr2", "none"];
         if !VALID_CC_ALGORITHMS.contains(&self.tuning.h3_cc_algorithm.as_str()) {
             errors.push(ValidationError::InvalidCcAlgorithm {
                 algorithm: self.tuning.h3_cc_algorithm.clone(),
@@ -1756,7 +1756,7 @@ peers:
 
     #[test]
     fn accepts_all_valid_cc_algorithms() {
-        for algo in &["reno", "cubic", "bbr", "bbr2"] {
+        for algo in &["reno", "cubic", "bbr", "bbr2", "none"] {
             let mut config = sample_h3_config();
             config.tuning.h3_cc_algorithm = algo.to_string();
             assert!(

@@ -241,18 +241,8 @@ dependencies = [
 
 [[package]]
 name = "buffer-pool"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18624a184ec50bea2991d342bec1a442e3411467d59a4ab64f4683c898fb3c0b"
-dependencies = [
- "crossbeam",
- "foundations",
-]
-
-[[package]]
-name = "buffer-pool"
-version = "0.2.0"
-source = "git+https://github.com/Tonny-Gu/quiche#35d81976317893f5e365cfaf784aff9880dffc53"
+version = "0.2.1"
+source = "git+https://github.com/Tonny-Gu/quiche#e2a7e935d0a9a57692e9141181aac9a794890e87"
 dependencies = [
  "crossbeam",
  "foundations",
@@ -601,9 +591,9 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 [[package]]
 name = "datagram-socket"
 version = "0.6.0"
-source = "git+https://github.com/Tonny-Gu/quiche#35d81976317893f5e365cfaf784aff9880dffc53"
+source = "git+https://github.com/Tonny-Gu/quiche#e2a7e935d0a9a57692e9141181aac9a794890e87"
 dependencies = [
- "buffer-pool 0.2.0 (git+https://github.com/Tonny-Gu/quiche)",
+ "buffer-pool",
  "futures-util",
  "libc",
  "smallvec",
@@ -1415,7 +1405,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core",
 ]
 
 [[package]]
@@ -2025,8 +2015,7 @@ dependencies = [
 [[package]]
 name = "octets"
 version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ba5d98c13e549f6f26f7d70808688ab85c6b42eb350ba2524d96c24ebde27e9"
+source = "git+https://github.com/Tonny-Gu/quiche#e2a7e935d0a9a57692e9141181aac9a794890e87"
 
 [[package]]
 name = "once_cell"
@@ -2406,8 +2395,7 @@ dependencies = [
 [[package]]
 name = "qlog"
 version = "0.15.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f15b83c59e6b945f2261c95a1dd9faf239187f32ff0a96af1d1d28c4557f919"
+source = "git+https://github.com/Tonny-Gu/quiche#e2a7e935d0a9a57692e9141181aac9a794890e87"
 dependencies = [
  "serde",
  "serde_json",
@@ -2432,9 +2420,8 @@ dependencies = [
 
 [[package]]
 name = "quiche"
-version = "0.24.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "616543d7ac97fc41c787a146f3daebef444125403e89704637e252fa6e1190ad"
+version = "0.24.9"
+source = "git+https://github.com/Tonny-Gu/quiche#e2a7e935d0a9a57692e9141181aac9a794890e87"
 dependencies = [
  "boring",
  "cmake",
@@ -2447,6 +2434,7 @@ dependencies = [
  "log",
  "octets",
  "qlog",
+ "serde_json",
  "slab",
  "smallvec",
  "windows-sys 0.59.0",
@@ -3216,8 +3204,7 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 [[package]]
 name = "task-killswitch"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73dc630154f65447b1ee9d2d097522ac1eff991a84e18256417f33eaf3225014"
+source = "git+https://github.com/Tonny-Gu/quiche#e2a7e935d0a9a57692e9141181aac9a794890e87"
 dependencies = [
  "dashmap 6.1.0",
  "parking_lot",
@@ -3419,13 +3406,12 @@ dependencies = [
 
 [[package]]
 name = "tokio-quiche"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10f64fe719e3d5865ca0b834223046cfe1edd4756f4c6b82689729bf741d4512"
+version = "0.14.2"
+source = "git+https://github.com/Tonny-Gu/quiche#e2a7e935d0a9a57692e9141181aac9a794890e87"
 dependencies = [
  "anyhow",
  "boring",
- "buffer-pool 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "buffer-pool",
  "crossbeam",
  "datagram-socket",
  "foundations",
@@ -3886,7 +3872,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9babd3a767a4c1aef6900409f85f5d53ce2544ccdfaa86dad48c91782c6d6893"
 dependencies = [
  "windows-collections",
- "windows-core 0.61.2",
+ "windows-core",
  "windows-future",
  "windows-link 0.1.3",
  "windows-numerics",
@@ -3898,7 +3884,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3beeceb5e5cfd9eb1d76b381630e82c4241ccd0d27f1a39ed41b2760b255c5e8"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
 ]
 
 [[package]]
@@ -3910,21 +3896,8 @@ dependencies = [
  "windows-implement",
  "windows-interface",
  "windows-link 0.1.3",
- "windows-result 0.3.4",
- "windows-strings 0.4.2",
-]
-
-[[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement",
- "windows-interface",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
- "windows-strings 0.5.1",
+ "windows-result",
+ "windows-strings",
 ]
 
 [[package]]
@@ -3933,7 +3906,7 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc6a41e98427b19fe4b73c550f060b59fa592d7d686537eebf9385621bfbad8e"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
  "windows-link 0.1.3",
  "windows-threading",
 ]
@@ -3978,7 +3951,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9150af68066c4c5c07ddc0ce30421554771e528bde427614c61038bc2c92c2b1"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
  "windows-link 0.1.3",
 ]
 
@@ -3992,30 +3965,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-result"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
-dependencies = [
- "windows-link 0.2.1",
-]
-
-[[package]]
 name = "windows-strings"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56e6c93f3a0c3b36176cb1327a4958a0353d5d166c2a35cb268ace15e91d3b57"
 dependencies = [
  "windows-link 0.1.3",
-]
-
-[[package]]
-name = "windows-strings"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
-dependencies = [
- "windows-link 0.2.1",
 ]
 
 [[package]]
