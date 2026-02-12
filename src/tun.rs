@@ -509,7 +509,7 @@ impl RoutingTable {
         }
     }
 
-    /// Builds a routing table from enabled peers with their TX channels.
+    /// Builds a routing table from peers with their TX channels.
     ///
     /// # Arguments
     ///
@@ -525,10 +525,10 @@ impl RoutingTable {
     ) -> Result<Self, RoutingError> {
         let mut table = RoutingTable::new();
 
-        for peer in peers.iter().filter(|peer| peer.enabled) {
+        for peer in peers {
             let Some(tx) = peer_txs.get(&peer.id) else {
                 warn!(
-                    "enabled peer '{}' has no TX channel; skipping route registration",
+                    "peer '{}' has no TX channel; skipping route registration",
                     peer.id
                 );
                 continue;
@@ -999,7 +999,7 @@ mod tests {
         // Setup routing: 192.0.2.0/24 -> peer1
         let peer_config = Peer {
             id: "peer1".to_string(),
-            enabled: true,
+
             h3: None,
             bare: None,
             tun: PeerTun {
@@ -1148,10 +1148,9 @@ mod tests {
 
     use crate::config::{PeerBare, PeerTun, UdpEndpoint};
 
-    fn bare_peer(id: &str, enabled: bool, allowed: &[&str]) -> Peer {
+    fn bare_peer(id: &str, allowed: &[&str]) -> Peer {
         Peer {
             id: id.to_string(),
-            enabled,
             h3: None,
             bare: Some(PeerBare {
                 endpoint: UdpEndpoint {
@@ -1180,8 +1179,8 @@ mod tests {
     #[test]
     fn chooses_longest_prefix() {
         let peers = vec![
-            bare_peer("peer-a", true, &["10.0.0.0/16"]),
-            bare_peer("peer-b", true, &["10.0.0.0/24"]),
+            bare_peer("peer-a", &["10.0.0.0/16"]),
+            bare_peer("peer-b", &["10.0.0.0/24"]),
         ];
         let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
         let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
@@ -1193,25 +1192,10 @@ mod tests {
     }
 
     #[test]
-    fn ignores_disabled_peers() {
-        let peers = vec![
-            bare_peer("peer-disabled", false, &["10.1.0.0/16"]),
-            bare_peer("peer-active", true, &["10.0.0.0/8"]),
-        ];
-        let peer_txs = dummy_peer_txs(&["peer-disabled", "peer-active"]);
-        let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
-        assert_eq!(table.len(), (1, 0));
-        let result = table
-            .lookup(IpAddr::V4(Ipv4Addr::new(10, 2, 3, 4)))
-            .expect("lookup should succeed");
-        assert_eq!(result.peer_id, "peer-active");
-    }
-
-    #[test]
     fn errors_on_conflicting_prefix_ownership() {
         let peers = vec![
-            bare_peer("peer-a", true, &["10.0.0.0/24"]),
-            bare_peer("peer-b", true, &["10.0.0.0/24"]),
+            bare_peer("peer-a", &["10.0.0.0/24"]),
+            bare_peer("peer-b", &["10.0.0.0/24"]),
         ];
         let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
         let err = RoutingTable::from_peers(&peers, &peer_txs).unwrap_err();
@@ -1227,7 +1211,7 @@ mod tests {
 
     #[test]
     fn skips_duplicate_prefixes_within_peer() {
-        let peers = vec![bare_peer("peer-a", true, &["10.0.0.0/24", "10.0.0.0/24"])];
+        let peers = vec![bare_peer("peer-a", &["10.0.0.0/24", "10.0.0.0/24"])];
         let peer_txs = dummy_peer_txs(&["peer-a"]);
         let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
         assert_eq!(table.len(), (1, 0));
@@ -1249,7 +1233,7 @@ mod tests {
         // Initial routing: 192.0.2.0/24 -> peer1
         let peer1_config = Peer {
             id: "peer1".to_string(),
-            enabled: true,
+
             h3: None,
             bare: None,
             tun: PeerTun {
@@ -1272,7 +1256,7 @@ mod tests {
         // Update routing: 192.0.2.0/24 -> peer2
         let peer2_config = Peer {
             id: "peer2".to_string(),
-            enabled: true,
+
             h3: None,
             bare: None,
             tun: PeerTun {
@@ -1404,7 +1388,7 @@ mod tests {
 
         let peer_config = Peer {
             id: "peer1".to_string(),
-            enabled: true,
+
             h3: None,
             bare: None,
             tun: PeerTun {

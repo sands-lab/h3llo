@@ -115,9 +115,6 @@ pub struct LocalTun {
 pub struct Peer {
     /// Remote node identifier.
     pub id: String,
-    /// Whether the peer entry is active (default: true).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     /// HTTP/3 transport options.
     #[serde(default)]
     pub h3: Option<PeerH3>,
@@ -808,7 +805,6 @@ mod tests {
             tuning: Tuning::default(),
             peers: vec![Peer {
                 id: "example-node-2".to_string(),
-                enabled: true,
                 h3: Some(PeerH3 {
                     token: "example-node-2-token".to_string(), // >= 12 chars
                     endpoint: Some(H3Endpoint {
@@ -1151,7 +1147,6 @@ peers:
         assert_eq!(cfg.local.dns.bindif, None);
         assert_eq!(cfg.local.tun.ifname, "h3llo0");
         assert_eq!(cfg.local.tun.mtu, 1393);
-        assert!(cfg.peers[0].enabled);
         assert!(cfg.peers[0].h3.is_some());
         if let Some(h3) = cfg.peers[0].h3.as_ref() {
             assert!(h3.endpoint.is_none());

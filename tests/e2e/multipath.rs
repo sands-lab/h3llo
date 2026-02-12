@@ -42,14 +42,12 @@ local:
     key: {key_path}
 peers:
   - id: node-b-mp-bare
-    enabled: true
     bare:
       endpoint: "udp://node-b-mp.h3llo-test-net:5353"
     tun:
       allowed_ips:
         - 10.0.0.0/24
   - id: node-b-mp-h3
-    enabled: true
     h3:
       endpoint: "https://node-b-mp.h3llo-test-net:443/"
       token: multipath-token-12ch
@@ -83,14 +81,12 @@ local:
     key: {key_path}
 peers:
   - id: node-a-mp-bare
-    enabled: true
     bare:
       endpoint: "udp://node-a-mp.h3llo-test-net:5353"
     tun:
       allowed_ips:
         - 10.0.0.0/24
   - id: node-a-mp-h3
-    enabled: true
     h3:
       endpoint: "https://node-a-mp.h3llo-test-net:443/"
       token: multipath-token-12ch

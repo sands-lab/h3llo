@@ -84,7 +84,6 @@ local:
     key: {key_path}
 peers:
   - id: {peer_id}
-    enabled: true
     h3:
       endpoint: {peer_endpoint}
       token: {peer_token}
