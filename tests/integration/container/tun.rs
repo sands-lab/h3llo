@@ -187,7 +187,7 @@ async fn check_send_recv() -> Result<(), String> {
 
         let scratch_size = reader.scratch_buf_size();
         let mut scratch = vec![0u8; scratch_size];
-        let mut bufs = vec![TunBuf::alloc_uninit()];
+        let mut bufs = vec![TunBuf::alloc_uninit(reader.mtu())];
         let mut sizes = vec![0usize; 1];
         loop {
             match reader.recv_batch(&mut scratch, &mut bufs, &mut sizes).await {

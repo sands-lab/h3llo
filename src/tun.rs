@@ -42,13 +42,42 @@ const _: () = assert!(
     "HEADROOM must be >= VIRTIO_NET_HDR_LEN for zero-copy TUN TX"
 );
 
+/// Allocates an uninitialized pooled buffer with [`HEADROOM`] bytes reserved,
+/// selecting the smallest pool that fits `length + HEADROOM`.
+///
+/// Uses the datagram pool (≤ [`BufFactory::MAX_DGRAM_SIZE`] bytes) for typical
+/// packets and falls back to the generic pool for oversized payloads.
+///
+/// The returned buffer's visible length is `pool_capacity - HEADROOM`, which
+/// may exceed `length`. Callers must [`truncate`](PooledBuf::truncate) to the
+/// actual payload size.
+///
+/// # Arguments
+///
+/// * `length` - Expected payload size (excluding headroom).
+pub(crate) fn alloc_uninit_packet_buf(length: usize) -> PooledBuf {
+    if length + HEADROOM <= BufFactory::MAX_DGRAM_SIZE {
+        let mut buf = BufFactory::get_max_datagram();
+        // get_max_datagram() reserves an internal prefix (DGRAM_PREFIX) that
+        // may differ from our HEADROOM.  Compute and consume the difference.
+        let dgram_headroom = BufFactory::MAX_DGRAM_SIZE - buf.len();
+        if dgram_headroom < HEADROOM {
+            buf.pop_front(HEADROOM - dgram_headroom);
+        }
+        buf
+    } else {
+        let mut buf = BufFactory::get_max_buf();
+        buf.pop_front(HEADROOM);
+        buf
+    }
+}
+
 /// Allocates a pooled buffer with headroom for in-place header prepending.
 ///
 /// Data starts at offset `HEADROOM`, leaving room for downstream consumers
 /// to prepend headers via `add_prefix` without reallocation.
 pub(crate) fn alloc_packet_buf(data: &[u8]) -> PooledBuf {
-    let mut buf = BufFactory::get_max_buf();
-    buf.pop_front(HEADROOM);
+    let mut buf = alloc_uninit_packet_buf(data.len());
     buf.truncate(data.len());
     buf[..data.len()].copy_from_slice(data);
     buf
@@ -56,19 +85,21 @@ pub(crate) fn alloc_packet_buf(data: &[u8]) -> PooledBuf {
 
 /// Zero-copy wrapper around [`PooledBuf`] for TUN I/O (RX and TX).
 ///
-/// RX: [`TunBuf::alloc_uninit()`] allocates with headroom; [`into_pooled`](Self::into_pooled) truncates.
+/// RX: [`TunBuf::alloc_uninit`] allocates with headroom; [`into_pooled`](Self::into_pooled) truncates.
 /// TX: `From<PooledBuf>` constructs; [`TunTx::send_batch`] prepends virtio_net_hdr.
 pub struct TunBuf(PooledBuf);
 
 impl TunBuf {
-    /// Allocates a max-capacity pooled buffer with [`HEADROOM`] bytes reserved.
+    /// Allocates a pooled buffer sized for `mtu` with [`HEADROOM`] bytes reserved.
     ///
     /// The caller must call [`into_pooled`](Self::into_pooled) after filling
     /// to set the actual length.
-    pub fn alloc_uninit() -> Self {
-        let mut buf = BufFactory::get_max_buf();
-        buf.pop_front(HEADROOM);
-        Self(buf)
+    ///
+    /// # Arguments
+    ///
+    /// * `mtu` - Expected maximum payload size (excluding headroom).
+    pub fn alloc_uninit(mtu: usize) -> Self {
+        Self(alloc_uninit_packet_buf(mtu))
     }
 
     /// Truncates to `len` bytes and returns the underlying [`PooledBuf`].
@@ -94,12 +125,6 @@ impl TunBuf {
             debug_assert!(ok, "alloc_packet_buf guarantees HEADROOM bytes");
             self.0 = buf;
         }
-    }
-}
-
-impl Default for TunBuf {
-    fn default() -> Self {
-        Self::alloc_uninit()
     }
 }
 
@@ -625,9 +650,10 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
     let handle = tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
         let mut ticker = time::interval(interval);
+        let mtu = tun.mtu();
 
         let mut scratch = vec![0u8; scratch_buf_size];
-        let mut bufs: Vec<TunBuf> = (0..batch_size).map(|_| TunBuf::alloc_uninit()).collect();
+        let mut bufs: Vec<TunBuf> = (0..batch_size).map(|_| TunBuf::alloc_uninit(mtu)).collect();
         let mut sizes = vec![0usize; batch_size];
 
         loop {
@@ -643,7 +669,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                                 continue;
                             };
 
-                            let first_packet = std::mem::take(&mut bufs[first_idx])
+                            let first_packet = std::mem::replace(&mut bufs[first_idx], TunBuf::alloc_uninit(mtu))
                                 .into_pooled(sizes[first_idx]);
                             let total_bytes: u64 = sizes[..count].iter().map(|&s| s as u64).sum();
                             let Some(dest) = extract_dst_ip(&first_packet) else {
@@ -661,7 +687,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             for i in 0..count {
                                 if i != first_idx && sizes[i] > 0 {
                                     batch.push(
-                                        std::mem::take(&mut bufs[i])
+                                        std::mem::replace(&mut bufs[i], TunBuf::alloc_uninit(mtu))
                                             .into_pooled(sizes[i]),
                                     );
                                 }
@@ -1389,7 +1415,7 @@ mod tests {
     async fn memory_tun_rx_recv_batch_returns_packet() {
         let (mut rx, _tx, inject, _output) = memory_tun("mem-rx-batch", 64);
         let mut scratch = vec![0u8; rx.scratch_buf_size()];
-        let mut bufs = vec![TunBuf::alloc_uninit()];
+        let mut bufs = vec![TunBuf::alloc_uninit(rx.mtu())];
         let mut sizes = vec![0usize; 1];
         inject.send(vec![10, 20, 30]).await.unwrap();
         let count = rx
@@ -1415,7 +1441,7 @@ mod tests {
         let (mut rx, _tx, inject, _output) = memory_tun("mem-rx-close", 64);
         drop(inject);
         let mut scratch = vec![0u8; rx.scratch_buf_size()];
-        let mut bufs = vec![TunBuf::alloc_uninit()];
+        let mut bufs = vec![TunBuf::alloc_uninit(rx.mtu())];
         let mut sizes = vec![0usize; 1];
         let result = rx.recv_batch(&mut scratch, &mut bufs, &mut sizes).await;
         assert!(result.is_err());
@@ -1425,7 +1451,7 @@ mod tests {
 
     #[test]
     fn tun_buf_into_pooled_truncates() {
-        let mut tun_buf = TunBuf::alloc_uninit();
+        let mut tun_buf = TunBuf::alloc_uninit(1400);
         tun_buf.as_mut()[..4].copy_from_slice(&[1, 2, 3, 4]);
         let pooled = tun_buf.into_pooled(4);
         assert_eq!(&pooled[..], &[1, 2, 3, 4]);
@@ -1433,9 +1459,49 @@ mod tests {
 
     #[test]
     fn tun_buf_new_has_headroom() {
-        let tun_buf = TunBuf::alloc_uninit();
+        let tun_buf = TunBuf::alloc_uninit(1400);
         let mut buf = tun_buf.into_pooled(0);
         assert!(buf.add_prefix(&[0u8; HEADROOM]));
+    }
+
+    #[test]
+    fn alloc_uninit_packet_buf_small_uses_datagram_pool() {
+        let buf = alloc_uninit_packet_buf(1400);
+        // Datagram pool: visible = MAX_DGRAM_SIZE - HEADROOM = 1490
+        assert_eq!(buf.len(), BufFactory::MAX_DGRAM_SIZE - HEADROOM);
+        let mut buf = buf;
+        buf.truncate(0);
+        assert!(buf.add_prefix(&[0u8; HEADROOM]));
+    }
+
+    #[test]
+    fn alloc_uninit_packet_buf_large_uses_generic_pool() {
+        let buf = alloc_uninit_packet_buf(BufFactory::MAX_DGRAM_SIZE);
+        assert_eq!(buf.len(), BufFactory::MAX_BUF_SIZE - HEADROOM);
+        let mut buf = buf;
+        buf.truncate(0);
+        assert!(buf.add_prefix(&[0u8; HEADROOM]));
+    }
+
+    #[test]
+    fn alloc_packet_buf_small_has_correct_data_and_headroom() {
+        let data = [1u8, 2, 3, 4, 5];
+        let buf = alloc_packet_buf(&data);
+        assert_eq!(&buf[..], &data);
+        let mut buf = buf;
+        assert!(buf.add_prefix(&[0u8; HEADROOM]));
+    }
+
+    #[test]
+    fn alloc_uninit_packet_buf_boundary() {
+        // Exactly at the threshold: length + HEADROOM == MAX_DGRAM_SIZE
+        let boundary_len = BufFactory::MAX_DGRAM_SIZE - HEADROOM;
+        let buf = alloc_uninit_packet_buf(boundary_len);
+        assert_eq!(buf.len(), boundary_len);
+
+        // One byte over: falls back to generic pool
+        let buf = alloc_uninit_packet_buf(boundary_len + 1);
+        assert_eq!(buf.len(), BufFactory::MAX_BUF_SIZE - HEADROOM);
     }
 
     #[test]
