@@ -1,1 +1,0 @@
-../../3rdparty/agentize/.claude-plugin/commands/mega-planner.md

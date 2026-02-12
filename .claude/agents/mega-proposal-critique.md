@@ -1,1 +1,0 @@
-../../3rdparty/agentize/.claude-plugin/agents/mega-proposal-critique.md

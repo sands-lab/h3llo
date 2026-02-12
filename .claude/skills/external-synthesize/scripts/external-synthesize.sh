@@ -1,1 +1,0 @@
-../../../../3rdparty/agentize/.claude-plugin/skills/external-synthesize/scripts/external-synthesize.sh
