@@ -207,6 +207,19 @@ pub struct Tuning {
     /// HTTP/3 keepalive interval (default: 20s). Sends QUIC PING frames to prevent idle timeout.
     #[serde(with = "serde_duration_secs")]
     pub h3_keepalive_interval: Duration,
+    /// QUIC congestion control algorithm (default: `"cubic"`).
+    ///
+    /// Accepted values: `"reno"`, `"cubic"`, `"bbr"`, `"bbr2"`.
+    /// Applied to both client (dial) and server (listener) QUIC connections.
+    #[serde(default = "default_cc_algorithm")]
+    pub h3_cc_algorithm: String,
+    /// Enable QUIC packet pacing (default: `false`).
+    ///
+    /// Smooths out bursty sends at the cost of slight latency increase.
+    /// Requires OS-level pacing support (e.g., `SO_TXTIME` on Linux).
+    /// Applied to both client and server QUIC connections.
+    #[serde(default)]
+    pub h3_enable_pacing: bool,
 }
 
 impl Default for Tuning {
@@ -221,6 +234,8 @@ impl Default for Tuning {
             h3_handshake_timeout: Duration::from_secs(30),
             h3_max_idle_timeout: Duration::from_secs(60),
             h3_keepalive_interval: Duration::from_secs(20),
+            h3_cc_algorithm: default_cc_algorithm(),
+            h3_enable_pacing: false,
         }
     }
 }
@@ -348,6 +363,15 @@ pub enum ValidationError {
     /// Allowed IP entry duplicates another entry on the same peer.
     #[error("peer '{peer_id}' has duplicate allowed_ips entry '{cidr}'")]
     PeerDuplicateAllowedIp { peer_id: String, cidr: String },
+    /// `tuning.h3_cc_algorithm` is not a recognized congestion control algorithm.
+    #[error(
+        "tuning.h3_cc_algorithm '{algorithm}' is not recognized \
+         (accepted: reno, cubic, bbr, bbr2)"
+    )]
+    InvalidCcAlgorithm {
+        /// The unrecognized algorithm name.
+        algorithm: String,
+    },
 }
 
 impl Config {
@@ -377,6 +401,15 @@ impl Config {
             errors.push(ValidationError::H3KeepaliveExceedsIdleTimeout {
                 keepalive: self.tuning.h3_keepalive_interval,
                 idle_timeout: self.tuning.h3_max_idle_timeout,
+            });
+        }
+
+        // Subset of quiche::CongestionControlAlgorithm::from_str();
+        // excludes internal aliases (bbr2_gcongestion).
+        const VALID_CC_ALGORITHMS: &[&str] = &["reno", "cubic", "bbr", "bbr2"];
+        if !VALID_CC_ALGORITHMS.contains(&self.tuning.h3_cc_algorithm.as_str()) {
+            errors.push(ValidationError::InvalidCcAlgorithm {
+                algorithm: self.tuning.h3_cc_algorithm.clone(),
             });
         }
 
@@ -529,6 +562,10 @@ fn default_dns() -> LocalDns {
 
 fn default_dns_server() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)
+}
+
+fn default_cc_algorithm() -> String {
+    "cubic".to_string()
 }
 
 fn default_ifname() -> String {
@@ -1683,6 +1720,56 @@ peers:
         assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(30));
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
         assert_eq!(cfg.tuning.h3_keepalive_interval, Duration::from_secs(20));
+        assert_eq!(cfg.tuning.h3_cc_algorithm, "cubic");
+        assert!(!cfg.tuning.h3_enable_pacing);
+    }
+
+    #[test]
+    fn tuning_cc_algorithm_override() {
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  h3_cc_algorithm: bbr
+  h3_enable_pacing: true
+peers:
+- id: example-node-2
+  h3:
+    token: example-node-2-token
+  tun:
+    allowed_ips:
+      - 192.168.180.2/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert_eq!(cfg.tuning.h3_cc_algorithm, "bbr");
+        assert!(cfg.tuning.h3_enable_pacing);
+    }
+
+    #[test]
+    fn rejects_invalid_cc_algorithm() {
+        let mut config = sample_h3_config();
+        config.tuning.h3_cc_algorithm = "invalid".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.iter().any(|e| matches!(e, ValidationError::InvalidCcAlgorithm { .. }))
+        ));
+    }
+
+    #[test]
+    fn accepts_all_valid_cc_algorithms() {
+        for algo in &["reno", "cubic", "bbr", "bbr2"] {
+            let mut config = sample_h3_config();
+            config.tuning.h3_cc_algorithm = algo.to_string();
+            assert!(
+                config.validate().is_ok(),
+                "should accept cc_algorithm={algo}"
+            );
+        }
     }
 
     #[test]
