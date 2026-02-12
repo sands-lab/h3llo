@@ -470,6 +470,8 @@ pub async fn dial_h3<P: RouteProbe>(
 
     quic_settings.max_send_udp_payload_size = quic_udp_payload_size;
     quic_settings.max_recv_udp_payload_size = quic_udp_payload_size;
+    quic_settings.cc_algorithm = tuning.h3_cc_algorithm.clone();
+    quic_settings.enable_pacing = tuning.h3_enable_pacing;
 
     let params = ConnectionParams::new_client(quic_settings, None, Hooks::default());
 
@@ -995,6 +997,8 @@ pub fn spawn_h3_listener(
     quic_settings.max_idle_timeout = Some(tuning.h3_max_idle_timeout);
     quic_settings.max_send_udp_payload_size = quic_udp_payload_size;
     quic_settings.max_recv_udp_payload_size = quic_udp_payload_size;
+    quic_settings.cc_algorithm = tuning.h3_cc_algorithm.clone();
+    quic_settings.enable_pacing = tuning.h3_enable_pacing;
 
     let conn_params = ConnectionParams::new_server(quic_settings, tls_config, Default::default());
 
