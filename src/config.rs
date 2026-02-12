@@ -189,9 +189,9 @@ pub struct Tuning {
     /// Minimum interval between reconnection attempts (default: 3s).
     #[serde(with = "serde_duration_secs")]
     pub reconnect_interval: Duration,
-    /// Metrics logging interval (default: 30s).
+    /// Metrics push interval (default: 30s).
     #[serde(with = "serde_duration_secs")]
-    pub log_metrics_interval: Duration,
+    pub metrics_push_interval: Duration,
     /// DNS query timeout (default: 2s).
     #[serde(with = "serde_duration_secs")]
     pub dns_query_timeout: Duration,
@@ -226,7 +226,7 @@ impl Default for Tuning {
             packet_queue_depth: 256,
             socket_buffer_size: 16,
             reconnect_interval: Duration::from_secs(3),
-            log_metrics_interval: Duration::from_secs(30),
+            metrics_push_interval: Duration::from_secs(30),
             dns_query_timeout: Duration::from_secs(2),
             dns_refresh_interval: Duration::from_secs(60),
             h3_handshake_timeout: Duration::from_secs(30),
@@ -1708,7 +1708,7 @@ peers:
         assert_eq!(cfg.tuning.packet_queue_depth, 256);
         assert_eq!(cfg.tuning.socket_buffer_size, 16);
         assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(3));
-        assert_eq!(cfg.tuning.log_metrics_interval, Duration::from_secs(30));
+        assert_eq!(cfg.tuning.metrics_push_interval, Duration::from_secs(30));
         assert_eq!(cfg.tuning.dns_query_timeout, Duration::from_secs(2));
         assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(60));
         assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(30));
@@ -1789,7 +1789,7 @@ peers:
         assert_eq!(cfg.tuning.packet_queue_depth, 512);
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(120));
         assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(3));
-        assert_eq!(cfg.tuning.log_metrics_interval, Duration::from_secs(30));
+        assert_eq!(cfg.tuning.metrics_push_interval, Duration::from_secs(30));
     }
 
     #[test]
