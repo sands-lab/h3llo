@@ -103,6 +103,11 @@ fn extract_and_validate_auth(
     validate_connect_auth(auth_header.as_deref(), peer_iter)
 }
 
+/// Returns `true` if `status` is a 3-digit ASCII HTTP 2xx code.
+fn is_success_status(status: &[u8]) -> bool {
+    status.len() == 3 && status[0] == b'2'
+}
+
 /// Validates that headers contain `capsule-protocol: ?1` per RFC 9484.
 fn has_capsule_protocol(headers: &[Header]) -> bool {
     headers
@@ -119,7 +124,7 @@ async fn send_response_headers(
     sender: &mut OutboundFrameSender,
     status: &[u8],
 ) -> Result<(), &'static str> {
-    let headers = if status.len() == 3 && status[0] == b'2' {
+    let headers = if is_success_status(status) {
         vec![
             Header::new(b":status", status),
             Header::new(b"capsule-protocol", b"?1"),
@@ -545,34 +550,31 @@ pub async fn dial_h3<P: RouteProbe>(
                         .iter()
                         .find(|h| h.name() == b":status")
                         .map(|h| h.value());
-                    match status {
-                        Some(s) if s.len() == 3 && s[0] == b'2' => {
-                            // Validate capsule-protocol header per RFC 9484
-                            if !has_capsule_protocol(&incoming.headers) {
-                                warn!(%remote_addr, "server response missing capsule-protocol: ?1");
-                                return Err(DialError::Handshake(
-                                    "server response missing capsule-protocol: ?1".to_string(),
-                                ));
-                            }
+                    let Some(s) = status else {
+                        return Err(DialError::Handshake("missing status".to_string()));
+                    };
+                    if s == b"401" {
+                        return Err(DialError::Auth("unauthorized".to_string()));
+                    }
+                    if !is_success_status(s) {
+                        let code_str = String::from_utf8_lossy(s);
+                        let code_num: u16 = code_str.parse().unwrap_or(0);
+                        return Err(DialError::Rejected(code_num));
+                    }
 
-                            debug!(%remote_addr, "CONNECT-IP accepted");
-                            status_validated = true;
-                            // If NewFlow already arrived, we can exit
-                            if datagram_tx.is_some() {
-                                break;
-                            }
-                        }
-                        Some(b"401") => {
-                            return Err(DialError::Auth("unauthorized".to_string()));
-                        }
-                        Some(code) => {
-                            let code_str = String::from_utf8_lossy(code);
-                            let code_num: u16 = code_str.parse().unwrap_or(0);
-                            return Err(DialError::Rejected(code_num));
-                        }
-                        None => {
-                            return Err(DialError::Handshake("missing status".to_string()));
-                        }
+                    // Validate capsule-protocol header per RFC 9484
+                    if !has_capsule_protocol(&incoming.headers) {
+                        warn!(%remote_addr, "server response missing capsule-protocol: ?1");
+                        return Err(DialError::Handshake(
+                            "server response missing capsule-protocol: ?1".to_string(),
+                        ));
+                    }
+
+                    debug!(%remote_addr, "CONNECT-IP accepted");
+                    status_validated = true;
+                    // If NewFlow already arrived, we can exit
+                    if datagram_tx.is_some() {
+                        break;
                     }
                 }
                 ClientH3Event::Core(H3Event::NewFlow {
@@ -1027,29 +1029,30 @@ pub fn spawn_h3_listener(
                     }
                 }
                 conn_result = accept_stream.next() => {
-                    match conn_result {
-                        Some(Ok(initial_conn)) => {
-                            let (driver, controller) =
-                                ServerH3Driver::new(Http3Settings::default());
-                            let quic_conn = initial_conn.start(driver);
-                            let remote_addr = quic_conn.peer_addr();
-                            drop(quic_conn);
-
-                            tokio::spawn(handle_h3_connection(
-                                controller,
-                                remote_addr,
-                                peer_tokens.clone(),
-                                events_tx.clone(),
-                                h3_handshake_timeout,
-                            ));
-                        }
-                        Some(Err(e)) => {
+                    let Some(result) = conn_result else {
+                        return Ok(());
+                    };
+                    let initial_conn = match result {
+                        Ok(c) => c,
+                        Err(e) => {
                             warn!(error = %e, "accept error");
+                            continue;
                         }
-                        None => {
-                            return Ok(());
-                        }
-                    }
+                    };
+
+                    let (driver, controller) =
+                        ServerH3Driver::new(Http3Settings::default());
+                    let quic_conn = initial_conn.start(driver);
+                    let remote_addr = quic_conn.peer_addr();
+                    drop(quic_conn);
+
+                    tokio::spawn(handle_h3_connection(
+                        controller,
+                        remote_addr,
+                        peer_tokens.clone(),
+                        events_tx.clone(),
+                        h3_handshake_timeout,
+                    ));
                 }
             }
         }
