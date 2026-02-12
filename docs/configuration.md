@@ -23,25 +23,24 @@ local:
       - 192.168.180.2/24 # required; supports subnets (e.g., /24) or host addresses (/32, /128)
     mtu: 1393 # optional, default: 1393 (see docs/protocol.md for MTU sizing)
 tuning: # optional, all fields have defaults
-  packet_queue_depth: 256 # optional, default: 256
+  packet_queue_depth: 2048 # optional, default: 2048
   socket_buffer_size: 16 # optional, default: 16 (MiB; 0 to use system default)
   reconnect_interval: 3 # optional, default: 3 (seconds)
-  metrics_push_interval: 30 # optional, default: 30 (seconds)
+  metrics_push_interval: 1000 # optional, default: 1000 (milliseconds)
   dns_query_timeout: 2 # optional, default: 2 (seconds)
   dns_refresh_interval: 60 # optional, default: 60 (seconds; 0 disables)
   h3_handshake_timeout: 30 # optional, default: 30 (seconds)
   h3_max_idle_timeout: 60 # optional, default: 60 (seconds)
   h3_keepalive_interval: 20 # optional, default: 20 (seconds; must be < h3_max_idle_timeout)
-  h3_cc_algorithm: cubic # optional, default: cubic (accepted: reno, cubic, bbr, bbr2)
-  h3_enable_pacing: false # optional, default: false
+  h3_cc_algorithm: bbr2 # optional, default: bbr2 (accepted: reno, cubic, bbr, bbr2)
+  h3_enable_pacing: true # optional, default: true
+  h3_insecure_skip_verify: false # optional, default: false (skip TLS verification; testing only)
 peers: # optional, default: []
 - id: example-node-1
   h3: # optional, conflicts with peers.bare; endpoint optional (listen-only if omitted)
     token: example-token-12ch # required whenever peers[].h3 is set (minimum 12 characters)
     endpoint: https://node1.example.com:443/path # optional; omit for listen-only
     sni: node1.example.com # optional; TLS SNI override (defaults to endpoint hostname)
-    ca: ./ca.pem # optional
-    insecure: false # optional, default: false
     bindif: eth0 # optional; omit to auto-detect
   bare: # optional, conflicts with peers.h3
     endpoint: udp://node1.example.com:6635 # required when peers.bare is set
@@ -67,25 +66,25 @@ peers: # optional, default: []
 - `local.tun.addrs` (required): IP prefixes in CIDR notation (e.g., `192.168.180.1/24`, `2001:db8::1/64`) for the TUN interface. Supports IPv4, IPv6, dual-stack, and multiple prefixes. Extra system routes come from `peers[].tun.allowed_ips` when `local.table=true`.
 - `local.tun.mtu` (default `1393`): MTU for the TUN interface; see [docs/protocol.md](protocol.md) for sizing guidance.
 - `tuning` (optional): All fields have defaults; omit the entire section to use defaults.
-- `tuning.packet_queue_depth` (default `256`): Bounded channel capacity for data-plane packet queues between actors. Counts batch messages, not individual packets; each batch carries one device I/O operation's worth of packets.
+- `tuning.packet_queue_depth` (default `2048`): Bounded channel capacity for data-plane packet queues between actors. Counts batch messages, not individual packets; each batch carries one device I/O operation's worth of packets.
 - `tuning.socket_buffer_size` (default `16`): Socket buffer size in megabytes, applied to all UDP sockets via SO_RCVBUF and SO_SNDBUF. Set to `0` to skip buffer configuration and use system defaults. On Linux, the effective buffer size may be clamped by `net.core.rmem_max` / `net.core.wmem_max`; setting failures are logged as warnings without aborting.
 - `tuning.reconnect_interval` (default `3`): Minimum seconds between `try_connect` attempts per peer.
-- `tuning.metrics_push_interval` (default `30`): Seconds between periodic metric push emissions from actors to the orchestrator.
+- `tuning.metrics_push_interval` (default `1000`): Milliseconds between periodic metric push emissions from actors to the orchestrator.
 - `tuning.dns_query_timeout` (default `2`): Seconds before a DNS query is considered timed out and retried.
 - `tuning.dns_refresh_interval` (default `60`): DNS refresh timer in seconds (`0` disables). The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)).
 - `tuning.h3_handshake_timeout` (default `30`): Seconds to wait for an HTTP/3 handshake to complete.
 - `tuning.h3_max_idle_timeout` (default `60`): QUIC idle timeout in seconds; connections idle longer than this are closed.
 - `tuning.h3_keepalive_interval` (default `20`): QUIC keepalive interval in seconds; sends PING frames to prevent idle timeout. Must be less than `h3_max_idle_timeout`.
-- `tuning.h3_cc_algorithm` (default `cubic`): QUIC congestion control algorithm. Accepted values: `reno`, `cubic`, `bbr`, `bbr2`. Applied to both client (dial) and server (listener) QUIC connections.
-- `tuning.h3_enable_pacing` (default `false`): Enable QUIC packet pacing to smooth bursty sends. Requires OS-level support (e.g., `SO_TXTIME` on Linux). Applied to both client and server QUIC connections.
+- `tuning.h3_cc_algorithm` (default `bbr2`): QUIC congestion control algorithm. Accepted values: `reno`, `cubic`, `bbr`, `bbr2`. Applied to both client (dial) and server (listener) QUIC connections.
+- `tuning.h3_enable_pacing` (default `true`): Enable QUIC packet pacing to smooth bursty sends. Requires OS-level support (e.g., `SO_TXTIME` on Linux). Applied to both client and server QUIC connections.
+- `tuning.h3_insecure_skip_verify` (default `false`): Skip TLS certificate verification globally for all H3 connections. Intended for testing with self-signed certificates only. **Not recommended for production.**
 - `peers[]`: Remote peer entries.
 - `peers[].id`: Remote peer identifier; must be unique within the configuration and non-empty.
 - `peers[].h3.token`: Remote peer authentication token; required (and must be at least 12 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. Must be unique across all peers. Bearer Token auth for CONNECT uses `Authorization: Bearer <token>`; server matches tokens to identify peers.
 - `peers[].h3.endpoint` (optional): HTTP/3 dialing address (scheme/host/port/path); omit to wait for inbound HTTP/3 from the peer. Mutually exclusive with `peers[].bare`.
 - `peers[].h3.sni` (optional): TLS Server Name Indication (SNI) override for the QUIC/TLS handshake. When set, this value is sent as the SNI instead of the hostname from `peers[].h3.endpoint`. The HTTP/3 `:authority` pseudo-header is derived from the `endpoint` authority (`host`, or `host:port` when a non-default HTTPS port is used) and is not affected by `sni`. Useful for reverse proxy traversal, CDN-fronted deployments, or when `endpoint` uses an IP address but the server certificate contains a DNS name.
 - `peers[].h3.bindif` (optional): Interface for HTTP/3 dialer. When omitted, auto-detects at most one interface. Probe/bind fallbacks and recursive-routing warnings are described in [docs/internals.md](internals.md).
-- `peers[].h3.ca`: Custom CA bundle path for validating the peer’s certificate (useful for self-signed certs); otherwise the system trust store is used.
-- `peers[].h3.insecure` (default `false`): Skip TLS certificate validation (not recommended; prefer `ca`).
+- Custom CA certificate bundles are not currently supported. The underlying QUIC library (tokio-quiche) does not expose an API for configuring custom CA certificates; all TLS verification uses the system trust store.
 - `peers[].bare.endpoint`: BareUDP dialing address; mutually exclusive with peers[].h3. DNS handling, source-IP filtering, and multi-answer behavior are detailed in [docs/protocol.md](protocol.md).
 - `peers[].bare.bindif` (optional): Interface for BareUDP dialing. Auto-detect when absent; binding and fallback behavior is in [docs/internals.md](internals.md).
 - `peers[].tun.allowed_ips` (required): Prefixes routed via this peer; longest-prefix wins when multiple peers overlap.

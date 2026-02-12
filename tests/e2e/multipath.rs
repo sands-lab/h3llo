@@ -51,12 +51,12 @@ peers:
     h3:
       endpoint: "https://node-b-mp.h3llo-test-net:443/"
       token: multipath-token-12ch
-      insecure: true
     tun:
       allowed_ips:
         - 10.0.1.0/24
 tuning:
   dns_refresh_interval: 1
+  h3_insecure_skip_verify: true
 "#
     )
 }
@@ -90,12 +90,12 @@ peers:
     h3:
       endpoint: "https://node-a-mp.h3llo-test-net:443/"
       token: multipath-token-12ch
-      insecure: true
     tun:
       allowed_ips:
         - 10.0.1.0/24
 tuning:
   dns_refresh_interval: 1
+  h3_insecure_skip_verify: true
 "#
     )
 }

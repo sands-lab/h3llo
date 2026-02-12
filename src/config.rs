@@ -134,11 +134,6 @@ pub struct PeerH3 {
     pub endpoint: Option<H3Endpoint>,
     /// Remote peer token (>= 12 characters) required whenever HTTP/3 is configured, including listen-only peers.
     pub token: String,
-    /// Optional custom CA bundle.
-    pub ca: Option<String>,
-    /// Whether to skip TLS validation (default: false).
-    #[serde(default)]
-    pub insecure: bool,
     /// Optional interface to bind HTTP/3 dialers.
     pub bindif: Option<String>,
     /// Optional TLS Server Name Indication (SNI) override.
@@ -172,11 +167,11 @@ pub struct PeerTun {
 ///
 /// All fields have sensible defaults. The entire section is optional in YAML.
 /// When partially specified, unset fields use their defaults.
-/// Duration fields are serialized as integer seconds in YAML.
+/// Duration fields are serialized as integer seconds in YAML unless noted otherwise.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Tuning {
-    /// Data-plane packet queue depth for bounded backpressure channels (default: 256).
+    /// Data-plane packet queue depth for bounded backpressure channels (default: 2048).
     pub packet_queue_depth: usize,
     /// Socket buffer size in megabytes for SO_RCVBUF and SO_SNDBUF (default: 16).
     ///
@@ -186,8 +181,8 @@ pub struct Tuning {
     /// Minimum interval between reconnection attempts (default: 3s).
     #[serde(with = "serde_duration_secs")]
     pub reconnect_interval: Duration,
-    /// Metrics push interval (default: 30s).
-    #[serde(with = "serde_duration_secs")]
+    /// Metrics push interval in milliseconds (default: 1000ms).
+    #[serde(with = "serde_duration_millis")]
     pub metrics_push_interval: Duration,
     /// DNS query timeout (default: 2s).
     #[serde(with = "serde_duration_secs")]
@@ -204,33 +199,40 @@ pub struct Tuning {
     /// HTTP/3 keepalive interval (default: 20s). Sends QUIC PING frames to prevent idle timeout.
     #[serde(with = "serde_duration_secs")]
     pub h3_keepalive_interval: Duration,
-    /// QUIC congestion control algorithm (default: `"cubic"`).
+    /// QUIC congestion control algorithm (default: `"bbr2"`).
     ///
     /// Accepted values: `"reno"`, `"cubic"`, `"bbr"`, `"bbr2"`, `"none"`.
     /// Applied to both client (dial) and server (listener) QUIC connections.
     pub h3_cc_algorithm: String,
-    /// Enable QUIC packet pacing (default: `false`).
+    /// Enable QUIC packet pacing (default: `true`).
     ///
     /// Smooths out bursty sends at the cost of slight latency increase.
     /// Requires OS-level pacing support (e.g., `SO_TXTIME` on Linux).
     /// Applied to both client and server QUIC connections.
     pub h3_enable_pacing: bool,
+    /// Skip TLS certificate verification for all H3 connections (default: `false`).
+    ///
+    /// When `true`, QUIC/TLS peer verification is disabled. Intended for testing
+    /// with self-signed certificates only. **Not recommended for production.**
+    #[serde(default)]
+    pub h3_insecure_skip_verify: bool,
 }
 
 impl Default for Tuning {
     fn default() -> Self {
         Self {
-            packet_queue_depth: 256,
+            packet_queue_depth: 2048,
             socket_buffer_size: 16,
             reconnect_interval: Duration::from_secs(3),
-            metrics_push_interval: Duration::from_secs(30),
+            metrics_push_interval: Duration::from_millis(1000),
             dns_query_timeout: Duration::from_secs(2),
             dns_refresh_interval: Duration::from_secs(60),
             h3_handshake_timeout: Duration::from_secs(30),
             h3_max_idle_timeout: Duration::from_secs(60),
             h3_keepalive_interval: Duration::from_secs(20),
-            h3_cc_algorithm: "cubic".to_string(),
-            h3_enable_pacing: false,
+            h3_cc_algorithm: "bbr2".to_string(),
+            h3_enable_pacing: true,
+            h3_insecure_skip_verify: false,
         }
     }
 }
@@ -254,6 +256,21 @@ mod serde_duration_secs {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         let secs = u64::deserialize(d)?;
         Ok(Duration::from_secs(secs))
+    }
+}
+
+/// Serde helper: serializes `Duration` as integer milliseconds in YAML.
+mod serde_duration_millis {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(d.as_millis() as u64)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let millis = u64::deserialize(d)?;
+        Ok(Duration::from_millis(millis))
     }
 }
 
@@ -812,8 +829,6 @@ mod tests {
                         port: 443,
                         path: "/path".to_string(),
                     }),
-                    ca: None,
-                    insecure: false,
                     bindif: None,
                     sni: None,
                 }),
@@ -1700,17 +1715,21 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.packet_queue_depth, 256);
+        assert_eq!(cfg.tuning.packet_queue_depth, 2048);
         assert_eq!(cfg.tuning.socket_buffer_size, 16);
         assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(3));
-        assert_eq!(cfg.tuning.metrics_push_interval, Duration::from_secs(30));
+        assert_eq!(
+            cfg.tuning.metrics_push_interval,
+            Duration::from_millis(1000)
+        );
         assert_eq!(cfg.tuning.dns_query_timeout, Duration::from_secs(2));
         assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(60));
         assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(30));
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
         assert_eq!(cfg.tuning.h3_keepalive_interval, Duration::from_secs(20));
-        assert_eq!(cfg.tuning.h3_cc_algorithm, "cubic");
-        assert!(!cfg.tuning.h3_enable_pacing);
+        assert_eq!(cfg.tuning.h3_cc_algorithm, "bbr2");
+        assert!(cfg.tuning.h3_enable_pacing);
+        assert!(!cfg.tuning.h3_insecure_skip_verify);
     }
 
     #[test]
@@ -1722,8 +1741,8 @@ local:
     addrs:
       - 192.168.180.1/32
 tuning:
-  h3_cc_algorithm: bbr
-  h3_enable_pacing: true
+  h3_cc_algorithm: cubic
+  h3_enable_pacing: false
 peers:
 - id: example-node-2
   h3:
@@ -1733,8 +1752,8 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.h3_cc_algorithm, "bbr");
-        assert!(cfg.tuning.h3_enable_pacing);
+        assert_eq!(cfg.tuning.h3_cc_algorithm, "cubic");
+        assert!(!cfg.tuning.h3_enable_pacing);
     }
 
     #[test]
@@ -1784,7 +1803,10 @@ peers:
         assert_eq!(cfg.tuning.packet_queue_depth, 512);
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(120));
         assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(3));
-        assert_eq!(cfg.tuning.metrics_push_interval, Duration::from_secs(30));
+        assert_eq!(
+            cfg.tuning.metrics_push_interval,
+            Duration::from_millis(1000)
+        );
     }
 
     #[test]
@@ -1879,5 +1901,90 @@ peers:
 
         tuning.socket_buffer_size = 1;
         assert_eq!(tuning.socket_buffer_bytes(), 1024 * 1024);
+    }
+
+    #[test]
+    fn tuning_insecure_skip_verify_override() {
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  h3_insecure_skip_verify: true
+peers:
+- id: example-node-2
+  h3:
+    token: example-node-2-token
+  tun:
+    allowed_ips:
+      - 192.168.180.2/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert!(cfg.tuning.h3_insecure_skip_verify);
+    }
+
+    #[test]
+    fn metrics_push_interval_millis_override() {
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  metrics_push_interval: 500
+peers:
+- id: example-node-2
+  h3:
+    token: example-node-2-token
+  tun:
+    allowed_ips:
+      - 192.168.180.2/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert_eq!(cfg.tuning.metrics_push_interval, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn rejects_removed_peer_h3_fields() {
+        // `ca` field removed
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+peers:
+- id: node-2
+  h3:
+    token: example-node-2-token
+    ca: ./ca.pem
+  tun:
+    allowed_ips:
+      - 192.168.180.2/32
+"#;
+        let result = Config::load_from_str(yaml);
+        assert!(matches!(result, Err(ConfigError::Parse(_))));
+
+        // `insecure` field removed
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+peers:
+- id: node-2
+  h3:
+    token: example-node-2-token
+    insecure: true
+  tun:
+    allowed_ips:
+      - 192.168.180.2/32
+"#;
+        let result = Config::load_from_str(yaml);
+        assert!(matches!(result, Err(ConfigError::Parse(_))));
     }
 }
