@@ -113,6 +113,23 @@ impl TunBuf {
         self.0
     }
 
+    /// Ensures capacity for `additional` bytes, upgrading to a max-capacity
+    /// pooled buffer when the current buffer crosses the single-datagram
+    /// threshold. This avoids incremental Vec reallocations during GRO
+    /// coalescing on the TUN TX path.
+    #[cfg(target_os = "linux")]
+    fn buf_extend(&mut self, additional: usize) {
+        let current_len = self.0.len();
+        if current_len <= BufFactory::MAX_DGRAM_SIZE
+            && current_len + additional > BufFactory::MAX_DGRAM_SIZE
+        {
+            let mut new_buf = BufFactory::get_max_buf();
+            new_buf.truncate(current_len);
+            new_buf[..current_len].copy_from_slice(&self.0);
+            self.0 = new_buf;
+        }
+    }
+
     /// Prepends a zeroed virtio_net_hdr using headroom when available,
     /// falling back to alloc + copy otherwise. Called by `send_batch`
     /// implementations, not by the TUN TX actor.
@@ -161,12 +178,13 @@ impl tun_rs::ExpandBuffer for TunBuf {
         if new_len <= current {
             self.0.truncate(new_len);
         } else {
-            // ConsumeBuffer only has Extend<&u8>; iterate bytes.
+            self.buf_extend(new_len - current);
             self.0.extend(std::iter::repeat_n(&val, new_len - current));
         }
     }
 
     fn buf_extend_from_slice(&mut self, src: &[u8]) {
+        self.buf_extend(src.len());
         self.0.extend(src.iter());
     }
 }
@@ -1517,6 +1535,68 @@ mod tests {
         let mut tun_buf = TunBuf::from(buf);
         tun_buf.as_mut()[0] = 99;
         assert_eq!(tun_buf.as_ref()[0], 99);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_buf_expand_upgrades_buffer_on_threshold_crossing() {
+        let small_data = vec![0xABu8; BufFactory::MAX_DGRAM_SIZE];
+        let buf = BufFactory::buf_from_slice(&small_data);
+        let mut tun_buf = TunBuf::from(buf);
+        assert_eq!(tun_buf.as_ref().len(), BufFactory::MAX_DGRAM_SIZE);
+
+        let extra = [0xCDu8; 100];
+        tun_rs::ExpandBuffer::buf_extend_from_slice(&mut tun_buf, &extra);
+
+        let result = tun_buf.as_ref();
+        assert_eq!(result.len(), BufFactory::MAX_DGRAM_SIZE + 100);
+        assert_eq!(&result[..BufFactory::MAX_DGRAM_SIZE], &small_data[..]);
+        assert_eq!(&result[BufFactory::MAX_DGRAM_SIZE..], &extra[..]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_buf_expand_no_upgrade_when_already_large() {
+        let large_data = vec![0xABu8; BufFactory::MAX_DGRAM_SIZE + 1];
+        let buf = BufFactory::buf_from_slice(&large_data);
+        let mut tun_buf = TunBuf::from(buf);
+
+        let extra = [0xCDu8; 50];
+        tun_rs::ExpandBuffer::buf_extend_from_slice(&mut tun_buf, &extra);
+
+        let result = tun_buf.as_ref();
+        assert_eq!(result.len(), BufFactory::MAX_DGRAM_SIZE + 1 + 50);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_buf_expand_no_upgrade_when_below_threshold() {
+        let small_data = vec![0xABu8; 100];
+        let buf = BufFactory::buf_from_slice(&small_data);
+        let mut tun_buf = TunBuf::from(buf);
+
+        let extra = [0xCDu8; 50];
+        tun_rs::ExpandBuffer::buf_extend_from_slice(&mut tun_buf, &extra);
+
+        let result = tun_buf.as_ref();
+        assert_eq!(result.len(), 150);
+        assert_eq!(&result[..100], &small_data[..]);
+        assert_eq!(&result[100..], &extra[..]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_buf_resize_triggers_upgrade() {
+        let small_data = vec![0xABu8; 500];
+        let buf = BufFactory::buf_from_slice(&small_data);
+        let mut tun_buf = TunBuf::from(buf);
+
+        tun_rs::ExpandBuffer::buf_resize(&mut tun_buf, BufFactory::MAX_DGRAM_SIZE + 100, 0xFF);
+
+        let result = tun_buf.as_ref();
+        assert_eq!(result.len(), BufFactory::MAX_DGRAM_SIZE + 100);
+        assert_eq!(&result[..500], &small_data[..]);
+        assert!(result[500..].iter().all(|&b| b == 0xFF));
     }
 
     #[cfg(target_os = "linux")]
