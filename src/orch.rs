@@ -497,7 +497,7 @@ impl Orchestrator {
                 let peer_tokens: HashMap<String, String> = config
                     .peers
                     .iter()
-                    .filter(|p| p.enabled && p.h3.is_some())
+                    .filter(|p| p.h3.is_some())
                     .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().token.clone()))
                     .collect();
 
@@ -526,11 +526,10 @@ impl Orchestrator {
             _ => None,
         };
 
-        // Initialize unified peer state from config (enabled peers only)
+        // Initialize unified peer state from config
         let peers: HashMap<String, PeerEntry> = config
             .peers
             .iter()
-            .filter(|p| p.enabled)
             .map(|p| (p.id.clone(), PeerEntry::new(p.clone())))
             .collect();
 
@@ -1054,7 +1053,7 @@ mod tests {
         use crate::config::UdpEndpoint;
         Peer {
             id: id.to_string(),
-            enabled: true,
+
             h3: None,
             bare: Some(PeerBare {
                 endpoint: UdpEndpoint {
@@ -1074,7 +1073,7 @@ mod tests {
         use crate::config::UdpEndpoint;
         Peer {
             id: id.to_string(),
-            enabled: true,
+
             h3: None,
             bare: Some(PeerBare {
                 endpoint: UdpEndpoint {
@@ -1474,7 +1473,7 @@ mod tests {
     fn collect_hostnames_skips_non_bare_peers() {
         let peer = Peer {
             id: "h3only".to_string(),
-            enabled: true,
+
             h3: None,
             bare: None,
             tun: PeerTun {
@@ -1508,7 +1507,7 @@ mod tests {
         use crate::config::{H3Endpoint, PeerH3};
         Peer {
             id: id.to_string(),
-            enabled: true,
+
             h3: Some(PeerH3 {
                 endpoint: Some(H3Endpoint {
                     host: host.to_string(),

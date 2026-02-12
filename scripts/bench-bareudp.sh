@@ -77,7 +77,6 @@ local:
     listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-b
-    enabled: true
     bare:
       endpoint: "udp://192.168.100.2:5353"
     tun:
@@ -99,7 +98,6 @@ local:
     listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-a
-    enabled: true
     bare:
       endpoint: "udp://192.168.100.1:5353"
     tun:

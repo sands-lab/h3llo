@@ -98,7 +98,6 @@ tuning:
   h3_cc_algorithm: $H3_CC
 peers:
   - id: node-b
-    enabled: true
     h3:
       token: "$H3_TOKEN"
       endpoint: "https://192.168.100.2:${H3_PORT}${H3_PATH}"
@@ -126,7 +125,6 @@ tuning:
   h3_cc_algorithm: $H3_CC
 peers:
   - id: node-a
-    enabled: true
     h3:
       token: "$H3_TOKEN"
       endpoint: "https://192.168.100.1:${H3_PORT}${H3_PATH}"

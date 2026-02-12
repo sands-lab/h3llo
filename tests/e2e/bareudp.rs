@@ -28,7 +28,6 @@ local:
     listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-b
-    enabled: true
     bare:
       endpoint: "udp://node-b.h3llo-test-net:5353"
     tun:
@@ -53,7 +52,6 @@ local:
     listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-a
-    enabled: true
     bare:
       endpoint: "udp://node-a.h3llo-test-net:5353"
     tun:
@@ -185,7 +183,6 @@ local:
     listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-a-filter
-    enabled: true
     bare:
       endpoint: "udp://node-a-filter.h3llo-test-net:5353"
     tun:
@@ -208,7 +205,6 @@ local:
     listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-b
-    enabled: true
     bare:
       endpoint: "udp://node-b.h3llo-test-net:5353"
     tun:
@@ -304,7 +300,6 @@ local:
     listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-b-mtu
-    enabled: true
     bare:
       endpoint: "udp://node-b-mtu.h3llo-test-net:5353"
     tun:
@@ -326,7 +321,6 @@ local:
     listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-a-mtu
-    enabled: true
     bare:
       endpoint: "udp://node-a-mtu.h3llo-test-net:5353"
     tun:
