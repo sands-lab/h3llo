@@ -66,16 +66,7 @@ fn make_quic_settings(tuning: &Tuning, tun_mtu: u16) -> QuicSettings {
 const CONTEXT_ID_IP: u8 = 0x00;
 
 /// Maximum packets per H3 RX batch before flush.
-///
-/// Matches TUN device `IDEAL_BATCH_SIZE` (128 on Linux) for optimal
-/// GRO coalescing throughput in the downstream TUN TX path.
-const BATCH_MAX_PACKETS: usize = 128;
-
-/// Maximum total payload bytes per H3 RX batch before flush.
-///
-/// Matches TUN GRO max coalesced payload (65535 bytes) so the batch
-/// fits in a single write syscall.
-const BATCH_MAX_BYTES: usize = 65535;
+const H3_RX_BATCH_SIZE: usize = 128;
 
 /// Conservative CONNECT-IP encapsulation overhead in bytes per
 /// [RFC 9484 Section 7.2](https://datatracker.ietf.org/doc/html/rfc9484#section-7.2).
@@ -666,13 +657,11 @@ pub struct H3Rx {
 /// * `packet_tx` - Bounded channel to push received packets into (data plane).
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
-/// * `mtu` - TUN MTU for computing per-batch byte limit.
 pub fn spawn_h3_rx(
     rx: H3Rx,
     packet_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
-    mtu: usize,
 ) -> JoinHandle<ActorExitResult> {
     let H3Rx {
         peer_id,
@@ -683,8 +672,6 @@ pub fn spawn_h3_rx(
     tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::Http3, Direction::Rx);
         let mut ticker = time::interval(interval);
-        let batch_byte_limit = BATCH_MAX_BYTES - mtu;
-
         loop {
             tokio::select! {
                 frame = datagram_rx.recv() => {
@@ -693,7 +680,7 @@ pub fn spawn_h3_rx(
                         return Ok(());
                     };
 
-                    let mut batch: Vec<PooledBuf> = Vec::with_capacity(BATCH_MAX_PACKETS);
+                    let mut batch: Vec<PooledBuf> = Vec::with_capacity(H3_RX_BATCH_SIZE);
                     let mut ok_pkts: u64 = 0;
                     let mut ok_bytes: u64 = 0;
 
@@ -705,9 +692,7 @@ pub fn spawn_h3_rx(
                     );
 
                     // Drain all immediately-ready frames without awaiting.
-                    while batch.len() < BATCH_MAX_PACKETS
-                        && (ok_bytes as usize) < batch_byte_limit
-                    {
+                    while batch.len() < H3_RX_BATCH_SIZE {
                         let Some(f) = datagram_rx.try_recv().ok() else { break };
                         handle_inbound_frame(
                             &peer, f,
@@ -1834,13 +1819,8 @@ mod tests {
 
         // Server RX actor
         let (server_packet_tx, mut server_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
-        let _server_rx_handle = spawn_h3_rx(
-            server_rx,
-            server_packet_tx,
-            events_tx,
-            metrics_interval,
-            crate::config::default_mtu() as usize,
-        );
+        let _server_rx_handle =
+            spawn_h3_rx(server_rx, server_packet_tx, events_tx, metrics_interval);
 
         // Send test packet (allocate with headroom for H3 TX encoding)
         use crate::tun::alloc_packet_buf;
@@ -1936,7 +1916,6 @@ mod tests {
             server_to_client_tx,
             events_tx.clone(),
             metrics_interval,
-            crate::config::default_mtu() as usize,
         );
 
         // Split server connection
@@ -1952,13 +1931,8 @@ mod tests {
         );
 
         let (client_to_server_tx, mut server_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
-        let _server_rx_handle = spawn_h3_rx(
-            server_rx,
-            client_to_server_tx,
-            events_tx,
-            metrics_interval,
-            crate::config::default_mtu() as usize,
-        );
+        let _server_rx_handle =
+            spawn_h3_rx(server_rx, client_to_server_tx, events_tx, metrics_interval);
 
         // Test client -> server
         let packet_c2s = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));

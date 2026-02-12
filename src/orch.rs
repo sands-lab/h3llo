@@ -848,7 +848,6 @@ impl Orchestrator {
             self.tun_packet_tx.clone(),
             self.events_tx.clone(),
             self.tuning.log_metrics_interval,
-            self.mtu,
         );
 
         // Spawn TX actor
