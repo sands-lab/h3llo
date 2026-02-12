@@ -211,14 +211,12 @@ pub struct Tuning {
     ///
     /// Accepted values: `"reno"`, `"cubic"`, `"bbr"`, `"bbr2"`.
     /// Applied to both client (dial) and server (listener) QUIC connections.
-    #[serde(default = "default_cc_algorithm")]
     pub h3_cc_algorithm: String,
     /// Enable QUIC packet pacing (default: `false`).
     ///
     /// Smooths out bursty sends at the cost of slight latency increase.
     /// Requires OS-level pacing support (e.g., `SO_TXTIME` on Linux).
     /// Applied to both client and server QUIC connections.
-    #[serde(default)]
     pub h3_enable_pacing: bool,
 }
 
@@ -234,7 +232,7 @@ impl Default for Tuning {
             h3_handshake_timeout: Duration::from_secs(30),
             h3_max_idle_timeout: Duration::from_secs(60),
             h3_keepalive_interval: Duration::from_secs(20),
-            h3_cc_algorithm: default_cc_algorithm(),
+            h3_cc_algorithm: "cubic".to_string(),
             h3_enable_pacing: false,
         }
     }
@@ -562,10 +560,6 @@ fn default_dns() -> LocalDns {
 
 fn default_dns_server() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53)
-}
-
-fn default_cc_algorithm() -> String {
-    "cubic".to_string()
 }
 
 fn default_ifname() -> String {
