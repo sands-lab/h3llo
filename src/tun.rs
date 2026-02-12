@@ -54,14 +54,34 @@ pub(crate) fn alloc_packet_buf(data: &[u8]) -> PooledBuf {
     buf
 }
 
-/// Zero-copy wrapper around [`PooledBuf`] for TUN TX.
+/// Zero-copy wrapper around [`PooledBuf`] for TUN I/O (RX and TX).
 ///
-/// On Linux, implements tun-rs [`ExpandBuffer`] for direct use with
-/// `AsyncDevice::send_multiple`. The virtio_net_hdr is prepended inside
-/// [`TunTx::send_batch`] — callers never deal with header details.
+/// RX: [`TunBuf::new()`] allocates with headroom; [`into_pooled`](Self::into_pooled) truncates.
+/// TX: `From<PooledBuf>` constructs; [`TunTx::send_batch`] prepends virtio_net_hdr.
 pub struct TunBuf(PooledBuf);
 
 impl TunBuf {
+    /// Allocates a max-capacity pooled buffer with [`HEADROOM`] bytes reserved.
+    ///
+    /// The caller must call [`into_pooled`](Self::into_pooled) after filling
+    /// to set the actual length.
+    pub fn new() -> Self {
+        let mut buf = BufFactory::get_max_buf();
+        buf.pop_front(HEADROOM);
+        Self(buf)
+    }
+
+    /// Truncates to `len` bytes and returns the underlying [`PooledBuf`].
+    pub fn into_pooled(mut self, len: usize) -> PooledBuf {
+        debug_assert!(
+            len <= self.0.len(),
+            "into_pooled: len {len} exceeds buffer visible length {}",
+            self.0.len()
+        );
+        self.0.truncate(len);
+        self.0
+    }
+
     /// Prepends a zeroed virtio_net_hdr using headroom when available,
     /// falling back to alloc + copy otherwise. Called by `send_batch`
     /// implementations, not by the TUN TX actor.
@@ -74,6 +94,12 @@ impl TunBuf {
             debug_assert!(ok, "alloc_packet_buf guarantees HEADROOM bytes");
             self.0 = buf;
         }
+    }
+}
+
+impl Default for TunBuf {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -153,12 +179,12 @@ pub trait TunRx: Send + 'static {
     ///
     /// * `scratch` - Scratch buffer for the raw kernel read (sized via
     ///   [`scratch_buf_size`](Self::scratch_buf_size)).
-    /// * `bufs` - Pre-allocated packet buffers to receive into.
+    /// * `bufs` - Pre-allocated [`TunBuf`] packet buffers to receive into.
     /// * `sizes` - Output lengths for each received packet.
     fn recv_batch(
         &mut self,
         scratch: &mut [u8],
-        bufs: &mut [Vec<u8>],
+        bufs: &mut [TunBuf],
         sizes: &mut [usize],
     ) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 }
@@ -295,7 +321,7 @@ impl TunRx for TunReader {
     async fn recv_batch(
         &mut self,
         scratch: &mut [u8],
-        bufs: &mut [Vec<u8>],
+        bufs: &mut [TunBuf],
         sizes: &mut [usize],
     ) -> io::Result<usize> {
         #[cfg(target_os = "linux")]
@@ -305,7 +331,7 @@ impl TunRx for TunReader {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = scratch;
-            let len = self.device.recv(&mut bufs[0]).await?;
+            let len = self.device.recv(bufs[0].as_mut()).await?;
             sizes[0] = len;
             Ok(1)
         }
@@ -597,12 +623,11 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
     let scratch_buf_size = tun.scratch_buf_size();
 
     let handle = tokio::spawn(async move {
-        let mtu = tun.mtu();
         let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
         let mut ticker = time::interval(interval);
 
         let mut scratch = vec![0u8; scratch_buf_size];
-        let mut bufs = vec![vec![0u8; mtu]; batch_size];
+        let mut bufs: Vec<TunBuf> = (0..batch_size).map(|_| TunBuf::new()).collect();
         let mut sizes = vec![0usize; batch_size];
 
         loop {
@@ -618,7 +643,8 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                                 continue;
                             };
 
-                            let first_packet = alloc_packet_buf(&bufs[first_idx][..sizes[first_idx]]);
+                            let first_packet = std::mem::take(&mut bufs[first_idx])
+                                .into_pooled(sizes[first_idx]);
                             let total_bytes: u64 = sizes[..count].iter().map(|&s| s as u64).sum();
                             let Some(dest) = extract_dst_ip(&first_packet) else {
                                 counters.record_drop(DropReason::InvalidIpVersion, count as u64, total_bytes);
@@ -634,7 +660,10 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             batch.push(first_packet);
                             for i in 0..count {
                                 if i != first_idx && sizes[i] > 0 {
-                                    batch.push(alloc_packet_buf(&bufs[i][..sizes[i]]));
+                                    batch.push(
+                                        std::mem::take(&mut bufs[i])
+                                            .into_pooled(sizes[i]),
+                                    );
                                 }
                             }
 
@@ -843,13 +872,14 @@ pub mod test_support {
         async fn recv_batch(
             &mut self,
             _scratch: &mut [u8],
-            bufs: &mut [Vec<u8>],
+            bufs: &mut [TunBuf],
             sizes: &mut [usize],
         ) -> io::Result<usize> {
             match self.packet_rx.recv().await {
                 Some(packet) => {
-                    let len = packet.len().min(bufs[0].len());
-                    bufs[0][..len].copy_from_slice(&packet[..len]);
+                    let dst = bufs[0].as_mut();
+                    let len = packet.len().min(dst.len());
+                    dst[..len].copy_from_slice(&packet[..len]);
                     sizes[0] = len;
                     Ok(1)
                 }
@@ -1359,7 +1389,7 @@ mod tests {
     async fn memory_tun_rx_recv_batch_returns_packet() {
         let (mut rx, _tx, inject, _output) = memory_tun("mem-rx-batch", 64);
         let mut scratch = vec![0u8; rx.scratch_buf_size()];
-        let mut bufs = vec![vec![0u8; 64]; 1];
+        let mut bufs = vec![TunBuf::new()];
         let mut sizes = vec![0usize; 1];
         inject.send(vec![10, 20, 30]).await.unwrap();
         let count = rx
@@ -1368,7 +1398,7 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(sizes[0], 3);
-        assert_eq!(&bufs[0][..3], &[10, 20, 30]);
+        assert_eq!(&bufs[0].as_ref()[..3], &[10, 20, 30]);
     }
 
     #[tokio::test]
@@ -1385,13 +1415,28 @@ mod tests {
         let (mut rx, _tx, inject, _output) = memory_tun("mem-rx-close", 64);
         drop(inject);
         let mut scratch = vec![0u8; rx.scratch_buf_size()];
-        let mut bufs = vec![vec![0u8; 64]; 1];
+        let mut bufs = vec![TunBuf::new()];
         let mut sizes = vec![0usize; 1];
         let result = rx.recv_batch(&mut scratch, &mut bufs, &mut sizes).await;
         assert!(result.is_err());
     }
 
     // ========== TunBuf Tests ==========
+
+    #[test]
+    fn tun_buf_into_pooled_truncates() {
+        let mut tun_buf = TunBuf::new();
+        tun_buf.as_mut()[..4].copy_from_slice(&[1, 2, 3, 4]);
+        let pooled = tun_buf.into_pooled(4);
+        assert_eq!(&pooled[..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn tun_buf_new_has_headroom() {
+        let tun_buf = TunBuf::new();
+        let mut buf = tun_buf.into_pooled(0);
+        assert!(buf.add_prefix(&[0u8; HEADROOM]));
+    }
 
     #[test]
     fn tun_buf_from_wraps_unchanged() {

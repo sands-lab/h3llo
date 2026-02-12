@@ -183,10 +183,11 @@ async fn check_send_recv() -> Result<(), String> {
 
     // Spawn ICMP echo responder using batch API
     let responder = tokio::spawn(async move {
-        let mtu = reader.mtu();
+        use h3llo::tun::TunBuf;
+
         let scratch_size = reader.scratch_buf_size();
         let mut scratch = vec![0u8; scratch_size];
-        let mut bufs = vec![vec![0u8; mtu]; 1];
+        let mut bufs = vec![TunBuf::new()];
         let mut sizes = vec![0usize; 1];
         loop {
             match reader.recv_batch(&mut scratch, &mut bufs, &mut sizes).await {
@@ -196,7 +197,7 @@ async fn check_send_recv() -> Result<(), String> {
             };
             let len = sizes[0];
 
-            let packet = &mut bufs[0][..len];
+            let packet = &mut bufs[0].as_mut()[..len];
             // IPv4 only
             if packet[0] >> 4 != 4 {
                 continue;
