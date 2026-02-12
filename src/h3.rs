@@ -481,7 +481,11 @@ pub async fn dial_h3<P: RouteProbe>(
     let params = ConnectionParams::new_client(quic_settings, None, Hooks::default());
 
     // Create H3 driver and controller
-    let (h3_driver, mut controller) = ClientH3Driver::new(Http3Settings::default());
+    let h3_settings = Http3Settings {
+        enable_extended_connect: true,
+        ..Default::default()
+    };
+    let (h3_driver, mut controller) = ClientH3Driver::new(h3_settings);
 
     // Extract cmd_sender before the handshake loop consumes the controller's
     // event receiver (cmd_sender() borrows &self, handshake takes &mut self).
@@ -1025,8 +1029,12 @@ pub fn spawn_h3_listener(
                         }
                     };
 
+                    let h3_settings = Http3Settings {
+                        enable_extended_connect: true,
+                        ..Default::default()
+                    };
                     let (driver, controller) =
-                        ServerH3Driver::new(Http3Settings::default());
+                        ServerH3Driver::new(h3_settings);
                     let quic_conn = initial_conn.start(driver);
                     let remote_addr = quic_conn.peer_addr();
                     drop(quic_conn);
