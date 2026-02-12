@@ -186,7 +186,7 @@ impl PeerEntry {
                 let peer_id = self.config.id.clone();
                 let bindif = bare.bindif.clone();
                 let endpoint = Endpoint::Udp(bare.endpoint.clone());
-                let metrics_interval = tuning.log_metrics_interval;
+                let metrics_interval = tuning.metrics_push_interval;
                 let packet_queue_depth = tuning.packet_queue_depth;
                 let socket_buffer_bytes = tuning.socket_buffer_bytes();
 
@@ -445,13 +445,13 @@ impl Orchestrator {
             tun_reader,
             routing,
             events_tx.clone(),
-            tuning.log_metrics_interval,
+            tuning.metrics_push_interval,
         );
         // TUN-Tx actor creates its own packet channel; returns sender for transports to use
         let (tun_packet_tx, tun_tx_handle) = tun::spawn_tun_tx(
             tun_writer,
             events_tx.clone(),
-            tuning.log_metrics_interval,
+            tuning.metrics_push_interval,
             tuning.packet_queue_depth,
         );
 
@@ -471,7 +471,7 @@ impl Orchestrator {
                 std::collections::HashSet::new(),
                 tun_packet_tx.clone(),
                 events_tx.clone(),
-                tuning.log_metrics_interval,
+                tuning.metrics_push_interval,
             );
 
             join_set.spawn(bare_rx_handle);
@@ -847,14 +847,14 @@ impl Orchestrator {
             rx_state,
             self.tun_packet_tx.clone(),
             self.events_tx.clone(),
-            self.tuning.log_metrics_interval,
+            self.tuning.metrics_push_interval,
         );
 
         // Spawn TX actor
         let (packet_tx, tx_handle) = spawn_h3_tx(
             tx_state,
             self.events_tx.clone(),
-            self.tuning.log_metrics_interval,
+            self.tuning.metrics_push_interval,
             self.tuning.packet_queue_depth,
             self.tuning.h3_keepalive_interval,
         );
