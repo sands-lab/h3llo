@@ -170,15 +170,9 @@ peers:
   h3:
     token: new-token-for-peer-123
 
-# POST partial update: disable a peer
+# POST partial update: add H3 with custom trust
 peers:
 - id: example-node-1
-  enabled: false
-
-# POST partial update: enable H3 with custom trust
-peers:
-- id: example-node-1
-  enabled: true
   h3:
     token: peer-token-12chars
     endpoint: https://node1.example.com:443/path
@@ -188,7 +182,6 @@ peers:
 # POST partial update: switch to BareUDP (null clears H3)
 peers:
 - id: example-node-1
-  enabled: true
   h3: null
   bare:
     endpoint: udp://node1.example.com:6635

@@ -31,7 +31,6 @@ local:
     listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-b-tp
-    enabled: true
     bare:
       endpoint: "udp://node-b-tp.h3llo-test-net:5353"
     tun:
@@ -54,7 +53,6 @@ local:
     listen: "udp://0.0.0.0:5353"
 peers:
   - id: node-a-tp
-    enabled: true
     bare:
       endpoint: "udp://node-a-tp.h3llo-test-net:5353"
     tun:
