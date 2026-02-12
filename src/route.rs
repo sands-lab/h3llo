@@ -10,6 +10,7 @@ use route_manager::AsyncRouteManager;
 pub use route_manager::Route;
 use std::collections::HashSet;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -175,8 +176,9 @@ pub enum RouteSyncError {
 /// - Routes derived from `allowed` (default routes expanded into two /1 prefixes)
 ///   are actively added/preserved on the TUN interface.
 /// - OS-managed routes from `tun_addrs` are preserved but never added. For each TUN
-///   address (e.g., `10.0.0.1/24`), both the network prefix (`10.0.0.0/24`) and the
-///   host route (`10.0.0.1/32`) are protected from deletion.
+///   address (e.g., `10.0.0.1/24`), the network prefix (`10.0.0.0/24`), host route
+///   (`10.0.0.1/32`), and IPv4 broadcast routes (`10.0.0.0/32`, `10.0.0.255/32`) are
+///   protected from deletion. The limited broadcast `255.255.255.255/32` is also protected.
 /// - Any other route on the TUN interface is considered stale and will be deleted.
 /// - If a desired prefix already exists on another interface, a conflict warning is logged.
 /// - Failures when adding or deleting are logged as warnings.
@@ -196,13 +198,25 @@ pub async fn sync_tun_routes<H: RouteHandle, R: IfIndexResolver>(
     let desired_routes: HashSet<IpNet> = expand_allowed_prefixes(allowed);
 
     // OS-managed routes to preserve (never added, only protected from deletion).
-    // For each TUN address (e.g., 192.168.1.2/24), include both:
+    // For each TUN address (e.g., 192.168.1.2/24), include:
     // - the network prefix (192.168.1.0/24) — kernel connected route
     // - the host address (192.168.1.2/32) — kernel host route
-    let tun_addr_set: HashSet<IpNet> = tun_addrs
+    // - IPv4 broadcast routes (192.168.1.0/32, 192.168.1.255/32) — kernel broadcast routes
+    let mut tun_addr_set: HashSet<IpNet> = tun_addrs
         .iter()
-        .flat_map(|addr| [addr.trunc(), addr.addr().into()])
+        .flat_map(|addr| {
+            let mut nets = vec![addr.trunc(), addr.addr().into()];
+            if let IpNet::V4(v4net) = addr.trunc() {
+                if v4net.prefix_len() <= 30 {
+                    nets.push(IpAddr::V4(v4net.network()).into());
+                    nets.push(IpAddr::V4(v4net.broadcast()).into());
+                }
+            }
+            nets
+        })
         .collect();
+    // Limited broadcast (255.255.255.255/32) — some systems add this to local table
+    tun_addr_set.insert(IpAddr::V4(Ipv4Addr::BROADCAST).into());
 
     let mut existing_routes: HashSet<IpNet> = HashSet::new();
 
@@ -668,6 +682,60 @@ mod tests {
 
         // All routes already exist, no operations
         assert!(handle.ops().is_empty());
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// Kernel broadcast routes (network /32 and directed broadcast /32) preserved.
+    async fn kernel_broadcast_routes_preserved() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![
+            route("192.168.1.0/32", Some(10)),   // broadcast network-addr route
+            route("192.168.1.255/32", Some(10)), // broadcast directed route
+        ]);
+        let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
+        let allowed: Vec<IpNet> = vec![];
+
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        assert!(handle.ops().is_empty());
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// Limited broadcast 255.255.255.255/32 preserved even with no TUN addresses.
+    async fn limited_broadcast_preserved() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![route("255.255.255.255/32", Some(10))]);
+        let tun_addrs: Vec<IpNet> = vec![];
+        let allowed: Vec<IpNet> = vec![];
+
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        assert!(handle.ops().is_empty());
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// /31 and /32 TUN addresses do not generate broadcast protection entries.
+    async fn no_broadcast_for_narrow_prefixes() {
+        let resolver = FakeResolver { idx: 10 };
+        // 10.0.0.0/32 would be the "network" broadcast — should NOT be protected
+        let mut handle = FakeHandle::new(vec![route("10.0.0.0/32", Some(10))]);
+        let tun_addrs: Vec<IpNet> = vec!["10.0.0.1/31".parse().unwrap()];
+        let allowed: Vec<IpNet> = vec![];
+
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        // 10.0.0.0/31 (connected) and 10.0.0.1/32 (host) are protected,
+        // but 10.0.0.0/32 is NOT — it gets deleted as stale
+        assert_eq!(handle.ops(), vec!["del 10.0.0.0/32"]);
     }
 
     /// Always fails interface resolution (for error path tests).
