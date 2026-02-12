@@ -39,7 +39,6 @@ use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::listen;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::QuicCommand;
-use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::quiche::h3::{Header, NameValue};
 use tokio_quiche::settings::{
     CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
@@ -1007,13 +1006,8 @@ pub fn spawn_h3_listener(
     let conn_params = ConnectionParams::new_server(quic_settings, tls_config, Default::default());
 
     // Create tokio-quiche listener (infallible after socket is bound)
-    let mut listeners = listen(
-        vec![socket],
-        conn_params,
-        SimpleConnectionIdGenerator,
-        DefaultMetrics,
-    )
-    .expect("listen on already-bound socket should not fail");
+    let mut listeners = listen(vec![socket], conn_params, DefaultMetrics)
+        .expect("listen on already-bound socket should not fail");
 
     let mut accept_stream = listeners.remove(0);
     let h3_handshake_timeout = tuning.h3_handshake_timeout;
