@@ -32,6 +32,8 @@ tuning: # optional, all fields have defaults
   h3_handshake_timeout: 30 # optional, default: 30 (seconds)
   h3_max_idle_timeout: 60 # optional, default: 60 (seconds)
   h3_keepalive_interval: 20 # optional, default: 20 (seconds; must be < h3_max_idle_timeout)
+  h3_cc_algorithm: cubic # optional, default: cubic (accepted: reno, cubic, bbr, bbr2)
+  h3_enable_pacing: false # optional, default: false
 peers: # optional, default: []
 - id: example-node-1
   enabled: true # optional, default: true
@@ -75,6 +77,8 @@ peers: # optional, default: []
 - `tuning.h3_handshake_timeout` (default `30`): Seconds to wait for an HTTP/3 handshake to complete.
 - `tuning.h3_max_idle_timeout` (default `60`): QUIC idle timeout in seconds; connections idle longer than this are closed.
 - `tuning.h3_keepalive_interval` (default `20`): QUIC keepalive interval in seconds; sends PING frames to prevent idle timeout. Must be less than `h3_max_idle_timeout`.
+- `tuning.h3_cc_algorithm` (default `cubic`): QUIC congestion control algorithm. Accepted values: `reno`, `cubic`, `bbr`, `bbr2`. Applied to both client (dial) and server (listener) QUIC connections.
+- `tuning.h3_enable_pacing` (default `false`): Enable QUIC packet pacing to smooth bursty sends. Requires OS-level support (e.g., `SO_TXTIME` on Linux). Applied to both client and server QUIC connections.
 - `peers[]`: Remote peer entries.
 - `peers[].id`: Remote peer identifier; must be unique within the configuration and non-empty.
 - `peers[].h3.token`: Remote peer authentication token; required (and must be at least 12 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. Must be unique across all peers. Bearer Token auth for CONNECT uses `Authorization: Bearer <token>`; server matches tokens to identify peers.
