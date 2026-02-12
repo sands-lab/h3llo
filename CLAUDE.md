@@ -30,7 +30,7 @@
 
 ### 记忆 Prompt
 
-【记忆prompt】是自动从对话中归纳的本项目实操过程中的具体要求和行动准则。[memo.md](docs/.claude/memo.md)中保存了【记忆prompt】。
+【记忆prompt】是自动从对话中归纳的本项目实操过程中的具体要求和行动准则。[memo.md](.claude/memo.md)中保存了【记忆prompt】。
 
 - 如果当前对话中有可归纳和固化为长期准则的内容，【应当】询问是否更新【记忆prompt】。
 - 【必须】使用 markdown bullet points，用【主prompt】相同的风格编写【记忆prompt】。
