@@ -46,6 +46,23 @@ use tokio_quiche::settings::{
 };
 use tracing::{debug, error, warn};
 
+/// Builds common `QuicSettings` from `Tuning` and TUN MTU.
+///
+/// Sets DATAGRAM support, idle timeout, UDP payload sizes (MTU + CONNECT-IP overhead),
+/// congestion control algorithm, and pacing. Callers may further customize the
+/// returned settings (e.g., `verify_peer` for client connections).
+fn make_quic_settings(tuning: &Tuning, tun_mtu: u16) -> QuicSettings {
+    let quic_udp_payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
+    let mut s = QuicSettings::default();
+    s.enable_dgram = true;
+    s.max_idle_timeout = Some(tuning.h3_max_idle_timeout);
+    s.max_send_udp_payload_size = quic_udp_payload_size;
+    s.max_recv_udp_payload_size = quic_udp_payload_size;
+    s.cc_algorithm = tuning.h3_cc_algorithm.clone();
+    s.enable_pacing = tuning.h3_enable_pacing;
+    s
+}
+
 /// Context ID for IP payloads per RFC 9484 (always 0 for CONNECT-IP).
 const CONTEXT_ID_IP: u8 = 0x00;
 
@@ -460,18 +477,11 @@ pub async fn dial_h3<P: RouteProbe>(
     }
 
     // Configure QUIC settings
-    let quic_udp_payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
-    let mut quic_settings = QuicSettings::default();
-    quic_settings.max_idle_timeout = Some(tuning.h3_max_idle_timeout);
+    let mut quic_settings = make_quic_settings(tuning, tun_mtu);
     // Only disable verification when explicitly requested (testing only)
     if !peer_h3.insecure {
         quic_settings.verify_peer = true;
     }
-
-    quic_settings.max_send_udp_payload_size = quic_udp_payload_size;
-    quic_settings.max_recv_udp_payload_size = quic_udp_payload_size;
-    quic_settings.cc_algorithm = tuning.h3_cc_algorithm.clone();
-    quic_settings.enable_pacing = tuning.h3_enable_pacing;
 
     let params = ConnectionParams::new_client(quic_settings, None, Hooks::default());
 
@@ -992,13 +1002,7 @@ pub fn spawn_h3_listener(
         kind: CertificateKind::X509,
     };
 
-    let quic_udp_payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
-    let mut quic_settings = QuicSettings::default();
-    quic_settings.max_idle_timeout = Some(tuning.h3_max_idle_timeout);
-    quic_settings.max_send_udp_payload_size = quic_udp_payload_size;
-    quic_settings.max_recv_udp_payload_size = quic_udp_payload_size;
-    quic_settings.cc_algorithm = tuning.h3_cc_algorithm.clone();
-    quic_settings.enable_pacing = tuning.h3_enable_pacing;
+    let quic_settings = make_quic_settings(tuning, tun_mtu);
 
     let conn_params = ConnectionParams::new_server(quic_settings, tls_config, Default::default());
 
