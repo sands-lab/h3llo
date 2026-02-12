@@ -32,7 +32,7 @@ tuning: # optional, all fields have defaults
   h3_handshake_timeout: 30 # optional, default: 30 (seconds)
   h3_max_idle_timeout: 60 # optional, default: 60 (seconds)
   h3_keepalive_interval: 20 # optional, default: 20 (seconds; must be < h3_max_idle_timeout)
-  h3_cc_algorithm: bbr2 # optional, default: bbr2 (accepted: reno, cubic, bbr, bbr2)
+  h3_cc_algorithm: bbr2 # optional, default: bbr2 (accepted: none, reno, cubic, bbr, bbr2)
   h3_enable_pacing: true # optional, default: true
   h3_insecure_skip_verify: false # optional, default: false (skip TLS verification; testing only)
 peers: # optional, default: []
