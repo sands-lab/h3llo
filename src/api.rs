@@ -8,7 +8,7 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::config::Peer;
 use crate::events::{ApiEvent, Event};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -19,6 +19,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::debug;
+
+/// Maximum request body size (1 MiB).
+const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 /// Binds a `TcpListener` for the management API.
 ///
@@ -160,12 +163,12 @@ async fn handle_post_config(
     req: Request<Incoming>,
     events_tx: &mpsc::UnboundedSender<Event>,
 ) -> Response<Full<Bytes>> {
-    let body = match req.collect().await {
+    let body = match Limited::new(req.into_body(), MAX_BODY_SIZE).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("body read error: {e}")),
     };
 
-    // Syntactic validation: only `peers` key allowed at top level
+    // Parse once as Value for key validation, then convert to typed payload.
     let parsed: serde_yaml::Value = match serde_yaml::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("invalid YAML: {e}")),
@@ -183,13 +186,12 @@ async fn handle_post_config(
         return response(StatusCode::BAD_REQUEST, "expected a YAML mapping");
     }
 
-    // Deserialize peers
     #[derive(serde::Deserialize)]
     struct PostPayload {
         #[serde(default)]
         peers: Vec<Peer>,
     }
-    let payload: PostPayload = match serde_yaml::from_slice(&body) {
+    let payload: PostPayload = match serde_yaml::from_value(parsed) {
         Ok(p) => p,
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("invalid peers: {e}")),
     };
@@ -221,7 +223,7 @@ async fn handle_delete_config(
     req: Request<Incoming>,
     events_tx: &mpsc::UnboundedSender<Event>,
 ) -> Response<Full<Bytes>> {
-    let body = match req.collect().await {
+    let body = match Limited::new(req.into_body(), MAX_BODY_SIZE).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("body read error: {e}")),
     };
@@ -256,5 +258,24 @@ async fn handle_delete_config(
             StatusCode::INTERNAL_SERVER_ERROR,
             "orchestrator dropped reply",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn post_body_rejects_non_peers_key() {
+        let body = "local:\n  table: false\n";
+        let parsed: serde_yaml::Value = serde_yaml::from_str(body).unwrap();
+        let map = parsed.as_mapping().unwrap();
+        assert!(map.keys().any(|k| k.as_str() != Some("peers")));
+    }
+
+    #[test]
+    fn post_body_accepts_peers_only_key() {
+        let body = "peers:\n- id: test\n";
+        let parsed: serde_yaml::Value = serde_yaml::from_str(body).unwrap();
+        let map = parsed.as_mapping().unwrap();
+        assert!(!map.keys().any(|k| k.as_str() != Some("peers")));
     }
 }

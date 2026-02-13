@@ -347,8 +347,7 @@ pub struct Orchestrator {
     /// Packet sender to TUN TX (for H3 RX actors).
     tun_packet_tx: mpsc::Sender<Vec<PooledBuf>>,
 
-    /// DNS resolver command sender for SetHostnames (used for future reconfiguration).
-    #[allow(dead_code)]
+    /// DNS resolver command sender for SetHostnames.
     dns_cmd_tx: mpsc::UnboundedSender<DnsCommand>,
 
     /// Route sync actor command sender (None when `local.table` is false or init failed).
