@@ -920,7 +920,7 @@ mod tests {
     // ========== IP Literal Tests ==========
 
     #[tokio::test]
-    async fn ip_literal_emits_snapshot_on_tick() {
+    async fn ip_literal_emits_snapshot() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
@@ -939,7 +939,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ipv6_literal_emits_snapshot_on_tick() {
+    async fn ipv6_literal_emits_snapshot() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
