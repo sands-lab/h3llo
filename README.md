@@ -72,7 +72,8 @@ High-level connection/auth/routing summary; see [docs/protocol.md](docs/protocol
 ### Authentication and Security
 
 - Identity: every peer needs a unique `id` (non-empty).
-- Bearer Token auth for CONNECT uses `Authorization: Bearer <token>` where token is `peers[target].h3.token`; the server matches the token against its `peers[].h3.token` collection to identify the peer. Every HTTP/3 peer entry must set `h3.token` (>= 12 chars) even when `endpoint` is absent, and tokens may differ per peer/direction. Control-plane GET/POST still use Basic Auth with `local.h3.admin` (`name`/`pass`). Full rules live in [docs/protocol.md](docs/protocol.md). QUIC/TLS certificates are required for HTTP/3.
+- Bearer Token auth for CONNECT uses `Authorization: Bearer <token>` where token is `peers[target].h3.token`; the server matches the token against its `peers[].h3.token` collection to identify the peer. Every HTTP/3 peer entry must set `h3.token` (>= 12 chars) even when `endpoint` is absent, and tokens may differ per peer/direction. Full rules live in [docs/protocol.md](docs/protocol.md). QUIC/TLS certificates are required for HTTP/3.
+- Management API: an optional localhost-bound HTTP/1.1 server (`local.api`) for runtime peer configuration. See [docs/protocol.md](docs/protocol.md) for endpoint details.
 
 ### Routing
 

@@ -136,7 +136,7 @@ Management API summary: a localhost-bound HTTP/1.1 server for runtime peer manag
 
 - `GET /config` — returns the full configuration snapshot in YAML, matching the shape documented in [docs/configuration.md](configuration.md).
 - `POST /config` — accepts a YAML `peers` list. Each entry must be a **complete** peer configuration (not a partial update); the entry **replaces** any existing peer with the same `peers[].id`. Peers not present in the payload are unchanged. Only `peers` is accepted at the top level; all other keys are rejected with `400 Bad Request`.
-- `DELETE /config` — accepts a YAML `peers` list containing only `peers[].id` fields. Matching peers are removed. Non-existent IDs are silently ignored.
+- `DELETE /config` — accepts a YAML body with `peer_ids` (list of peer ID strings). Matching peers are removed. Non-existent IDs are silently ignored.
 - `GET /events` — Server-Sent Events (SSE) stream. TBD.
 - `GET /metrics` — Prometheus exposition format. Reserved for Prometheus scraping.
 
@@ -150,7 +150,7 @@ All three config endpoints are idempotent:
 `POST` replace rules:
 - Each peer entry in the payload must contain all required fields (`id`, transport config, `tun`). Omitted optional fields revert to defaults, not to previous values.
 - Transport exclusivity (exactly one of `peers[].h3` or `peers[].bare`) is validated before applying; invalid entries are rejected with `400 Bad Request`.
-- Only `endpoint` changes trigger an immediate reconnect. Other transport fields (e.g., `token`, `bindif`, `ca`, `insecure`) take effect on the next connection establishment — if `endpoint` is unchanged, the new values apply only after the existing connection drops.
+- Only `endpoint` changes trigger an immediate reconnect. Other transport fields (e.g., `token`, `bindif`, `sni`) take effect on the next connection establishment — if `endpoint` is unchanged, the new values apply only after the existing connection drops.
 - Route refresh is zero-downtime: internal route tables update atomically; existing traffic to removed peers drains naturally.
 
 #### Examples
@@ -171,8 +171,6 @@ peers:
   h3:
     token: peer-token-12chars
     endpoint: https://node1.example.com:443/path
-    ca: ./ca.pem
-    insecure: false
   tun:
     allowed_ips:
       - 10.0.1.0/24
@@ -189,10 +187,10 @@ peers:
       - 10.0.1.0/24
 '
 
-# DELETE http://localhost:9090/config — remove a peer
+# DELETE http://localhost:9090/config — remove peers by ID
 $ curl -X DELETE http://localhost:9090/config -d '
-peers:
-- id: example-node-1
+peer_ids:
+  - example-node-1
 '
 
 # GET http://localhost:9090/events — subscribe to SSE event stream

@@ -3,8 +3,9 @@
 use crate::actor::{ActorError, ActorExitResult, ActorKind};
 use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUdpRxCommand};
 use crate::bind::DefaultRouteProbe;
-use crate::config::{Config, Peer, Tuning};
+use crate::config::{Config, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
+use crate::events::ApiEvent;
 use crate::events::{
     BareConnectedEvent, ConnectionDirection, DnsEvent, Endpoint, Event, H3ConnectedEvent,
     TransportEvent,
@@ -298,6 +299,9 @@ pub enum OrchestratorError {
     /// HTTP/3 dial failed.
     #[error("h3 dial to '{peer_id}' failed: {reason}")]
     H3Dial { peer_id: String, reason: String },
+    /// Management API failed to initialize.
+    #[error("api server failed to start: {0}")]
+    ApiInit(String),
     /// DNS resolver failed to initialize.
     #[error("dns resolver failed to initialize: {0}")]
     DnsInit(String),
@@ -351,6 +355,8 @@ pub struct Orchestrator {
     route_cmd_tx: Option<mpsc::UnboundedSender<RouteCommand>>,
     /// TUN interface addresses for route sync commands.
     tun_addrs: Vec<IpNet>,
+    /// Stored local config for GET /config snapshot reconstruction.
+    local: Local,
 }
 
 impl Orchestrator {
@@ -480,50 +486,42 @@ impl Orchestrator {
             None
         };
 
-        // Initialize H3 listener if configured with listen address
-        let h3_cfg = config.local.h3.as_ref();
-        let listen_endpoint = h3_cfg.and_then(|h3| h3.listen.as_ref());
+        // Initialize H3 listener if configured
+        let h3_listener_cmd_tx = if let Some(ref h3_cfg) = config.local.h3 {
+            let listen_addr = resolve_listen_addr(&h3_cfg.listen.host, h3_cfg.listen.port)?;
+            let cert_path = Path::new(&h3_cfg.cert);
+            let key_path = Path::new(&h3_cfg.key);
 
-        let h3_listener_cmd_tx = match (h3_cfg, listen_endpoint) {
-            (Some(h3_cfg), Some(listen_ep)) => {
-                // Endpoint already parsed during config deserialization
-                let listen_addr = resolve_listen_addr(&listen_ep.host, listen_ep.port)?;
+            // Build peer tokens map for authentication
+            let peer_tokens: HashMap<String, String> = config
+                .peers
+                .iter()
+                .filter(|p| p.h3.is_some())
+                .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().token.clone()))
+                .collect();
 
-                // SAFETY: cert and key are validated to be Some when listen is set
-                let cert_path = Path::new(h3_cfg.cert.as_ref().expect("validated"));
-                let key_path = Path::new(h3_cfg.key.as_ref().expect("validated"));
+            // make: fallible I/O (socket bind, TLS config)
+            let listener = make_h3_listener(
+                listen_addr,
+                cert_path,
+                key_path,
+                tuning.socket_buffer_bytes(),
+            )
+            .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
 
-                // Build peer tokens map for authentication
-                let peer_tokens: HashMap<String, String> = config
-                    .peers
-                    .iter()
-                    .filter(|p| p.h3.is_some())
-                    .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().token.clone()))
-                    .collect();
+            // spawn: infallible task creation; listener sends events through events_tx
+            let (cmd_tx, listener_handle, _bound_addr) = spawn_h3_listener(
+                listener,
+                peer_tokens,
+                config.local.tun.mtu,
+                events_tx.clone(),
+                tuning,
+            );
 
-                // make: fallible I/O (socket bind, TLS config)
-                let listener = make_h3_listener(
-                    listen_addr,
-                    cert_path,
-                    key_path,
-                    tuning.socket_buffer_bytes(),
-                )
-                .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
-
-                // spawn: infallible task creation; listener sends events through events_tx
-                let (cmd_tx, listener_handle, _bound_addr) = spawn_h3_listener(
-                    listener,
-                    peer_tokens,
-                    config.local.tun.mtu,
-                    events_tx.clone(),
-                    tuning,
-                );
-
-                join_set.spawn(listener_handle);
-                Some(cmd_tx)
-            }
-            // Dial-only mode or no H3 configured: no listener, but can dial H3 peers
-            _ => None,
+            join_set.spawn(listener_handle);
+            Some(cmd_tx)
+        } else {
+            None
         };
 
         // Initialize unified peer state from config
@@ -581,6 +579,21 @@ impl Orchestrator {
             warn!("no active peers; traffic will be dropped");
         }
 
+        // Initialize management API if configured
+        if let Some(ref local_api) = config.local.api {
+            let api_listen_addr =
+                resolve_listen_addr(&local_api.listen.host, local_api.listen.port)?;
+            let api_listener = crate::api::make_api(api_listen_addr)
+                .await
+                .map_err(|e| OrchestratorError::ApiInit(e.to_string()))?;
+            let api_handle = crate::api::spawn_api(
+                api_listener,
+                local_api.listen.path.clone(),
+                events_tx.clone(),
+            );
+            join_set.spawn(api_handle);
+        }
+
         Ok(Self {
             events_rx,
             events_tx,
@@ -596,6 +609,7 @@ impl Orchestrator {
             dns_cmd_tx,
             route_cmd_tx,
             tun_addrs,
+            local: config.local,
         })
     }
 
@@ -679,11 +693,105 @@ impl Orchestrator {
         }
     }
 
+    /// Handles management API events.
+    fn handle_api_event(&mut self, event: ApiEvent) {
+        match event {
+            ApiEvent::GetConfig { reply_tx } => {
+                let snapshot = Config {
+                    local: self.local.clone(),
+                    tuning: self.tuning.clone(),
+                    peers: self.peer_configs(),
+                };
+                let _ = reply_tx.send(snapshot);
+            }
+            ApiEvent::PostConfig { peers, reply_tx } => {
+                let result = self.handle_post_config(peers);
+                let _ = reply_tx.send(result);
+            }
+            ApiEvent::DeleteConfig { peer_ids, reply_tx } => {
+                self.handle_delete_config(&peer_ids);
+                let _ = reply_tx.send(Ok(()));
+            }
+        }
+    }
+
+    /// Common operations after peer mutations (POST/DELETE).
+    fn refresh_after_peer_change(&mut self) {
+        let peer_configs = self.peer_configs();
+        let hostnames = collect_hostnames(&peer_configs);
+        let _ = self
+            .dns_cmd_tx
+            .send(DnsCommand::SetHostnames { hosts: hostnames });
+
+        self.update_routing();
+
+        let accepted_ips: HashSet<IpAddr> = self
+            .peers
+            .values()
+            .filter(|e| e.config.bare.is_some())
+            .flat_map(|e| e.resolved_ips.iter().copied())
+            .collect();
+        self.update_accepted_sources(&accepted_ips);
+    }
+
+    /// Handles POST /config — upsert peers with orchestrator-side validation.
+    fn handle_post_config(&mut self, new_peers: Vec<Peer>) -> Result<(), String> {
+        // Build merged peer list for validation
+        let mut merged = self.peer_configs();
+        for new_peer in &new_peers {
+            merged.retain(|p| p.id != new_peer.id);
+            merged.push(new_peer.clone());
+        }
+        // Validate using real config state
+        let temp_config = Config {
+            local: self.local.clone(),
+            tuning: self.tuning.clone(),
+            peers: merged,
+        };
+        temp_config.validate().map_err(|e| e.to_string())?;
+
+        let count = new_peers.len();
+        for peer in new_peers {
+            let id = peer.id.clone();
+            if let Some(existing) = self.peers.get_mut(&id) {
+                let old_ep = existing.config_endpoint();
+                existing.config = peer;
+                let new_ep = existing.config_endpoint();
+                if old_ep != new_ep {
+                    existing.prune();
+                }
+            } else {
+                self.peers.insert(id, PeerEntry::new(peer));
+            }
+        }
+
+        self.refresh_after_peer_change();
+        info!(count, "API: peers upserted");
+        Ok(())
+    }
+
+    /// Handles DELETE /config — remove peers by ID.
+    fn handle_delete_config(&mut self, peer_ids: &[String]) {
+        let mut changed = false;
+        for id in peer_ids {
+            if self.peers.remove(id).is_some() {
+                changed = true;
+                debug!(peer = %id, "API: peer removed");
+            }
+        }
+        if changed {
+            self.refresh_after_peer_change();
+        }
+    }
+
     /// Handles an event from a child actor.
     async fn handle_event(&mut self, event: Event) {
         match event {
             Event::Dns(dns_event) => {
                 self.handle_dns_snapshot(dns_event);
+            }
+            Event::Api(api_event) => {
+                self.handle_api_event(api_event);
             }
             Event::Transport(TransportEvent::Metrics(metrics)) => {
                 let labels = &metrics.labels;
@@ -941,6 +1049,7 @@ mod test_support {
         mtu: usize,
         peers: HashMap<String, PeerEntry>,
         tun_addrs: Vec<IpNet>,
+        local: Option<crate::config::Local>,
     }
 
     impl Default for TestableOrchestratorBuilder {
@@ -950,6 +1059,7 @@ mod test_support {
                 mtu: crate::config::default_mtu() as usize,
                 peers: HashMap::new(),
                 tun_addrs: Vec::new(),
+                local: None,
             }
         }
     }
@@ -965,6 +1075,11 @@ mod test_support {
     }
 
     impl TestableOrchestratorBuilder {
+        pub fn with_local(mut self, local: crate::config::Local) -> Self {
+            self.local = Some(local);
+            self
+        }
+
         pub fn with_peers(mut self, peers: Vec<Peer>) -> Self {
             self.peers = peers
                 .into_iter()
@@ -1005,6 +1120,22 @@ mod test_support {
             let (tun_packet_tx, _tun_packet_rx) = mpsc::channel(1);
             let (route_cmd_tx, route_cmd_rx) = mpsc::unbounded_channel();
 
+            let local = self.local.unwrap_or_else(|| crate::config::Local {
+                table: false,
+                dns: crate::config::LocalDns {
+                    server: "1.1.1.1:53".parse().unwrap(),
+                    bindif: None,
+                },
+                h3: None,
+                bare: None,
+                api: None,
+                tun: crate::config::LocalTun {
+                    ifname: "test0".to_string(),
+                    addrs: vec!["192.168.180.1/32".parse().unwrap()],
+                    mtu: 1393,
+                },
+            });
+
             let orch = Orchestrator {
                 events_rx,
                 events_tx: events_tx.clone(),
@@ -1020,6 +1151,7 @@ mod test_support {
                 dns_cmd_tx,
                 route_cmd_tx: Some(route_cmd_tx),
                 tun_addrs: self.tun_addrs,
+                local,
             };
 
             (
@@ -1883,5 +2015,134 @@ mod tests {
         // Second immediate call should be rate-limited (timestamp unchanged)
         entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
         assert_eq!(entry.last_try_connect.unwrap(), first_time);
+    }
+
+    // ========== API event handling tests ==========
+
+    #[tokio::test]
+    async fn api_get_config_returns_snapshot() {
+        let peer = Peer {
+            id: "peer-1".to_string(),
+            h3: Some(crate::config::PeerH3 {
+                endpoint: None,
+                token: "test-token-12ch".to_string(),
+                bindif: None,
+                sni: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            },
+        };
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orch.handle_api_event(ApiEvent::GetConfig { reply_tx });
+
+        let config = reply_rx.await.expect("should receive config");
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].id, "peer-1");
+    }
+
+    #[tokio::test]
+    async fn api_post_config_adds_peer() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+        assert!(orch.peers.is_empty());
+
+        let new_peer = Peer {
+            id: "new-peer".to_string(),
+            h3: Some(crate::config::PeerH3 {
+                endpoint: None,
+                token: "test-token-12ch".to_string(),
+                bindif: None,
+                sni: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+            },
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orch.handle_api_event(ApiEvent::PostConfig {
+            peers: vec![new_peer],
+            reply_tx,
+        });
+
+        let result = reply_rx.await.expect("should receive reply");
+        assert!(result.is_ok());
+        assert_eq!(orch.peers.len(), 1);
+        assert!(orch.peers.contains_key("new-peer"));
+    }
+
+    #[tokio::test]
+    async fn api_post_config_rejects_invalid_peer() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+
+        let bad_peer = Peer {
+            id: "".to_string(), // empty id is invalid
+            h3: None,
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            },
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orch.handle_api_event(ApiEvent::PostConfig {
+            peers: vec![bad_peer],
+            reply_tx,
+        });
+
+        let result = reply_rx.await.expect("should receive reply");
+        assert!(result.is_err());
+        assert!(orch.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_delete_config_removes_peer() {
+        let peer = Peer {
+            id: "peer-1".to_string(),
+            h3: Some(crate::config::PeerH3 {
+                endpoint: None,
+                token: "test-token-12ch".to_string(),
+                bindif: None,
+                sni: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            },
+        };
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+        assert_eq!(orch.peers.len(), 1);
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orch.handle_api_event(ApiEvent::DeleteConfig {
+            peer_ids: vec!["peer-1".to_string()],
+            reply_tx,
+        });
+
+        let result = reply_rx.await.expect("should receive reply");
+        assert!(result.is_ok());
+        assert!(orch.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_delete_config_ignores_unknown_ids() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orch.handle_api_event(ApiEvent::DeleteConfig {
+            peer_ids: vec!["nonexistent".to_string()],
+            reply_tx,
+        });
+
+        let result = reply_rx.await.expect("should receive reply");
+        assert!(result.is_ok());
     }
 }

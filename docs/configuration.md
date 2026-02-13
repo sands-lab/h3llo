@@ -9,14 +9,13 @@ local:
     server: udp://1.1.1.1:53 # optional, default: udp://1.1.1.1:53
     bindif: eth0 # optional, default: auto-detect; warn and fallback to unbound on failure
   h3: # optional; enables HTTP/3 transport
-    listen: https://[::]:443/path # optional; omit for dial-only H3 mode
-    cert: ./cert.pem # required when local.h3.listen is set
-    key: ./key.pem # required when local.h3.listen is set
-    admin: # optional; enables control-plane API when set (requires both name and pass, each longer than 8 characters)
-      name: admin-username
-      pass: admin-password
+    listen: https://[::]:443/path # required when local.h3 is set
+    cert: ./cert.pem # required when local.h3 is set
+    key: ./key.pem # required when local.h3 is set
   bare: # optional
     listen: udp://[::]:6635 # required when local.bare is set
+  api: # optional; enables management API
+    listen: http://127.0.0.1:9090/ # required when local.api is set (default port 9090)
   tun: # required
     ifname: h3llo0 # optional, default: h3llo0
     addrs: # required (CIDR notation with prefix length)
@@ -53,14 +52,14 @@ peers: # optional, default: []
 ## Field notes
 
 - `peers` (default `[]`): Optional peer list; omit entirely when running standalone.
-- `local.h3` (optional): Enables HTTP/3 transport. When `local.h3.listen` is set, `cert` and `key` are required. When `listen` is omitted, the node operates in dial-only mode (can connect to peers but not accept inbound connections).
+- `local.h3` (optional): Enables HTTP/3 transport. When set, `listen`, `cert`, and `key` are all required.
 - `local.bare` (optional): When present, `local.bare.listen` is required.
 - `local.table` (default `true`): Update the system routing table to steer matching traffic into the h3llo TUN. When `false`, h3llo does not touch system routes; the OS still installs host routes (`/32` or `/128`) for `local.tun.addrs`.
-- `local.h3.admin.name` / `local.h3.admin.pass` (optional; both longer than 8 characters): Control-plane Basic Auth credentials bound to HTTP/3. Enable GET/POST APIs only when both are set; authentication matrix is described in [docs/protocol.md](protocol.md).
+- `local.api` (optional): Enables the management API. When set, `local.api.listen` is required (parsed as `http://` URI, default port 9090). The API binds to a localhost address and relies on OS-level access control. See [docs/protocol.md](protocol.md) for endpoint details.
 - `local.dns.server` (default `udp://1.1.1.1:53`): DNS server address as a UDP URI with an IP literal and port; outbound binding/recursive-routing guards are detailed in [docs/internals.md](internals.md).
 - `local.dns.bindif` (optional): Outbound interface for DNS resolution; prefer it when present in probe results, otherwise warn and fall back to a probed interface. Auto-detects at most one interface when omitted. Binding behavior and fallbacks are in [docs/internals.md](internals.md).
-- `local.h3.listen`: HTTP/3 listen address (scheme/host/port/path) for inbound peers when H3 is enabled; required when `local.h3` is set.
-- `local.h3.cert` / `local.h3.key`: Certificate and private key for QUIC/TLS, enabling encryption and peer authentication.
+- `local.h3.listen`: HTTP/3 listen address (scheme/host/port/path); required when `local.h3` is set.
+- `local.h3.cert` / `local.h3.key`: Certificate and private key for QUIC/TLS; required when `local.h3` is set.
 - `local.bare.listen`: BareUDP listen address when using the plaintext fast path; required to start BareUDP and optional alongside `local.h3`.
 - `local.tun.ifname` (default `h3llo0`): Name of the TUN interface created by h3llo.
 - `local.tun.addrs` (required): IP prefixes in CIDR notation (e.g., `192.168.180.1/24`, `2001:db8::1/64`) for the TUN interface. Supports IPv4, IPv6, dual-stack, and multiple prefixes. Extra system routes come from `peers[].tun.allowed_ips` when `local.table=true`.
@@ -91,8 +90,8 @@ peers: # optional, default: []
 
 ## Notes
 
-- Transport selection: `local.h3` and `local.bare` can both be configured so the node offers HTTP/3 and BareUDP concurrently; each `peers[]` entry must pick exactly one of H3 or BareUDP.
-- Dynamic updates: Require both `local.h3.listen` and `local.h3.admin` (with `name` and `pass` set and longer than 8 characters); when absent, the control-plane API remains disabled. Update semantics are described in [docs/protocol.md](protocol.md); dynamic POST allows updating `local.h3.admin` and `peers` (other `local` fields are rejected).
+- Transport selection: `local.h3` and `local.bare` can both be configured so the node offers HTTP/3 and BareUDP concurrently; each `peers[]` entry must pick exactly one of H3 or BareUDP. Neither transport is required; a node with only `local.api` configured can serve as a management endpoint.
+- Dynamic updates: Require `local.api` to be configured; when absent, the management API is disabled. Update semantics are described in [docs/protocol.md](protocol.md); POST only accepts the `peers` key (other top-level keys are rejected with `400 Bad Request`).
 - Routing scope with `local.table=false`: POST still refreshes internal routes and peer transports, but system routes remain untouched (only host routes from `local.tun.addrs` stay).
 - H3 dialing optionality: If `peers[].h3` is present but `peers[].h3.endpoint` is omitted, the node waits for the peer to initiate an HTTP/3 connection (listener-only posture).
 - DNS resolution and binding behavior: summarized above; resolver cadence, binding probes, and recursion guards are detailed in [docs/internals.md](internals.md).
