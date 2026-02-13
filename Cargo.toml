@@ -31,6 +31,9 @@ rustls-pemfile = "2"
 http = "1"
 bytes = "1"
 subtle = "2"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 # Use mimalloc for musl targets to avoid musl's slow default allocator
 [target.'cfg(target_env = "musl")'.dependencies]

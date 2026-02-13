@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use crate::actor::ActorExitResult;
-use crate::config::{H3Endpoint, UdpEndpoint};
+use crate::config::{Config, H3Endpoint, Peer, UdpEndpoint};
 use crate::h3::H3Connection;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_quiche::buf_factory::PooledBuf;
 
@@ -40,8 +40,49 @@ pub enum Event {
     Transport(TransportEvent),
     /// Events originating from DNS resolution.
     Dns(DnsEvent),
+    /// Events originating from the management API.
+    Api(ApiEvent),
     /// Placeholder for future modules to extend the event stream without changing the channel type.
     Other(String),
+}
+
+/// Events emitted by the management API actor.
+pub enum ApiEvent {
+    /// GET /config — orchestrator replies with current config snapshot.
+    GetConfig {
+        /// Reply channel carrying the full `Config` struct for API-side serialization.
+        reply_tx: oneshot::Sender<Config>,
+    },
+    /// POST /config — upsert peers; orchestrator validates and replies.
+    PostConfig {
+        /// Parsed peer definitions from the request body.
+        peers: Vec<Peer>,
+        /// Reply channel for validation result.
+        reply_tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// DELETE /config — remove peers by ID; orchestrator confirms.
+    DeleteConfig {
+        /// Peer IDs to remove.
+        peer_ids: Vec<String>,
+        /// Reply channel for operation result.
+        reply_tx: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+impl std::fmt::Debug for ApiEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GetConfig { .. } => f.debug_struct("GetConfig").finish_non_exhaustive(),
+            Self::PostConfig { peers, .. } => f
+                .debug_struct("PostConfig")
+                .field("peers_count", &peers.len())
+                .finish_non_exhaustive(),
+            Self::DeleteConfig { peer_ids, .. } => f
+                .debug_struct("DeleteConfig")
+                .field("peer_ids", peer_ids)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Describes transport-level events.

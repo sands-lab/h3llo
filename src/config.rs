@@ -39,6 +39,9 @@ pub struct Local {
     /// BareUDP listener options.
     #[serde(default)]
     pub bare: Option<LocalBare>,
+    /// Management API server options.
+    #[serde(default)]
+    pub api: Option<LocalApi>,
     /// Local TUN configuration.
     pub tun: LocalTun,
 }
@@ -47,27 +50,12 @@ pub struct Local {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LocalH3 {
-    /// HTTP/3 listen address (scheme/host/port/path); optional (dial-only when absent).
-    #[serde(default)]
-    pub listen: Option<H3Endpoint>,
-    /// Certificate path for QUIC/TLS; required when `listen` is set.
-    #[serde(default)]
-    pub cert: Option<String>,
-    /// Private key path for QUIC/TLS; required when `listen` is set.
-    #[serde(default)]
-    pub key: Option<String>,
-    /// Optional control-plane credentials scoped to HTTP/3.
-    pub admin: Option<LocalAdmin>,
-}
-
-/// Control-plane Basic Auth credentials.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct LocalAdmin {
-    /// Stores the admin username (> 8 characters) enabling control-plane.
-    pub name: String,
-    /// Stores the admin password (> 8 characters) enabling control-plane.
-    pub pass: String,
+    /// HTTP/3 listen address; required when `local.h3` is set.
+    pub listen: H3Endpoint,
+    /// Certificate path for QUIC/TLS; required when `local.h3` is set.
+    pub cert: String,
+    /// Private key path for QUIC/TLS; required when `local.h3` is set.
+    pub key: String,
 }
 
 /// BareUDP settings for the local node.
@@ -322,23 +310,12 @@ pub enum ValidationError {
         /// Configured idle timeout.
         idle_timeout: Duration,
     },
-    /// `local.h3.cert` and `local.h3.key` are required when `local.h3.listen` is set.
-    #[error("local.h3.cert and local.h3.key must be set when local.h3.listen is configured")]
+    /// `local.h3.cert` and `local.h3.key` must not be empty when `local.h3` is set.
+    #[error("local.h3.cert and local.h3.key must not be empty when local.h3 is configured")]
     LocalH3CredentialsMissing,
-    /// `local.h3.admin` is present but too short.
-    #[error(
-        "local.h3.admin.name and local.h3.admin.pass must be longer than 8 characters when set"
-    )]
-    LocalAdminTooShort,
-    /// `local.h3.admin` requires a listener.
-    #[error("local.h3.admin requires local.h3.listen to be set")]
-    LocalAdminMissingListener,
     /// TUN addresses are missing.
     #[error("local.tun.addrs must include at least one address")]
     MissingLocalTunAddrs,
-    /// No transport configured (neither H3 nor BareUDP).
-    #[error("at least one transport must be configured (local.h3 or local.bare)")]
-    NoTransportConfigured,
     /// Peer identifier is empty.
     #[error("peer id must not be empty")]
     PeerIdEmpty { peer_id: String },
@@ -425,132 +402,19 @@ impl Config {
             });
         }
 
-        let mut seen_peer_ids = HashSet::new();
-        let mut seen_peer_tokens = HashSet::new();
-
-        // At least one transport must be configured
-        if self.local.h3.is_none() && self.local.bare.is_none() {
-            errors.push(ValidationError::NoTransportConfigured);
-        }
-
-        // H3 listener validation: cert/key required only when listen is set
-        let has_h3_listener = self
-            .local
-            .h3
-            .as_ref()
-            .and_then(|h3| h3.listen.as_ref())
-            .is_some();
-
+        // H3 validation: cert/key must not be empty when local.h3 is set
         if let Some(h3) = self.local.h3.as_ref() {
-            if has_h3_listener {
-                let has_cert = h3
-                    .cert
-                    .as_ref()
-                    .map(|c| !c.trim().is_empty())
-                    .unwrap_or(false);
-                let has_key = h3
-                    .key
-                    .as_ref()
-                    .map(|k| !k.trim().is_empty())
-                    .unwrap_or(false);
-                if !has_cert || !has_key {
-                    errors.push(ValidationError::LocalH3CredentialsMissing);
-                }
-            }
-
-            if let Some(admin) = &h3.admin {
-                if admin.name.trim().len() <= 8 || admin.pass.trim().len() <= 8 {
-                    errors.push(ValidationError::LocalAdminTooShort);
-                }
-                if !has_h3_listener {
-                    errors.push(ValidationError::LocalAdminMissingListener);
-                }
+            if h3.cert.trim().is_empty() || h3.key.trim().is_empty() {
+                errors.push(ValidationError::LocalH3CredentialsMissing);
             }
         }
 
         if self.local.tun.addrs.is_empty() {
             errors.push(ValidationError::MissingLocalTunAddrs);
         }
-        for peer in &self.peers {
-            // Peer ID validation: must be non-empty and have no leading/trailing whitespace
-            if peer.id.trim().is_empty() {
-                errors.push(ValidationError::PeerIdEmpty {
-                    peer_id: peer.id.clone(),
-                });
-            } else if peer.id != peer.id.trim() {
-                errors.push(ValidationError::PeerIdHasWhitespace {
-                    peer_id: peer.id.clone(),
-                });
-            }
 
-            if !seen_peer_ids.insert(peer.id.clone()) {
-                errors.push(ValidationError::DuplicatePeerId {
-                    peer_id: peer.id.clone(),
-                });
-            }
-
-            if let Some(h3) = peer.h3.as_ref() {
-                // Token validation: must be >= 12 chars and have no leading/trailing whitespace
-                if h3.token.len() < 12 {
-                    errors.push(ValidationError::PeerTokenTooShort {
-                        peer_id: peer.id.clone(),
-                    });
-                } else if h3.token != h3.token.trim() {
-                    errors.push(ValidationError::PeerTokenHasWhitespace {
-                        peer_id: peer.id.clone(),
-                    });
-                }
-
-                if !seen_peer_tokens.insert(h3.token.clone()) {
-                    errors.push(ValidationError::DuplicatePeerToken {
-                        peer_id: peer.id.clone(),
-                    });
-                }
-                if let Some(sni) = &h3.sni {
-                    if sni.trim().is_empty() {
-                        errors.push(ValidationError::PeerSniEmpty {
-                            peer_id: peer.id.clone(),
-                        });
-                    } else if sni != sni.trim() {
-                        errors.push(ValidationError::PeerSniHasWhitespace {
-                            peer_id: peer.id.clone(),
-                        });
-                    }
-                }
-
-                if let Some(bindif) = &h3.bindif {
-                    if bindif != bindif.trim() {
-                        errors.push(ValidationError::PeerBindifHasWhitespace {
-                            peer_id: peer.id.clone(),
-                        });
-                    }
-                }
-            }
-
-            match (&peer.h3, &peer.bare) {
-                (Some(_), Some(_)) | (None, None) => {
-                    errors.push(ValidationError::PeerTransportConflict {
-                        peer_id: peer.id.clone(),
-                    })
-                }
-                (Some(_), None) | (None, Some(_)) => {}
-            }
-
-            if peer.tun.allowed_ips.is_empty() {
-                errors.push(ValidationError::PeerMissingAllowedIps {
-                    peer_id: peer.id.clone(),
-                });
-            }
-
-            let mut seen_allowed = HashSet::new();
-            for net in &peer.tun.allowed_ips {
-                if !seen_allowed.insert(*net) {
-                    errors.push(ValidationError::PeerDuplicateAllowedIp {
-                        peer_id: peer.id.clone(),
-                        cidr: net.to_string(),
-                    });
-                }
-            }
+        if let Err(ValidationErrors(peer_errors)) = validate_peers(&self.peers) {
+            errors.extend(peer_errors);
         }
 
         if errors.is_empty() {
@@ -558,6 +422,101 @@ impl Config {
         } else {
             Err(ConfigError::Validation(ValidationErrors(errors)))
         }
+    }
+}
+
+/// Validates a peer list in isolation (ID, token, transport, allowed_ips).
+pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
+    let mut errors = Vec::new();
+    let mut seen_peer_ids = HashSet::new();
+    let mut seen_peer_tokens = HashSet::new();
+
+    for peer in peers {
+        // Peer ID validation: must be non-empty and have no leading/trailing whitespace
+        if peer.id.trim().is_empty() {
+            errors.push(ValidationError::PeerIdEmpty {
+                peer_id: peer.id.clone(),
+            });
+        } else if peer.id != peer.id.trim() {
+            errors.push(ValidationError::PeerIdHasWhitespace {
+                peer_id: peer.id.clone(),
+            });
+        }
+
+        if !seen_peer_ids.insert(peer.id.clone()) {
+            errors.push(ValidationError::DuplicatePeerId {
+                peer_id: peer.id.clone(),
+            });
+        }
+
+        if let Some(h3) = peer.h3.as_ref() {
+            // Token validation: must be >= 12 chars and have no leading/trailing whitespace
+            if h3.token.len() < 12 {
+                errors.push(ValidationError::PeerTokenTooShort {
+                    peer_id: peer.id.clone(),
+                });
+            } else if h3.token != h3.token.trim() {
+                errors.push(ValidationError::PeerTokenHasWhitespace {
+                    peer_id: peer.id.clone(),
+                });
+            }
+
+            if !seen_peer_tokens.insert(h3.token.clone()) {
+                errors.push(ValidationError::DuplicatePeerToken {
+                    peer_id: peer.id.clone(),
+                });
+            }
+            if let Some(sni) = &h3.sni {
+                if sni.trim().is_empty() {
+                    errors.push(ValidationError::PeerSniEmpty {
+                        peer_id: peer.id.clone(),
+                    });
+                } else if sni != sni.trim() {
+                    errors.push(ValidationError::PeerSniHasWhitespace {
+                        peer_id: peer.id.clone(),
+                    });
+                }
+            }
+
+            if let Some(bindif) = &h3.bindif {
+                if bindif != bindif.trim() {
+                    errors.push(ValidationError::PeerBindifHasWhitespace {
+                        peer_id: peer.id.clone(),
+                    });
+                }
+            }
+        }
+
+        match (&peer.h3, &peer.bare) {
+            (Some(_), Some(_)) | (None, None) => {
+                errors.push(ValidationError::PeerTransportConflict {
+                    peer_id: peer.id.clone(),
+                })
+            }
+            (Some(_), None) | (None, Some(_)) => {}
+        }
+
+        if peer.tun.allowed_ips.is_empty() {
+            errors.push(ValidationError::PeerMissingAllowedIps {
+                peer_id: peer.id.clone(),
+            });
+        }
+
+        let mut seen_allowed = HashSet::new();
+        for net in &peer.tun.allowed_ips {
+            if !seen_allowed.insert(*net) {
+                errors.push(ValidationError::PeerDuplicateAllowedIp {
+                    peer_id: peer.id.clone(),
+                    cidr: net.to_string(),
+                });
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationErrors(errors))
     }
 }
 
@@ -673,6 +632,73 @@ impl Serialize for H3Endpoint {
     }
 }
 
+/// Management API settings for the local node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalApi {
+    /// HTTP listen address for the management API (required when `local.api` is set).
+    pub listen: ApiEndpoint,
+}
+
+/// Represents an HTTP management API endpoint parsed from an `http://` URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiEndpoint {
+    /// Host portion of the URI (IP literal or hostname).
+    pub host: String,
+    /// Port number (defaults to 9090 if not specified).
+    pub port: u16,
+    /// Path portion of the URI.
+    pub path: String,
+}
+
+impl<'de> Deserialize<'de> for ApiEndpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        parse_api_uri(&s).map_err(de::Error::custom)
+    }
+}
+
+impl Serialize for ApiEndpoint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Always include the port to avoid round-trip bugs (HTTP default is 80, not 9090).
+        let uri = format!("http://{}:{}{}", self.host, self.port, self.path);
+        serializer.serialize_str(&uri)
+    }
+}
+
+/// Parses a scheme-specific endpoint URI into host/port/path components.
+///
+/// Shared logic for `parse_h3_uri` and `parse_api_uri`.
+fn parse_endpoint_uri(
+    raw: &str,
+    expected_scheme: &str,
+    default_port: u16,
+) -> Result<(String, u16, String), String> {
+    let url = Url::parse(raw).map_err(|e| e.to_string())?;
+    if url.scheme() != expected_scheme {
+        return Err(format!("scheme must be {expected_scheme}"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("userinfo is not supported".to_string());
+    }
+    let host = url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| "host is required".to_string())?;
+    let port = url.port().unwrap_or(default_port);
+    let path = url.path().to_string();
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("query and fragment are not supported".to_string());
+    }
+    Ok((host.to_string(), port, path))
+}
+
 /// Parses a UDP DNS server URI (e.g., `udp://1.1.1.1:53`) into a socket address, enforcing IP literals.
 ///
 /// Supports both IPv4 (`udp://1.1.1.1:53`) and IPv6 (`udp://[::1]:53`) addresses.
@@ -724,33 +750,26 @@ pub fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
 ///
 /// Returns an error if the URI is invalid, uses a non-https scheme, or is missing a host.
 pub fn parse_h3_uri(raw: &str) -> Result<H3Endpoint, String> {
-    let url = Url::parse(raw).map_err(|e| e.to_string())?;
+    let (host, port, path) = parse_endpoint_uri(raw, "https", 443)?;
+    Ok(H3Endpoint { host, port, path })
+}
 
-    if url.scheme() != "https" {
-        return Err("scheme must be https".to_string());
-    }
-
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("userinfo is not supported".to_string());
-    }
-
-    let host = url
-        .host_str()
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| "host is required".to_string())?;
-
-    let port = url.port().unwrap_or(443);
-    let path = url.path().to_string();
-
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err("query and fragment are not supported".to_string());
-    }
-
-    Ok(H3Endpoint {
-        host: host.to_string(),
-        port,
-        path,
-    })
+/// Parses an HTTP management API URI (e.g., `http://127.0.0.1:9090/admin`).
+///
+/// # Arguments
+///
+/// * `raw` - The URI string to parse.
+///
+/// # Returns
+///
+/// Returns an `ApiEndpoint`. Port defaults to 9090 if not specified.
+///
+/// # Errors
+///
+/// Returns an error if the URI is invalid, uses a non-http scheme, or is missing a host.
+pub fn parse_api_uri(raw: &str) -> Result<ApiEndpoint, String> {
+    let (host, port, path) = parse_endpoint_uri(raw, "http", 9090)?;
+    Ok(ApiEndpoint { host, port, path })
 }
 
 /// Parses a UDP URI (e.g., `udp://host:6635`) into host and port components.
@@ -800,19 +819,16 @@ mod tests {
                     bindif: None,
                 },
                 h3: Some(LocalH3 {
-                    listen: Some(H3Endpoint {
+                    listen: H3Endpoint {
                         host: "[::]".to_string(),
                         port: 443,
                         path: "/path".to_string(),
-                    }),
-                    cert: Some("./cert.pem".to_string()),
-                    key: Some("./key.pem".to_string()),
-                    admin: Some(LocalAdmin {
-                        name: "admin-username".to_string(),
-                        pass: "admin-password".to_string(),
-                    }),
+                    },
+                    cert: "./cert.pem".to_string(),
+                    key: "./key.pem".to_string(),
                 }),
                 bare: None,
+                api: None,
                 tun: LocalTun {
                     ifname: "h3llo0".to_string(),
                     addrs: vec!["192.168.180.1/32".parse().unwrap()],
@@ -888,30 +904,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_admin_listener() {
-        let mut config = sample_h3_config();
-        if let Some(h3) = config.local.h3.as_mut() {
-            h3.listen = None;
-        }
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.contains(&ValidationError::LocalAdminMissingListener)
-        ));
-    }
-
-    #[test]
-    fn rejects_h3_listener_without_credentials() {
+    fn rejects_h3_with_empty_credentials() {
         let mut config = sample_h3_config();
         config.local.h3 = Some(LocalH3 {
-            listen: Some(H3Endpoint {
+            listen: H3Endpoint {
                 host: "[::]".to_string(),
                 port: 443,
                 path: "/".to_string(),
-            }),
-            cert: None,
-            key: None,
-            admin: None,
+            },
+            cert: String::new(),
+            key: String::new(),
         });
         let err = config.validate().unwrap_err();
         assert!(matches!(
@@ -922,17 +924,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_h3_listener_with_partial_credentials() {
+    fn rejects_h3_with_partial_credentials() {
         let mut config = sample_h3_config();
         config.local.h3 = Some(LocalH3 {
-            listen: Some(H3Endpoint {
+            listen: H3Endpoint {
                 host: "[::]".to_string(),
                 port: 443,
                 path: "/".to_string(),
-            }),
-            cert: Some("./cert.pem".to_string()),
-            key: None, // missing key
-            admin: None,
+            },
+            cert: "./cert.pem".to_string(),
+            key: String::new(), // missing key
         });
         let err = config.validate().unwrap_err();
         assert!(matches!(
@@ -943,32 +944,15 @@ mod tests {
     }
 
     #[test]
-    fn accepts_h3_without_listener_dial_only() {
-        let mut config = sample_h3_config();
-        config.local.h3 = Some(LocalH3 {
-            listen: None,
-            cert: None,
-            key: None,
-            admin: None,
-        });
-        let result = config.validate();
-        assert!(result.is_ok(), "dial-only H3 config should be valid");
-    }
-
-    #[test]
-    fn rejects_short_admin_credentials() {
-        let mut config = sample_h3_config();
-        if let Some(h3) = config.local.h3.as_mut() {
-            h3.admin = Some(LocalAdmin {
-                name: "short".to_string(),
-                pass: "short".to_string(),
-            });
-        }
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.contains(&ValidationError::LocalAdminTooShort)
-        ));
+    fn rejects_h3_without_required_fields() {
+        let yaml = r#"
+local:
+  h3: {}
+  tun:
+    addrs:
+      - 192.168.180.1/32
+"#;
+        assert!(Config::load_from_str(yaml).is_err());
     }
 
     #[test]
@@ -1067,7 +1051,10 @@ mod tests {
         // Unknown field at top level
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1079,7 +1066,6 @@ unknown_top_level: true
         // Unknown field in nested struct (local.dns)
         let yaml = r#"
 local:
-  h3: {}
   dns:
     server: udp://1.1.1.1:53
     refresh: 1
@@ -1093,7 +1079,10 @@ local:
         // Unknown field in tuning
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1106,7 +1095,10 @@ tuning:
         // Unknown field in peer
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1175,7 +1167,6 @@ peers:
     fn parses_single_endpoint_and_applies_dns_defaults() {
         let yaml = r#"
 local:
-  h3: {}
   dns:
     server: udp://8.8.8.8:53
   tun:
@@ -1393,11 +1384,100 @@ peers:
         assert_eq!(endpoint.path, "/");
     }
 
+    // ========== parse_api_uri tests ==========
+
     #[test]
-    fn parse_dial_only_h3_config() {
+    fn parse_api_uri_accepts_full_uri() {
+        let ep = parse_api_uri("http://127.0.0.1:9090/admin").expect("should parse");
+        assert_eq!(ep.host, "127.0.0.1");
+        assert_eq!(ep.port, 9090);
+        assert_eq!(ep.path, "/admin");
+    }
+
+    #[test]
+    fn parse_api_uri_defaults_port_9090() {
+        let ep = parse_api_uri("http://localhost/").expect("should parse");
+        assert_eq!(ep.host, "localhost");
+        assert_eq!(ep.port, 9090);
+    }
+
+    #[test]
+    fn parse_api_uri_rejects_https() {
+        assert!(parse_api_uri("https://127.0.0.1:9090/").is_err());
+    }
+
+    #[test]
+    fn parse_api_uri_accepts_ipv6() {
+        let ep = parse_api_uri("http://[::1]:8080/").expect("should parse");
+        assert_eq!(ep.host, "[::1]");
+        assert_eq!(ep.port, 8080);
+    }
+
+    #[test]
+    fn parse_api_uri_rejects_userinfo() {
+        assert!(parse_api_uri("http://user:pass@127.0.0.1:9090/").is_err());
+    }
+
+    // ========== local.api config tests ==========
+
+    #[test]
+    fn parses_config_with_local_api() {
         let yaml = r#"
 local:
-  h3: {}
+  api:
+    listen: http://127.0.0.1:9090/
+  tun:
+    addrs:
+      - 192.168.180.1/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        let api = cfg.local.api.as_ref().expect("api should be present");
+        assert_eq!(api.listen.host, "127.0.0.1");
+        assert_eq!(api.listen.port, 9090);
+        assert_eq!(api.listen.path, "/");
+    }
+
+    #[test]
+    fn parses_config_with_api_and_h3() {
+        let yaml = r#"
+local:
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
+  api:
+    listen: http://127.0.0.1:9090/
+  tun:
+    addrs:
+      - 192.168.180.1/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert!(cfg.local.h3.is_some());
+        assert!(cfg.local.api.is_some());
+    }
+
+    #[test]
+    fn parses_config_without_any_transport() {
+        let yaml = r#"
+local:
+  tun:
+    addrs:
+      - 192.168.180.1/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert!(cfg.local.h3.is_none());
+        assert!(cfg.local.bare.is_none());
+        assert!(cfg.local.api.is_none());
+    }
+
+    #[test]
+    fn parse_h3_config_with_all_required_fields() {
+        let yaml = r#"
+local:
+  h3:
+    listen: https://[::]:443/path
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1413,9 +1493,10 @@ peers:
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert!(cfg.local.h3.is_some());
         let h3 = cfg.local.h3.as_ref().unwrap();
-        assert!(h3.listen.is_none());
-        assert!(h3.cert.is_none());
-        assert!(h3.key.is_none());
+        assert_eq!(h3.listen.host, "[::]");
+        assert_eq!(h3.listen.port, 443);
+        assert_eq!(h3.cert, "./cert.pem");
+        assert_eq!(h3.key, "./key.pem");
     }
 
     #[test]
@@ -1520,29 +1601,16 @@ local:
         assert!(matches!(result, Err(ConfigError::Parse(_))));
     }
 
-    #[test]
-    fn rejects_no_transport_configured() {
-        let yaml = r#"
-local:
-  tun:
-    addrs:
-      - 192.168.180.1/32
-"#;
-        let result = Config::load_from_str(yaml);
-        assert!(matches!(
-            result,
-            Err(ConfigError::Validation(ValidationErrors(ref errs)))
-                if errs.contains(&ValidationError::NoTransportConfigured)
-        ));
-    }
-
     // ========== Parse-at-deserialization tests ==========
 
     #[test]
     fn deserializes_local_tun_addrs_as_ipnet() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.0/24
@@ -1558,7 +1626,10 @@ local:
     fn rejects_invalid_tun_addr_at_parse_time() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - not-a-cidr
@@ -1571,7 +1642,10 @@ local:
     fn accepts_cidr_in_tun_addrs() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1587,7 +1661,10 @@ local:
     fn deserializes_allowed_ips_as_ipnet() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1610,7 +1687,10 @@ peers:
     fn rejects_invalid_allowed_ip_at_parse_time() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1630,7 +1710,6 @@ peers:
     fn deserializes_dns_server_as_socket_addr() {
         let yaml = r#"
 local:
-  h3: {}
   dns:
     server: udp://8.8.8.8:53
   tun:
@@ -1646,7 +1725,6 @@ local:
     fn rejects_invalid_dns_server_at_parse_time() {
         let yaml = r#"
 local:
-  h3: {}
   dns:
     server: tcp://8.8.8.8:53
   tun:
@@ -1661,7 +1739,6 @@ local:
     fn dns_server_round_trip_serialization() {
         let yaml = r#"
 local:
-  h3: {}
   dns:
     server: udp://8.8.8.8:53
   tun:
@@ -1679,7 +1756,6 @@ local:
     fn dns_server_ipv6_round_trip_serialization() {
         let yaml = r#"
 local:
-  h3: {}
   dns:
     server: udp://[2001:4860:4860::8888]:53
   tun:
@@ -1702,7 +1778,10 @@ local:
     fn tuning_defaults_applied_when_absent() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1736,7 +1815,10 @@ peers:
     fn tuning_cc_algorithm_override() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1784,7 +1866,10 @@ peers:
     fn tuning_partial_override() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1813,7 +1898,10 @@ peers:
     fn rejects_zero_packet_queue_depth() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1872,7 +1960,10 @@ peers:
     fn tuning_socket_buffer_size_override() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1907,7 +1998,10 @@ peers:
     fn tuning_insecure_skip_verify_override() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1929,7 +2023,10 @@ peers:
     fn metrics_push_interval_millis_override() {
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1952,7 +2049,10 @@ peers:
         // `ca` field removed
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32
@@ -1971,7 +2071,10 @@ peers:
         // `insecure` field removed
         let yaml = r#"
 local:
-  h3: {}
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
   tun:
     addrs:
       - 192.168.180.1/32

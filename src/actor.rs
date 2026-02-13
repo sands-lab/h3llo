@@ -92,6 +92,15 @@ pub enum ActorError {
         /// Failure reason.
         reason: String,
     },
+
+    /// Management API server exited with I/O error.
+    #[error("api[{addr}]: server failed: {reason}")]
+    ApiServer {
+        /// Listen address.
+        addr: String,
+        /// Failure reason.
+        reason: String,
+    },
 }
 
 impl ActorError {
@@ -103,6 +112,7 @@ impl ActorError {
             ActorError::TunTxSend { .. } => ActorKind::Critical,
             ActorError::BareRxRecv { .. } => ActorKind::Critical,
             ActorError::DnsRecv { .. } => ActorKind::Critical,
+            ActorError::ApiServer { .. } => ActorKind::Critical,
             // Restartable actors - could be reconnected (future work)
             ActorError::BareTxSend { .. } => ActorKind::Restartable,
             ActorError::H3RxRecv { .. } => ActorKind::Restartable,
@@ -133,6 +143,10 @@ mod tests {
             ActorError::DnsRecv {
                 server: "8.8.8.8:53".into(),
                 source: io::Error::new(io::ErrorKind::Other, "test"),
+            },
+            ActorError::ApiServer {
+                addr: "127.0.0.1:9090".into(),
+                reason: "bind failed".into(),
             },
         ];
         for err in errors {

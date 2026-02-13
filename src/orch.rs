@@ -3,8 +3,9 @@
 use crate::actor::{ActorError, ActorExitResult, ActorKind};
 use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUdpRxCommand};
 use crate::bind::DefaultRouteProbe;
-use crate::config::{Config, Peer, Tuning};
+use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
+use crate::events::ApiEvent;
 use crate::events::{
     BareConnectedEvent, ConnectionDirection, DnsEvent, Endpoint, Event, H3ConnectedEvent,
     TransportEvent,
@@ -165,8 +166,7 @@ impl PeerEntry {
         // Determine which IPs need connections
         let uncovered: Vec<IpAddr> = self
             .resolved_ips
-            .iter()
-            .filter(|ip| !covered_ips.contains(ip))
+            .difference(&covered_ips)
             .copied()
             .collect();
 
@@ -298,6 +298,9 @@ pub enum OrchestratorError {
     /// HTTP/3 dial failed.
     #[error("h3 dial to '{peer_id}' failed: {reason}")]
     H3Dial { peer_id: String, reason: String },
+    /// Management API failed to initialize.
+    #[error("api server failed to start: {0}")]
+    ApiInit(String),
     /// DNS resolver failed to initialize.
     #[error("dns resolver failed to initialize: {0}")]
     DnsInit(String),
@@ -343,14 +346,15 @@ pub struct Orchestrator {
     /// Packet sender to TUN TX (for H3 RX actors).
     tun_packet_tx: mpsc::Sender<Vec<PooledBuf>>,
 
-    /// DNS resolver command sender for SetHostnames (used for future reconfiguration).
-    #[allow(dead_code)]
+    /// DNS resolver command sender for SetHostnames.
     dns_cmd_tx: mpsc::UnboundedSender<DnsCommand>,
 
     /// Route sync actor command sender (None when `local.table` is false or init failed).
     route_cmd_tx: Option<mpsc::UnboundedSender<RouteCommand>>,
     /// TUN interface addresses for route sync commands.
     tun_addrs: Vec<IpNet>,
+    /// Stored local config for GET /config snapshot reconstruction.
+    local: Local,
 }
 
 impl Orchestrator {
@@ -358,11 +362,15 @@ impl Orchestrator {
     ///
     /// Sends the new set of accepted source IPs to the BareUDP RX actor.
     /// No-op when BareUDP is not configured (`bare_rx_cmd_tx` is `None`).
-    fn update_accepted_sources(&self, accepted_ips: &HashSet<IpAddr>) {
+    fn update_accepted_sources(&self) {
         if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
-            if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAcceptedSources(
-                accepted_ips.clone(),
-            )) {
+            let accepted_ips: HashSet<IpAddr> = self
+                .peers
+                .values()
+                .filter(|e| e.config.bare.is_some())
+                .flat_map(|e| e.resolved_ips.iter().copied())
+                .collect();
+            if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAcceptedSources(accepted_ips)) {
                 warn!(error = %e, "failed to send accepted sources update command");
             }
         }
@@ -375,7 +383,11 @@ impl Orchestrator {
     /// 2. System routes via route actor (if available)
     fn update_routing(&self) {
         let peer_configs = self.peer_configs();
-        let peer_txs = self.peer_txs();
+        let peer_txs: HashMap<String, mpsc::Sender<Vec<PooledBuf>>> = self
+            .peers
+            .iter()
+            .filter_map(|(id, e)| e.preferred_tx().map(|tx| (id.clone(), tx.clone())))
+            .collect();
         if let Ok(routing) = RoutingTable::from_peers(&peer_configs, &peer_txs) {
             if let Err(e) = self
                 .tun_cmd_tx
@@ -394,14 +406,6 @@ impl Orchestrator {
                 warn!(error = %e, "failed to send route sync command");
             }
         }
-    }
-
-    /// Returns map of peer ID to preferred TX channel (for routing table).
-    fn peer_txs(&self) -> HashMap<String, mpsc::Sender<Vec<PooledBuf>>> {
-        self.peers
-            .iter()
-            .filter_map(|(id, e)| e.preferred_tx().map(|tx| (id.clone(), tx.clone())))
-            .collect()
     }
 
     /// Returns peer configurations as a Vec (for routing table and route sync).
@@ -480,50 +484,41 @@ impl Orchestrator {
             None
         };
 
-        // Initialize H3 listener if configured with listen address
-        let h3_cfg = config.local.h3.as_ref();
-        let listen_endpoint = h3_cfg.and_then(|h3| h3.listen.as_ref());
+        // Initialize H3 listener if configured
+        let h3_listener_cmd_tx = if let Some(ref h3_cfg) = config.local.h3 {
+            let listen_addr = resolve_listen_addr(&h3_cfg.listen.host, h3_cfg.listen.port)?;
+            let cert_path = Path::new(&h3_cfg.cert);
+            let key_path = Path::new(&h3_cfg.key);
 
-        let h3_listener_cmd_tx = match (h3_cfg, listen_endpoint) {
-            (Some(h3_cfg), Some(listen_ep)) => {
-                // Endpoint already parsed during config deserialization
-                let listen_addr = resolve_listen_addr(&listen_ep.host, listen_ep.port)?;
+            // Build peer tokens map for authentication
+            let peer_tokens: HashMap<String, String> = config
+                .peers
+                .iter()
+                .filter_map(|p| p.h3.as_ref().map(|h3| (p.id.clone(), h3.token.clone())))
+                .collect();
 
-                // SAFETY: cert and key are validated to be Some when listen is set
-                let cert_path = Path::new(h3_cfg.cert.as_ref().expect("validated"));
-                let key_path = Path::new(h3_cfg.key.as_ref().expect("validated"));
+            // make: fallible I/O (socket bind, TLS config)
+            let listener = make_h3_listener(
+                listen_addr,
+                cert_path,
+                key_path,
+                tuning.socket_buffer_bytes(),
+            )
+            .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
 
-                // Build peer tokens map for authentication
-                let peer_tokens: HashMap<String, String> = config
-                    .peers
-                    .iter()
-                    .filter(|p| p.h3.is_some())
-                    .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().token.clone()))
-                    .collect();
+            // spawn: infallible task creation; listener sends events through events_tx
+            let (cmd_tx, listener_handle, _bound_addr) = spawn_h3_listener(
+                listener,
+                peer_tokens,
+                config.local.tun.mtu,
+                events_tx.clone(),
+                tuning,
+            );
 
-                // make: fallible I/O (socket bind, TLS config)
-                let listener = make_h3_listener(
-                    listen_addr,
-                    cert_path,
-                    key_path,
-                    tuning.socket_buffer_bytes(),
-                )
-                .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
-
-                // spawn: infallible task creation; listener sends events through events_tx
-                let (cmd_tx, listener_handle, _bound_addr) = spawn_h3_listener(
-                    listener,
-                    peer_tokens,
-                    config.local.tun.mtu,
-                    events_tx.clone(),
-                    tuning,
-                );
-
-                join_set.spawn(listener_handle);
-                Some(cmd_tx)
-            }
-            // Dial-only mode or no H3 configured: no listener, but can dial H3 peers
-            _ => None,
+            join_set.spawn(listener_handle);
+            Some(cmd_tx)
+        } else {
+            None
         };
 
         // Initialize unified peer state from config
@@ -549,14 +544,6 @@ impl Orchestrator {
         // Spawn DNS actor task (infallible)
         let (dns_cmd_tx, handle) = spawn_dns(dns_actor, events_tx.clone());
 
-        // Send all hostnames to DNS module in one shot.
-        // IP literals are handled by the DNS module directly (immediate IpResolved event).
-        let peer_configs: Vec<Peer> = peers.values().map(|e| e.config.clone()).collect();
-        let hostnames = collect_hostnames(&peer_configs);
-        if let Err(e) = dns_cmd_tx.send(DnsCommand::SetHostnames { hosts: hostnames }) {
-            warn!(error = %e, "dns: failed to send initial hostnames");
-        }
-
         join_set.spawn(handle);
 
         // Initialize route sync actor if system route management is enabled.
@@ -581,7 +568,22 @@ impl Orchestrator {
             warn!("no active peers; traffic will be dropped");
         }
 
-        Ok(Self {
+        // Initialize management API if configured
+        if let Some(ref local_api) = config.local.api {
+            let api_listen_addr =
+                resolve_listen_addr(&local_api.listen.host, local_api.listen.port)?;
+            let api_listener = crate::api::make_api(api_listen_addr)
+                .await
+                .map_err(|e| OrchestratorError::ApiInit(e.to_string()))?;
+            let api_handle = crate::api::spawn_api(
+                api_listener,
+                local_api.listen.path.clone(),
+                events_tx.clone(),
+            );
+            join_set.spawn(api_handle);
+        }
+
+        let mut orch = Self {
             events_rx,
             events_tx,
             join_set,
@@ -596,7 +598,10 @@ impl Orchestrator {
             dns_cmd_tx,
             route_cmd_tx,
             tun_addrs,
-        })
+            local: config.local,
+        };
+        orch.sync_dns_hostnames();
+        Ok(orch)
     }
 
     /// Runs the orchestrator event loop until shutdown or task failure.
@@ -679,11 +684,87 @@ impl Orchestrator {
         }
     }
 
+    /// Handles management API events.
+    fn handle_api_event(&mut self, event: ApiEvent) {
+        match event {
+            ApiEvent::GetConfig { reply_tx } => {
+                let snapshot = Config {
+                    local: self.local.clone(),
+                    tuning: self.tuning.clone(),
+                    peers: self.peer_configs(),
+                };
+                let _ = reply_tx.send(snapshot);
+            }
+            ApiEvent::PostConfig { peers, reply_tx } => {
+                let result = self.handle_post_config(peers);
+                let _ = reply_tx.send(result);
+            }
+            ApiEvent::DeleteConfig { peer_ids, reply_tx } => {
+                self.handle_delete_config(&peer_ids);
+                let _ = reply_tx.send(Ok(()));
+            }
+        }
+    }
+
+    /// Sends updated hostname set to the DNS resolver after peer mutations.
+    ///
+    /// The DNS resolver will re-resolve and emit a snapshot, which triggers
+    /// routing and accepted-source updates in [`handle_dns_snapshot`].
+    fn sync_dns_hostnames(&mut self) {
+        let peer_configs = self.peer_configs();
+        let hostnames = collect_hostnames(&peer_configs);
+        let _ = self
+            .dns_cmd_tx
+            .send(DnsCommand::SetHostnames { hosts: hostnames });
+    }
+
+    /// Handles POST /config — upsert peers with orchestrator-side validation.
+    fn handle_post_config(&mut self, new_peers: Vec<Peer>) -> Result<(), String> {
+        // Build merged peer list for validation
+        let mut merged = self.peer_configs();
+        for new_peer in &new_peers {
+            merged.retain(|p| p.id != new_peer.id);
+            merged.push(new_peer.clone());
+        }
+        validate_peers(&merged).map_err(|e| ConfigError::Validation(e).to_string())?;
+
+        let count = new_peers.len();
+        for peer in new_peers {
+            let id = peer.id.clone();
+            if let Some(existing) = self.peers.get_mut(&id) {
+                existing.config = peer;
+            } else {
+                self.peers.insert(id, PeerEntry::new(peer));
+            }
+        }
+
+        self.sync_dns_hostnames();
+        info!(count = count, "API: peers upserted");
+        Ok(())
+    }
+
+    /// Handles DELETE /config — remove peers by ID.
+    fn handle_delete_config(&mut self, peer_ids: &[String]) {
+        let mut changed = false;
+        for id in peer_ids {
+            if self.peers.remove(id).is_some() {
+                changed = true;
+                debug!(peer = %id, "API: peer removed");
+            }
+        }
+        if changed {
+            self.sync_dns_hostnames();
+        }
+    }
+
     /// Handles an event from a child actor.
     async fn handle_event(&mut self, event: Event) {
         match event {
             Event::Dns(dns_event) => {
                 self.handle_dns_snapshot(dns_event);
+            }
+            Event::Api(api_event) => {
+                self.handle_api_event(api_event);
             }
             Event::Transport(TransportEvent::Metrics(metrics)) => {
                 let labels = &metrics.labels;
@@ -722,11 +803,13 @@ impl Orchestrator {
     }
 
     /// Handles a DNS state snapshot: update resolved IPs, prune stale bounds, try reconnect.
+    ///
+    /// Always rebuilds routing and accepted sources, since this is the
+    /// authoritative point where peer connectivity state is reconciled
+    /// after DNS changes or peer mutations (add/remove via API).
     fn handle_dns_snapshot(&mut self, dns_event: DnsEvent) {
         let dns_state = dns_event.state;
-        let mut routing_changed = false;
 
-        // 1. Update resolved_ips + 2. prune + try_connect for each peer
         for entry in self.peers.values_mut() {
             let hostname = peer_dns_hostname(&entry.config);
             entry.resolved_ips = hostname
@@ -734,24 +817,12 @@ impl Orchestrator {
                 .map(|ips| ips.iter().copied().collect())
                 .unwrap_or_default();
 
-            if entry.prune() {
-                routing_changed = true;
-            }
+            entry.prune();
             entry.try_connect(&self.events_tx, &self.tun_if, self.mtu, &self.tuning);
         }
 
-        // 3. Update accepted sources (all resolved IPs for bare peers)
-        let accepted_ips: HashSet<IpAddr> = self
-            .peers
-            .values()
-            .filter(|e| e.config.bare.is_some())
-            .flat_map(|e| e.resolved_ips.iter().copied())
-            .collect();
-        self.update_accepted_sources(&accepted_ips);
-
-        if routing_changed {
-            self.update_routing();
-        }
+        self.update_accepted_sources();
+        self.update_routing();
     }
 
     /// Registers a bound connection for a peer.
@@ -941,6 +1012,7 @@ mod test_support {
         mtu: usize,
         peers: HashMap<String, PeerEntry>,
         tun_addrs: Vec<IpNet>,
+        local: Option<crate::config::Local>,
     }
 
     impl Default for TestableOrchestratorBuilder {
@@ -950,6 +1022,7 @@ mod test_support {
                 mtu: crate::config::default_mtu() as usize,
                 peers: HashMap::new(),
                 tun_addrs: Vec::new(),
+                local: None,
             }
         }
     }
@@ -1005,6 +1078,22 @@ mod test_support {
             let (tun_packet_tx, _tun_packet_rx) = mpsc::channel(1);
             let (route_cmd_tx, route_cmd_rx) = mpsc::unbounded_channel();
 
+            let local = self.local.unwrap_or_else(|| crate::config::Local {
+                table: false,
+                dns: crate::config::LocalDns {
+                    server: "1.1.1.1:53".parse().unwrap(),
+                    bindif: None,
+                },
+                h3: None,
+                bare: None,
+                api: None,
+                tun: crate::config::LocalTun {
+                    ifname: "test0".to_string(),
+                    addrs: vec!["192.168.180.1/32".parse().unwrap()],
+                    mtu: 1393,
+                },
+            });
+
             let orch = Orchestrator {
                 events_rx,
                 events_tx: events_tx.clone(),
@@ -1020,6 +1109,7 @@ mod test_support {
                 dns_cmd_tx,
                 route_cmd_tx: Some(route_cmd_tx),
                 tun_addrs: self.tun_addrs,
+                local,
             };
 
             (
@@ -1301,14 +1391,17 @@ mod tests {
 
         // No bound created (hostname doesn't match)
         assert!(orch.peers.get("peer1").unwrap().bounds.is_empty());
-        // Routing not updated (no bounds change)
-        assert!(handles.tun_cmd_rx.try_recv().is_err());
         // Accepted sources always updated (unconditionally), but empty since no hostname matched
         let cmd = handles
             .bare_rx_cmd_rx
             .try_recv()
             .expect("accepted sources always sent");
         assert_eq!(cmd, BareUdpRxCommand::UpdateAcceptedSources(HashSet::new()));
+        // Routing always updated unconditionally
+        handles
+            .tun_cmd_rx
+            .try_recv()
+            .expect("routing update always sent");
     }
 
     #[tokio::test]
@@ -1349,14 +1442,17 @@ mod tests {
         let event = make_dns_snapshot_event(state);
         orch.handle_event(event).await;
 
-        // Routing not updated (no bounds change)
-        assert!(handles.tun_cmd_rx.try_recv().is_err());
         // Accepted sources always updated (unconditionally), but empty since no hostname matched
         let cmd = handles
             .bare_rx_cmd_rx
             .try_recv()
             .expect("accepted sources always sent");
         assert_eq!(cmd, BareUdpRxCommand::UpdateAcceptedSources(HashSet::new()));
+        // Routing always updated unconditionally
+        handles
+            .tun_cmd_rx
+            .try_recv()
+            .expect("routing update always sent");
     }
 
     #[tokio::test]
@@ -1564,19 +1660,20 @@ mod tests {
     async fn update_accepted_sources_independent_of_routing() {
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
 
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let (orch, mut handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer])
+            .with_resolved_ips("peer1", HashSet::from([ip]))
             .build();
 
-        let accepted = HashSet::from(["1.2.3.4".parse::<IpAddr>().unwrap()]);
-        orch.update_accepted_sources(&accepted);
+        orch.update_accepted_sources();
 
         let BareUdpRxCommand::UpdateAcceptedSources(ips) = handles
             .bare_rx_cmd_rx
             .try_recv()
             .expect("accepted sources update expected");
         assert_eq!(ips.len(), 1);
-        assert!(ips.contains(&"1.2.3.4".parse().unwrap()));
+        assert!(ips.contains(&ip));
 
         // Routing command should NOT be sent
         assert!(handles.tun_cmd_rx.try_recv().is_err());
@@ -1630,8 +1727,11 @@ mod tests {
         assert!(ips.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()));
         assert!(ips.contains(&"5.6.7.8".parse::<IpAddr>().unwrap()));
 
-        // Routing should NOT be updated (no bounds change — first bound unchanged)
-        assert!(handles.tun_cmd_rx.try_recv().is_err());
+        // Routing always updated unconditionally
+        handles
+            .tun_cmd_rx
+            .try_recv()
+            .expect("routing update always sent");
     }
 
     // ========== BareConnected event handling tests ==========
@@ -1883,5 +1983,134 @@ mod tests {
         // Second immediate call should be rate-limited (timestamp unchanged)
         entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
         assert_eq!(entry.last_try_connect.unwrap(), first_time);
+    }
+
+    // ========== API event handling tests ==========
+
+    #[tokio::test]
+    async fn api_get_config_returns_snapshot() {
+        let peer = Peer {
+            id: "peer-1".to_string(),
+            h3: Some(crate::config::PeerH3 {
+                endpoint: None,
+                token: "test-token-12ch".to_string(),
+                bindif: None,
+                sni: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            },
+        };
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orch.handle_api_event(ApiEvent::GetConfig { reply_tx });
+
+        let config = reply_rx.await.expect("should receive config");
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].id, "peer-1");
+    }
+
+    #[tokio::test]
+    async fn api_post_config_adds_peer() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+        assert!(orch.peers.is_empty());
+
+        let new_peer = Peer {
+            id: "new-peer".to_string(),
+            h3: Some(crate::config::PeerH3 {
+                endpoint: None,
+                token: "test-token-12ch".to_string(),
+                bindif: None,
+                sni: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+            },
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orch.handle_api_event(ApiEvent::PostConfig {
+            peers: vec![new_peer],
+            reply_tx,
+        });
+
+        let result = reply_rx.await.expect("should receive reply");
+        assert!(result.is_ok());
+        assert_eq!(orch.peers.len(), 1);
+        assert!(orch.peers.contains_key("new-peer"));
+    }
+
+    #[tokio::test]
+    async fn api_post_config_rejects_invalid_peer() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+
+        let bad_peer = Peer {
+            id: "".to_string(), // empty id is invalid
+            h3: None,
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            },
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orch.handle_api_event(ApiEvent::PostConfig {
+            peers: vec![bad_peer],
+            reply_tx,
+        });
+
+        let result = reply_rx.await.expect("should receive reply");
+        assert!(result.is_err());
+        assert!(orch.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_delete_config_removes_peer() {
+        let peer = Peer {
+            id: "peer-1".to_string(),
+            h3: Some(crate::config::PeerH3 {
+                endpoint: None,
+                token: "test-token-12ch".to_string(),
+                bindif: None,
+                sni: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            },
+        };
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+        assert_eq!(orch.peers.len(), 1);
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orch.handle_api_event(ApiEvent::DeleteConfig {
+            peer_ids: vec!["peer-1".to_string()],
+            reply_tx,
+        });
+
+        let result = reply_rx.await.expect("should receive reply");
+        assert!(result.is_ok());
+        assert!(orch.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_delete_config_ignores_unknown_ids() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orch.handle_api_event(ApiEvent::DeleteConfig {
+            peer_ids: vec!["nonexistent".to_string()],
+            reply_tx,
+        });
+
+        let result = reply_rx.await.expect("should receive reply");
+        assert!(result.is_ok());
     }
 }

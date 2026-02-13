@@ -247,7 +247,7 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 ## Current Tests
 
 - Linux CI: `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, Docker integration tests.
-- Unit: `src/config.rs` tests for defaults, admin/listener coupling, peer transport exclusivity.
+- Unit: `src/config.rs` tests for defaults, H3/API config validation, peer transport exclusivity.
 - Unit: `src/h3.rs` tests for datagram encoding, error display, CONNECT-IP header validation, and listener spawn/shutdown.
 - Unit: `src/auth.rs` tests for Basic Auth generation and validation.
 - Unit: `src/dns.rs` real-network DNS resolver tests.

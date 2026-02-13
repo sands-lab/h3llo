@@ -1,6 +1,7 @@
 //! Library entry point for h3llo.
 
 pub mod actor;
+pub mod api;
 pub mod auth;
 pub mod bare;
 pub mod bind;
