@@ -118,19 +118,19 @@ impl DnsState {
         removed
     }
 
-    /// Returns snapshot if dirty, clearing the dirty flag.
-    fn take_snapshot(&mut self) -> Option<HashMap<String, HashSet<IpAddr>>> {
+    /// Emits a snapshot to the orchestrator if dirty, clearing the dirty flag.
+    fn emit_snapshot(&mut self, events_tx: &mpsc::UnboundedSender<Event>) {
         if !self.dirty {
-            return None;
+            return;
         }
         self.dirty = false;
 
-        Some(
-            self.entries
-                .iter()
-                .map(|(host, ips)| (host.clone(), ips.keys().copied().collect()))
-                .collect(),
-        )
+        let state = self
+            .entries
+            .iter()
+            .map(|(host, ips)| (host.clone(), ips.keys().copied().collect()))
+            .collect();
+        let _ = events_tx.send(Event::Dns(DnsEvent { state }));
     }
 
     /// Checks if a hostname is registered.
@@ -312,7 +312,7 @@ pub fn spawn_dns(
                         &mut pending,
                         &socket,
                     ).await;
-                    arm_snapshot_timer!();
+                    state.emit_snapshot(&events_tx);
                 }
                 result = socket.recv(&mut buf) => {
                     match result {
@@ -333,9 +333,7 @@ pub fn spawn_dns(
                 }
                 () = &mut snapshot_timer, if snapshot_armed => {
                     snapshot_armed = false;
-                    if let Some(snapshot) = state.take_snapshot() {
-                        let _ = events_tx.send(Event::Dns(DnsEvent { state: snapshot }));
-                    }
+                    state.emit_snapshot(&events_tx);
                 }
                 _ = ticker.tick() => {
                     handle_tick(&mut pending, &socket, timeout).await;
@@ -818,8 +816,8 @@ mod tests {
         );
         socket.send_to(&response, peer).await.unwrap();
 
-        // Wait for first snapshot
-        let _ = next_dns_snapshot(&mut events_rx).await;
+        // Wait for snapshot with resolved IPs (skips the immediate empty snapshot)
+        let _ = next_dns_snapshot_with_ips(&mut events_rx, "example.com").await;
 
         // Consume AAAA query
         let (len2, peer2) = socket.recv_from(&mut buf).await.unwrap();
@@ -831,6 +829,10 @@ mod tests {
             vec![],
         );
         socket.send_to(&response2, peer2).await.unwrap();
+
+        // Drain any pending debounce snapshot before the duplicate check
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while events_rx.try_recv().is_ok() {}
 
         // Re-register same hosts (simulating refresh via new SetHostnames with same content)
         // This should not re-query since hosts haven't changed
