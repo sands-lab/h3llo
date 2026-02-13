@@ -1038,11 +1038,6 @@ mod test_support {
     }
 
     impl TestableOrchestratorBuilder {
-        pub fn with_local(mut self, local: crate::config::Local) -> Self {
-            self.local = Some(local);
-            self
-        }
-
         pub fn with_peers(mut self, peers: Vec<Peer>) -> Self {
             self.peers = peers
                 .into_iter()
