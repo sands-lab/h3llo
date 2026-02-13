@@ -3,7 +3,7 @@
 use crate::actor::{ActorError, ActorExitResult, ActorKind};
 use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUdpRxCommand};
 use crate::bind::DefaultRouteProbe;
-use crate::config::{Config, Local, Peer, Tuning};
+use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::ApiEvent;
 use crate::events::{
@@ -494,8 +494,7 @@ impl Orchestrator {
             let peer_tokens: HashMap<String, String> = config
                 .peers
                 .iter()
-                .filter(|p| p.h3.is_some())
-                .map(|p| (p.id.clone(), p.h3.as_ref().unwrap().token.clone()))
+                .filter_map(|p| p.h3.as_ref().map(|h3| (p.id.clone(), h3.token.clone())))
                 .collect();
 
             // make: fallible I/O (socket bind, TLS config)
@@ -545,14 +544,6 @@ impl Orchestrator {
         // Spawn DNS actor task (infallible)
         let (dns_cmd_tx, handle) = spawn_dns(dns_actor, events_tx.clone());
 
-        // Send all hostnames to DNS module in one shot.
-        // IP literals are handled by the DNS module directly (immediate IpResolved event).
-        let peer_configs: Vec<Peer> = peers.values().map(|e| e.config.clone()).collect();
-        let hostnames = collect_hostnames(&peer_configs);
-        if let Err(e) = dns_cmd_tx.send(DnsCommand::SetHostnames { hosts: hostnames }) {
-            warn!(error = %e, "dns: failed to send initial hostnames");
-        }
-
         join_set.spawn(handle);
 
         // Initialize route sync actor if system route management is enabled.
@@ -592,7 +583,7 @@ impl Orchestrator {
             join_set.spawn(api_handle);
         }
 
-        Ok(Self {
+        let mut orch = Self {
             events_rx,
             events_tx,
             join_set,
@@ -608,7 +599,9 @@ impl Orchestrator {
             route_cmd_tx,
             tun_addrs,
             local: config.local,
-        })
+        };
+        orch.sync_dns_hostnames();
+        Ok(orch)
     }
 
     /// Runs the orchestrator event loop until shutdown or task failure.
@@ -713,17 +706,16 @@ impl Orchestrator {
         }
     }
 
-    /// Common operations after peer mutations (POST/DELETE).
-    fn refresh_after_peer_change(&mut self) {
+    /// Sends updated hostname set to the DNS resolver after peer mutations.
+    ///
+    /// The DNS resolver will re-resolve and emit a snapshot, which triggers
+    /// routing and accepted-source updates in [`handle_dns_snapshot`].
+    fn sync_dns_hostnames(&mut self) {
         let peer_configs = self.peer_configs();
         let hostnames = collect_hostnames(&peer_configs);
         let _ = self
             .dns_cmd_tx
             .send(DnsCommand::SetHostnames { hosts: hostnames });
-
-        self.update_routing();
-
-        self.update_accepted_sources();
     }
 
     /// Handles POST /config — upsert peers with orchestrator-side validation.
@@ -734,13 +726,7 @@ impl Orchestrator {
             merged.retain(|p| p.id != new_peer.id);
             merged.push(new_peer.clone());
         }
-        // Validate using real config state
-        let temp_config = Config {
-            local: self.local.clone(),
-            tuning: self.tuning.clone(),
-            peers: merged,
-        };
-        temp_config.validate().map_err(|e| e.to_string())?;
+        validate_peers(&merged).map_err(|e| ConfigError::Validation(e).to_string())?;
 
         let count = new_peers.len();
         for peer in new_peers {
@@ -752,8 +738,7 @@ impl Orchestrator {
             }
         }
 
-        self.refresh_after_peer_change();
-        self.run_maintenance();
+        self.sync_dns_hostnames();
         info!(count = count, "API: peers upserted");
         Ok(())
     }
@@ -768,7 +753,7 @@ impl Orchestrator {
             }
         }
         if changed {
-            self.refresh_after_peer_change();
+            self.sync_dns_hostnames();
         }
     }
 
@@ -818,11 +803,13 @@ impl Orchestrator {
     }
 
     /// Handles a DNS state snapshot: update resolved IPs, prune stale bounds, try reconnect.
+    ///
+    /// Always rebuilds routing and accepted sources, since this is the
+    /// authoritative point where peer connectivity state is reconciled
+    /// after DNS changes or peer mutations (add/remove via API).
     fn handle_dns_snapshot(&mut self, dns_event: DnsEvent) {
         let dns_state = dns_event.state;
-        let mut routing_changed = false;
 
-        // 1. Update resolved_ips + 2. prune + try_connect for each peer
         for entry in self.peers.values_mut() {
             let hostname = peer_dns_hostname(&entry.config);
             entry.resolved_ips = hostname
@@ -830,18 +817,12 @@ impl Orchestrator {
                 .map(|ips| ips.iter().copied().collect())
                 .unwrap_or_default();
 
-            if entry.prune() {
-                routing_changed = true;
-            }
+            entry.prune();
             entry.try_connect(&self.events_tx, &self.tun_if, self.mtu, &self.tuning);
         }
 
-        // 3. Update accepted sources (all resolved IPs for bare peers)
         self.update_accepted_sources();
-
-        if routing_changed {
-            self.update_routing();
-        }
+        self.update_routing();
     }
 
     /// Registers a bound connection for a peer.
@@ -1415,14 +1396,17 @@ mod tests {
 
         // No bound created (hostname doesn't match)
         assert!(orch.peers.get("peer1").unwrap().bounds.is_empty());
-        // Routing not updated (no bounds change)
-        assert!(handles.tun_cmd_rx.try_recv().is_err());
         // Accepted sources always updated (unconditionally), but empty since no hostname matched
         let cmd = handles
             .bare_rx_cmd_rx
             .try_recv()
             .expect("accepted sources always sent");
         assert_eq!(cmd, BareUdpRxCommand::UpdateAcceptedSources(HashSet::new()));
+        // Routing always updated unconditionally
+        handles
+            .tun_cmd_rx
+            .try_recv()
+            .expect("routing update always sent");
     }
 
     #[tokio::test]
@@ -1463,14 +1447,17 @@ mod tests {
         let event = make_dns_snapshot_event(state);
         orch.handle_event(event).await;
 
-        // Routing not updated (no bounds change)
-        assert!(handles.tun_cmd_rx.try_recv().is_err());
         // Accepted sources always updated (unconditionally), but empty since no hostname matched
         let cmd = handles
             .bare_rx_cmd_rx
             .try_recv()
             .expect("accepted sources always sent");
         assert_eq!(cmd, BareUdpRxCommand::UpdateAcceptedSources(HashSet::new()));
+        // Routing always updated unconditionally
+        handles
+            .tun_cmd_rx
+            .try_recv()
+            .expect("routing update always sent");
     }
 
     #[tokio::test]
@@ -1745,8 +1732,11 @@ mod tests {
         assert!(ips.contains(&"1.2.3.4".parse::<IpAddr>().unwrap()));
         assert!(ips.contains(&"5.6.7.8".parse::<IpAddr>().unwrap()));
 
-        // Routing should NOT be updated (no bounds change — first bound unchanged)
-        assert!(handles.tun_cmd_rx.try_recv().is_err());
+        // Routing always updated unconditionally
+        handles
+            .tun_cmd_rx
+            .try_recv()
+            .expect("routing update always sent");
     }
 
     // ========== BareConnected event handling tests ==========

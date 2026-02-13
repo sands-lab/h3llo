@@ -402,9 +402,6 @@ impl Config {
             });
         }
 
-        let mut seen_peer_ids = HashSet::new();
-        let mut seen_peer_tokens = HashSet::new();
-
         // H3 validation: cert/key must not be empty when local.h3 is set
         if let Some(h3) = self.local.h3.as_ref() {
             if h3.cert.trim().is_empty() || h3.key.trim().is_empty() {
@@ -415,86 +412,9 @@ impl Config {
         if self.local.tun.addrs.is_empty() {
             errors.push(ValidationError::MissingLocalTunAddrs);
         }
-        for peer in &self.peers {
-            // Peer ID validation: must be non-empty and have no leading/trailing whitespace
-            if peer.id.trim().is_empty() {
-                errors.push(ValidationError::PeerIdEmpty {
-                    peer_id: peer.id.clone(),
-                });
-            } else if peer.id != peer.id.trim() {
-                errors.push(ValidationError::PeerIdHasWhitespace {
-                    peer_id: peer.id.clone(),
-                });
-            }
 
-            if !seen_peer_ids.insert(peer.id.clone()) {
-                errors.push(ValidationError::DuplicatePeerId {
-                    peer_id: peer.id.clone(),
-                });
-            }
-
-            if let Some(h3) = peer.h3.as_ref() {
-                // Token validation: must be >= 12 chars and have no leading/trailing whitespace
-                if h3.token.len() < 12 {
-                    errors.push(ValidationError::PeerTokenTooShort {
-                        peer_id: peer.id.clone(),
-                    });
-                } else if h3.token != h3.token.trim() {
-                    errors.push(ValidationError::PeerTokenHasWhitespace {
-                        peer_id: peer.id.clone(),
-                    });
-                }
-
-                if !seen_peer_tokens.insert(h3.token.clone()) {
-                    errors.push(ValidationError::DuplicatePeerToken {
-                        peer_id: peer.id.clone(),
-                    });
-                }
-                if let Some(sni) = &h3.sni {
-                    if sni.trim().is_empty() {
-                        errors.push(ValidationError::PeerSniEmpty {
-                            peer_id: peer.id.clone(),
-                        });
-                    } else if sni != sni.trim() {
-                        errors.push(ValidationError::PeerSniHasWhitespace {
-                            peer_id: peer.id.clone(),
-                        });
-                    }
-                }
-
-                if let Some(bindif) = &h3.bindif {
-                    if bindif != bindif.trim() {
-                        errors.push(ValidationError::PeerBindifHasWhitespace {
-                            peer_id: peer.id.clone(),
-                        });
-                    }
-                }
-            }
-
-            match (&peer.h3, &peer.bare) {
-                (Some(_), Some(_)) | (None, None) => {
-                    errors.push(ValidationError::PeerTransportConflict {
-                        peer_id: peer.id.clone(),
-                    })
-                }
-                (Some(_), None) | (None, Some(_)) => {}
-            }
-
-            if peer.tun.allowed_ips.is_empty() {
-                errors.push(ValidationError::PeerMissingAllowedIps {
-                    peer_id: peer.id.clone(),
-                });
-            }
-
-            let mut seen_allowed = HashSet::new();
-            for net in &peer.tun.allowed_ips {
-                if !seen_allowed.insert(*net) {
-                    errors.push(ValidationError::PeerDuplicateAllowedIp {
-                        peer_id: peer.id.clone(),
-                        cidr: net.to_string(),
-                    });
-                }
-            }
+        if let Err(ValidationErrors(peer_errors)) = validate_peers(&self.peers) {
+            errors.extend(peer_errors);
         }
 
         if errors.is_empty() {
@@ -502,6 +422,101 @@ impl Config {
         } else {
             Err(ConfigError::Validation(ValidationErrors(errors)))
         }
+    }
+}
+
+/// Validates a peer list in isolation (ID, token, transport, allowed_ips).
+pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
+    let mut errors = Vec::new();
+    let mut seen_peer_ids = HashSet::new();
+    let mut seen_peer_tokens = HashSet::new();
+
+    for peer in peers {
+        // Peer ID validation: must be non-empty and have no leading/trailing whitespace
+        if peer.id.trim().is_empty() {
+            errors.push(ValidationError::PeerIdEmpty {
+                peer_id: peer.id.clone(),
+            });
+        } else if peer.id != peer.id.trim() {
+            errors.push(ValidationError::PeerIdHasWhitespace {
+                peer_id: peer.id.clone(),
+            });
+        }
+
+        if !seen_peer_ids.insert(peer.id.clone()) {
+            errors.push(ValidationError::DuplicatePeerId {
+                peer_id: peer.id.clone(),
+            });
+        }
+
+        if let Some(h3) = peer.h3.as_ref() {
+            // Token validation: must be >= 12 chars and have no leading/trailing whitespace
+            if h3.token.len() < 12 {
+                errors.push(ValidationError::PeerTokenTooShort {
+                    peer_id: peer.id.clone(),
+                });
+            } else if h3.token != h3.token.trim() {
+                errors.push(ValidationError::PeerTokenHasWhitespace {
+                    peer_id: peer.id.clone(),
+                });
+            }
+
+            if !seen_peer_tokens.insert(h3.token.clone()) {
+                errors.push(ValidationError::DuplicatePeerToken {
+                    peer_id: peer.id.clone(),
+                });
+            }
+            if let Some(sni) = &h3.sni {
+                if sni.trim().is_empty() {
+                    errors.push(ValidationError::PeerSniEmpty {
+                        peer_id: peer.id.clone(),
+                    });
+                } else if sni != sni.trim() {
+                    errors.push(ValidationError::PeerSniHasWhitespace {
+                        peer_id: peer.id.clone(),
+                    });
+                }
+            }
+
+            if let Some(bindif) = &h3.bindif {
+                if bindif != bindif.trim() {
+                    errors.push(ValidationError::PeerBindifHasWhitespace {
+                        peer_id: peer.id.clone(),
+                    });
+                }
+            }
+        }
+
+        match (&peer.h3, &peer.bare) {
+            (Some(_), Some(_)) | (None, None) => {
+                errors.push(ValidationError::PeerTransportConflict {
+                    peer_id: peer.id.clone(),
+                })
+            }
+            (Some(_), None) | (None, Some(_)) => {}
+        }
+
+        if peer.tun.allowed_ips.is_empty() {
+            errors.push(ValidationError::PeerMissingAllowedIps {
+                peer_id: peer.id.clone(),
+            });
+        }
+
+        let mut seen_allowed = HashSet::new();
+        for net in &peer.tun.allowed_ips {
+            if !seen_allowed.insert(*net) {
+                errors.push(ValidationError::PeerDuplicateAllowedIp {
+                    peer_id: peer.id.clone(),
+                    cidr: net.to_string(),
+                });
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationErrors(errors))
     }
 }
 
