@@ -23,6 +23,18 @@ use tracing::debug;
 /// Maximum request body size (1 MiB).
 const MAX_BODY_SIZE: usize = 1024 * 1024;
 
+#[derive(serde::Deserialize)]
+struct PostPayload {
+    #[serde(default)]
+    peers: Vec<Peer>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeletePayload {
+    #[serde(default)]
+    peer_ids: Vec<String>,
+}
+
 /// Binds a `TcpListener` for the management API.
 ///
 /// # Arguments
@@ -50,46 +62,36 @@ pub fn spawn_api(
     api_path: String,
     events_tx: mpsc::UnboundedSender<Event>,
 ) -> JoinHandle<ActorExitResult> {
-    let addr = listener
-        .local_addr()
-        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+    let addr = listener.local_addr().unwrap_or_else(|_| {
+        "0.0.0.0:0"
+            .parse()
+            .expect("infallible: constant literal parse")
+    });
     tokio::spawn(async move {
-        run_api(listener, api_path, events_tx)
-            .await
-            .map_err(|e| ActorError::ApiServer {
+        loop {
+            let (stream, remote) = listener.accept().await.map_err(|e| ActorError::ApiServer {
                 addr: addr.to_string(),
-                reason: e,
-            })
+                reason: format!("accept failed: {e}"),
+            })?;
+            let io = TokioIo::new(stream);
+            let events_tx = events_tx.clone();
+            let api_path = api_path.clone();
+            tokio::spawn(async move {
+                let svc =
+                    service_fn(|req| handle_request(req, events_tx.clone(), api_path.clone()));
+                if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                    debug!(remote = %remote, error = %e, "API connection error");
+                }
+            });
+        }
     })
-}
-
-async fn run_api(
-    listener: TcpListener,
-    api_path: String,
-    events_tx: mpsc::UnboundedSender<Event>,
-) -> Result<(), String> {
-    loop {
-        let (stream, remote) = listener
-            .accept()
-            .await
-            .map_err(|e| format!("accept failed: {e}"))?;
-        let io = TokioIo::new(stream);
-        let events_tx = events_tx.clone();
-        let api_path = api_path.clone();
-        tokio::spawn(async move {
-            let svc = service_fn(|req| handle_request(req, events_tx.clone(), api_path.clone()));
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                debug!(remote = %remote, error = %e, "API connection error");
-            }
-        });
-    }
 }
 
 fn response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .body(Full::new(Bytes::from(body.to_string())))
-        .unwrap()
+        .expect("infallible: response builder with valid constants")
 }
 
 async fn handle_request(
@@ -146,7 +148,7 @@ async fn handle_get_config(events_tx: &mpsc::UnboundedSender<Event>) -> Response
                 .status(StatusCode::OK)
                 .header("content-type", "application/yaml")
                 .body(Full::new(Bytes::from(yaml)))
-                .unwrap(),
+                .expect("infallible: response builder with valid constants"),
             Err(e) => response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("serialization error: {e}"),
@@ -186,11 +188,6 @@ async fn handle_post_config(
         return response(StatusCode::BAD_REQUEST, "expected a YAML mapping");
     }
 
-    #[derive(serde::Deserialize)]
-    struct PostPayload {
-        #[serde(default)]
-        peers: Vec<Peer>,
-    }
     let payload: PostPayload = match serde_yaml::from_value(parsed) {
         Ok(p) => p,
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("invalid peers: {e}")),
@@ -228,11 +225,6 @@ async fn handle_delete_config(
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("body read error: {e}")),
     };
 
-    #[derive(serde::Deserialize)]
-    struct DeletePayload {
-        #[serde(default)]
-        peer_ids: Vec<String>,
-    }
     let payload: DeletePayload = match serde_yaml::from_slice(&body) {
         Ok(p) => p,
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("invalid YAML: {e}")),

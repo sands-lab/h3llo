@@ -166,8 +166,7 @@ impl PeerEntry {
         // Determine which IPs need connections
         let uncovered: Vec<IpAddr> = self
             .resolved_ips
-            .iter()
-            .filter(|ip| !covered_ips.contains(ip))
+            .difference(&covered_ips)
             .copied()
             .collect();
 
@@ -363,11 +362,15 @@ impl Orchestrator {
     ///
     /// Sends the new set of accepted source IPs to the BareUDP RX actor.
     /// No-op when BareUDP is not configured (`bare_rx_cmd_tx` is `None`).
-    fn update_accepted_sources(&self, accepted_ips: &HashSet<IpAddr>) {
+    fn update_accepted_sources(&self) {
         if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
-            if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAcceptedSources(
-                accepted_ips.clone(),
-            )) {
+            let accepted_ips: HashSet<IpAddr> = self
+                .peers
+                .values()
+                .filter(|e| e.config.bare.is_some())
+                .flat_map(|e| e.resolved_ips.iter().copied())
+                .collect();
+            if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAcceptedSources(accepted_ips)) {
                 warn!(error = %e, "failed to send accepted sources update command");
             }
         }
@@ -380,7 +383,11 @@ impl Orchestrator {
     /// 2. System routes via route actor (if available)
     fn update_routing(&self) {
         let peer_configs = self.peer_configs();
-        let peer_txs = self.peer_txs();
+        let peer_txs: HashMap<String, mpsc::Sender<Vec<PooledBuf>>> = self
+            .peers
+            .iter()
+            .filter_map(|(id, e)| e.preferred_tx().map(|tx| (id.clone(), tx.clone())))
+            .collect();
         if let Ok(routing) = RoutingTable::from_peers(&peer_configs, &peer_txs) {
             if let Err(e) = self
                 .tun_cmd_tx
@@ -399,14 +406,6 @@ impl Orchestrator {
                 warn!(error = %e, "failed to send route sync command");
             }
         }
-    }
-
-    /// Returns map of peer ID to preferred TX channel (for routing table).
-    fn peer_txs(&self) -> HashMap<String, mpsc::Sender<Vec<PooledBuf>>> {
-        self.peers
-            .iter()
-            .filter_map(|(id, e)| e.preferred_tx().map(|tx| (id.clone(), tx.clone())))
-            .collect()
     }
 
     /// Returns peer configurations as a Vec (for routing table and route sync).
@@ -724,13 +723,7 @@ impl Orchestrator {
 
         self.update_routing();
 
-        let accepted_ips: HashSet<IpAddr> = self
-            .peers
-            .values()
-            .filter(|e| e.config.bare.is_some())
-            .flat_map(|e| e.resolved_ips.iter().copied())
-            .collect();
-        self.update_accepted_sources(&accepted_ips);
+        self.update_accepted_sources();
     }
 
     /// Handles POST /config — upsert peers with orchestrator-side validation.
@@ -753,19 +746,15 @@ impl Orchestrator {
         for peer in new_peers {
             let id = peer.id.clone();
             if let Some(existing) = self.peers.get_mut(&id) {
-                let old_ep = existing.config_endpoint();
                 existing.config = peer;
-                let new_ep = existing.config_endpoint();
-                if old_ep != new_ep {
-                    existing.prune();
-                }
             } else {
                 self.peers.insert(id, PeerEntry::new(peer));
             }
         }
 
         self.refresh_after_peer_change();
-        info!(count, "API: peers upserted");
+        self.run_maintenance();
+        info!(count = count, "API: peers upserted");
         Ok(())
     }
 
@@ -848,13 +837,7 @@ impl Orchestrator {
         }
 
         // 3. Update accepted sources (all resolved IPs for bare peers)
-        let accepted_ips: HashSet<IpAddr> = self
-            .peers
-            .values()
-            .filter(|e| e.config.bare.is_some())
-            .flat_map(|e| e.resolved_ips.iter().copied())
-            .collect();
-        self.update_accepted_sources(&accepted_ips);
+        self.update_accepted_sources();
 
         if routing_changed {
             self.update_routing();
@@ -1695,19 +1678,20 @@ mod tests {
     async fn update_accepted_sources_independent_of_routing() {
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
 
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let (orch, mut handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![peer])
+            .with_resolved_ips("peer1", HashSet::from([ip]))
             .build();
 
-        let accepted = HashSet::from(["1.2.3.4".parse::<IpAddr>().unwrap()]);
-        orch.update_accepted_sources(&accepted);
+        orch.update_accepted_sources();
 
         let BareUdpRxCommand::UpdateAcceptedSources(ips) = handles
             .bare_rx_cmd_rx
             .try_recv()
             .expect("accepted sources update expected");
         assert_eq!(ips.len(), 1);
-        assert!(ips.contains(&"1.2.3.4".parse().unwrap()));
+        assert!(ips.contains(&ip));
 
         // Routing command should NOT be sent
         assert!(handles.tun_cmd_rx.try_recv().is_err());
