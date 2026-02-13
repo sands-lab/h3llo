@@ -119,7 +119,7 @@ impl DnsState {
     }
 
     /// Returns snapshot if dirty, clearing the dirty flag.
-    fn take_snapshot(&mut self) -> Option<HashMap<String, Vec<IpAddr>>> {
+    fn take_snapshot(&mut self) -> Option<HashMap<String, HashSet<IpAddr>>> {
         if !self.dirty {
             return None;
         }
@@ -188,6 +188,7 @@ pub struct DnsActor {
     socket: UdpSocket,
     timeout: Duration,
     refresh_interval: Duration,
+    snapshot_delay: Duration,
 }
 
 /// Creates a DNS resolver actor state from configuration.
@@ -201,6 +202,7 @@ pub struct DnsActor {
 /// * `tun_if` - Optional TUN interface name to exclude from routing.
 /// * `timeout` - Query timeout duration.
 /// * `refresh_interval` - Periodic re-query interval; `Duration::ZERO` disables.
+/// * `snapshot_delay` - Debounce delay before emitting dirty snapshot.
 /// * `probe` - Route probe for interface selection.
 /// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
@@ -212,6 +214,7 @@ pub async fn make_dns<P: RouteProbe>(
     tun_if: Option<&str>,
     timeout: Duration,
     refresh_interval: Duration,
+    snapshot_delay: Duration,
     probe: &P,
     socket_buffer_bytes: usize,
 ) -> Result<DnsActor, ResolveInitError> {
@@ -233,6 +236,7 @@ pub async fn make_dns<P: RouteProbe>(
         socket,
         timeout,
         refresh_interval,
+        snapshot_delay,
     })
 }
 
@@ -260,6 +264,7 @@ pub fn spawn_dns(
         socket,
         timeout,
         refresh_interval,
+        snapshot_delay,
     } = actor;
 
     let server_str = server.to_string();
@@ -272,6 +277,11 @@ pub fn spawn_dns(
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
         let mut ticker = time::interval(TICK_INTERVAL);
 
+        // Debounce timer: armed when state becomes dirty, fires after snapshot_delay.
+        let snapshot_timer = time::sleep(snapshot_delay);
+        tokio::pin!(snapshot_timer);
+        let mut snapshot_armed = false;
+
         let refresh_duration = if refresh_interval.is_zero() {
             Duration::from_secs(3600) // placeholder; branch disabled below
         } else {
@@ -279,6 +289,18 @@ pub fn spawn_dns(
         };
         let mut refresh_ticker = time::interval(refresh_duration);
         refresh_ticker.tick().await; // consume immediate first tick
+
+        // Arms the debounce timer if dirty and not already armed.
+        macro_rules! arm_snapshot_timer {
+            () => {
+                if state.dirty && !snapshot_armed {
+                    snapshot_timer
+                        .as_mut()
+                        .reset(time::Instant::now() + snapshot_delay);
+                    snapshot_armed = true;
+                }
+            };
+        }
 
         loop {
             tokio::select! {
@@ -290,6 +312,7 @@ pub fn spawn_dns(
                         &mut pending,
                         &socket,
                     ).await;
+                    arm_snapshot_timer!();
                 }
                 result = socket.recv(&mut buf) => {
                     match result {
@@ -299,6 +322,7 @@ pub fn spawn_dns(
                                 &mut pending,
                                 &mut state,
                             ).await;
+                            arm_snapshot_timer!();
                         }
                         Ok(_) => {}
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
@@ -307,12 +331,16 @@ pub fn spawn_dns(
                         }
                     }
                 }
+                () = &mut snapshot_timer, if snapshot_armed => {
+                    snapshot_armed = false;
+                    if let Some(snapshot) = state.take_snapshot() {
+                        let _ = events_tx.send(Event::Dns(DnsEvent { state: snapshot }));
+                    }
+                }
                 _ = ticker.tick() => {
                     handle_tick(&mut pending, &socket, timeout).await;
                     state.expire_stale();
-                    if let Some(snapshot) = state.take_snapshot() {
-                        let _ = events_tx.send(Event::Dns(DnsEvent { server, state: snapshot }));
-                    }
+                    arm_snapshot_timer!();
                 }
                 _ = refresh_ticker.tick(), if !refresh_interval.is_zero() => {
                     trigger_refresh(&state, &mut pending, &socket).await;
@@ -667,6 +695,7 @@ mod tests {
             None,
             Duration::from_millis(50),
             Duration::ZERO,
+            Duration::from_millis(50),
             &probe,
             0,
         )
@@ -700,7 +729,7 @@ mod tests {
     /// Receives the next DNS snapshot event.
     async fn next_dns_snapshot(
         events_rx: &mut mpsc::UnboundedReceiver<Event>,
-    ) -> HashMap<String, Vec<IpAddr>> {
+    ) -> HashMap<String, HashSet<IpAddr>> {
         loop {
             let event = events_rx.recv().await.expect("dns event");
             if let Event::Dns(dns) = event {
@@ -715,7 +744,7 @@ mod tests {
     async fn next_dns_snapshot_with_ips(
         events_rx: &mut mpsc::UnboundedReceiver<Event>,
         hostname: &str,
-    ) -> HashMap<String, Vec<IpAddr>> {
+    ) -> HashMap<String, HashSet<IpAddr>> {
         loop {
             let snapshot = next_dns_snapshot(events_rx).await;
             if let Some(ips) = snapshot.get(hostname) {
@@ -990,6 +1019,7 @@ mod tests {
             None,
             Duration::from_millis(50),
             Duration::ZERO,
+            Duration::from_millis(50),
             &probe,
             0,
         )
@@ -1021,6 +1051,7 @@ mod tests {
             None,
             Duration::from_millis(50),
             Duration::ZERO,
+            Duration::from_millis(50),
             &probe,
             0,
         )

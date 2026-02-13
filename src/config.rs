@@ -178,6 +178,13 @@ pub struct Tuning {
     /// DNS refresh interval; 0 disables (default: 60s).
     #[serde(with = "serde_duration_secs")]
     pub dns_refresh_interval: Duration,
+    /// Delay before emitting a DNS snapshot after the first state change (default: 100ms).
+    ///
+    /// After a DNS reply marks the state dirty, the resolver waits this duration
+    /// before emitting a snapshot to the orchestrator. Subsequent replies within
+    /// the window are coalesced into the same snapshot.
+    #[serde(with = "serde_duration_millis")]
+    pub dns_snapshot_delay: Duration,
     /// HTTP/3 handshake timeout (default: 30s).
     #[serde(with = "serde_duration_secs")]
     pub h3_handshake_timeout: Duration,
@@ -215,6 +222,7 @@ impl Default for Tuning {
             metrics_push_interval: Duration::from_millis(1000),
             dns_query_timeout: Duration::from_secs(2),
             dns_refresh_interval: Duration::from_secs(60),
+            dns_snapshot_delay: Duration::from_millis(100),
             h3_handshake_timeout: Duration::from_secs(30),
             h3_max_idle_timeout: Duration::from_secs(60),
             h3_keepalive_interval: Duration::from_secs(20),
@@ -1803,6 +1811,7 @@ peers:
         );
         assert_eq!(cfg.tuning.dns_query_timeout, Duration::from_secs(2));
         assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(60));
+        assert_eq!(cfg.tuning.dns_snapshot_delay, Duration::from_millis(100));
         assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(30));
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
         assert_eq!(cfg.tuning.h3_keepalive_interval, Duration::from_secs(20));
