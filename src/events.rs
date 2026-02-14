@@ -67,6 +67,11 @@ pub enum ApiEvent {
         /// Reply channel carrying updated config on success, or error string on failure.
         reply_tx: oneshot::Sender<Result<Config, String>>,
     },
+    /// GET /metrics — orchestrator replies with OpenMetrics text.
+    GetMetrics {
+        /// Reply channel carrying the rendered metrics text.
+        reply_tx: oneshot::Sender<String>,
+    },
 }
 
 impl std::fmt::Debug for ApiEvent {
@@ -81,6 +86,7 @@ impl std::fmt::Debug for ApiEvent {
                 .debug_struct("DeleteConfig")
                 .field("peer_ids", peer_ids)
                 .finish_non_exhaustive(),
+            Self::GetMetrics { .. } => f.debug_struct("GetMetrics").finish_non_exhaustive(),
         }
     }
 }
@@ -157,7 +163,7 @@ pub enum TransportKind {
 }
 
 /// Indicates whether metrics were collected on the receive or transmit path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     /// Metrics from the receive side.
     Rx,
@@ -271,7 +277,7 @@ pub struct TransportStats {
 }
 
 /// Labels attached to transport metrics for grouping.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransportLabels {
     /// Transport kind (TUN, BareUDP, HTTP/3).
     pub kind: TransportKind,
