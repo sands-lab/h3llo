@@ -534,6 +534,7 @@ mod tests {
         assert_eq!(metrics.labels.direction, Direction::Rx);
         assert_eq!(metrics.labels.peer_id, None);
         assert_eq!(metrics.labels.ip_addr, None);
+        assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 4);
 
@@ -580,6 +581,7 @@ mod tests {
         assert_eq!(metrics.labels.direction, Direction::Tx);
         assert_eq!(metrics.labels.peer_id, None);
         assert_eq!(metrics.labels.ip_addr, None);
+        assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 4);
         assert_eq!(metrics.stats.dropped.packets, 0);
@@ -853,6 +855,7 @@ mod tests {
         .expect("tx metrics should arrive")
         .expect("tx metrics should not be None");
 
+        assert!(metrics.stats.succeeded.batches >= 1);
         assert_eq!(metrics.stats.succeeded.packets, 2);
         assert_eq!(metrics.stats.succeeded.bytes, 6);
 

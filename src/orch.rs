@@ -771,12 +771,14 @@ impl Orchestrator {
                 let labels = &metrics.labels;
                 let stats = &metrics.stats;
                 debug!(
-                    "{:?} {:?} {}: {} pkts/{} bytes ok, {} pkts/{} bytes dropped",
+                    "{:?} {:?} {}: {} batches/{} pkts/{} bytes ok, {} batches/{} pkts/{} bytes dropped",
                     labels.kind,
                     labels.direction,
                     labels.peer_id.as_deref().unwrap_or("local"),
+                    stats.succeeded.batches,
                     stats.succeeded.packets,
                     stats.succeeded.bytes,
+                    stats.dropped.batches,
                     stats.dropped.packets,
                     stats.dropped.bytes,
                 );
