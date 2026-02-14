@@ -42,6 +42,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
+          name: ci-builder
           keep-state: true
       - name: Build Docker test image
         uses: docker/build-push-action@v6
