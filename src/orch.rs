@@ -951,27 +951,27 @@ fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, Orchestrator
     // Synchronous DNS lookup for hostname
     use std::net::ToSocketAddrs;
     let addr_str = format!("{}:{}", host, port);
-    let mut addrs =
-        addr_str
-            .to_socket_addrs()
-            .map_err(|err| OrchestratorError::ListenResolveFailed {
-                host: host.to_string(),
-                reason: err.to_string(),
-            })?;
+    let addrs: Vec<_> = addr_str
+        .to_socket_addrs()
+        .map_err(|err| OrchestratorError::ListenResolveFailed {
+            host: host.to_string(),
+            reason: err.to_string(),
+        })?
+        .collect();
 
-    let first = addrs
-        .next()
-        .ok_or_else(|| OrchestratorError::ListenResolveFailed {
+    if addrs.is_empty() {
+        return Err(OrchestratorError::ListenResolveFailed {
             host: host.to_string(),
             reason: "no resolved addresses".to_string(),
-        })?;
-    if addrs.next().is_some() {
+        });
+    }
+    if addrs.len() > 1 {
         warn!(
             "listen resolved multiple addresses for {}; using {}",
-            host, first
+            host, addrs[0]
         );
     }
-    Ok(first)
+    Ok(addrs[0])
 }
 
 fn collect_allowed_ips(peers: &[Peer]) -> Vec<IpNet> {
