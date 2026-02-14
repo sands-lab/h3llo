@@ -626,7 +626,7 @@ impl Orchestrator {
                                 }
                             }
                         }
-                        Some(Ok(Err(join_err))) | Some(Err(join_err)) => {
+                        Some(Ok(Err(join_err)) | Err(join_err)) => {
                             // Task panicked or was cancelled
                             error!("task join failed (panic/cancel): {}", join_err);
                             return Err(OrchestratorError::TaskJoin(join_err.to_string()));
@@ -657,9 +657,7 @@ impl Orchestrator {
     fn run_maintenance(&mut self) {
         let mut routing_changed = false;
         for entry in self.peers.values_mut() {
-            if entry.prune() {
-                routing_changed = true;
-            }
+            routing_changed |= entry.prune();
             entry.try_connect(&self.events_tx, &self.tun_if, self.mtu, &self.tuning);
         }
         if routing_changed {
@@ -879,7 +877,7 @@ impl Orchestrator {
         let remote_addr = conn.remote_addr;
 
         // Pre-check before destructive conn.into_actors(): peer must exist
-        if !self.peers.contains_key(&peer_id) {
+        let Some(entry) = self.peers.get(&peer_id) else {
             warn!(
                 peer = %peer_id,
                 addr = %remote_addr,
@@ -887,14 +885,11 @@ impl Orchestrator {
                 "H3 connection from unknown peer"
             );
             return;
-        }
+        };
 
         // Extract endpoint for outbound connections; inbound has None (listener-originated).
         let endpoint = match direction {
-            ConnectionDirection::Outbound => self
-                .peers
-                .get(&peer_id)
-                .unwrap()
+            ConnectionDirection::Outbound => entry
                 .config
                 .h3
                 .as_ref()

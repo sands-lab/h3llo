@@ -1001,9 +1001,11 @@ pub fn spawn_h3_listener(
 
     // Create tokio-quiche listener (infallible after socket is bound)
     let mut listeners = listen(vec![socket], conn_params, DefaultMetrics)
-        .expect("listen on already-bound socket should not fail");
+        .expect("infallible: listen on already-bound socket");
 
-    let mut accept_stream = listeners.remove(0);
+    let mut accept_stream = listeners
+        .pop()
+        .expect("infallible: single socket yields single listener");
     let h3_handshake_timeout = tuning.h3_handshake_timeout;
 
     let handle = tokio::spawn(async move {

@@ -528,16 +528,11 @@ async fn handle_tick(
     timeout: Duration,
 ) {
     let now = Instant::now();
-    let mut expired = Vec::new();
+    let expired: Vec<(u16, PendingRequest)> = pending
+        .extract_if(|_, req| now.duration_since(req.last_sent) >= timeout)
+        .collect();
 
-    for (id, req) in pending.iter() {
-        if now.duration_since(req.last_sent) >= timeout {
-            expired.push((*id, req.clone()));
-        }
-    }
-
-    for (id, request) in expired {
-        pending.remove(&id);
+    for (_id, request) in expired {
         warn!(host = %request.host, record_type = ?request.record_type, "dns: query timed out, retrying");
         if let Err(err) =
             send_query(request.host.clone(), request.record_type, pending, socket).await
@@ -583,7 +578,7 @@ fn extract_records(message: &Message, expected: DnsRecordType) -> Vec<DnsAnswerR
 
         records
             .entry(ip)
-            .or_insert_with(|| DnsAnswerRecord { address: ip, ttl });
+            .or_insert(DnsAnswerRecord { address: ip, ttl });
     }
 
     records.into_values().collect()

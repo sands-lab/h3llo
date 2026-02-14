@@ -501,13 +501,10 @@ pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
             }
         }
 
-        match (&peer.h3, &peer.bare) {
-            (Some(_), Some(_)) | (None, None) => {
-                errors.push(ValidationError::PeerTransportConflict {
-                    peer_id: peer.id.clone(),
-                })
-            }
-            (Some(_), None) | (None, Some(_)) => {}
+        if peer.h3.is_some() == peer.bare.is_some() {
+            errors.push(ValidationError::PeerTransportConflict {
+                peer_id: peer.id.clone(),
+            });
         }
 
         if peer.tun.allowed_ips.is_empty() {
