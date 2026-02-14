@@ -191,6 +191,8 @@ pub enum DropReason {
 /// Aggregates packet counters by outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PktCounters {
+    /// Number of batch operations (`record()` invocations).
+    pub batches: u64,
     /// Number of packets observed.
     pub packets: u64,
     /// Total bytes observed.
@@ -201,7 +203,10 @@ impl PktCounters {
     /// Records a batch of packets, saturating on overflow.
     ///
     /// For single-packet recording, pass `count = 1`.
+    /// Each call increments `batches` by 1, representing one `record()`
+    /// invocation for GSO/GRO effectiveness tracking.
     pub fn record(&mut self, count: u64, total_bytes: u64) {
+        self.batches = self.batches.saturating_add(1);
         self.packets = self.packets.saturating_add(count);
         self.bytes = self.bytes.saturating_add(total_bytes);
     }
@@ -215,6 +220,7 @@ mod tests {
     fn pkt_counters_record_batch() {
         let mut c = PktCounters::default();
         c.record(3, 150);
+        assert_eq!(c.batches, 1);
         assert_eq!(c.packets, 3);
         assert_eq!(c.bytes, 150);
     }
@@ -223,6 +229,7 @@ mod tests {
     fn pkt_counters_record_single() {
         let mut c = PktCounters::default();
         c.record(1, 64);
+        assert_eq!(c.batches, 1);
         assert_eq!(c.packets, 1);
         assert_eq!(c.bytes, 64);
     }
@@ -230,12 +237,25 @@ mod tests {
     #[test]
     fn pkt_counters_saturates() {
         let mut c = PktCounters {
+            batches: u64::MAX - 1,
             packets: u64::MAX - 1,
             bytes: u64::MAX - 1,
         };
         c.record(5, 100);
+        assert_eq!(c.batches, u64::MAX);
         assert_eq!(c.packets, u64::MAX);
         assert_eq!(c.bytes, u64::MAX);
+    }
+
+    #[test]
+    fn pkt_counters_multiple_batches() {
+        let mut c = PktCounters::default();
+        c.record(10, 1000);
+        c.record(5, 500);
+        c.record(1, 100);
+        assert_eq!(c.batches, 3);
+        assert_eq!(c.packets, 16);
+        assert_eq!(c.bytes, 1600);
     }
 }
 

@@ -256,9 +256,9 @@ Route deduplication: when synchronizing system routes, if a TUN address prefix (
 
 ### Observability
 
-Observability summary: interface loops emit cumulative metrics (packets/bytes, drops, and drop-reason breakdowns) on a timer; the orchestrator owns periodic reporting and change detection.
+Observability summary: interface loops emit cumulative metrics (batches/packets/bytes, drops, and drop-reason breakdowns) on a timer; the orchestrator owns periodic reporting and change detection.
 
-- Metric shape: every emit carries labels `{kind: Tun|BareUdp|Http3, direction: Rx|Tx, peer_id?: string, ip_addr?: IP}` plus total succeeded and dropped counters and a drop-reason map keyed by `DropReason` (e.g., `Oversize`, `DisallowedSource`, `SendError`, `ChannelClosed`).
+- Metric shape: every emit carries labels `{kind: Tun|BareUdp|Http3, direction: Rx|Tx, peer_id?: string, ip_addr?: IP}` plus total succeeded and dropped counters (batches, packets, bytes) and a drop-reason map keyed by `DropReason` (e.g., `Oversize`, `DisallowedSource`, `SendError`, `ChannelClosed`). The `batches` counter tracks `record()` invocations; `packets / batches` reveals GSO/GRO coalescing effectiveness (ratio > 1 indicates active offloading).
 - Drop accounting: TUN TX counts oversize and send failures; TUN RX counts channel-closed drops when forwarding to the writer queue fails; BareUDP RX counts disallowed sources; BareUDP TX counts send failures. All counters saturate to avoid panics.
 - Reporting: only the orchestrator prints periodic drop summaries (when counters change); transport loops stay silent, including oversized TUN drops.
 
