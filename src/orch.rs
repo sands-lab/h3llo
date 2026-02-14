@@ -530,17 +530,9 @@ impl Orchestrator {
 
         // Create DNS actor state (performs fallible socket binding)
         let probe = DefaultRouteProbe;
-        let dns_actor = make_dns(
-            &config.local.dns,
-            Some(tun_if.as_str()),
-            tuning.dns_query_timeout,
-            tuning.dns_refresh_interval,
-            tuning.dns_snapshot_delay,
-            &probe,
-            tuning.socket_buffer_bytes(),
-        )
-        .await
-        .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
+        let dns_actor = make_dns(&config.local.dns, Some(tun_if.as_str()), tuning, &probe)
+            .await
+            .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
         // Spawn DNS actor task (infallible)
         let (dns_cmd_tx, handle) = spawn_dns(dns_actor, events_tx.clone());
