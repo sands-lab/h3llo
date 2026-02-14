@@ -626,13 +626,9 @@ fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
     for addr in addrs {
-        match addr {
-            IpNet::V4(net) => {
-                v4.push(*net);
-            }
-            IpNet::V6(net) => {
-                v6.push(*net);
-            }
+        match *addr {
+            IpNet::V4(n) => v4.push(n),
+            IpNet::V6(n) => v6.push(n),
         }
     }
     (v4, v6)

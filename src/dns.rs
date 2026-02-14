@@ -48,6 +48,12 @@ struct DnsState {
 }
 
 impl DnsState {
+    #[inline]
+    fn touch(&mut self, changed: bool) -> bool {
+        self.dirty |= changed;
+        changed
+    }
+
     /// Updates the set of registered hostnames.
     ///
     /// Removes unregistered hostnames and their IPs; adds new hostnames with
@@ -55,27 +61,20 @@ impl DnsState {
     fn set_hostnames(&mut self, hosts: &HashSet<String>) -> bool {
         let mut changed = false;
 
-        // Remove unregistered hostnames
         self.entries.retain(|h, _| {
             let keep = hosts.contains(h);
-            if !keep {
-                changed = true;
-            }
+            changed |= !keep;
             keep
         });
 
-        // Add new hostnames (empty IP map)
-        for host in hosts {
-            self.entries.entry(host.clone()).or_insert_with(|| {
+        for h in hosts {
+            if !self.entries.contains_key(h) {
                 changed = true;
-                HashMap::new()
-            });
+                self.entries.insert(h.clone(), HashMap::new());
+            }
         }
 
-        if changed {
-            self.dirty = true;
-        }
-        changed
+        self.touch(changed)
     }
 
     /// Records a resolved IP for a hostname. Returns true if the IP is new.
@@ -84,19 +83,10 @@ impl DnsState {
             return false;
         };
 
-        let ttl_secs = ttl.max(self.min_ttl_secs);
-        let expires_at = Instant::now() + Duration::from_secs(ttl_secs as u64);
-        let mut is_new = false;
-        ips.entry(ip)
-            .and_modify(|exp| *exp = expires_at)
-            .or_insert_with(|| {
-                is_new = true;
-                expires_at
-            });
-        if is_new {
-            self.dirty = true;
-        }
-        is_new
+        let expires_at = Instant::now() + Duration::from_secs(ttl.max(self.min_ttl_secs) as u64);
+
+        let is_new = ips.insert(ip, expires_at).is_none();
+        self.touch(is_new)
     }
 
     /// Removes expired IPs. Returns true if any were removed.
@@ -105,19 +95,12 @@ impl DnsState {
         let mut removed = false;
 
         for ips in self.entries.values_mut() {
-            ips.retain(|_, expires_at| {
-                let keep = *expires_at > now;
-                if !keep {
-                    removed = true;
-                }
-                keep
-            });
+            let before = ips.len();
+            ips.retain(|_, exp| *exp > now);
+            removed |= ips.len() != before;
         }
 
-        if removed {
-            self.dirty = true;
-        }
-        removed
+        self.touch(removed)
     }
 
     /// Emits a snapshot to the orchestrator if dirty, clearing the dirty flag.
