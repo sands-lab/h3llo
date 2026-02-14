@@ -287,8 +287,8 @@ pub struct TransportLabels {
     pub direction: Direction,
     /// Optional peer identifier when the transport is peer-scoped.
     pub peer_id: Option<String>,
-    /// Optional IP address associated with the transport.
-    pub ip_addr: Option<IpAddr>,
+    /// Optional remote socket address for per-connection disambiguation.
+    pub remote_addr: Option<SocketAddr>,
 }
 
 /// Carries cumulative counters collected from a transport loop.

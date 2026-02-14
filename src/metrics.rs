@@ -3,7 +3,7 @@
 use crate::events::{
     Direction, DropReason, TransportKind, TransportLabels, TransportMetrics, TransportStats,
 };
-use std::net::IpAddr;
+use std::net::SocketAddr;
 
 /// Tracks counters for a transport direction.
 pub(crate) struct TransportCounters {
@@ -41,18 +41,18 @@ impl TransportCounters {
             .record(count, total_bytes);
     }
 
-    /// Generates a metrics snapshot with optional peer and IP labels.
+    /// Generates a metrics snapshot with optional peer and remote address labels.
     pub(crate) fn snapshot(
         &self,
         peer_id: Option<&str>,
-        ip_addr: Option<IpAddr>,
+        remote_addr: Option<SocketAddr>,
     ) -> TransportMetrics {
         TransportMetrics {
             labels: TransportLabels {
                 kind: self.kind,
                 direction: self.direction,
                 peer_id: peer_id.map(str::to_string),
-                ip_addr,
+                remote_addr,
             },
             stats: self.stats.clone(),
         }
