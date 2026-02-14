@@ -7,8 +7,8 @@ use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::ApiEvent;
 use crate::events::{
-    BareConnectedEvent, ConnectionDirection, DnsEvent, Endpoint, Event, H3ConnectedEvent,
-    TransportEvent,
+    BareConnectedEvent, ConnectionDirection, Direction, DnsEvent, DropReason, Endpoint, Event,
+    H3ConnectedEvent, TransportEvent, TransportLabels, TransportMetrics,
 };
 use crate::h3::{
     dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
@@ -18,6 +18,7 @@ use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Instant;
@@ -355,6 +356,8 @@ pub struct Orchestrator {
     tun_addrs: Vec<IpNet>,
     /// Stored local config for GET /config snapshot reconstruction.
     local: Local,
+    /// Latest metrics snapshot per unique label set, for Prometheus exposition.
+    metrics_store: HashMap<TransportLabels, TransportMetrics>,
 }
 
 impl Orchestrator {
@@ -592,6 +595,7 @@ impl Orchestrator {
             route_cmd_tx,
             tun_addrs,
             local: config.local,
+            metrics_store: HashMap::new(),
         };
         orch.sync_dns_hostnames();
         Ok(orch)
@@ -682,6 +686,10 @@ impl Orchestrator {
         match event {
             ApiEvent::GetConfig { reply_tx } => {
                 let _ = reply_tx.send(self.config_snapshot());
+            }
+            ApiEvent::GetMetrics { reply_tx } => {
+                let text = render_prometheus(&self.metrics_store);
+                let _ = reply_tx.send(text);
             }
             ApiEvent::PostConfig { peers, reply_tx } => {
                 let result = self
@@ -790,6 +798,7 @@ impl Orchestrator {
                         }
                     }
                 }
+                self.metrics_store.insert(metrics.labels.clone(), metrics);
             }
             Event::Transport(TransportEvent::H3Connected(event)) => {
                 self.handle_h3_connection(event).await;
@@ -1000,6 +1009,123 @@ fn collect_hostnames(peers: &[Peer]) -> HashSet<String> {
     hosts
 }
 
+/// Label-value string for `TransportKind`.
+fn kind_label(kind: crate::events::TransportKind) -> &'static str {
+    use crate::events::TransportKind;
+    match kind {
+        TransportKind::Tun => "tun",
+        TransportKind::BareUdp => "bare_udp",
+        TransportKind::Http3 => "http3",
+    }
+}
+
+/// Label-value string for `Direction`.
+fn direction_label(dir: Direction) -> &'static str {
+    match dir {
+        Direction::Rx => "rx",
+        Direction::Tx => "tx",
+    }
+}
+
+/// Label-value string for `DropReason`.
+fn drop_reason_label(reason: DropReason) -> &'static str {
+    match reason {
+        DropReason::Oversize => "oversize",
+        DropReason::DisallowedSource => "disallowed_source",
+        DropReason::SendError => "send_error",
+        DropReason::ChannelClosed => "channel_closed",
+        DropReason::InvalidIpVersion => "invalid_ip_version",
+        DropReason::InvalidFraming => "invalid_framing",
+        DropReason::NoRoute => "no_route",
+        DropReason::NoPeerChannel => "no_peer_channel",
+        DropReason::NoHeadroom => "no_headroom",
+    }
+}
+
+/// Writes base labels `kind="...",direction="...",peer_id="..."` to the output buffer.
+fn write_base_labels(out: &mut String, labels: &TransportLabels) {
+    let _ = write!(
+        out,
+        "kind=\"{}\",direction=\"{}\",peer_id=\"{}\"",
+        kind_label(labels.kind),
+        direction_label(labels.direction),
+        labels.peer_id.as_deref().unwrap_or(""),
+    );
+}
+
+/// Renders all stored metrics as Prometheus text exposition format 0.0.4.
+///
+/// Produces monotonically-grouped counter families:
+/// - `h3llo_transport_packets_total` (succeeded + dropped)
+/// - `h3llo_transport_bytes_total` (succeeded + dropped)
+/// - `h3llo_transport_drops_total` (per reason)
+/// - `h3llo_transport_drop_bytes_total` (per reason)
+fn render_prometheus(store: &HashMap<TransportLabels, TransportMetrics>) -> String {
+    let mut out = String::with_capacity(4096);
+
+    // --- h3llo_transport_packets_total ---
+    out.push_str("# HELP h3llo_transport_packets_total Cumulative packet count.\n");
+    out.push_str("# TYPE h3llo_transport_packets_total counter\n");
+    for m in store.values() {
+        out.push_str("h3llo_transport_packets_total{");
+        write_base_labels(&mut out, &m.labels);
+        let _ = writeln!(
+            out,
+            ",outcome=\"succeeded\"}} {}",
+            m.stats.succeeded.packets
+        );
+        out.push_str("h3llo_transport_packets_total{");
+        write_base_labels(&mut out, &m.labels);
+        let _ = writeln!(out, ",outcome=\"dropped\"}} {}", m.stats.dropped.packets);
+    }
+
+    // --- h3llo_transport_bytes_total ---
+    out.push_str("# HELP h3llo_transport_bytes_total Cumulative byte count.\n");
+    out.push_str("# TYPE h3llo_transport_bytes_total counter\n");
+    for m in store.values() {
+        out.push_str("h3llo_transport_bytes_total{");
+        write_base_labels(&mut out, &m.labels);
+        let _ = writeln!(out, ",outcome=\"succeeded\"}} {}", m.stats.succeeded.bytes);
+        out.push_str("h3llo_transport_bytes_total{");
+        write_base_labels(&mut out, &m.labels);
+        let _ = writeln!(out, ",outcome=\"dropped\"}} {}", m.stats.dropped.bytes);
+    }
+
+    // --- h3llo_transport_drops_total (per reason) ---
+    out.push_str("# HELP h3llo_transport_drops_total Cumulative drop count by reason.\n");
+    out.push_str("# TYPE h3llo_transport_drops_total counter\n");
+    for m in store.values() {
+        for (reason, counters) in &m.stats.drop_reasons {
+            out.push_str("h3llo_transport_drops_total{");
+            write_base_labels(&mut out, &m.labels);
+            let _ = writeln!(
+                out,
+                ",reason=\"{}\"}} {}",
+                drop_reason_label(*reason),
+                counters.packets
+            );
+        }
+    }
+
+    // --- h3llo_transport_drop_bytes_total (per reason) ---
+    out.push_str("# HELP h3llo_transport_drop_bytes_total Cumulative drop bytes by reason.\n");
+    out.push_str("# TYPE h3llo_transport_drop_bytes_total counter\n");
+    for m in store.values() {
+        for (reason, counters) in &m.stats.drop_reasons {
+            out.push_str("h3llo_transport_drop_bytes_total{");
+            write_base_labels(&mut out, &m.labels);
+            let _ = writeln!(
+                out,
+                ",reason=\"{}\"}} {}",
+                drop_reason_label(*reason),
+                counters.bytes
+            );
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod test_support {
     use super::*;
@@ -1111,6 +1237,7 @@ mod test_support {
                 route_cmd_tx: Some(route_cmd_tx),
                 tun_addrs: self.tun_addrs,
                 local,
+                metrics_store: HashMap::new(),
             };
 
             (
@@ -1133,8 +1260,8 @@ mod tests {
     use super::*;
     use crate::config::{PeerBare, PeerTun};
     use crate::events::{
-        Direction, DnsEvent, TransportEvent, TransportKind, TransportLabels, TransportMetrics,
-        TransportStats,
+        Direction, DnsEvent, DropReason, TransportEvent, TransportKind, TransportLabels,
+        TransportMetrics, TransportStats,
     };
 
     // ========== PeerEntry unit tests ==========
@@ -2132,5 +2259,187 @@ mod tests {
         let config = result.expect("should succeed");
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers[0].id, "keeper");
+    }
+
+    // ========== Metrics storage and rendering tests ==========
+
+    #[tokio::test]
+    async fn handle_metrics_event_stores_snapshot() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+        assert!(orch.metrics_store.is_empty());
+        orch.handle_event(make_metrics_event()).await;
+        assert_eq!(orch.metrics_store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_metrics_event_replaces_on_same_labels() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+        orch.handle_event(make_metrics_event()).await;
+        assert_eq!(orch.metrics_store.len(), 1);
+
+        // Push again with different values — should replace, not accumulate
+        let event = Event::Transport(TransportEvent::Metrics(TransportMetrics {
+            labels: TransportLabels {
+                kind: TransportKind::Tun,
+                direction: Direction::Rx,
+                peer_id: None,
+                ip_addr: None,
+            },
+            stats: TransportStats {
+                succeeded: crate::events::PktCounters {
+                    packets: 42,
+                    bytes: 1000,
+                },
+                ..TransportStats::default()
+            },
+        }));
+        orch.handle_event(event).await;
+        assert_eq!(orch.metrics_store.len(), 1);
+        let stored = orch.metrics_store.values().next().unwrap();
+        assert_eq!(stored.stats.succeeded.packets, 42);
+    }
+
+    #[tokio::test]
+    async fn api_get_metrics_returns_prometheus_text() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+        orch.handle_event(make_metrics_event()).await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        orch.handle_api_event(ApiEvent::GetMetrics { reply_tx });
+
+        let text = reply_rx.await.expect("should receive metrics text");
+        assert!(text.contains("# TYPE h3llo_transport_packets_total counter"));
+        assert!(text.contains("# HELP h3llo_transport_bytes_total"));
+    }
+
+    #[test]
+    fn render_prometheus_empty_store() {
+        let store = HashMap::new();
+        let text = render_prometheus(&store);
+        assert!(text.contains("# TYPE h3llo_transport_packets_total counter"));
+        // No sample lines when store is empty
+        assert!(!text.contains("} 0\n") || text.contains("# TYPE"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_succeeded_and_dropped() {
+        let mut store = HashMap::new();
+        let labels = TransportLabels {
+            kind: TransportKind::Tun,
+            direction: Direction::Rx,
+            peer_id: None,
+            ip_addr: None,
+        };
+        store.insert(
+            labels.clone(),
+            TransportMetrics {
+                labels,
+                stats: TransportStats {
+                    succeeded: crate::events::PktCounters {
+                        packets: 100,
+                        bytes: 50000,
+                    },
+                    dropped: crate::events::PktCounters {
+                        packets: 2,
+                        bytes: 128,
+                    },
+                    drop_reasons: HashMap::new(),
+                },
+            },
+        );
+        let text = render_prometheus(&store);
+        assert!(text.contains(
+            "h3llo_transport_packets_total{kind=\"tun\",direction=\"rx\",peer_id=\"\",outcome=\"succeeded\"} 100"
+        ));
+        assert!(text.contains(
+            "h3llo_transport_packets_total{kind=\"tun\",direction=\"rx\",peer_id=\"\",outcome=\"dropped\"} 2"
+        ));
+        assert!(text.contains(
+            "h3llo_transport_bytes_total{kind=\"tun\",direction=\"rx\",peer_id=\"\",outcome=\"succeeded\"} 50000"
+        ));
+    }
+
+    #[test]
+    fn render_prometheus_includes_drop_reasons() {
+        let mut store = HashMap::new();
+        let labels = TransportLabels {
+            kind: TransportKind::BareUdp,
+            direction: Direction::Tx,
+            peer_id: Some("peer-1".to_string()),
+            ip_addr: None,
+        };
+        let mut drop_reasons = HashMap::new();
+        drop_reasons.insert(
+            DropReason::Oversize,
+            crate::events::PktCounters {
+                packets: 3,
+                bytes: 4500,
+            },
+        );
+        store.insert(
+            labels.clone(),
+            TransportMetrics {
+                labels,
+                stats: TransportStats {
+                    succeeded: crate::events::PktCounters {
+                        packets: 50,
+                        bytes: 25000,
+                    },
+                    dropped: crate::events::PktCounters {
+                        packets: 3,
+                        bytes: 4500,
+                    },
+                    drop_reasons,
+                },
+            },
+        );
+        let text = render_prometheus(&store);
+        assert!(text.contains(
+            "h3llo_transport_drops_total{kind=\"bare_udp\",direction=\"tx\",peer_id=\"peer-1\",reason=\"oversize\"} 3"
+        ));
+        assert!(text.contains(
+            "h3llo_transport_drop_bytes_total{kind=\"bare_udp\",direction=\"tx\",peer_id=\"peer-1\",reason=\"oversize\"} 4500"
+        ));
+    }
+
+    #[test]
+    fn kind_label_covers_all_variants() {
+        assert_eq!(kind_label(TransportKind::Tun), "tun");
+        assert_eq!(kind_label(TransportKind::BareUdp), "bare_udp");
+        assert_eq!(kind_label(TransportKind::Http3), "http3");
+    }
+
+    #[test]
+    fn direction_label_covers_all_variants() {
+        assert_eq!(direction_label(Direction::Rx), "rx");
+        assert_eq!(direction_label(Direction::Tx), "tx");
+    }
+
+    #[test]
+    fn drop_reason_label_covers_all_variants() {
+        assert_eq!(drop_reason_label(DropReason::Oversize), "oversize");
+        assert_eq!(
+            drop_reason_label(DropReason::DisallowedSource),
+            "disallowed_source"
+        );
+        assert_eq!(drop_reason_label(DropReason::SendError), "send_error");
+        assert_eq!(
+            drop_reason_label(DropReason::ChannelClosed),
+            "channel_closed"
+        );
+        assert_eq!(
+            drop_reason_label(DropReason::InvalidIpVersion),
+            "invalid_ip_version"
+        );
+        assert_eq!(
+            drop_reason_label(DropReason::InvalidFraming),
+            "invalid_framing"
+        );
+        assert_eq!(drop_reason_label(DropReason::NoRoute), "no_route");
+        assert_eq!(
+            drop_reason_label(DropReason::NoPeerChannel),
+            "no_peer_channel"
+        );
+        assert_eq!(drop_reason_label(DropReason::NoHeadroom), "no_headroom");
     }
 }

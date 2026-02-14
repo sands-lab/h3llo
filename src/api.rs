@@ -135,6 +135,9 @@ async fn handle_request(
         (&Method::DELETE, "/config") | (&Method::DELETE, "/config/") => {
             handle_delete_config(req, &events_tx).await
         }
+        (&Method::GET, "/metrics") | (&Method::GET, "/metrics/") => {
+            handle_get_metrics(&events_tx).await
+        }
         _ => response(StatusCode::NOT_FOUND, "not found"),
     };
     Ok(resp)
@@ -170,6 +173,31 @@ async fn handle_get_config(events_tx: &mpsc::UnboundedSender<Event>) -> Response
     }
     match reply_rx.await {
         Ok(config) => yaml_config_response(&config),
+        Err(_) => response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "orchestrator dropped reply",
+        ),
+    }
+}
+
+/// Handles `GET /metrics` — returns Prometheus text exposition format.
+async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Response<Full<Bytes>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if events_tx
+        .send(Event::Api(ApiEvent::GetMetrics { reply_tx }))
+        .is_err()
+    {
+        return response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "orchestrator unavailable",
+        );
+    }
+    match reply_rx.await {
+        Ok(text) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+            .body(Full::new(Bytes::from(text)))
+            .expect("infallible: response builder with valid constants"),
         Err(_) => response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "orchestrator dropped reply",

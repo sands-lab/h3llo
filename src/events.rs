@@ -53,6 +53,11 @@ pub enum ApiEvent {
         /// Reply channel carrying the full `Config` struct for API-side serialization.
         reply_tx: oneshot::Sender<Config>,
     },
+    /// GET /metrics — orchestrator renders Prometheus text and replies.
+    GetMetrics {
+        /// Reply channel carrying the rendered Prometheus text exposition.
+        reply_tx: oneshot::Sender<String>,
+    },
     /// POST /config — upsert peers; orchestrator validates and replies.
     PostConfig {
         /// Parsed peer definitions from the request body.
@@ -73,6 +78,7 @@ impl std::fmt::Debug for ApiEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::GetConfig { .. } => f.debug_struct("GetConfig").finish_non_exhaustive(),
+            Self::GetMetrics { .. } => f.debug_struct("GetMetrics").finish_non_exhaustive(),
             Self::PostConfig { peers, .. } => f
                 .debug_struct("PostConfig")
                 .field("peers_count", &peers.len())
@@ -157,7 +163,7 @@ pub enum TransportKind {
 }
 
 /// Indicates whether metrics were collected on the receive or transmit path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     /// Metrics from the receive side.
     Rx,
@@ -251,7 +257,7 @@ pub struct TransportStats {
 }
 
 /// Labels attached to transport metrics for grouping.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransportLabels {
     /// Transport kind (TUN, BareUDP, HTTP/3).
     pub kind: TransportKind,
