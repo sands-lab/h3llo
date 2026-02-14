@@ -1429,6 +1429,10 @@ mod tests {
             text.contains("h3llo_transport_bytes_total"),
             "missing bytes metric: {text}"
         );
+        assert!(
+            text.contains("h3llo_transport_batches_total"),
+            "missing batches metric: {text}"
+        );
         assert!(text.contains("# EOF"), "missing EOF marker: {text}");
     }
 

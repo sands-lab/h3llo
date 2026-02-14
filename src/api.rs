@@ -127,6 +127,25 @@ impl Collector for MetricsStore {
             }
         }
 
+        // --- h3llo_transport_batches ---
+        {
+            let counter = ConstCounter::new(0u64);
+            let mut metric_enc = encoder.encode_descriptor(
+                "h3llo_transport_batches",
+                "Cumulative batch count (record() invocations for GSO/GRO tracking).",
+                None,
+                counter.metric_type(),
+            )?;
+            for m in store.values() {
+                let labels = PacketLabelSet::from_metrics(m, "succeeded");
+                ConstCounter::new(m.stats.succeeded.batches)
+                    .encode(metric_enc.encode_family(&labels)?)?;
+                let labels = PacketLabelSet::from_metrics(m, "dropped");
+                ConstCounter::new(m.stats.dropped.batches)
+                    .encode(metric_enc.encode_family(&labels)?)?;
+            }
+        }
+
         // --- h3llo_transport_drops ---
         {
             let counter = ConstCounter::new(0u64);
@@ -589,6 +608,10 @@ mod tests {
             "missing bytes: {text}"
         );
         assert!(text.contains("50000"), "missing succeeded bytes: {text}");
+        assert!(
+            text.contains("h3llo_transport_batches_total"),
+            "missing batches: {text}"
+        );
     }
 
     #[test]
