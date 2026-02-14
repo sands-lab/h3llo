@@ -61,11 +61,7 @@ impl DnsState {
     fn set_hostnames(&mut self, hosts: &HashSet<String>) -> bool {
         let mut changed = false;
 
-        self.entries.retain(|h, _| {
-            let keep = hosts.contains(h);
-            changed |= !keep;
-            keep
-        });
+        changed |= self.entries.extract_if(|h, _| !hosts.contains(h)).count() > 0;
 
         for h in hosts {
             if !self.entries.contains_key(h) {
@@ -95,9 +91,7 @@ impl DnsState {
         let mut removed = false;
 
         for ips in self.entries.values_mut() {
-            let before = ips.len();
-            ips.retain(|_, exp| *exp > now);
-            removed |= ips.len() != before;
+            removed |= ips.extract_if(|_, exp| *exp <= now).count() > 0;
         }
 
         self.touch(removed)
