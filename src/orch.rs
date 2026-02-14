@@ -69,16 +69,6 @@ impl PeerEntry {
         self.bounds.first().map(|b| &b.tx)
     }
 
-    /// Appends a new bound connection.
-    fn push_bound(
-        &mut self,
-        endpoint: Option<Endpoint>,
-        dest: SocketAddr,
-        tx: mpsc::Sender<Vec<PooledBuf>>,
-    ) {
-        self.bounds.push(BoundState { endpoint, dest, tx });
-    }
-
     /// Returns the current config endpoint as an `Endpoint` enum, if configured.
     fn config_endpoint(&self) -> Option<Endpoint> {
         if let Some(bare) = &self.config.bare {
@@ -852,7 +842,7 @@ impl Orchestrator {
             return;
         };
         let was_empty = entry.bounds.is_empty();
-        entry.push_bound(endpoint, dest, tx);
+        entry.bounds.push(BoundState { endpoint, dest, tx });
         let first_changed = entry.prune();
         if was_empty || first_changed {
             self.update_routing();
@@ -1065,7 +1055,7 @@ mod test_support {
         ) -> Self {
             if let Some(entry) = self.peers.get_mut(peer_id) {
                 let endpoint = entry.config_endpoint();
-                entry.push_bound(endpoint, dest, tx);
+                entry.bounds.push(BoundState { endpoint, dest, tx });
             }
             self
         }
@@ -1604,7 +1594,12 @@ mod tests {
         orch.peers
             .get_mut("peer1")
             .unwrap()
-            .push_bound(None, dest, tx);
+            .bounds
+            .push(BoundState {
+                endpoint: None,
+                dest,
+                tx,
+            });
 
         assert!(!orch.peers.get("peer1").unwrap().bounds.is_empty());
 
@@ -1950,7 +1945,12 @@ mod tests {
         entry.resolved_ips.insert("1.2.3.4".parse().unwrap());
 
         let (tx, rx) = mpsc::channel(1);
-        entry.push_bound(entry.config_endpoint(), "1.2.3.4:5353".parse().unwrap(), tx);
+        let ep = entry.config_endpoint();
+        entry.bounds.push(BoundState {
+            endpoint: ep,
+            dest: "1.2.3.4:5353".parse().unwrap(),
+            tx,
+        });
 
         assert!(!entry.bounds.is_empty());
         // Drop receiver to close channel
@@ -1969,7 +1969,12 @@ mod tests {
         entry.resolved_ips.insert("5.6.7.8".parse().unwrap());
 
         let (tx, _rx) = mpsc::channel(1);
-        entry.push_bound(entry.config_endpoint(), "1.2.3.4:5353".parse().unwrap(), tx);
+        let ep = entry.config_endpoint();
+        entry.bounds.push(BoundState {
+            endpoint: ep,
+            dest: "1.2.3.4:5353".parse().unwrap(),
+            tx,
+        });
 
         let changed = entry.prune();
         assert!(entry.bounds.is_empty());
@@ -1986,8 +1991,16 @@ mod tests {
         let (tx1, rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         let ep = entry.config_endpoint();
-        entry.push_bound(ep.clone(), "1.2.3.4:5353".parse().unwrap(), tx1);
-        entry.push_bound(ep, "5.6.7.8:5353".parse().unwrap(), tx2);
+        entry.bounds.push(BoundState {
+            endpoint: ep.clone(),
+            dest: "1.2.3.4:5353".parse().unwrap(),
+            tx: tx1,
+        });
+        entry.bounds.push(BoundState {
+            endpoint: ep,
+            dest: "5.6.7.8:5353".parse().unwrap(),
+            tx: tx2,
+        });
 
         // Drop first receiver -> first bound becomes invalid
         drop(rx1);
@@ -2011,8 +2024,16 @@ mod tests {
         let (tx1, rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         let ep = entry.config_endpoint();
-        entry.push_bound(ep.clone(), "1.2.3.4:5353".parse().unwrap(), tx1);
-        entry.push_bound(ep, "1.2.3.4:5353".parse().unwrap(), tx2);
+        entry.bounds.push(BoundState {
+            endpoint: ep.clone(),
+            dest: "1.2.3.4:5353".parse().unwrap(),
+            tx: tx1,
+        });
+        entry.bounds.push(BoundState {
+            endpoint: ep,
+            dest: "1.2.3.4:5353".parse().unwrap(),
+            tx: tx2,
+        });
 
         // Drop first receiver -> first bound becomes invalid
         drop(rx1);
@@ -2029,7 +2050,11 @@ mod tests {
         // resolved_ips is EMPTY -- but inbound bounds (endpoint: None) should survive
 
         let (tx, _rx) = mpsc::channel(1);
-        entry.push_bound(None, "9.8.7.6:12345".parse().unwrap(), tx);
+        entry.bounds.push(BoundState {
+            endpoint: None,
+            dest: "9.8.7.6:12345".parse().unwrap(),
+            tx,
+        });
 
         let changed = entry.prune();
         assert!(!changed);
