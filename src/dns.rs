@@ -86,9 +86,13 @@ impl DnsState {
 
         let ttl_secs = ttl.max(self.min_ttl_secs);
         let expires_at = Instant::now() + Duration::from_secs(ttl_secs as u64);
-        let is_new = !ips.contains_key(&ip);
-        ips.insert(ip, expires_at);
-
+        let mut is_new = false;
+        ips.entry(ip)
+            .and_modify(|exp| *exp = expires_at)
+            .or_insert_with(|| {
+                is_new = true;
+                expires_at
+            });
         if is_new {
             self.dirty = true;
         }

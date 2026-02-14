@@ -569,18 +569,11 @@ where
 }
 
 /// Serializes a `SocketAddr` back to `udp://` URI format.
-///
-/// IPv6 addresses are wrapped in brackets per RFC 2732 (e.g., `udp://[::1]:53`).
 fn serialize_dns_server<S>(addr: &SocketAddr, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    use std::net::IpAddr;
-    let host = match addr.ip() {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => format!("[{v6}]"),
-    };
-    serializer.serialize_str(&format!("udp://{host}:{}", addr.port()))
+    serializer.serialize_str(&format!("udp://{addr}"))
 }
 
 /// Represents a UDP endpoint parsed from a `udp://` URI.
@@ -717,36 +710,24 @@ fn parse_endpoint_uri(
 ///
 /// Supports both IPv4 (`udp://1.1.1.1:53`) and IPv6 (`udp://[::1]:53`) addresses.
 pub fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
+    let (host, port, path) = parse_endpoint_uri(raw, "udp", 0)?;
+    // UDP URIs require an explicit port (no default).
     let url = Url::parse(raw).map_err(|e| e.to_string())?;
-
-    if url.scheme() != "udp" {
-        return Err("scheme must be udp".to_string());
+    if url.port().is_none() {
+        return Err("port is required (e.g., udp://1.1.1.1:53)".to_string());
     }
-
-    let host = url
-        .host_str()
-        .ok_or_else(|| "host is required".to_string())?;
-
+    if path != "/" && !path.is_empty() {
+        return Err("path must be empty".to_string());
+    }
     // For non-special schemes like "udp://", the URL parser treats all hosts as domains.
-    // We need to parse the host string manually, stripping brackets for IPv6.
+    // Parse the host string manually, stripping brackets for IPv6.
     let host_stripped = host
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(host);
+        .unwrap_or(&host);
     let ip: IpAddr = host_stripped
         .parse()
         .map_err(|_| "host must be an IP literal".to_string())?;
-
-    let port = url
-        .port()
-        .ok_or_else(|| "port is required (e.g., udp://1.1.1.1:53)".to_string())?;
-    if url.path() != "/" && !url.path().is_empty() {
-        return Err("path must be empty".to_string());
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err("query and fragment are not supported".to_string());
-    }
-
     Ok(SocketAddr::new(ip, port))
 }
 
@@ -788,35 +769,15 @@ pub fn parse_api_uri(raw: &str) -> Result<ApiEndpoint, String> {
 
 /// Parses a UDP URI (e.g., `udp://host:6635`) into host and port components.
 pub fn parse_udp_uri(raw: &str) -> Result<UdpEndpoint, String> {
+    let (host, port, path) = parse_endpoint_uri(raw, "udp", 0)?;
     let url = Url::parse(raw).map_err(|e| e.to_string())?;
-
-    if url.scheme() != "udp" {
-        return Err("scheme must be udp".to_string());
+    if url.port().is_none() {
+        return Err("port is required (e.g., udp://host:6635)".to_string());
     }
-
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("userinfo is not supported".to_string());
-    }
-
-    let host = url
-        .host_str()
-        .ok_or_else(|| "host is required".to_string())?;
-
-    let port = url
-        .port()
-        .ok_or_else(|| "port is required (e.g., udp://host:6635)".to_string())?;
-
-    if url.path() != "/" && !url.path().is_empty() {
+    if path != "/" && !path.is_empty() {
         return Err("path must be empty".to_string());
     }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err("query and fragment are not supported".to_string());
-    }
-
-    Ok(UdpEndpoint {
-        host: host.to_string(),
-        port,
-    })
+    Ok(UdpEndpoint { host, port })
 }
 
 #[cfg(test)]

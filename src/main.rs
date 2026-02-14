@@ -70,22 +70,18 @@ fn parse_config_path() -> Result<PathBuf, String> {
     let mut config_path = None;
 
     while let Some(arg) = args.next() {
-        if let Some(value) = arg.strip_prefix("--config=") {
+        if let Some(value) = arg
+            .strip_prefix("--config=")
+            .or_else(|| arg.strip_prefix("-c="))
+        {
             config_path = Some(PathBuf::from(value));
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("-c=") {
+        } else if matches!(arg.as_str(), "-c" | "--config") {
+            let value = args
+                .next()
+                .ok_or_else(|| "missing value for -c/--config".to_string())?;
             config_path = Some(PathBuf::from(value));
-            continue;
-        }
-        match arg.as_str() {
-            "-c" | "--config" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "missing value for -c/--config".to_string())?;
-                config_path = Some(PathBuf::from(value));
-            }
-            _ => return Err(format!("unknown argument: {arg}")),
+        } else {
+            return Err(format!("unknown argument: {arg}"));
         }
     }
 

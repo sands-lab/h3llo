@@ -721,13 +721,17 @@ impl Orchestrator {
 
     /// Handles POST /config — upsert peers with orchestrator-side validation.
     fn handle_post_config(&mut self, new_peers: Vec<Peer>) -> Result<(), String> {
-        // Build merged peer list for validation
-        let mut merged = self.peer_configs();
-        for new_peer in &new_peers {
-            merged.retain(|p| p.id != new_peer.id);
-            merged.push(new_peer.clone());
+        // Build merged peer map for validation (borrow-based, O(n+m)).
+        let mut merged: HashMap<&str, &Peer> = self
+            .peers
+            .iter()
+            .map(|(id, entry)| (id.as_str(), &entry.config))
+            .collect();
+        for peer in &new_peers {
+            merged.insert(&peer.id, peer);
         }
-        validate_peers(&merged).map_err(|e| ConfigError::Validation(e).to_string())?;
+        let merged_vec: Vec<Peer> = merged.into_values().cloned().collect();
+        validate_peers(&merged_vec).map_err(|e| ConfigError::Validation(e).to_string())?;
 
         let count = new_peers.len();
         for peer in new_peers {

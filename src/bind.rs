@@ -517,17 +517,13 @@ fn matching_route_indexes(routes: &[Route], target: IpAddr, tun_index: Option<u3
         .collect();
     matches.sort_by(|a, b| b.0.cmp(&a.0));
 
-    let mut deduped = Vec::new();
-    for (_, idx) in matches {
-        if tun_index == Some(idx) {
-            continue;
-        }
-        if !deduped.contains(&idx) {
-            deduped.push(idx);
-        }
-    }
-
-    deduped
+    let mut seen = HashSet::new();
+    matches
+        .into_iter()
+        .map(|(_, idx)| idx)
+        .filter(|idx| tun_index != Some(*idx))
+        .filter(|idx| seen.insert(*idx))
+        .collect()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
