@@ -224,18 +224,21 @@ pub fn spawn_udp_rx(
 ///
 /// # Arguments
 /// - `tx`: Send-only socket with quinn-udp state and destination.
+/// - `peer_id`: Peer identifier for metrics labels.
 /// - `events_tx`: Unbounded channel for emitting transmit metrics.
 /// - `interval`: Metrics emission interval.
 /// - `packet_queue_depth`: Bounded channel capacity.
 pub fn spawn_udp_tx(
     tx: BareUdpTx,
+    peer_id: String,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
     packet_queue_depth: usize,
 ) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
     let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
-    let dest_str = tx.destination.to_string();
+    let dest_addr = tx.destination;
+    let dest_str = dest_addr.to_string();
 
     let BareUdpTx {
         socket,
@@ -313,7 +316,7 @@ pub fn spawn_udp_tx(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
+                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(Some(&peer_id), Some(dest_addr))))).is_err() {
                         return Ok(()); // Events channel closed during shutdown
                     }
                 }
@@ -469,7 +472,13 @@ mod tests {
 
         let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
         let context = test_bare_tx(sender_socket, dest);
-        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200), 256);
+        let (packet_tx, handle) = spawn_udp_tx(
+            context,
+            "test-peer".to_string(),
+            events_tx,
+            Duration::from_millis(200),
+            256,
+        );
 
         packet_tx
             .send(vec![BufFactory::buf_from_slice(&[9, 8, 7])])
@@ -533,7 +542,7 @@ mod tests {
         assert_eq!(metrics.labels.kind, TransportKind::BareUdp);
         assert_eq!(metrics.labels.direction, Direction::Rx);
         assert_eq!(metrics.labels.peer_id, None);
-        assert_eq!(metrics.labels.ip_addr, None);
+        assert_eq!(metrics.labels.remote_addr, None);
         assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 4);
@@ -550,7 +559,13 @@ mod tests {
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let context = test_bare_tx(sender_socket, dest);
-        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(10), 256);
+        let (packet_tx, handle) = spawn_udp_tx(
+            context,
+            "test-peer".to_string(),
+            events_tx,
+            Duration::from_millis(10),
+            256,
+        );
 
         packet_tx
             .send(vec![BufFactory::buf_from_slice(&[5, 4, 3, 2])])
@@ -579,8 +594,8 @@ mod tests {
 
         assert_eq!(metrics.labels.kind, TransportKind::BareUdp);
         assert_eq!(metrics.labels.direction, Direction::Tx);
-        assert_eq!(metrics.labels.peer_id, None);
-        assert_eq!(metrics.labels.ip_addr, None);
+        assert_eq!(metrics.labels.peer_id, Some("test-peer".to_string()));
+        assert_eq!(metrics.labels.remote_addr, Some(dest));
         assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 4);
@@ -654,7 +669,13 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let context = test_bare_tx(sender_socket, dest);
 
-        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_secs(60), 256);
+        let (packet_tx, handle) = spawn_udp_tx(
+            context,
+            "test-peer".to_string(),
+            events_tx,
+            Duration::from_secs(60),
+            256,
+        );
 
         // Verify packet_tx is functional by sending a batch
         assert!(packet_tx
@@ -675,8 +696,13 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let context = test_bare_tx(sender_socket, dest);
 
-        let (packet_tx, join_handle) =
-            spawn_udp_tx(context, events_tx, Duration::from_secs(60), 256);
+        let (packet_tx, join_handle) = spawn_udp_tx(
+            context,
+            "test-peer".to_string(),
+            events_tx,
+            Duration::from_secs(60),
+            256,
+        );
 
         // Drop sender to signal shutdown
         drop(packet_tx);
@@ -706,6 +732,7 @@ mod tests {
         // Spawn TX first to get its packet_tx channel
         let (packet_tx, tx_handle) = spawn_udp_tx(
             test_bare_tx(tx_socket, dest),
+            "test-peer".to_string(),
             events_tx.clone(),
             Duration::from_secs(60),
             256,
@@ -748,7 +775,13 @@ mod tests {
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let context = test_bare_tx(sender_socket, dest);
-        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200), 256);
+        let (packet_tx, handle) = spawn_udp_tx(
+            context,
+            "test-peer".to_string(),
+            events_tx,
+            Duration::from_millis(200),
+            256,
+        );
 
         // Send a batch of 3 equal-sized packets (simulates TUN GSO output)
         let batch = vec![
@@ -788,7 +821,13 @@ mod tests {
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let context = test_bare_tx(sender_socket, dest);
-        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(200), 256);
+        let (packet_tx, handle) = spawn_udp_tx(
+            context,
+            "test-peer".to_string(),
+            events_tx,
+            Duration::from_millis(200),
+            256,
+        );
 
         // Last packet is shorter (e.g., TCP stream tail)
         let batch = vec![
@@ -827,7 +866,13 @@ mod tests {
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let context = test_bare_tx(sender_socket, dest);
-        let (packet_tx, handle) = spawn_udp_tx(context, events_tx, Duration::from_millis(10), 256);
+        let (packet_tx, handle) = spawn_udp_tx(
+            context,
+            "test-peer".to_string(),
+            events_tx,
+            Duration::from_millis(10),
+            256,
+        );
 
         let batch = vec![
             BufFactory::buf_from_slice(&[1, 2, 3]),

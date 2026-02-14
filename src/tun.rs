@@ -1040,7 +1040,7 @@ mod tests {
         assert_eq!(metrics.labels.kind, TransportKind::Tun);
         assert_eq!(metrics.labels.direction, Direction::Rx);
         assert_eq!(metrics.labels.peer_id, None);
-        assert_eq!(metrics.labels.ip_addr, None);
+        assert_eq!(metrics.labels.remote_addr, None);
         assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 20);
@@ -1088,7 +1088,7 @@ mod tests {
         assert_eq!(metrics.labels.kind, TransportKind::Tun);
         assert_eq!(metrics.labels.direction, Direction::Tx);
         assert_eq!(metrics.labels.peer_id, None);
-        assert_eq!(metrics.labels.ip_addr, None);
+        assert_eq!(metrics.labels.remote_addr, None);
         assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 3);
@@ -1140,7 +1140,7 @@ mod tests {
         assert_eq!(metrics.labels.kind, TransportKind::Tun);
         assert_eq!(metrics.labels.direction, Direction::Tx);
         assert_eq!(metrics.labels.peer_id, None);
-        assert_eq!(metrics.labels.ip_addr, None);
+        assert_eq!(metrics.labels.remote_addr, None);
         assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.dropped.packets, 0);

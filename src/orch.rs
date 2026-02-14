@@ -30,8 +30,6 @@ use tracing::{debug, error, info, warn};
 /// A single active connection bound to a peer.
 #[derive(Debug)]
 struct BoundState {
-    /// Unique identifier for detecting changes in preferred TX.
-    id: u64,
     /// Configured endpoint that originated this connection.
     ///
     /// `None` for listener-originated (inbound) connections.
@@ -53,8 +51,6 @@ struct PeerEntry {
     resolved_ips: HashSet<IpAddr>,
     /// Last time `try_connect` actually spawned connections.
     last_try_connect: Option<Instant>,
-    /// Monotonic counter for assigning unique bound IDs.
-    next_bound_id: u64,
 }
 
 impl PeerEntry {
@@ -65,7 +61,6 @@ impl PeerEntry {
             bounds: Vec::new(),
             resolved_ips: HashSet::new(),
             last_try_connect: None,
-            next_bound_id: 0,
         }
     }
 
@@ -74,21 +69,14 @@ impl PeerEntry {
         self.bounds.first().map(|b| &b.tx)
     }
 
-    /// Appends a new bound with an auto-assigned unique ID.
+    /// Appends a new bound connection.
     fn push_bound(
         &mut self,
         endpoint: Option<Endpoint>,
         dest: SocketAddr,
         tx: mpsc::Sender<Vec<PooledBuf>>,
     ) {
-        let id = self.next_bound_id;
-        self.next_bound_id += 1;
-        self.bounds.push(BoundState {
-            id,
-            endpoint,
-            dest,
-            tx,
-        });
+        self.bounds.push(BoundState { endpoint, dest, tx });
     }
 
     /// Returns the current config endpoint as an `Endpoint` enum, if configured.
@@ -109,7 +97,7 @@ impl PeerEntry {
     /// - Its endpoint is `Some` but differs from the current config endpoint (reconfig).
     /// - Its endpoint is `Some` and its dest IP is not in `resolved_ips` (DNS changed).
     fn prune(&mut self) -> bool {
-        let old_first_id = self.bounds.first().map(|b| b.id);
+        let old_first_tx = self.bounds.first().map(|b| b.tx.clone());
         let config_ep = self.config_endpoint();
 
         self.bounds.retain(|bound| {
@@ -134,7 +122,11 @@ impl PeerEntry {
             true
         });
 
-        old_first_id != self.bounds.first().map(|b| b.id)
+        match (&old_first_tx, self.bounds.first()) {
+            (Some(old), Some(new)) => !old.same_channel(&new.tx),
+            (None, None) => false,
+            _ => true,
+        }
     }
 
     /// Spawns connections for resolved IPs not already covered by an existing bound.
@@ -204,6 +196,7 @@ impl PeerEntry {
                         Ok(tx_socket) => {
                             let (packet_tx, tx_handle) = spawn_udp_tx(
                                 tx_socket,
+                                peer_id.clone(),
                                 events_tx.clone(),
                                 metrics_interval,
                                 packet_queue_depth,
@@ -1203,7 +1196,7 @@ mod tests {
                 kind: TransportKind::Tun,
                 direction: Direction::Rx,
                 peer_id: None,
-                ip_addr: None,
+                remote_addr: None,
             },
             stats: TransportStats::default(),
         }))
@@ -1381,7 +1374,7 @@ mod tests {
                 kind: TransportKind::Tun,
                 direction: Direction::Rx,
                 peer_id: None,
-                ip_addr: None,
+                remote_addr: None,
             },
             stats: TransportStats {
                 succeeded: crate::events::PktCounters {

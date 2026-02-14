@@ -146,6 +146,7 @@ struct PacketLabelSet {
     kind: TransportKindLabel,
     direction: DirectionLabel,
     peer_id: String,
+    remote_addr: String,
     outcome: String,
 }
 
@@ -155,6 +156,11 @@ impl PacketLabelSet {
             kind: TransportKindLabel(m.labels.kind),
             direction: DirectionLabel(m.labels.direction),
             peer_id: m.labels.peer_id.clone().unwrap_or_default(),
+            remote_addr: m
+                .labels
+                .remote_addr
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
             outcome: outcome.to_string(),
         }
     }
@@ -166,6 +172,7 @@ struct DropLabelSet {
     kind: TransportKindLabel,
     direction: DirectionLabel,
     peer_id: String,
+    remote_addr: String,
     reason: DropReasonLabel,
 }
 
@@ -175,6 +182,11 @@ impl DropLabelSet {
             kind: TransportKindLabel(m.labels.kind),
             direction: DirectionLabel(m.labels.direction),
             peer_id: m.labels.peer_id.clone().unwrap_or_default(),
+            remote_addr: m
+                .labels
+                .remote_addr
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
             reason: DropReasonLabel(reason),
         }
     }
@@ -528,7 +540,7 @@ mod tests {
                 kind: TransportKind::Tun,
                 direction: Direction::Rx,
                 peer_id: None,
-                ip_addr: None,
+                remote_addr: None,
             },
             stats: TransportStats {
                 succeeded: PktCounters {
@@ -579,7 +591,7 @@ mod tests {
                 kind: TransportKind::BareUdp,
                 direction: Direction::Tx,
                 peer_id: Some("peer-1".to_string()),
-                ip_addr: None,
+                remote_addr: None,
             },
             stats: TransportStats {
                 succeeded: PktCounters {
@@ -619,7 +631,7 @@ mod tests {
                 kind: TransportKind::Tun,
                 direction: Direction::Rx,
                 peer_id: None,
-                ip_addr: None,
+                remote_addr: None,
             },
             stats: TransportStats::default(),
         };
@@ -629,6 +641,39 @@ mod tests {
         assert!(
             text.contains("_total{"),
             "counters must have _total suffix: {text}"
+        );
+    }
+
+    #[test]
+    fn encode_snapshot_includes_remote_addr_label() {
+        let mut snapshot = HashMap::new();
+        let addr: std::net::SocketAddr = "1.2.3.4:5353".parse().unwrap();
+        let metrics = TransportMetrics {
+            labels: TransportLabels {
+                kind: TransportKind::BareUdp,
+                direction: Direction::Tx,
+                peer_id: Some("peer-x".to_string()),
+                remote_addr: Some(addr),
+            },
+            stats: TransportStats {
+                succeeded: PktCounters {
+                    packets: 10,
+                    bytes: 1000,
+                    ..Default::default()
+                },
+                dropped: PktCounters::default(),
+                drop_reasons: HashMap::new(),
+            },
+        };
+        snapshot.insert(metrics.labels.clone(), metrics);
+        let text = encode_metrics_snapshot(snapshot);
+        assert!(
+            text.contains("remote_addr=\"1.2.3.4:5353\""),
+            "missing remote_addr label: {text}"
+        );
+        assert!(
+            text.contains("peer_id=\"peer-x\""),
+            "missing peer_id label: {text}"
         );
     }
 

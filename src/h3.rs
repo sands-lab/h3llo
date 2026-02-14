@@ -392,10 +392,12 @@ impl H3Connection {
     pub fn into_actors(self) -> (H3Rx, H3Tx) {
         let rx = H3Rx {
             peer_id: self.peer_id.clone(),
+            remote_addr: self.remote_addr,
             datagram_rx: self.datagram_rx,
         };
         let tx = H3Tx {
             peer_id: self.peer_id,
+            remote_addr: self.remote_addr,
             datagram_tx: self.datagram_tx,
             flow_id: self.flow_id,
             keepalive_tx: self.keepalive_tx,
@@ -637,6 +639,8 @@ pub async fn dial_h3<P: RouteProbe>(
 pub struct H3Rx {
     /// Peer identifier for logging and metrics.
     pub peer_id: String,
+    /// Remote socket address for per-connection metrics disambiguation.
+    pub remote_addr: SocketAddr,
     /// Inbound datagram receiver (from tokio-quiche).
     pub datagram_rx: InboundFrameStream,
 }
@@ -663,6 +667,7 @@ pub fn spawn_h3_rx(
 ) -> JoinHandle<ActorExitResult> {
     let H3Rx {
         peer_id,
+        remote_addr,
         mut datagram_rx,
     } = rx;
     let peer = peer_id.clone();
@@ -709,7 +714,7 @@ pub fn spawn_h3_rx(
                     counters.record_success(ok_pkts, ok_bytes);
                 }
                 _ = ticker.tick() => {
-                    let metrics = counters.snapshot(Some(&peer), None);
+                    let metrics = counters.snapshot(Some(&peer), Some(remote_addr));
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(metrics))).is_err() {
                         return Ok(());
                     }
@@ -769,6 +774,8 @@ fn handle_inbound_frame(
 pub struct H3Tx {
     /// Peer identifier for logging and metrics.
     pub peer_id: String,
+    /// Remote socket address for per-connection metrics disambiguation.
+    pub remote_addr: SocketAddr,
     /// Outbound datagram sender (to tokio-quiche).
     pub datagram_tx: OutboundFrameSender,
     /// DATAGRAM flow ID for this connection.
@@ -781,6 +788,7 @@ impl std::fmt::Debug for H3Tx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("H3Tx")
             .field("peer_id", &self.peer_id)
+            .field("remote_addr", &self.remote_addr)
             .field("flow_id", &self.flow_id)
             .finish_non_exhaustive()
     }
@@ -810,6 +818,7 @@ pub fn spawn_h3_tx(
 
     let H3Tx {
         peer_id,
+        remote_addr,
         mut datagram_tx,
         flow_id,
         keepalive_tx,
@@ -850,7 +859,7 @@ pub fn spawn_h3_tx(
                     }
                 }
                 _ = ticker.tick() => {
-                    let metrics = counters.snapshot(Some(&peer), None);
+                    let metrics = counters.snapshot(Some(&peer), Some(remote_addr));
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(metrics))).is_err() {
                         return Ok(());
                     }
@@ -1644,6 +1653,8 @@ mod tests {
         let (rx, tx) = server_event.connection.into_actors();
         assert_eq!(rx.peer_id, peer_id);
         assert_eq!(tx.peer_id, peer_id);
+        assert_eq!(rx.remote_addr, tx.remote_addr);
+        assert!(rx.remote_addr.ip().is_loopback());
 
         drop(cmd_tx);
     }
