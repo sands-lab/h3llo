@@ -454,15 +454,14 @@ async fn probe_interfaces_impl(
             .map_err(|err| RouteProbeError::Probe(err.to_string()))?
     };
 
-    let names = matching_route_indexes(&routes, target_ip, tun_index)
-        .into_iter()
-        .map(|ifindex| {
-            ifindex_to_name(ifindex).map_err(|err| RouteProbeError::InterfaceLookup {
-                ifindex,
-                error: err.to_string(),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut names = Vec::new();
+    for ifindex in matching_route_indexes(&routes, target_ip, tun_index) {
+        let name = ifindex_to_name(ifindex).map_err(|err| RouteProbeError::InterfaceLookup {
+            ifindex,
+            error: err.to_string(),
+        })?;
+        names.push(name);
+    }
 
     Ok(names)
 }
