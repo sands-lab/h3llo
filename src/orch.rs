@@ -681,21 +681,29 @@ impl Orchestrator {
     fn handle_api_event(&mut self, event: ApiEvent) {
         match event {
             ApiEvent::GetConfig { reply_tx } => {
-                let snapshot = Config {
-                    local: self.local.clone(),
-                    tuning: self.tuning.clone(),
-                    peers: self.peer_configs(),
-                };
-                let _ = reply_tx.send(snapshot);
+                let _ = reply_tx.send(self.config_snapshot());
             }
             ApiEvent::PostConfig { peers, reply_tx } => {
-                let result = self.handle_post_config(peers);
+                let result = self
+                    .handle_post_config(peers)
+                    .map(|()| self.config_snapshot());
                 let _ = reply_tx.send(result);
             }
             ApiEvent::DeleteConfig { peer_ids, reply_tx } => {
                 self.handle_delete_config(&peer_ids);
-                let _ = reply_tx.send(Ok(()));
+                let _ = reply_tx.send(Ok(self.config_snapshot()));
             }
+        }
+    }
+
+    /// Builds a full Config snapshot from current orchestrator state.
+    ///
+    /// Reused by GET, POST, and DELETE API handlers for consistent responses.
+    fn config_snapshot(&self) -> Config {
+        Config {
+            local: self.local.clone(),
+            tuning: self.tuning.clone(),
+            peers: self.peer_configs(),
         }
     }
 
@@ -2002,6 +2010,8 @@ mod tests {
         let config = reply_rx.await.expect("should receive config");
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers[0].id, "peer-1");
+        // Verify local section is included in snapshot
+        assert_eq!(config.local.tun.ifname, "test0");
     }
 
     #[tokio::test]
@@ -2030,7 +2040,9 @@ mod tests {
         });
 
         let result = reply_rx.await.expect("should receive reply");
-        assert!(result.is_ok());
+        let config = result.expect("should succeed");
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].id, "new-peer");
         assert_eq!(orch.peers.len(), 1);
         assert!(orch.peers.contains_key("new-peer"));
     }
@@ -2086,13 +2098,29 @@ mod tests {
         });
 
         let result = reply_rx.await.expect("should receive reply");
-        assert!(result.is_ok());
+        let config = result.expect("should succeed");
+        assert!(config.peers.is_empty());
         assert!(orch.peers.is_empty());
     }
 
     #[tokio::test]
     async fn api_delete_config_ignores_unknown_ids() {
-        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+        let peer = Peer {
+            id: "keeper".to_string(),
+            h3: Some(crate::config::PeerH3 {
+                endpoint: None,
+                token: "test-token-12ch".to_string(),
+                bindif: None,
+                sni: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            },
+        };
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         orch.handle_api_event(ApiEvent::DeleteConfig {
@@ -2101,6 +2129,8 @@ mod tests {
         });
 
         let result = reply_rx.await.expect("should receive reply");
-        assert!(result.is_ok());
+        let config = result.expect("should succeed");
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].id, "keeper");
     }
 }

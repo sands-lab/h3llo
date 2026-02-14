@@ -135,8 +135,8 @@ Management API summary: a localhost-bound HTTP/1.1 server for runtime peer manag
 #### Endpoints
 
 - `GET /config` — returns the full configuration snapshot in YAML, matching the shape documented in [docs/configuration.md](configuration.md).
-- `POST /config` — accepts a YAML `peers` list. Each entry must be a **complete** peer configuration (not a partial update); the entry **replaces** any existing peer with the same `peers[].id`. Peers not present in the payload are unchanged. Only `peers` is accepted at the top level; all other keys are rejected with `400 Bad Request`.
-- `DELETE /config` — accepts a YAML body with `peer_ids` (list of peer ID strings). Matching peers are removed. Non-existent IDs are silently ignored.
+- `POST /config` — accepts a YAML `peers` list. Each entry must be a **complete** peer configuration (not a partial update); the entry **replaces** any existing peer with the same `peers[].id`. Peers not present in the payload are unchanged. Only `peers` is accepted at the top level; all other keys are rejected with `400 Bad Request`. On success, returns the full updated configuration snapshot in YAML (same format as `GET /config`).
+- `DELETE /config` — accepts a YAML body with `peers` (list of peer entries; only `id` is required per entry). Matching peers are removed. Non-existent IDs are silently ignored. On success, returns the full updated configuration snapshot in YAML (same format as `GET /config`). Only `peers` is accepted at the top level; all other keys are rejected with `400 Bad Request`.
 - `GET /events` — Server-Sent Events (SSE) stream. TBD.
 - `GET /metrics` — Prometheus exposition format. Reserved for Prometheus scraping.
 
@@ -146,6 +146,8 @@ All three config endpoints are idempotent:
 - `GET /config` is naturally idempotent (read-only).
 - `POST /config` with the same payload always produces the same state (replace semantics).
 - `DELETE /config` with already-removed peers is a no-op.
+
+All three config endpoints return the same response format on success: a complete YAML configuration snapshot (content-type: `application/yaml`). This eliminates the need for a follow-up `GET /config` after mutations.
 
 `POST` replace rules:
 - Each peer entry in the payload must contain all required fields (`id`, transport config, `tun`). Omitted optional fields revert to defaults, not to previous values.
@@ -175,6 +177,7 @@ peers:
     allowed_ips:
       - 10.0.1.0/24
 '
+# Response: full YAML config (same as GET /config)
 
 # POST http://localhost:9090/config — replace a peer, switching from H3 to BareUDP
 $ curl -X POST http://localhost:9090/config -d '
@@ -186,12 +189,14 @@ peers:
     allowed_ips:
       - 10.0.1.0/24
 '
+# Response: full YAML config (same as GET /config)
 
-# DELETE http://localhost:9090/config — remove peers by ID
+# DELETE http://localhost:9090/config — remove peers
 $ curl -X DELETE http://localhost:9090/config -d '
-peer_ids:
-  - example-node-1
+peers:
+  - id: example-node-1
 '
+# Response: full YAML config (same as GET /config)
 
 # GET http://localhost:9090/events — subscribe to SSE event stream
 $ curl -N http://localhost:9090/events
