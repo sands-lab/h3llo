@@ -67,10 +67,10 @@ pub enum ApiEvent {
         /// Reply channel carrying updated config on success, or error string on failure.
         reply_tx: oneshot::Sender<Result<Config, String>>,
     },
-    /// GET /metrics — orchestrator replies with OpenMetrics text.
-    GetMetrics {
-        /// Reply channel carrying the rendered metrics text.
-        reply_tx: oneshot::Sender<String>,
+    /// GET /metrics — orchestrator replies with raw metrics snapshot for API-side rendering.
+    GetMetricsSnapshot {
+        /// Reply channel carrying cloned metrics data. Rendering happens in the API actor.
+        reply_tx: oneshot::Sender<HashMap<TransportLabels, TransportMetrics>>,
     },
 }
 
@@ -86,7 +86,9 @@ impl std::fmt::Debug for ApiEvent {
                 .debug_struct("DeleteConfig")
                 .field("peer_ids", peer_ids)
                 .finish_non_exhaustive(),
-            Self::GetMetrics { .. } => f.debug_struct("GetMetrics").finish_non_exhaustive(),
+            Self::GetMetricsSnapshot { .. } => {
+                f.debug_struct("GetMetricsSnapshot").finish_non_exhaustive()
+            }
         }
     }
 }

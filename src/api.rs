@@ -5,8 +5,8 @@
 //! GET /metrics for Prometheus-compatible metrics exposition.
 //! Communicates with the orchestrator via the `Event` channel pattern.
 //!
-//! Also houses the `MetricsStore` type and `prometheus-client` `Collector`
-//! implementation for rendering transport metrics on `GET /metrics`.
+//! Also houses the `SnapshotCollector` and `encode_metrics_snapshot` for
+//! rendering transport metrics on `GET /metrics` from owned snapshot data.
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::{Config, Peer};
@@ -25,126 +25,61 @@ use prometheus_client::encoding::{
     DescriptorEncoder, EncodeLabelSet, EncodeLabelValue, EncodeMetric,
 };
 use prometheus_client::metrics::counter::ConstCounter;
+use prometheus_client::registry::Registry;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
-// MetricsStore + Collector
+// Snapshot-based Collector (lock-free, owned data)
 // ---------------------------------------------------------------------------
 
-/// Thread-safe metrics store shared between the orchestrator and the Collector.
+/// Collector that owns a snapshot of metrics data for one-shot encoding.
 ///
-/// Updated by the orchestrator (single-threaded) on each `TransportEvent::Metrics`.
-/// Read by the collector during `GET /metrics` scrapes. The `Mutex` is only
-/// locked during scrapes and metric updates — both on the orchestrator thread,
-/// so there is zero contention.
-#[derive(Debug, Clone)]
-pub(crate) struct MetricsStore(Arc<Mutex<HashMap<TransportLabels, TransportMetrics>>>);
+/// Created per scrape from the snapshot received via `ApiEvent::GetMetricsSnapshot`.
+/// No `Arc`, no `Mutex` — the collector owns the `HashMap` directly.
+#[derive(Debug)]
+struct SnapshotCollector(HashMap<TransportLabels, TransportMetrics>);
 
-impl MetricsStore {
-    /// Creates a new empty metrics store.
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(Mutex::new(HashMap::new())))
-    }
-
-    /// Updates the stored snapshot for the given label set.
-    pub(crate) fn update(&self, metrics: TransportMetrics) {
-        self.0
-            .lock()
-            .expect("metrics store lock poisoned")
-            .insert(metrics.labels.clone(), metrics);
-    }
-
-    /// Returns `true` if the store contains no entries.
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0
-            .lock()
-            .expect("metrics store lock poisoned")
-            .is_empty()
-    }
-
-    /// Returns the number of entries in the store.
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.0.lock().expect("metrics store lock poisoned").len()
-    }
-
-    /// Locks the store and returns a guard for direct access (test use).
-    #[cfg(test)]
-    pub(crate) fn lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<TransportLabels, TransportMetrics>> {
-        self.0.lock().expect("metrics store lock poisoned")
-    }
+/// Encodes a metrics snapshot into OpenMetrics text format.
+pub(crate) fn encode_metrics_snapshot(
+    snapshot: HashMap<TransportLabels, TransportMetrics>,
+) -> String {
+    let mut registry = Registry::default();
+    registry.register_collector(Box::new(SnapshotCollector(snapshot)));
+    let mut text = String::new();
+    prometheus_client::encoding::text::encode(&mut text, &registry)
+        .expect("infallible: encoding to String cannot fail");
+    text
 }
 
-impl Collector for MetricsStore {
+impl Collector for SnapshotCollector {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
-        let store = self.0.lock().expect("metrics store lock poisoned");
-
-        // --- h3llo_transport_packets ---
-        {
-            let counter = ConstCounter::new(0u64);
-            let mut metric_enc = encoder.encode_descriptor(
-                "h3llo_transport_packets",
-                "Cumulative packet count.",
-                None,
-                counter.metric_type(),
-            )?;
-            for m in store.values() {
-                let labels = PacketLabelSet::from_metrics(m, "succeeded");
-                ConstCounter::new(m.stats.succeeded.packets)
-                    .encode(metric_enc.encode_family(&labels)?)?;
-                let labels = PacketLabelSet::from_metrics(m, "dropped");
-                ConstCounter::new(m.stats.dropped.packets)
-                    .encode(metric_enc.encode_family(&labels)?)?;
-            }
-        }
-
-        // --- h3llo_transport_bytes ---
-        {
-            let counter = ConstCounter::new(0u64);
-            let mut metric_enc = encoder.encode_descriptor(
-                "h3llo_transport_bytes",
-                "Cumulative byte count.",
-                None,
-                counter.metric_type(),
-            )?;
-            for m in store.values() {
-                let labels = PacketLabelSet::from_metrics(m, "succeeded");
-                ConstCounter::new(m.stats.succeeded.bytes)
-                    .encode(metric_enc.encode_family(&labels)?)?;
-                let labels = PacketLabelSet::from_metrics(m, "dropped");
-                ConstCounter::new(m.stats.dropped.bytes)
-                    .encode(metric_enc.encode_family(&labels)?)?;
-            }
-        }
-
-        // --- h3llo_transport_batches ---
-        {
-            let counter = ConstCounter::new(0u64);
-            let mut metric_enc = encoder.encode_descriptor(
-                "h3llo_transport_batches",
-                "Cumulative batch count (record() invocations for GSO/GRO tracking).",
-                None,
-                counter.metric_type(),
-            )?;
-            for m in store.values() {
-                let labels = PacketLabelSet::from_metrics(m, "succeeded");
-                ConstCounter::new(m.stats.succeeded.batches)
-                    .encode(metric_enc.encode_family(&labels)?)?;
-                let labels = PacketLabelSet::from_metrics(m, "dropped");
-                ConstCounter::new(m.stats.dropped.batches)
-                    .encode(metric_enc.encode_family(&labels)?)?;
-            }
-        }
+        encode_counter_family(
+            &mut encoder,
+            "h3llo_transport_packets",
+            "Cumulative packet count.",
+            &self.0,
+            |m| (m.stats.succeeded.packets, m.stats.dropped.packets),
+        )?;
+        encode_counter_family(
+            &mut encoder,
+            "h3llo_transport_bytes",
+            "Cumulative byte count.",
+            &self.0,
+            |m| (m.stats.succeeded.bytes, m.stats.dropped.bytes),
+        )?;
+        encode_counter_family(
+            &mut encoder,
+            "h3llo_transport_batches",
+            "Cumulative batch count (record() invocations for GSO/GRO tracking).",
+            &self.0,
+            |m| (m.stats.succeeded.batches, m.stats.dropped.batches),
+        )?;
 
         // --- h3llo_transport_drops ---
         {
@@ -155,7 +90,7 @@ impl Collector for MetricsStore {
                 None,
                 counter.metric_type(),
             )?;
-            for m in store.values() {
+            for m in self.0.values() {
                 for (reason, counters) in &m.stats.drop_reasons {
                     let labels = DropLabelSet::from_metrics(m, *reason);
                     ConstCounter::new(counters.packets)
@@ -173,7 +108,7 @@ impl Collector for MetricsStore {
                 None,
                 counter.metric_type(),
             )?;
-            for m in store.values() {
+            for m in self.0.values() {
                 for (reason, counters) in &m.stats.drop_reasons {
                     let labels = DropLabelSet::from_metrics(m, *reason);
                     ConstCounter::new(counters.bytes).encode(metric_enc.encode_family(&labels)?)?;
@@ -183,6 +118,26 @@ impl Collector for MetricsStore {
 
         Ok(())
     }
+}
+
+/// Encodes a succeeded/dropped counter family, reducing duplication.
+fn encode_counter_family(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    store: &HashMap<TransportLabels, TransportMetrics>,
+    extractor: fn(&TransportMetrics) -> (u64, u64),
+) -> Result<(), fmt::Error> {
+    let counter = ConstCounter::new(0u64);
+    let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+    for m in store.values() {
+        let (succeeded, dropped) = extractor(m);
+        let labels = PacketLabelSet::from_metrics(m, "succeeded");
+        ConstCounter::new(succeeded).encode(metric_enc.encode_family(&labels)?)?;
+        let labels = PacketLabelSet::from_metrics(m, "dropped");
+        ConstCounter::new(dropped).encode(metric_enc.encode_family(&labels)?)?;
+    }
+    Ok(())
 }
 
 /// Label set for packet/byte counter families.
@@ -521,10 +476,13 @@ async fn handle_delete_config(
 }
 
 /// Handles `GET /metrics` — returns OpenMetrics text format.
+///
+/// Requests a raw metrics snapshot from the orchestrator via event channel,
+/// then renders OpenMetrics text locally using `prometheus-client`.
 async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Response<Full<Bytes>> {
     let (reply_tx, reply_rx) = oneshot::channel();
     if events_tx
-        .send(Event::Api(ApiEvent::GetMetrics { reply_tx }))
+        .send(Event::Api(ApiEvent::GetMetricsSnapshot { reply_tx }))
         .is_err()
     {
         return response(
@@ -533,14 +491,17 @@ async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Respons
         );
     }
     match reply_rx.await {
-        Ok(text) => Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                "content-type",
-                "application/openmetrics-text; version=1.0.0; charset=utf-8",
-            )
-            .body(Full::new(Bytes::from(text)))
-            .expect("infallible: response builder with valid constants"),
+        Ok(snapshot) => {
+            let text = encode_metrics_snapshot(snapshot);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    "content-type",
+                    "application/openmetrics-text; version=1.0.0; charset=utf-8",
+                )
+                .body(Full::new(Bytes::from(text)))
+                .expect("infallible: response builder with valid constants")
+        }
         Err(_) => response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "orchestrator dropped reply",
@@ -552,29 +513,17 @@ async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Respons
 mod tests {
     use super::*;
     use crate::events::{PktCounters, TransportStats};
-    use prometheus_client::registry::Registry;
-
-    /// Helper: encode the registry to text and return the string.
-    fn encode_metrics(registry: &Registry) -> String {
-        let mut buf = String::new();
-        prometheus_client::encoding::text::encode(&mut buf, registry)
-            .expect("infallible: encoding to String cannot fail");
-        buf
-    }
 
     #[test]
-    fn metrics_collector_empty_store() {
-        let store = MetricsStore::new();
-        let mut registry = Registry::default();
-        registry.register_collector(Box::new(store));
-        let text = encode_metrics(&registry);
+    fn encode_empty_snapshot() {
+        let text = encode_metrics_snapshot(HashMap::new());
         assert!(text.contains("# EOF"), "should contain EOF: {text}");
     }
 
     #[test]
-    fn metrics_collector_includes_succeeded_and_dropped() {
-        let store = MetricsStore::new();
-        store.update(TransportMetrics {
+    fn encode_snapshot_includes_succeeded_and_dropped() {
+        let mut snapshot = HashMap::new();
+        let metrics = TransportMetrics {
             labels: TransportLabels {
                 kind: TransportKind::Tun,
                 direction: Direction::Rx,
@@ -594,10 +543,9 @@ mod tests {
                 },
                 drop_reasons: HashMap::new(),
             },
-        });
-        let mut registry = Registry::default();
-        registry.register_collector(Box::new(store));
-        let text = encode_metrics(&registry);
+        };
+        snapshot.insert(metrics.labels.clone(), metrics);
+        let text = encode_metrics_snapshot(snapshot);
         assert!(
             text.contains("h3llo_transport_packets_total"),
             "missing packets: {text}"
@@ -615,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn metrics_collector_includes_drop_reasons() {
+    fn encode_snapshot_includes_drop_reasons() {
         let mut drop_reasons = HashMap::new();
         drop_reasons.insert(
             DropReason::Oversize,
@@ -625,8 +573,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let store = MetricsStore::new();
-        store.update(TransportMetrics {
+        let mut snapshot = HashMap::new();
+        let metrics = TransportMetrics {
             labels: TransportLabels {
                 kind: TransportKind::BareUdp,
                 direction: Direction::Tx,
@@ -646,10 +594,9 @@ mod tests {
                 },
                 drop_reasons,
             },
-        });
-        let mut registry = Registry::default();
-        registry.register_collector(Box::new(store));
-        let text = encode_metrics(&registry);
+        };
+        snapshot.insert(metrics.labels.clone(), metrics);
+        let text = encode_metrics_snapshot(snapshot);
         assert!(
             text.contains("h3llo_transport_drops_total"),
             "missing drops: {text}"
@@ -665,9 +612,9 @@ mod tests {
     }
 
     #[test]
-    fn output_is_openmetrics_format() {
-        let store = MetricsStore::new();
-        store.update(TransportMetrics {
+    fn encode_snapshot_is_openmetrics_format() {
+        let mut snapshot = HashMap::new();
+        let metrics = TransportMetrics {
             labels: TransportLabels {
                 kind: TransportKind::Tun,
                 direction: Direction::Rx,
@@ -675,10 +622,9 @@ mod tests {
                 ip_addr: None,
             },
             stats: TransportStats::default(),
-        });
-        let mut registry = Registry::default();
-        registry.register_collector(Box::new(store));
-        let text = encode_metrics(&registry);
+        };
+        snapshot.insert(metrics.labels.clone(), metrics);
+        let text = encode_metrics_snapshot(snapshot);
         assert!(text.ends_with("# EOF\n"), "must end with # EOF: {text}");
         assert!(
             text.contains("_total{"),
