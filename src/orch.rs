@@ -1,7 +1,6 @@
 //! Runtime orchestration for BareUDP and HTTP/3 transports.
 
 use crate::actor::{ActorError, ActorExitResult, ActorKind};
-use crate::api::MetricsStore;
 use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUdpRxCommand};
 use crate::bind::DefaultRouteProbe;
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
@@ -9,7 +8,7 @@ use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::ApiEvent;
 use crate::events::{
     BareConnectedEvent, ConnectionDirection, DnsEvent, Endpoint, Event, H3ConnectedEvent,
-    TransportEvent,
+    TransportEvent, TransportLabels, TransportMetrics,
 };
 use crate::h3::{
     dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
@@ -17,7 +16,6 @@ use crate::h3::{
 use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
-use prometheus_client::registry::Registry;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -358,10 +356,11 @@ pub struct Orchestrator {
     /// Stored local config for GET /config snapshot reconstruction.
     local: Local,
 
-    /// Metrics store shared with the prometheus-client Collector.
-    metrics_store: MetricsStore,
-    /// Prometheus registry with registered collector for /metrics rendering.
-    metrics_registry: Registry,
+    /// Cumulative metrics snapshot, keyed by transport label set.
+    ///
+    /// Owned exclusively by the orchestrator — no `Arc<Mutex<_>>` sharing.
+    /// Updated on `TransportEvent::Metrics`; cloned on `ApiEvent::GetMetricsSnapshot`.
+    metrics: HashMap<TransportLabels, TransportMetrics>,
 }
 
 impl Orchestrator {
@@ -583,10 +582,6 @@ impl Orchestrator {
             join_set.spawn(api_handle);
         }
 
-        let metrics_store = MetricsStore::new();
-        let mut metrics_registry = Registry::default();
-        metrics_registry.register_collector(Box::new(metrics_store.clone()));
-
         let mut orch = Self {
             events_rx,
             events_tx,
@@ -603,8 +598,7 @@ impl Orchestrator {
             route_cmd_tx,
             tun_addrs,
             local: config.local,
-            metrics_store,
-            metrics_registry,
+            metrics: HashMap::new(),
         };
         orch.sync_dns_hostnames();
         Ok(orch)
@@ -706,11 +700,8 @@ impl Orchestrator {
                 self.handle_delete_config(&peer_ids);
                 let _ = reply_tx.send(Ok(self.config_snapshot()));
             }
-            ApiEvent::GetMetrics { reply_tx } => {
-                let mut text = String::new();
-                prometheus_client::encoding::text::encode(&mut text, &self.metrics_registry)
-                    .expect("infallible: encoding to String cannot fail");
-                let _ = reply_tx.send(text);
+            ApiEvent::GetMetricsSnapshot { reply_tx } => {
+                let _ = reply_tx.send(self.metrics.clone());
             }
         }
     }
@@ -815,7 +806,7 @@ impl Orchestrator {
                         }
                     }
                 }
-                self.metrics_store.update(metrics);
+                self.metrics.insert(metrics.labels.clone(), metrics);
             }
             Event::Transport(TransportEvent::H3Connected(event)) => {
                 self.handle_h3_connection(event).await;
@@ -1121,10 +1112,6 @@ mod test_support {
                 },
             });
 
-            let metrics_store = MetricsStore::new();
-            let mut metrics_registry = Registry::default();
-            metrics_registry.register_collector(Box::new(metrics_store.clone()));
-
             let orch = Orchestrator {
                 events_rx,
                 events_tx: events_tx.clone(),
@@ -1141,8 +1128,7 @@ mod test_support {
                 route_cmd_tx: Some(route_cmd_tx),
                 tun_addrs: self.tun_addrs,
                 local,
-                metrics_store,
-                metrics_registry,
+                metrics: HashMap::new(),
             };
 
             (
@@ -1378,16 +1364,16 @@ mod tests {
     #[tokio::test]
     async fn handle_metrics_event_stores_snapshot() {
         let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
-        assert!(orch.metrics_store.is_empty());
+        assert!(orch.metrics.is_empty());
         orch.handle_event(make_metrics_event()).await;
-        assert_eq!(orch.metrics_store.len(), 1);
+        assert_eq!(orch.metrics.len(), 1);
     }
 
     #[tokio::test]
     async fn handle_metrics_event_replaces_on_same_labels() {
         let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
         orch.handle_event(make_metrics_event()).await;
-        assert_eq!(orch.metrics_store.len(), 1);
+        assert_eq!(orch.metrics.len(), 1);
 
         // Push again with different values but same labels
         let event = Event::Transport(TransportEvent::Metrics(TransportMetrics {
@@ -1406,9 +1392,8 @@ mod tests {
             },
         }));
         orch.handle_event(event).await;
-        let store = orch.metrics_store.lock();
-        assert_eq!(store.len(), 1);
-        let stored = store.values().next().unwrap();
+        assert_eq!(orch.metrics.len(), 1);
+        let stored = orch.metrics.values().next().unwrap();
         assert_eq!(stored.stats.succeeded.packets, 42);
     }
 
@@ -1418,9 +1403,10 @@ mod tests {
         orch.handle_event(make_metrics_event()).await;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        orch.handle_api_event(ApiEvent::GetMetrics { reply_tx });
+        orch.handle_api_event(ApiEvent::GetMetricsSnapshot { reply_tx });
 
-        let text = reply_rx.await.expect("should receive metrics text");
+        let snapshot = reply_rx.await.expect("should receive metrics snapshot");
+        let text = crate::api::encode_metrics_snapshot(snapshot);
         assert!(
             text.contains("h3llo_transport_packets_total"),
             "missing packets metric: {text}"
