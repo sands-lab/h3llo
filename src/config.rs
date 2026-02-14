@@ -569,18 +569,11 @@ where
 }
 
 /// Serializes a `SocketAddr` back to `udp://` URI format.
-///
-/// IPv6 addresses are wrapped in brackets per RFC 2732 (e.g., `udp://[::1]:53`).
 fn serialize_dns_server<S>(addr: &SocketAddr, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    use std::net::IpAddr;
-    let host = match addr.ip() {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => format!("[{v6}]"),
-    };
-    serializer.serialize_str(&format!("udp://{host}:{}", addr.port()))
+    serializer.serialize_str(&format!("udp://{addr}"))
 }
 
 /// Represents a UDP endpoint parsed from a `udp://` URI.
@@ -688,12 +681,11 @@ impl Serialize for ApiEndpoint {
 
 /// Parses a scheme-specific endpoint URI into host/port/path components.
 ///
-/// Shared logic for `parse_h3_uri` and `parse_api_uri`.
+/// Shared URI validation: scheme, userinfo, host, query/fragment checks.
 fn parse_endpoint_uri(
     raw: &str,
     expected_scheme: &str,
-    default_port: u16,
-) -> Result<(String, u16, String), String> {
+) -> Result<(String, Option<u16>, String), String> {
     let url = Url::parse(raw).map_err(|e| e.to_string())?;
     if url.scheme() != expected_scheme {
         return Err(format!("scheme must be {expected_scheme}"));
@@ -705,48 +697,31 @@ fn parse_endpoint_uri(
         .host_str()
         .filter(|h| !h.is_empty())
         .ok_or_else(|| "host is required".to_string())?;
-    let port = url.port().unwrap_or(default_port);
     let path = url.path().to_string();
     if url.query().is_some() || url.fragment().is_some() {
         return Err("query and fragment are not supported".to_string());
     }
-    Ok((host.to_string(), port, path))
+    Ok((host.to_string(), url.port(), path))
 }
 
 /// Parses a UDP DNS server URI (e.g., `udp://1.1.1.1:53`) into a socket address, enforcing IP literals.
 ///
 /// Supports both IPv4 (`udp://1.1.1.1:53`) and IPv6 (`udp://[::1]:53`) addresses.
 pub fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
-    let url = Url::parse(raw).map_err(|e| e.to_string())?;
-
-    if url.scheme() != "udp" {
-        return Err("scheme must be udp".to_string());
+    let (host, port, path) = parse_endpoint_uri(raw, "udp")?;
+    let port = port.ok_or("port is required (e.g., udp://1.1.1.1:53)")?;
+    if path != "/" && !path.is_empty() {
+        return Err("path must be empty".to_string());
     }
-
-    let host = url
-        .host_str()
-        .ok_or_else(|| "host is required".to_string())?;
-
     // For non-special schemes like "udp://", the URL parser treats all hosts as domains.
-    // We need to parse the host string manually, stripping brackets for IPv6.
+    // Parse the host string manually, stripping brackets for IPv6.
     let host_stripped = host
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(host);
+        .unwrap_or(&host);
     let ip: IpAddr = host_stripped
         .parse()
         .map_err(|_| "host must be an IP literal".to_string())?;
-
-    let port = url
-        .port()
-        .ok_or_else(|| "port is required (e.g., udp://1.1.1.1:53)".to_string())?;
-    if url.path() != "/" && !url.path().is_empty() {
-        return Err("path must be empty".to_string());
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err("query and fragment are not supported".to_string());
-    }
-
     Ok(SocketAddr::new(ip, port))
 }
 
@@ -764,8 +739,12 @@ pub fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
 ///
 /// Returns an error if the URI is invalid, uses a non-https scheme, or is missing a host.
 pub fn parse_h3_uri(raw: &str) -> Result<H3Endpoint, String> {
-    let (host, port, path) = parse_endpoint_uri(raw, "https", 443)?;
-    Ok(H3Endpoint { host, port, path })
+    let (host, port, path) = parse_endpoint_uri(raw, "https")?;
+    Ok(H3Endpoint {
+        host,
+        port: port.unwrap_or(443),
+        path,
+    })
 }
 
 /// Parses an HTTP management API URI (e.g., `http://127.0.0.1:9090/admin`).
@@ -782,41 +761,22 @@ pub fn parse_h3_uri(raw: &str) -> Result<H3Endpoint, String> {
 ///
 /// Returns an error if the URI is invalid, uses a non-http scheme, or is missing a host.
 pub fn parse_api_uri(raw: &str) -> Result<ApiEndpoint, String> {
-    let (host, port, path) = parse_endpoint_uri(raw, "http", 9090)?;
-    Ok(ApiEndpoint { host, port, path })
+    let (host, port, path) = parse_endpoint_uri(raw, "http")?;
+    Ok(ApiEndpoint {
+        host,
+        port: port.unwrap_or(9090),
+        path,
+    })
 }
 
 /// Parses a UDP URI (e.g., `udp://host:6635`) into host and port components.
 pub fn parse_udp_uri(raw: &str) -> Result<UdpEndpoint, String> {
-    let url = Url::parse(raw).map_err(|e| e.to_string())?;
-
-    if url.scheme() != "udp" {
-        return Err("scheme must be udp".to_string());
-    }
-
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("userinfo is not supported".to_string());
-    }
-
-    let host = url
-        .host_str()
-        .ok_or_else(|| "host is required".to_string())?;
-
-    let port = url
-        .port()
-        .ok_or_else(|| "port is required (e.g., udp://host:6635)".to_string())?;
-
-    if url.path() != "/" && !url.path().is_empty() {
+    let (host, port, path) = parse_endpoint_uri(raw, "udp")?;
+    let port = port.ok_or("port is required (e.g., udp://host:6635)")?;
+    if path != "/" && !path.is_empty() {
         return Err("path must be empty".to_string());
     }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err("query and fragment are not supported".to_string());
-    }
-
-    Ok(UdpEndpoint {
-        host: host.to_string(),
-        port,
-    })
+    Ok(UdpEndpoint { host, port })
 }
 
 #[cfg(test)]
@@ -1786,6 +1746,16 @@ local:
         // Re-parse to verify round-trip
         let cfg2: Config = serde_yaml::from_str(&serialized).expect("should re-parse");
         assert_eq!(cfg.local.dns.server, cfg2.local.dns.server);
+    }
+
+    #[test]
+    fn parse_dns_server_uri_rejects_userinfo() {
+        let result = parse_dns_server_uri("udp://user:pass@1.1.1.1:53");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("userinfo"),
+            "should reject userinfo in DNS server URI"
+        );
     }
 
     #[test]
