@@ -24,6 +24,7 @@ use tracing::debug;
 const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PostPayload {
     #[serde(default)]
     peers: Vec<Peer>,
@@ -37,6 +38,7 @@ struct DeletePeerRef {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeletePayload {
     #[serde(default)]
     peers: Vec<DeletePeerRef>,
@@ -184,27 +186,9 @@ async fn handle_post_config(
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("body read error: {e}")),
     };
 
-    // Parse once as Value for key validation, then convert to typed payload.
-    let parsed: serde_yaml::Value = match serde_yaml::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return response(StatusCode::BAD_REQUEST, &format!("invalid YAML: {e}")),
-    };
-    if let Some(map) = parsed.as_mapping() {
-        for key in map.keys() {
-            if key.as_str() != Some("peers") {
-                return response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("only 'peers' key accepted, found: {key:?}"),
-                );
-            }
-        }
-    } else {
-        return response(StatusCode::BAD_REQUEST, "expected a YAML mapping");
-    }
-
-    let payload: PostPayload = match serde_yaml::from_value(parsed) {
+    let payload: PostPayload = match serde_yaml::from_slice(&body) {
         Ok(p) => p,
-        Err(e) => return response(StatusCode::BAD_REQUEST, &format!("invalid peers: {e}")),
+        Err(e) => return response(StatusCode::BAD_REQUEST, &format!("invalid YAML: {e}")),
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -239,27 +223,9 @@ async fn handle_delete_config(
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("body read error: {e}")),
     };
 
-    // Parse once as Value for key validation (same pattern as POST).
-    let parsed: serde_yaml::Value = match serde_yaml::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return response(StatusCode::BAD_REQUEST, &format!("invalid YAML: {e}")),
-    };
-    if let Some(map) = parsed.as_mapping() {
-        for key in map.keys() {
-            if key.as_str() != Some("peers") {
-                return response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("only 'peers' key accepted, found: {key:?}"),
-                );
-            }
-        }
-    } else {
-        return response(StatusCode::BAD_REQUEST, "expected a YAML mapping");
-    }
-
-    let payload: DeletePayload = match serde_yaml::from_value(parsed) {
+    let payload: DeletePayload = match serde_yaml::from_slice(&body) {
         Ok(p) => p,
-        Err(e) => return response(StatusCode::BAD_REQUEST, &format!("invalid peers: {e}")),
+        Err(e) => return response(StatusCode::BAD_REQUEST, &format!("invalid YAML: {e}")),
     };
     let peer_ids: Vec<String> = payload.peers.into_iter().map(|p| p.id).collect();
 
@@ -286,42 +252,36 @@ async fn handle_delete_config(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn post_body_rejects_non_peers_key() {
+    fn post_payload_rejects_unknown_key() {
         let body = "local:\n  table: false\n";
-        let parsed: serde_yaml::Value = serde_yaml::from_str(body).unwrap();
-        let map = parsed.as_mapping().unwrap();
-        assert!(map.keys().any(|k| k.as_str() != Some("peers")));
+        let result: Result<super::PostPayload, _> = serde_yaml::from_str(body);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn post_body_accepts_peers_only_key() {
-        let body = "peers:\n- id: test\n";
-        let parsed: serde_yaml::Value = serde_yaml::from_str(body).unwrap();
-        let map = parsed.as_mapping().unwrap();
-        assert!(!map.keys().any(|k| k.as_str() != Some("peers")));
+    fn post_payload_accepts_peers_only() {
+        let body = "peers: []\n";
+        let payload: super::PostPayload = serde_yaml::from_str(body).unwrap();
+        assert!(payload.peers.is_empty());
     }
 
     #[test]
-    fn delete_body_rejects_non_peers_key() {
+    fn delete_payload_rejects_old_peer_ids_key() {
         let body = "peer_ids:\n  - test\n";
-        let parsed: serde_yaml::Value = serde_yaml::from_str(body).unwrap();
-        let map = parsed.as_mapping().unwrap();
-        assert!(map.keys().any(|k| k.as_str() != Some("peers")));
+        let result: Result<super::DeletePayload, _> = serde_yaml::from_str(body);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn delete_body_accepts_peers_key_with_id() {
+    fn delete_payload_accepts_peers_with_id() {
         let body = "peers:\n- id: test\n";
-        let parsed: serde_yaml::Value = serde_yaml::from_str(body).unwrap();
-        let map = parsed.as_mapping().unwrap();
-        assert!(!map.keys().any(|k| k.as_str() != Some("peers")));
-        let payload: super::DeletePayload = serde_yaml::from_value(parsed).unwrap();
+        let payload: super::DeletePayload = serde_yaml::from_str(body).unwrap();
         assert_eq!(payload.peers.len(), 1);
         assert_eq!(payload.peers[0].id, "test");
     }
 
     #[test]
-    fn delete_body_extracts_multiple_ids() {
+    fn delete_payload_extracts_multiple_ids() {
         let body = "peers:\n- id: a\n- id: b\n";
         let payload: super::DeletePayload = serde_yaml::from_str(body).unwrap();
         let ids: Vec<String> = payload.peers.into_iter().map(|e| e.id).collect();
@@ -332,9 +292,6 @@ mod tests {
     fn delete_payload_rejects_string_list() {
         let body = "peers:\n- peer-1\n- peer-2\n";
         let result: Result<super::DeletePayload, _> = serde_yaml::from_str(body);
-        assert!(
-            result.is_err(),
-            "plain strings should not parse as DeletePeerRef"
-        );
+        assert!(result.is_err());
     }
 }
