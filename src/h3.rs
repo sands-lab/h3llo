@@ -1002,9 +1002,7 @@ pub fn spawn_h3_listener(
     let mut listeners = listen(vec![socket], conn_params, DefaultMetrics)
         .expect("infallible: listen on already-bound socket");
 
-    let mut accept_stream = listeners
-        .pop()
-        .expect("infallible: single socket yields single listener");
+    let mut accept_stream = listeners.remove(0);
     let h3_handshake_timeout = tuning.h3_handshake_timeout;
 
     let handle = tokio::spawn(async move {
