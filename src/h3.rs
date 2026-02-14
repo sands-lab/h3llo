@@ -834,9 +834,8 @@ pub fn spawn_h3_tx(
         loop {
             tokio::select! {
                 maybe_batch = packet_rx.recv() => {
-                    let packets = match maybe_batch {
-                        Some(batch) => batch,
-                        None => return Ok(()), // Channel closed, exit gracefully
+                    let Some(packets) = maybe_batch else {
+                        return Ok(()); // Channel closed, exit gracefully
                     };
 
                     for mut packet in packets {
@@ -1001,7 +1000,7 @@ pub fn spawn_h3_listener(
 
     // Create tokio-quiche listener (infallible after socket is bound)
     let mut listeners = listen(vec![socket], conn_params, DefaultMetrics)
-        .expect("listen on already-bound socket should not fail");
+        .expect("infallible: listen on already-bound socket");
 
     let mut accept_stream = listeners.remove(0);
     let h3_handshake_timeout = tuning.h3_handshake_timeout;
@@ -1697,7 +1696,7 @@ mod tests {
         .await;
 
         match result {
-            Err(DialError::Auth(_)) | Err(DialError::Rejected(401)) => {}
+            Err(DialError::Auth(_) | DialError::Rejected(401)) => {}
             Err(other) => panic!("expected Auth error, got {:?}", other),
             Ok(_) => panic!("expected dial to fail with wrong secret"),
         }

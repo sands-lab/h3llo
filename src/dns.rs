@@ -48,6 +48,12 @@ struct DnsState {
 }
 
 impl DnsState {
+    #[inline]
+    fn touch(&mut self, changed: bool) -> bool {
+        self.dirty |= changed;
+        changed
+    }
+
     /// Updates the set of registered hostnames.
     ///
     /// Removes unregistered hostnames and their IPs; adds new hostnames with
@@ -55,27 +61,16 @@ impl DnsState {
     fn set_hostnames(&mut self, hosts: &HashSet<String>) -> bool {
         let mut changed = false;
 
-        // Remove unregistered hostnames
-        self.entries.retain(|h, _| {
-            let keep = hosts.contains(h);
-            if !keep {
+        changed |= self.entries.extract_if(|h, _| !hosts.contains(h)).count() > 0;
+
+        for h in hosts {
+            if !self.entries.contains_key(h) {
                 changed = true;
+                self.entries.insert(h.clone(), HashMap::new());
             }
-            keep
-        });
-
-        // Add new hostnames (empty IP map)
-        for host in hosts {
-            self.entries.entry(host.clone()).or_insert_with(|| {
-                changed = true;
-                HashMap::new()
-            });
         }
 
-        if changed {
-            self.dirty = true;
-        }
-        changed
+        self.touch(changed)
     }
 
     /// Records a resolved IP for a hostname. Returns true if the IP is new.
@@ -84,19 +79,10 @@ impl DnsState {
             return false;
         };
 
-        let ttl_secs = ttl.max(self.min_ttl_secs);
-        let expires_at = Instant::now() + Duration::from_secs(ttl_secs as u64);
-        let mut is_new = false;
-        ips.entry(ip)
-            .and_modify(|exp| *exp = expires_at)
-            .or_insert_with(|| {
-                is_new = true;
-                expires_at
-            });
-        if is_new {
-            self.dirty = true;
-        }
-        is_new
+        let expires_at = Instant::now() + Duration::from_secs(ttl.max(self.min_ttl_secs) as u64);
+
+        let is_new = ips.insert(ip, expires_at).is_none();
+        self.touch(is_new)
     }
 
     /// Removes expired IPs. Returns true if any were removed.
@@ -105,19 +91,10 @@ impl DnsState {
         let mut removed = false;
 
         for ips in self.entries.values_mut() {
-            ips.retain(|_, expires_at| {
-                let keep = *expires_at > now;
-                if !keep {
-                    removed = true;
-                }
-                keep
-            });
+            removed |= ips.extract_if(|_, exp| *exp <= now).count() > 0;
         }
 
-        if removed {
-            self.dirty = true;
-        }
-        removed
+        self.touch(removed)
     }
 
     /// Emits a snapshot to the orchestrator if dirty, clearing the dirty flag.
@@ -545,16 +522,11 @@ async fn handle_tick(
     timeout: Duration,
 ) {
     let now = Instant::now();
-    let mut expired = Vec::new();
+    let expired: Vec<(u16, PendingRequest)> = pending
+        .extract_if(|_, req| now.duration_since(req.last_sent) >= timeout)
+        .collect();
 
-    for (id, req) in pending.iter() {
-        if now.duration_since(req.last_sent) >= timeout {
-            expired.push((*id, req.clone()));
-        }
-    }
-
-    for (id, request) in expired {
-        pending.remove(&id);
+    for (_id, request) in expired {
         warn!(host = %request.host, record_type = ?request.record_type, "dns: query timed out, retrying");
         if let Err(err) =
             send_query(request.host.clone(), request.record_type, pending, socket).await
@@ -590,19 +562,17 @@ fn extract_records(message: &Message, expected: DnsRecordType) -> Vec<DnsAnswerR
     for answer in message.answers() {
         let (ip, ttl) = match answer.data() {
             RData::A(addr) if expected == DnsRecordType::A => {
-                (Some(IpAddr::V4(ipv4_from_rdata(addr))), answer.ttl())
+                (IpAddr::V4(ipv4_from_rdata(addr)), answer.ttl())
             }
             RData::AAAA(addr) if expected == DnsRecordType::Aaaa => {
-                (Some(IpAddr::V6(ipv6_from_rdata(addr))), answer.ttl())
+                (IpAddr::V6(ipv6_from_rdata(addr)), answer.ttl())
             }
-            _ => (None, 0u32),
+            _ => continue,
         };
 
-        if let Some(ip) = ip {
-            records
-                .entry(ip)
-                .or_insert_with(|| DnsAnswerRecord { address: ip, ttl });
-        }
+        records
+            .entry(ip)
+            .or_insert(DnsAnswerRecord { address: ip, ttl });
     }
 
     records.into_values().collect()

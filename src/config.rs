@@ -501,13 +501,10 @@ pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
             }
         }
 
-        match (&peer.h3, &peer.bare) {
-            (Some(_), Some(_)) | (None, None) => {
-                errors.push(ValidationError::PeerTransportConflict {
-                    peer_id: peer.id.clone(),
-                })
-            }
-            (Some(_), None) | (None, Some(_)) => {}
+        if peer.h3.is_some() == peer.bare.is_some() {
+            errors.push(ValidationError::PeerTransportConflict {
+                peer_id: peer.id.clone(),
+            });
         }
 
         if peer.tun.allowed_ips.is_empty() {
@@ -1972,11 +1969,16 @@ peers:
         let tuning = Tuning::default();
         assert_eq!(tuning.socket_buffer_bytes(), 16 * 1024 * 1024);
 
-        let mut tuning = Tuning::default();
-        tuning.socket_buffer_size = 0;
+        let tuning = Tuning {
+            socket_buffer_size: 0,
+            ..Tuning::default()
+        };
         assert_eq!(tuning.socket_buffer_bytes(), 0);
 
-        tuning.socket_buffer_size = 1;
+        let tuning = Tuning {
+            socket_buffer_size: 1,
+            ..Tuning::default()
+        };
         assert_eq!(tuning.socket_buffer_bytes(), 1024 * 1024);
     }
 

@@ -361,18 +361,10 @@ async fn handle_request(
     };
 
     let resp = match (req.method(), relative.as_str()) {
-        (&Method::GET, "/config") | (&Method::GET, "/config/") => {
-            handle_get_config(&events_tx).await
-        }
-        (&Method::POST, "/config") | (&Method::POST, "/config/") => {
-            handle_post_config(req, &events_tx).await
-        }
-        (&Method::DELETE, "/config") | (&Method::DELETE, "/config/") => {
-            handle_delete_config(req, &events_tx).await
-        }
-        (&Method::GET, "/metrics") | (&Method::GET, "/metrics/") => {
-            handle_get_metrics(&events_tx).await
-        }
+        (&Method::GET, "/config" | "/config/") => handle_get_config(&events_tx).await,
+        (&Method::POST, "/config" | "/config/") => handle_post_config(req, &events_tx).await,
+        (&Method::DELETE, "/config" | "/config/") => handle_delete_config(req, &events_tx).await,
+        (&Method::GET, "/metrics" | "/metrics/") => handle_get_metrics(&events_tx).await,
         _ => response(StatusCode::NOT_FOUND, "not found"),
     };
     Ok(resp)

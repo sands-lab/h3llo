@@ -626,13 +626,9 @@ fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
     for addr in addrs {
-        match addr {
-            IpNet::V4(net) => {
-                v4.push(*net);
-            }
-            IpNet::V6(net) => {
-                v6.push(*net);
-            }
+        match *addr {
+            IpNet::V4(n) => v4.push(n),
+            IpNet::V6(n) => v6.push(n),
         }
     }
     (v4, v6)
@@ -766,9 +762,8 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
         loop {
             tokio::select! {
                 maybe_batch = packet_rx.recv() => {
-                    let packets = match maybe_batch {
-                        Some(batch) => batch,
-                        None => return Ok(()), // Channel closed, exit gracefully
+                    let Some(packets) = maybe_batch else {
+                        return Ok(()); // Channel closed, exit gracefully
                     };
 
                     let mut tun_bufs: Vec<TunBuf> = Vec::with_capacity(packets.len());

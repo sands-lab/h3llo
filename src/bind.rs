@@ -19,7 +19,7 @@ use std::num::NonZeroU32;
 use std::os::windows::io::AsRawSocket;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::IpNet;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use route_manager::{AsyncRouteManager, Route};
 
@@ -108,10 +108,7 @@ pub fn make_server_udp_socket(
     listen: SocketAddr,
     socket_buffer_bytes: usize,
 ) -> Result<UdpSocket, UdpError> {
-    let domain = match listen {
-        SocketAddr::V4(_) => Domain::IPV4,
-        SocketAddr::V6(_) => Domain::IPV6,
-    };
+    let domain = Domain::for_address(listen);
     make_udp_socket_raw(domain, Some(listen), None, socket_buffer_bytes)
         .map_err(|e| UdpError::Socket(e.to_string()))
 }
@@ -141,10 +138,7 @@ pub async fn make_unbound_udp_socket<P: RouteProbe>(
     probe: &P,
     socket_buffer_bytes: usize,
 ) -> Result<UdpSocket, UdpError> {
-    let domain = match target {
-        SocketAddr::V4(_) => Domain::IPV4,
-        SocketAddr::V6(_) => Domain::IPV6,
-    };
+    let domain = Domain::for_address(target);
 
     // Skip interface probing for localhost targets
     let selected_interface = if target.ip().is_loopback() {
@@ -531,26 +525,8 @@ fn matching_route_indexes(routes: &[Route], target: IpAddr, tun_index: Option<u3
 fn route_match(route: &Route, target: IpAddr) -> Option<(u8, u32)> {
     let ifindex = route.if_index()?;
     let prefix = route.prefix();
-
-    match (route.destination(), target) {
-        (IpAddr::V4(dest), IpAddr::V4(target_v4)) => {
-            let net = Ipv4Net::new(dest, prefix).ok()?;
-            if net.contains(&target_v4) {
-                Some((prefix, ifindex))
-            } else {
-                None
-            }
-        }
-        (IpAddr::V6(dest), IpAddr::V6(target_v6)) => {
-            let net = Ipv6Net::new(dest, prefix).ok()?;
-            if net.contains(&target_v6) {
-                Some((prefix, ifindex))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
+    let net = IpNet::new(route.destination(), prefix).ok()?;
+    net.contains(&target).then_some((prefix, ifindex))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
