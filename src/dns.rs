@@ -3,7 +3,7 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_client_udp_socket, RouteProbe};
-use crate::config::LocalDns;
+use crate::config::{LocalDns, Tuning};
 use crate::events::{DnsEvent, Event};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
@@ -20,10 +20,6 @@ use tokio::time;
 use tracing::warn;
 
 const DNS_BUFFER_SIZE: usize = 1500;
-const TICK_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Minimum TTL floor to prevent excessive refresh (60 seconds).
-const MIN_TTL_SECS: u32 = 60;
 
 /// Commands accepted by the DNS resolver coroutine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,12 +37,14 @@ pub enum DnsCommand {
 ///
 /// Consolidates hostname registration and IP cache into a single structure.
 /// Emits state snapshots on change rather than per-IP events.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct DnsState {
     /// Active resolutions: hostname -> (IP -> expiration time).
     entries: HashMap<String, HashMap<IpAddr, Instant>>,
     /// True if state changed since last snapshot emission.
     dirty: bool,
+    /// Minimum TTL floor in seconds to prevent excessive refresh.
+    min_ttl_secs: u32,
 }
 
 impl DnsState {
@@ -86,7 +84,7 @@ impl DnsState {
             return false;
         };
 
-        let ttl_secs = ttl.max(MIN_TTL_SECS);
+        let ttl_secs = ttl.max(self.min_ttl_secs);
         let expires_at = Instant::now() + Duration::from_secs(ttl_secs as u64);
         let is_new = !ips.contains_key(&ip);
         ips.insert(ip, expires_at);
@@ -118,19 +116,19 @@ impl DnsState {
         removed
     }
 
-    /// Returns snapshot if dirty, clearing the dirty flag.
-    fn take_snapshot(&mut self) -> Option<HashMap<String, Vec<IpAddr>>> {
+    /// Emits a snapshot to the orchestrator if dirty, clearing the dirty flag.
+    fn emit_snapshot(&mut self, events_tx: &mpsc::UnboundedSender<Event>) {
         if !self.dirty {
-            return None;
+            return;
         }
         self.dirty = false;
 
-        Some(
-            self.entries
-                .iter()
-                .map(|(host, ips)| (host.clone(), ips.keys().copied().collect()))
-                .collect(),
-        )
+        let state = self
+            .entries
+            .iter()
+            .map(|(host, ips)| (host.clone(), ips.keys().copied().collect()))
+            .collect();
+        let _ = events_tx.send(Event::Dns(DnsEvent { state }));
     }
 
     /// Checks if a hostname is registered.
@@ -188,6 +186,8 @@ pub struct DnsActor {
     socket: UdpSocket,
     timeout: Duration,
     refresh_interval: Duration,
+    snapshot_delay: Duration,
+    min_ttl_secs: u32,
 }
 
 /// Creates a DNS resolver actor state from configuration.
@@ -199,10 +199,8 @@ pub struct DnsActor {
 ///
 /// * `local_dns` - DNS configuration from config file.
 /// * `tun_if` - Optional TUN interface name to exclude from routing.
-/// * `timeout` - Query timeout duration.
-/// * `refresh_interval` - Periodic re-query interval; `Duration::ZERO` disables.
+/// * `tuning` - Tuning parameters (timeouts, intervals, TTL floor, etc.).
 /// * `probe` - Route probe for interface selection.
-/// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
 /// # Errors
 ///
@@ -210,12 +208,9 @@ pub struct DnsActor {
 pub async fn make_dns<P: RouteProbe>(
     local_dns: &LocalDns,
     tun_if: Option<&str>,
-    timeout: Duration,
-    refresh_interval: Duration,
+    tuning: &Tuning,
     probe: &P,
-    socket_buffer_bytes: usize,
 ) -> Result<DnsActor, ResolveInitError> {
-    // server is pre-parsed as SocketAddr during config deserialization
     let server = local_dns.server;
 
     let socket = make_client_udp_socket(
@@ -223,7 +218,7 @@ pub async fn make_dns<P: RouteProbe>(
         tun_if,
         local_dns.bindif.as_deref(),
         probe,
-        socket_buffer_bytes,
+        tuning.socket_buffer_bytes(),
     )
     .await
     .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
@@ -231,8 +226,10 @@ pub async fn make_dns<P: RouteProbe>(
     Ok(DnsActor {
         server,
         socket,
-        timeout,
-        refresh_interval,
+        timeout: tuning.dns_query_timeout,
+        refresh_interval: tuning.dns_refresh_interval,
+        snapshot_delay: tuning.dns_snapshot_delay,
+        min_ttl_secs: tuning.dns_min_ttl,
     })
 }
 
@@ -260,6 +257,8 @@ pub fn spawn_dns(
         socket,
         timeout,
         refresh_interval,
+        snapshot_delay,
+        min_ttl_secs,
     } = actor;
 
     let server_str = server.to_string();
@@ -267,10 +266,19 @@ pub fn spawn_dns(
     let handle = tokio::spawn(async move {
         let mut pending: HashMap<u16, PendingRequest> = HashMap::new();
         let mut cmd_rx_closed = false;
-        let mut state = DnsState::default();
+        let mut state = DnsState {
+            entries: HashMap::new(),
+            dirty: false,
+            min_ttl_secs,
+        };
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
-        let mut ticker = time::interval(TICK_INTERVAL);
+        let mut ticker = time::interval(timeout / 2);
+
+        // Debounce timer: armed when state becomes dirty, fires after snapshot_delay.
+        let snapshot_timer = time::sleep(snapshot_delay);
+        tokio::pin!(snapshot_timer);
+        let mut snapshot_armed = false;
 
         let refresh_duration = if refresh_interval.is_zero() {
             Duration::from_secs(3600) // placeholder; branch disabled below
@@ -279,6 +287,18 @@ pub fn spawn_dns(
         };
         let mut refresh_ticker = time::interval(refresh_duration);
         refresh_ticker.tick().await; // consume immediate first tick
+
+        // Arms the debounce timer if dirty and not already armed.
+        macro_rules! arm_snapshot_timer {
+            () => {
+                if state.dirty && !snapshot_armed {
+                    snapshot_timer
+                        .as_mut()
+                        .reset(time::Instant::now() + snapshot_delay);
+                    snapshot_armed = true;
+                }
+            };
+        }
 
         loop {
             tokio::select! {
@@ -290,6 +310,7 @@ pub fn spawn_dns(
                         &mut pending,
                         &socket,
                     ).await;
+                    state.emit_snapshot(&events_tx);
                 }
                 result = socket.recv(&mut buf) => {
                     match result {
@@ -299,6 +320,7 @@ pub fn spawn_dns(
                                 &mut pending,
                                 &mut state,
                             ).await;
+                            arm_snapshot_timer!();
                         }
                         Ok(_) => {}
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
@@ -307,12 +329,14 @@ pub fn spawn_dns(
                         }
                     }
                 }
+                () = &mut snapshot_timer, if snapshot_armed => {
+                    snapshot_armed = false;
+                    state.emit_snapshot(&events_tx);
+                }
                 _ = ticker.tick() => {
                     handle_tick(&mut pending, &socket, timeout).await;
                     state.expire_stale();
-                    if let Some(snapshot) = state.take_snapshot() {
-                        let _ = events_tx.send(Event::Dns(DnsEvent { server, state: snapshot }));
-                    }
+                    arm_snapshot_timer!();
                 }
                 _ = refresh_ticker.tick(), if !refresh_interval.is_zero() => {
                     trigger_refresh(&state, &mut pending, &socket).await;
@@ -662,16 +686,10 @@ mod tests {
         };
 
         let probe = FakeRouteProbe::noop();
-        let dns_actor = make_dns(
-            &local_dns,
-            None,
-            Duration::from_millis(50),
-            Duration::ZERO,
-            &probe,
-            0,
-        )
-        .await
-        .expect("make_dns failed");
+        let tuning = Tuning::default();
+        let dns_actor = make_dns(&local_dns, None, &tuning, &probe)
+            .await
+            .expect("make_dns failed");
 
         let (cmd_tx, handle) = spawn_dns(dns_actor, event_tx);
         (cmd_tx, event_rx, handle)
@@ -700,7 +718,7 @@ mod tests {
     /// Receives the next DNS snapshot event.
     async fn next_dns_snapshot(
         events_rx: &mut mpsc::UnboundedReceiver<Event>,
-    ) -> HashMap<String, Vec<IpAddr>> {
+    ) -> HashMap<String, HashSet<IpAddr>> {
         loop {
             let event = events_rx.recv().await.expect("dns event");
             if let Event::Dns(dns) = event {
@@ -715,7 +733,7 @@ mod tests {
     async fn next_dns_snapshot_with_ips(
         events_rx: &mut mpsc::UnboundedReceiver<Event>,
         hostname: &str,
-    ) -> HashMap<String, Vec<IpAddr>> {
+    ) -> HashMap<String, HashSet<IpAddr>> {
         loop {
             let snapshot = next_dns_snapshot(events_rx).await;
             if let Some(ips) = snapshot.get(hostname) {
@@ -789,8 +807,8 @@ mod tests {
         );
         socket.send_to(&response, peer).await.unwrap();
 
-        // Wait for first snapshot
-        let _ = next_dns_snapshot(&mut events_rx).await;
+        // Wait for snapshot with resolved IPs (skips the immediate empty snapshot)
+        let _ = next_dns_snapshot_with_ips(&mut events_rx, "example.com").await;
 
         // Consume AAAA query
         let (len2, peer2) = socket.recv_from(&mut buf).await.unwrap();
@@ -802,6 +820,10 @@ mod tests {
             vec![],
         );
         socket.send_to(&response2, peer2).await.unwrap();
+
+        // Drain any pending debounce snapshot before the duplicate check
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while events_rx.try_recv().is_ok() {}
 
         // Re-register same hosts (simulating refresh via new SetHostnames with same content)
         // This should not re-query since hosts haven't changed
@@ -891,7 +913,7 @@ mod tests {
     // ========== IP Literal Tests ==========
 
     #[tokio::test]
-    async fn ip_literal_emits_snapshot_on_tick() {
+    async fn ip_literal_emits_snapshot() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
@@ -910,7 +932,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ipv6_literal_emits_snapshot_on_tick() {
+    async fn ipv6_literal_emits_snapshot() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
@@ -985,16 +1007,10 @@ mod tests {
         };
 
         let probe = FakeRouteProbe::noop();
-        let dns_actor = make_dns(
-            &local_dns,
-            None,
-            Duration::from_millis(50),
-            Duration::ZERO,
-            &probe,
-            0,
-        )
-        .await
-        .expect("make_dns");
+        let tuning = Tuning::default();
+        let dns_actor = make_dns(&local_dns, None, &tuning, &probe)
+            .await
+            .expect("make_dns");
 
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, _handle) = spawn_dns(dns_actor, event_tx);
@@ -1016,16 +1032,10 @@ mod tests {
         };
 
         let probe = FakeRouteProbe::noop();
-        let dns_actor = make_dns(
-            &local_dns,
-            None,
-            Duration::from_millis(50),
-            Duration::ZERO,
-            &probe,
-            0,
-        )
-        .await
-        .expect("make_dns");
+        let tuning = Tuning::default();
+        let dns_actor = make_dns(&local_dns, None, &tuning, &probe)
+            .await
+            .expect("make_dns");
 
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, join_handle) = spawn_dns(dns_actor, event_tx);

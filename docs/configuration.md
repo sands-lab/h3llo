@@ -28,6 +28,8 @@ tuning: # optional, all fields have defaults
   metrics_push_interval: 1000 # optional, default: 1000 (milliseconds)
   dns_query_timeout: 2 # optional, default: 2 (seconds)
   dns_refresh_interval: 60 # optional, default: 60 (seconds; 0 disables)
+  dns_snapshot_delay: 100 # optional, default: 100 (milliseconds)
+  dns_min_ttl: 60 # optional, default: 60 (seconds)
   h3_handshake_timeout: 30 # optional, default: 30 (seconds)
   h3_max_idle_timeout: 60 # optional, default: 60 (seconds)
   h3_keepalive_interval: 20 # optional, default: 20 (seconds; must be < h3_max_idle_timeout)
@@ -71,6 +73,8 @@ peers: # optional, default: []
 - `tuning.metrics_push_interval` (default `1000`): Milliseconds between periodic metric push emissions from actors to the orchestrator.
 - `tuning.dns_query_timeout` (default `2`): Seconds before a DNS query is considered timed out and retried.
 - `tuning.dns_refresh_interval` (default `60`): DNS refresh timer in seconds (`0` disables). The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)).
+- `tuning.dns_snapshot_delay` (default `100`): Milliseconds to wait after the first DNS state change before emitting a snapshot to the orchestrator. Coalesces bursts of DNS replies into a single event.
+- `tuning.dns_min_ttl` (default `60`): Minimum TTL floor in seconds for DNS records. Responses with shorter TTL are raised to this value to prevent excessive re-queries.
 - `tuning.h3_handshake_timeout` (default `30`): Seconds to wait for an HTTP/3 handshake to complete.
 - `tuning.h3_max_idle_timeout` (default `60`): QUIC idle timeout in seconds; connections idle longer than this are closed.
 - `tuning.h3_keepalive_interval` (default `20`): QUIC keepalive interval in seconds; sends PING frames to prevent idle timeout. Must be less than `h3_max_idle_timeout`.

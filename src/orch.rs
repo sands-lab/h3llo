@@ -530,16 +530,9 @@ impl Orchestrator {
 
         // Create DNS actor state (performs fallible socket binding)
         let probe = DefaultRouteProbe;
-        let dns_actor = make_dns(
-            &config.local.dns,
-            Some(tun_if.as_str()),
-            tuning.dns_query_timeout,
-            tuning.dns_refresh_interval,
-            &probe,
-            tuning.socket_buffer_bytes(),
-        )
-        .await
-        .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
+        let dns_actor = make_dns(&config.local.dns, Some(tun_if.as_str()), tuning, &probe)
+            .await
+            .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
         // Spawn DNS actor task (infallible)
         let (dns_cmd_tx, handle) = spawn_dns(dns_actor, events_tx.clone());
@@ -814,7 +807,7 @@ impl Orchestrator {
             let hostname = peer_dns_hostname(&entry.config);
             entry.resolved_ips = hostname
                 .and_then(|h| dns_state.get(h))
-                .map(|ips| ips.iter().copied().collect())
+                .cloned()
                 .unwrap_or_default();
 
             entry.prune();
@@ -1364,11 +1357,8 @@ mod tests {
         assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
     }
 
-    fn make_dns_snapshot_event(state: HashMap<String, Vec<IpAddr>>) -> Event {
-        Event::Dns(DnsEvent {
-            server: "127.0.0.1:53".parse().unwrap(),
-            state,
-        })
+    fn make_dns_snapshot_event(state: HashMap<String, HashSet<IpAddr>>) -> Event {
+        Event::Dns(DnsEvent { state })
     }
 
     #[tokio::test]
@@ -1384,7 +1374,7 @@ mod tests {
         let mut state = HashMap::new();
         state.insert(
             "unknown.example.com".to_string(),
-            vec!["1.2.3.4".parse().unwrap()],
+            HashSet::from(["1.2.3.4".parse().unwrap()]),
         );
         let event = make_dns_snapshot_event(state);
         orch.handle_event(event).await;
@@ -1416,7 +1406,7 @@ mod tests {
         let mut state = HashMap::new();
         state.insert(
             "shared.example.com".to_string(),
-            vec!["1.2.3.4".parse().unwrap()],
+            HashSet::from(["1.2.3.4".parse().unwrap()]),
         );
         let event = make_dns_snapshot_event(state);
         orch.handle_event(event).await;
@@ -1437,7 +1427,7 @@ mod tests {
         let mut state = HashMap::new();
         state.insert(
             "other.example.com".to_string(),
-            vec!["1.2.3.4".parse().unwrap()],
+            HashSet::from(["1.2.3.4".parse().unwrap()]),
         );
         let event = make_dns_snapshot_event(state);
         orch.handle_event(event).await;
@@ -1472,7 +1462,7 @@ mod tests {
 
         // Send snapshot WITHOUT the IP (simulating expiration)
         let mut state = HashMap::new();
-        state.insert("example.com".to_string(), vec![]);
+        state.insert("example.com".to_string(), HashSet::new());
         let event = make_dns_snapshot_event(state);
         orch.handle_event(event).await;
 
@@ -1507,8 +1497,8 @@ mod tests {
 
         // New snapshot: alpha expired, beta still alive
         let mut state = HashMap::new();
-        state.insert("alpha.example.com".to_string(), vec![]);
-        state.insert("beta.example.com".to_string(), vec![shared_ip]);
+        state.insert("alpha.example.com".to_string(), HashSet::new());
+        state.insert("beta.example.com".to_string(), HashSet::from([shared_ip]));
         let event = make_dns_snapshot_event(state);
         orch.handle_event(event).await;
 
@@ -1540,7 +1530,7 @@ mod tests {
 
         // Send snapshot without the IP
         let mut state = HashMap::new();
-        state.insert("example.com".to_string(), vec![]);
+        state.insert("example.com".to_string(), HashSet::new());
         let event = make_dns_snapshot_event(state);
         orch.handle_event(event).await;
 
@@ -1635,7 +1625,7 @@ mod tests {
         let mut state = HashMap::new();
         state.insert(
             "10.255.255.1".to_string(),
-            vec!["10.255.255.1".parse().unwrap()],
+            HashSet::from(["10.255.255.1".parse().unwrap()]),
         );
         let event = make_dns_snapshot_event(state);
 
@@ -1714,7 +1704,7 @@ mod tests {
         let mut state = HashMap::new();
         state.insert(
             "example.com".to_string(),
-            vec!["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()],
+            HashSet::from(["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()]),
         );
         let event = make_dns_snapshot_event(state);
         orch.handle_event(event).await;
@@ -1749,7 +1739,7 @@ mod tests {
         let mut state = HashMap::new();
         state.insert(
             "10.255.255.1".to_string(),
-            vec!["10.255.255.1".parse().unwrap()],
+            HashSet::from(["10.255.255.1".parse().unwrap()]),
         );
         let event = make_dns_snapshot_event(state);
 

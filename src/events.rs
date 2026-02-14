@@ -1,6 +1,6 @@
 //! Shared events flowing into the orchestrator.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use crate::actor::ActorExitResult;
@@ -278,11 +278,9 @@ pub struct TransportMetrics {
 /// Contains the complete hostname→IP mapping snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsEvent {
-    /// DNS server socket address.
-    pub server: SocketAddr,
     /// Complete resolution state: hostname -> resolved IPs.
     ///
     /// Each hostname maps to its currently valid IPs (TTL not expired).
-    /// Empty Vec indicates hostname is registered but has no valid IPs.
-    pub state: HashMap<String, Vec<IpAddr>>,
+    /// Empty set indicates hostname is registered but has no valid IPs.
+    pub state: HashMap<String, HashSet<IpAddr>>,
 }
