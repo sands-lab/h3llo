@@ -261,6 +261,7 @@ Observability summary: interface loops emit cumulative metrics (packets/bytes, d
 - Metric shape: every emit carries labels `{kind: Tun|BareUdp|Http3, direction: Rx|Tx, peer_id?: string, ip_addr?: IP}` plus total succeeded and dropped counters and a drop-reason map keyed by `DropReason` (e.g., `Oversize`, `DisallowedSource`, `SendError`, `ChannelClosed`).
 - Drop accounting: TUN TX counts oversize and send failures; TUN RX counts channel-closed drops when forwarding to the writer queue fails; BareUDP RX counts disallowed sources; BareUDP TX counts send failures. All counters saturate to avoid panics.
 - Reporting: only the orchestrator prints periodic drop summaries (when counters change); transport loops stay silent, including oversized TUN drops.
+- Prometheus exposition: the orchestrator stores the latest cumulative snapshot per unique label set in an inline `HashMap<TransportLabels, TransportMetrics>`. On `GET /metrics`, it renders Prometheus text exposition format 0.0.4 with four counter families (`h3llo_transport_packets_total`, `h3llo_transport_bytes_total`, `h3llo_transport_drops_total`, `h3llo_transport_drop_bytes_total`) labeled by `kind`, `direction`, `peer_id`, plus `outcome` or `reason`. No external Prometheus crate is used — the text format is hand-crafted to avoid atomic operations on data-plane hot paths. Snapshots are kept forever (Prometheus handles staleness natively via its 5-minute staleness marker).
 
 ### Logging and Warning Handling
 

@@ -138,7 +138,7 @@ Management API summary: a localhost-bound HTTP/1.1 server for runtime peer manag
 - `POST /config` — accepts a YAML `peers` list. Each entry must be a **complete** peer configuration (not a partial update); the entry **replaces** any existing peer with the same `peers[].id`. Peers not present in the payload are unchanged. Only `peers` is accepted at the top level; all other keys are rejected with `400 Bad Request`. On success, returns the full updated configuration snapshot in YAML (same format as `GET /config`).
 - `DELETE /config` — accepts a YAML body with `peers` (list of peer entries; only `id` is required per entry). Matching peers are removed. Non-existent IDs are silently ignored. On success, returns the full updated configuration snapshot in YAML (same format as `GET /config`). Only `peers` is accepted at the top level; all other keys are rejected with `400 Bad Request`.
 - `GET /events` — Server-Sent Events (SSE) stream. TBD.
-- `GET /metrics` — Prometheus exposition format. Reserved for Prometheus scraping.
+- `GET /metrics` — Returns transport metrics in Prometheus text exposition format 0.0.4 (`text/plain; version=0.0.4; charset=utf-8`). Exposes cumulative transport counters grouped by kind, direction, peer, and drop reason. Designed for Prometheus scraping at `scrape_interval` aligned with `tuning.metrics_push_interval`.
 
 #### Semantics
 
