@@ -108,10 +108,7 @@ pub fn make_server_udp_socket(
     listen: SocketAddr,
     socket_buffer_bytes: usize,
 ) -> Result<UdpSocket, UdpError> {
-    let domain = match listen {
-        SocketAddr::V4(_) => Domain::IPV4,
-        SocketAddr::V6(_) => Domain::IPV6,
-    };
+    let domain = Domain::for_address(listen);
     make_udp_socket_raw(domain, Some(listen), None, socket_buffer_bytes)
         .map_err(|e| UdpError::Socket(e.to_string()))
 }

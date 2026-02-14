@@ -1622,7 +1622,7 @@ mod tests {
             bare_peer_at_host("peer2", "shared.example.com", 5354, &["172.16.0.0/16"]),
         ];
 
-        let peer_configs: Vec<_> = peers.iter().map(|p| p.clone()).collect();
+        let peer_configs: Vec<_> = peers.iter().cloned().collect();
         let result = collect_hostnames(&peer_configs);
 
         // Deduplicated to single hostname

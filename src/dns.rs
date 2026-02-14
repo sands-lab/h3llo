@@ -573,19 +573,17 @@ fn extract_records(message: &Message, expected: DnsRecordType) -> Vec<DnsAnswerR
     for answer in message.answers() {
         let (ip, ttl) = match answer.data() {
             RData::A(addr) if expected == DnsRecordType::A => {
-                (Some(IpAddr::V4(ipv4_from_rdata(addr))), answer.ttl())
+                (IpAddr::V4(ipv4_from_rdata(addr)), answer.ttl())
             }
             RData::AAAA(addr) if expected == DnsRecordType::Aaaa => {
-                (Some(IpAddr::V6(ipv6_from_rdata(addr))), answer.ttl())
+                (IpAddr::V6(ipv6_from_rdata(addr)), answer.ttl())
             }
-            _ => (None, 0u32),
+            _ => continue,
         };
 
-        if let Some(ip) = ip {
-            records
-                .entry(ip)
-                .or_insert_with(|| DnsAnswerRecord { address: ip, ttl });
-        }
+        records
+            .entry(ip)
+            .or_insert_with(|| DnsAnswerRecord { address: ip, ttl });
     }
 
     records.into_values().collect()
