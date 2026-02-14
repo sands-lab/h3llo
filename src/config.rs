@@ -1789,6 +1789,16 @@ local:
     }
 
     #[test]
+    fn parse_dns_server_uri_rejects_userinfo() {
+        let result = parse_dns_server_uri("udp://user:pass@1.1.1.1:53");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("userinfo"),
+            "should reject userinfo in DNS server URI"
+        );
+    }
+
+    #[test]
     fn tuning_defaults_applied_when_absent() {
         let yaml = r#"
 local:
