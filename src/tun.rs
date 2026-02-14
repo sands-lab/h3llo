@@ -762,9 +762,8 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
         loop {
             tokio::select! {
                 maybe_batch = packet_rx.recv() => {
-                    let packets = match maybe_batch {
-                        Some(batch) => batch,
-                        None => return Ok(()), // Channel closed, exit gracefully
+                    let Some(packets) = maybe_batch else {
+                        return Ok(()); // Channel closed, exit gracefully
                     };
 
                     let mut tun_bufs: Vec<TunBuf> = Vec::with_capacity(packets.len());

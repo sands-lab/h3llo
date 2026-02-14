@@ -834,9 +834,8 @@ pub fn spawn_h3_tx(
         loop {
             tokio::select! {
                 maybe_batch = packet_rx.recv() => {
-                    let packets = match maybe_batch {
-                        Some(batch) => batch,
-                        None => return Ok(()), // Channel closed, exit gracefully
+                    let Some(packets) = maybe_batch else {
+                        return Ok(()); // Channel closed, exit gracefully
                     };
 
                     for mut packet in packets {
@@ -1699,7 +1698,7 @@ mod tests {
         .await;
 
         match result {
-            Err(DialError::Auth(_)) | Err(DialError::Rejected(401)) => {}
+            Err(DialError::Auth(_) | DialError::Rejected(401)) => {}
             Err(other) => panic!("expected Auth error, got {:?}", other),
             Ok(_) => panic!("expected dial to fail with wrong secret"),
         }

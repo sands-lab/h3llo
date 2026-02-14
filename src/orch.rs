@@ -951,27 +951,27 @@ fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, Orchestrator
     // Synchronous DNS lookup for hostname
     use std::net::ToSocketAddrs;
     let addr_str = format!("{}:{}", host, port);
-    let addrs: Vec<_> = addr_str
-        .to_socket_addrs()
-        .map_err(|err| OrchestratorError::ListenResolveFailed {
-            host: host.to_string(),
-            reason: err.to_string(),
-        })?
-        .collect();
+    let mut addrs =
+        addr_str
+            .to_socket_addrs()
+            .map_err(|err| OrchestratorError::ListenResolveFailed {
+                host: host.to_string(),
+                reason: err.to_string(),
+            })?;
 
-    if addrs.is_empty() {
-        return Err(OrchestratorError::ListenResolveFailed {
+    let first = addrs
+        .next()
+        .ok_or_else(|| OrchestratorError::ListenResolveFailed {
             host: host.to_string(),
             reason: "no resolved addresses".to_string(),
-        });
-    }
-    if addrs.len() > 1 {
+        })?;
+    if addrs.next().is_some() {
         warn!(
             "listen resolved multiple addresses for {}; using {}",
-            host, addrs[0]
+            host, first
         );
     }
-    Ok(addrs[0])
+    Ok(first)
 }
 
 fn collect_allowed_ips(peers: &[Peer]) -> Vec<IpNet> {
@@ -1617,7 +1617,7 @@ mod tests {
             bare_peer_at_host("peer2", "shared.example.com", 5354, &["172.16.0.0/16"]),
         ];
 
-        let peer_configs: Vec<_> = peers.iter().cloned().collect();
+        let peer_configs = peers.to_vec();
         let result = collect_hostnames(&peer_configs);
 
         // Deduplicated to single hostname

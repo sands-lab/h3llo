@@ -254,9 +254,8 @@ pub fn spawn_udp_tx(
         loop {
             tokio::select! {
                 maybe_batch = packet_rx.recv() => {
-                    let packets = match maybe_batch {
-                        Some(batch) => batch,
-                        None => return Ok(()), // Channel closed, exit gracefully
+                    let Some(packets) = maybe_batch else {
+                        return Ok(()); // Channel closed, exit gracefully
                     };
 
                     if packets.is_empty() {
