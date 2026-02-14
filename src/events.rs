@@ -57,15 +57,15 @@ pub enum ApiEvent {
     PostConfig {
         /// Parsed peer definitions from the request body.
         peers: Vec<Peer>,
-        /// Reply channel for validation result.
-        reply_tx: oneshot::Sender<Result<(), String>>,
+        /// Reply channel carrying updated config on success, or error string on failure.
+        reply_tx: oneshot::Sender<Result<Config, String>>,
     },
     /// DELETE /config — remove peers by ID; orchestrator confirms.
     DeleteConfig {
         /// Peer IDs to remove.
         peer_ids: Vec<String>,
-        /// Reply channel for operation result.
-        reply_tx: oneshot::Sender<Result<(), String>>,
+        /// Reply channel carrying updated config on success, or error string on failure.
+        reply_tx: oneshot::Sender<Result<Config, String>>,
     },
 }
 
