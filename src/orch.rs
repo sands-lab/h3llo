@@ -278,9 +278,6 @@ pub enum OrchestratorError {
     /// HTTP/3 listener failed to start.
     #[error("h3 listener failed: {0}")]
     H3Listener(String),
-    /// HTTP/3 dial failed.
-    #[error("h3 dial to '{peer_id}' failed: {reason}")]
-    H3Dial { peer_id: String, reason: String },
     /// Management API failed to initialize.
     #[error("api server failed to start: {0}")]
     ApiInit(String),
@@ -293,9 +290,6 @@ pub enum OrchestratorError {
     /// UDP socket setup failed.
     #[error("udp socket setup failed: {0}")]
     Udp(String),
-    /// Routing table build failed.
-    #[error("routing table build failed: {0}")]
-    Routing(String),
     /// An actor exited with an error.
     #[error("actor error: {0}")]
     ActorError(#[from] ActorError),
@@ -807,9 +801,6 @@ impl Orchestrator {
             Event::Transport(TransportEvent::BareConnected(event)) => {
                 self.handle_bare_connection(event);
             }
-            Event::Other(msg) => {
-                debug!("other event: {}", msg);
-            }
         }
     }
 
@@ -963,27 +954,24 @@ fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, Orchestrator
     // Synchronous DNS lookup for hostname
     use std::net::ToSocketAddrs;
     let addr_str = format!("{}:{}", host, port);
-    let addrs: Vec<_> = addr_str
-        .to_socket_addrs()
-        .map_err(|err| OrchestratorError::ListenResolveFailed {
-            host: host.to_string(),
-            reason: err.to_string(),
-        })?
-        .collect();
+    let mut addrs =
+        addr_str
+            .to_socket_addrs()
+            .map_err(|err| OrchestratorError::ListenResolveFailed {
+                host: host.to_string(),
+                reason: err.to_string(),
+            })?;
 
-    if addrs.is_empty() {
-        return Err(OrchestratorError::ListenResolveFailed {
+    let first = addrs
+        .next()
+        .ok_or_else(|| OrchestratorError::ListenResolveFailed {
             host: host.to_string(),
             reason: "no resolved addresses".to_string(),
-        });
+        })?;
+    if addrs.next().is_some() {
+        warn!("listen resolved multiple addresses for {host}; using {first}");
     }
-    if addrs.len() > 1 {
-        warn!(
-            "listen resolved multiple addresses for {}; using {}",
-            host, addrs[0]
-        );
-    }
-    Ok(addrs[0])
+    Ok(first)
 }
 
 fn collect_allowed_ips(peers: &[Peer]) -> Vec<IpNet> {
@@ -998,13 +986,10 @@ fn collect_allowed_ips(peers: &[Peer]) -> Vec<IpNet> {
 /// Handles both BareUDP and H3 endpoints. Endpoints are pre-parsed during
 /// config deserialization, so this function cannot fail.
 fn collect_hostnames(peers: &[Peer]) -> HashSet<String> {
-    let mut hosts = HashSet::new();
-    for peer in peers {
-        if let Some(h) = peer_dns_hostname(peer) {
-            hosts.insert(h.to_string());
-        }
-    }
-    hosts
+    peers
+        .iter()
+        .filter_map(|peer| peer_dns_hostname(peer).map(str::to_string))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1292,12 +1277,6 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_error_routing() {
-        let error = OrchestratorError::Routing("invalid prefix".to_string());
-        assert!(error.to_string().contains("invalid prefix"));
-    }
-
-    #[test]
     fn orchestrator_error_task_join() {
         let error = OrchestratorError::TaskJoin("task panicked".to_string());
         assert!(error.to_string().contains("task panicked"));
@@ -1413,28 +1392,6 @@ mod tests {
             "missing batches metric: {text}"
         );
         assert!(text.contains("# EOF"), "missing EOF marker: {text}");
-    }
-
-    #[tokio::test]
-    async fn handle_event_processes_other_event() {
-        let peer = bare_peer("peer1", &["10.0.0.0/24"]);
-        let (peer_tx, _peer_rx) = mpsc::channel(1);
-        let dest: SocketAddr = "127.0.0.1:5353".parse().unwrap();
-
-        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
-            .with_peers(vec![peer])
-            .with_peer_tx("peer1", dest, peer_tx)
-            .build();
-
-        orch.handle_event(Event::Other("test message".to_string()))
-            .await;
-
-        // State preserved
-        assert_eq!(orch.peers.len(), 1);
-
-        // No commands sent
-        assert!(handles.tun_cmd_rx.try_recv().is_err());
-        assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
     }
 
     fn make_dns_snapshot_event(state: HashMap<String, HashSet<IpAddr>>) -> Event {

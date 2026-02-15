@@ -22,7 +22,7 @@ use super::common::{
 
 /// Runs the route integration test binary inside a privileged Docker container.
 ///
-/// The container binary exercises `sync_tun_routes` with real `RouteManagerHandle`
+/// The container binary exercises `sync_tun_routes` with real `AsyncRouteManager`
 /// (netlink API), verifying route installation and cleanup on dummy interfaces.
 #[tokio::test]
 #[ignore = "requires Docker and pre-built test image with embedded binaries"]

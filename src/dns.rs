@@ -128,27 +128,6 @@ impl DnsState {
     }
 }
 
-/// Represents DNS record types supported by the resolver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DnsRecordType {
-    /// IPv4 A record.
-    A,
-    /// IPv6 AAAA record.
-    Aaaa,
-    /// Non-A/AAAA record type.
-    Other(u16),
-}
-
-/// Internal representation of a DNS answer record with its TTL.
-/// Used during response processing before caching.
-#[derive(Debug, Clone)]
-struct DnsAnswerRecord {
-    /// Resolved IP address.
-    address: IpAddr,
-    /// Time-to-live in seconds for the record.
-    ttl: u32,
-}
-
 /// Describes resolver initialization failures.
 #[derive(Debug, Error)]
 pub enum ResolveInitError {
@@ -284,13 +263,14 @@ pub fn spawn_dns(
         loop {
             tokio::select! {
                 maybe_cmd = cmd_rx.recv() => {
-                    handle_command(
-                        maybe_cmd,
-                        &mut cmd_rx_closed,
-                        &mut state,
-                        &mut pending,
-                        &socket,
-                    ).await;
+                    match maybe_cmd {
+                        Some(DnsCommand::SetHostnames { hosts }) => {
+                            handle_set_hostnames(hosts, &mut state, &mut pending, &socket).await;
+                        }
+                        None => {
+                            cmd_rx_closed = true;
+                        }
+                    }
                     state.emit_snapshot(&events_tx);
                 }
                 result = socket.recv(&mut buf) => {
@@ -337,26 +317,8 @@ pub fn spawn_dns(
 #[derive(Debug, Clone)]
 struct PendingRequest {
     host: String,
-    record_type: DnsRecordType,
+    record_type: RecordType,
     last_sent: Instant,
-}
-
-/// Handles commands from the orchestrator queue.
-async fn handle_command(
-    command: Option<DnsCommand>,
-    cmd_rx_closed: &mut bool,
-    state: &mut DnsState,
-    pending: &mut HashMap<u16, PendingRequest>,
-    socket: &UdpSocket,
-) {
-    match command {
-        Some(DnsCommand::SetHostnames { hosts }) => {
-            handle_set_hostnames(hosts, state, pending, socket).await;
-        }
-        None => {
-            *cmd_rx_closed = true;
-        }
-    }
 }
 
 /// Handles the SetHostnames command: diff against current state.
@@ -394,8 +356,8 @@ async fn resolve_hostname(
         // IP literals use max TTL (effectively never expire)
         state.record_ip(host, ip, u32::MAX);
     } else {
-        issue_query(host.to_string(), DnsRecordType::A, pending, socket).await;
-        issue_query(host.to_string(), DnsRecordType::Aaaa, pending, socket).await;
+        issue_query(host.to_string(), RecordType::A, pending, socket).await;
+        issue_query(host.to_string(), RecordType::AAAA, pending, socket).await;
     }
 }
 
@@ -408,8 +370,8 @@ async fn trigger_refresh(
     for host in state.hostnames() {
         // Skip IP literals (never need refresh)
         if host.parse::<IpAddr>().is_err() {
-            issue_query(host.clone(), DnsRecordType::A, pending, socket).await;
-            issue_query(host.clone(), DnsRecordType::Aaaa, pending, socket).await;
+            issue_query(host.clone(), RecordType::A, pending, socket).await;
+            issue_query(host.clone(), RecordType::AAAA, pending, socket).await;
         }
     }
 }
@@ -417,7 +379,7 @@ async fn trigger_refresh(
 /// Issues a query for `host` and `record_type`, logging on error.
 async fn issue_query(
     host: String,
-    record_type: DnsRecordType,
+    record_type: RecordType,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
 ) {
@@ -429,7 +391,7 @@ async fn issue_query(
 /// Sends a DNS query packet and records it as pending.
 async fn send_query(
     host: String,
-    record_type: DnsRecordType,
+    record_type: RecordType,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
 ) -> Result<(), String> {
@@ -510,8 +472,8 @@ fn handle_decoded_packet(message: Message, request: PendingRequest, state: &mut 
     }
 
     // Process each record: record new IPs, refresh existing TTLs
-    for record in records {
-        state.record_ip(&request.host, record.address, record.ttl);
+    for (address, ttl) in records {
+        state.record_ip(&request.host, address, ttl);
     }
 }
 
@@ -537,51 +499,38 @@ async fn handle_tick(
 }
 
 /// Builds a query for `name` and `record_type`.
-fn record_type_query(name: Name, record_type: DnsRecordType) -> Query {
+fn record_type_query(name: Name, record_type: RecordType) -> Query {
     let mut query = Query::new();
     query.set_name(name);
-    if let Some(rt) = to_record_type(record_type) {
-        query.set_query_type(rt);
-    }
+    query.set_query_type(record_type);
     query
 }
 
-/// Converts a `DnsRecordType` into Hickory's `RecordType`.
-fn to_record_type(record_type: DnsRecordType) -> Option<RecordType> {
-    match record_type {
-        DnsRecordType::A => Some(RecordType::A),
-        DnsRecordType::Aaaa => Some(RecordType::AAAA),
-        DnsRecordType::Other(_) => None,
-    }
-}
-
 /// Extracts answers matching `expected`, deduplicating by IP and keeping an arbitrary TTL (order not guaranteed).
-fn extract_records(message: &Message, expected: DnsRecordType) -> Vec<DnsAnswerRecord> {
-    let mut records: HashMap<IpAddr, DnsAnswerRecord> = HashMap::new();
+fn extract_records(message: &Message, expected: RecordType) -> Vec<(IpAddr, u32)> {
+    let mut records: HashMap<IpAddr, u32> = HashMap::new();
 
     for answer in message.answers() {
         let (ip, ttl) = match answer.data() {
-            RData::A(addr) if expected == DnsRecordType::A => {
+            RData::A(addr) if expected == RecordType::A => {
                 (IpAddr::V4(ipv4_from_rdata(addr)), answer.ttl())
             }
-            RData::AAAA(addr) if expected == DnsRecordType::Aaaa => {
+            RData::AAAA(addr) if expected == RecordType::AAAA => {
                 (IpAddr::V6(ipv6_from_rdata(addr)), answer.ttl())
             }
             _ => continue,
         };
 
-        records
-            .entry(ip)
-            .or_insert(DnsAnswerRecord { address: ip, ttl });
+        records.entry(ip).or_insert(ttl);
     }
 
-    records.into_values().collect()
+    records.into_iter().collect()
 }
 
 /// Finds the first answer whose record type does not match `expected`.
-fn first_nonmatching_answer(message: &Message, expected: DnsRecordType) -> Option<DnsRecordType> {
+fn first_nonmatching_answer(message: &Message, expected: RecordType) -> Option<RecordType> {
     for answer in message.answers() {
-        let record_type = DnsRecordType::from(answer.record_type());
+        let record_type = answer.record_type();
         if record_type != expected {
             return Some(record_type);
         }
@@ -621,17 +570,6 @@ fn ipv4_from_rdata(data: &hickory_proto::rr::rdata::A) -> std::net::Ipv4Addr {
 /// Converts Hickory's IPv6 RDATA to `Ipv6Addr`.
 fn ipv6_from_rdata(data: &hickory_proto::rr::rdata::AAAA) -> std::net::Ipv6Addr {
     data.0
-}
-
-impl From<RecordType> for DnsRecordType {
-    /// Converts Hickory's `RecordType` into the resolver-specific representation.
-    fn from(value: RecordType) -> Self {
-        match value {
-            RecordType::A => DnsRecordType::A,
-            RecordType::AAAA => DnsRecordType::Aaaa,
-            other => DnsRecordType::Other(u16::from(other)),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1039,32 +977,29 @@ mod tests {
         cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
-        let mut first_ids: HashMap<DnsRecordType, u16> = HashMap::new();
+        let mut first_ids: HashMap<RecordType, u16> = HashMap::new();
         for _ in 0..2 {
             let (len, _peer) = socket.recv_from(&mut buf).await.unwrap();
             let message = Message::from_vec(&buf[..len]).unwrap();
             let query = message.queries().first().cloned().unwrap();
-            first_ids.insert(DnsRecordType::from(query.query_type()), message.id());
+            first_ids.insert(query.query_type(), message.id());
         }
 
         // Wait for timeout and retry
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut retry_ids: HashMap<DnsRecordType, u16> = HashMap::new();
+        let mut retry_ids: HashMap<RecordType, u16> = HashMap::new();
         for _ in 0..2 {
             let (len, _peer) = socket.recv_from(&mut buf).await.unwrap();
             let message = Message::from_vec(&buf[..len]).unwrap();
             let query = message.queries().first().cloned().unwrap();
-            retry_ids.insert(DnsRecordType::from(query.query_type()), message.id());
+            retry_ids.insert(query.query_type(), message.id());
         }
 
+        assert_ne!(first_ids.get(&RecordType::A), retry_ids.get(&RecordType::A));
         assert_ne!(
-            first_ids.get(&DnsRecordType::A),
-            retry_ids.get(&DnsRecordType::A)
-        );
-        assert_ne!(
-            first_ids.get(&DnsRecordType::Aaaa),
-            retry_ids.get(&DnsRecordType::Aaaa)
+            first_ids.get(&RecordType::AAAA),
+            retry_ids.get(&RecordType::AAAA)
         );
 
         handle.abort();

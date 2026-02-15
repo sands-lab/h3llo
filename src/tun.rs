@@ -767,13 +767,15 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                     };
 
                     let mut tun_bufs: Vec<TunBuf> = Vec::with_capacity(packets.len());
-                    let mut pkt_lens: Vec<usize> = Vec::with_capacity(packets.len());
+                    let mut ok_count: u64 = 0;
+                    let mut ok_bytes: u64 = 0;
                     for packet in packets {
                         if packet.len() > mtu {
                             counters.record_drop(DropReason::Oversize, 1, packet.len() as u64);
                             continue;
                         }
-                        pkt_lens.push(packet.len());
+                        ok_count += 1;
+                        ok_bytes += packet.len() as u64;
                         tun_bufs.push(TunBuf::from(packet));
                     }
 
@@ -783,14 +785,10 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
 
                     match tun.send_batch(&mut tun_bufs).await {
                         Ok(_) => {
-                            let count = pkt_lens.len() as u64;
-                            let total_bytes: u64 = pkt_lens.iter().map(|&l| l as u64).sum();
-                            counters.record_success(count, total_bytes);
+                            counters.record_success(ok_count, ok_bytes);
                         }
                         Err(err) => {
-                            let count = pkt_lens.len() as u64;
-                            let total_bytes: u64 = pkt_lens.iter().map(|&l| l as u64).sum();
-                            counters.record_drop(DropReason::SendError, count, total_bytes);
+                            counters.record_drop(DropReason::SendError, ok_count, ok_bytes);
                             return Err(ActorError::TunTxSend { name: tun_name, source: err });
                         }
                     }
