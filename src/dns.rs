@@ -508,7 +508,7 @@ fn record_type_query(name: Name, record_type: RecordType) -> Query {
 
 /// Extracts answers matching `expected`, deduplicating by IP and keeping an arbitrary TTL (order not guaranteed).
 fn extract_records(message: &Message, expected: RecordType) -> Vec<(IpAddr, u32)> {
-    let mut records: HashMap<IpAddr, (IpAddr, u32)> = HashMap::new();
+    let mut records: HashMap<IpAddr, u32> = HashMap::new();
 
     for answer in message.answers() {
         let (ip, ttl) = match answer.data() {
@@ -521,10 +521,10 @@ fn extract_records(message: &Message, expected: RecordType) -> Vec<(IpAddr, u32)
             _ => continue,
         };
 
-        records.entry(ip).or_insert((ip, ttl));
+        records.entry(ip).or_insert(ttl);
     }
 
-    records.into_values().collect()
+    records.into_iter().collect()
 }
 
 /// Finds the first answer whose record type does not match `expected`.

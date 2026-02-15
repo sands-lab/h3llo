@@ -100,6 +100,9 @@ fn is_success_status(status: &[u8]) -> bool {
 }
 
 /// Finds a header by case-insensitive name lookup and returns its value.
+///
+/// Case-insensitive matching is safe for HTTP/3 pseudo-headers (`:method`, `:protocol`)
+/// because they are always lowercase per RFC 9114 Section 4.3.
 fn find_header_value<'a>(headers: &'a [Header], name: &[u8]) -> Option<&'a [u8]> {
     headers
         .iter()
