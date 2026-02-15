@@ -52,6 +52,7 @@ async fn run_checks() -> Result<(), String> {
     check_device_creation().await?;
     check_multi_address().await?;
     check_mtu_configuration().await?;
+    check_tx_queue_len().await?;
     check_send_recv().await?;
     Ok(())
 }
@@ -64,9 +65,12 @@ async fn check_device_creation() -> Result<(), String> {
         mtu: h3llo::config::default_mtu(),
     };
 
-    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun)
-        .await
-        .map_err(|e| format!("device_creation: make_tun failed: {e}"))?;
+    let (_reader, _writer) = h3llo::tun::make_tun(
+        &local_tun,
+        h3llo::config::Tuning::default().tun_tx_queue_len,
+    )
+    .await
+    .map_err(|e| format!("device_creation: make_tun failed: {e}"))?;
 
     let output = Command::new("ip")
         .args(["link", "show", "itun0"])
@@ -116,9 +120,12 @@ async fn check_multi_address() -> Result<(), String> {
         mtu: 1500,
     };
 
-    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun)
-        .await
-        .map_err(|e| format!("multi_address: make_tun failed: {e}"))?;
+    let (_reader, _writer) = h3llo::tun::make_tun(
+        &local_tun,
+        h3llo::config::Tuning::default().tun_tx_queue_len,
+    )
+    .await
+    .map_err(|e| format!("multi_address: make_tun failed: {e}"))?;
 
     let output = Command::new("ip")
         .args(["addr", "show", "itun1"])
@@ -141,6 +148,32 @@ async fn check_multi_address() -> Result<(), String> {
     Ok(())
 }
 
+/// Verifies TUN TX queue length is configured correctly on the TUN device.
+async fn check_tx_queue_len() -> Result<(), String> {
+    let local_tun = h3llo::config::LocalTun {
+        ifname: "itun4".to_string(),
+        addrs: vec!["10.99.4.1/32".parse().unwrap()],
+        mtu: h3llo::config::default_mtu(),
+    };
+
+    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun, 2000)
+        .await
+        .map_err(|e| format!("tx_queue_len: make_tun failed: {e}"))?;
+
+    let output = Command::new("ip")
+        .args(["link", "show", "itun4"])
+        .output()
+        .map_err(|e| format!("tx_queue_len: ip command failed: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("qlen 2000") {
+        return Err(format!("tx_queue_len: expected 'qlen 2000' in: {stdout}"));
+    }
+
+    eprintln!("  check_tx_queue_len: PASS");
+    Ok(())
+}
+
 /// Verifies actual data transmission through a TUN device using ICMP echo (ping).
 ///
 /// Creates a TUN device via `make_tun()`, disables rp_filter, adds a route for
@@ -155,9 +188,12 @@ async fn check_send_recv() -> Result<(), String> {
         mtu: h3llo::config::default_mtu(),
     };
 
-    let (mut reader, mut writer) = h3llo::tun::make_tun(&local_tun)
-        .await
-        .map_err(|e| format!("send_recv: make_tun failed: {e}"))?;
+    let (mut reader, mut writer) = h3llo::tun::make_tun(
+        &local_tun,
+        h3llo::config::Tuning::default().tun_tx_queue_len,
+    )
+    .await
+    .map_err(|e| format!("send_recv: make_tun failed: {e}"))?;
 
     // Disable rp_filter to allow ICMP replies from non-local source.
     // Write directly to /proc/sys since sysctl binary may not be available.
@@ -292,9 +328,12 @@ async fn check_mtu_configuration() -> Result<(), String> {
         mtu: 1280,
     };
 
-    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun)
-        .await
-        .map_err(|e| format!("mtu_configuration: make_tun failed: {e}"))?;
+    let (_reader, _writer) = h3llo::tun::make_tun(
+        &local_tun,
+        h3llo::config::Tuning::default().tun_tx_queue_len,
+    )
+    .await
+    .map_err(|e| format!("mtu_configuration: make_tun failed: {e}"))?;
 
     let output = Command::new("ip")
         .args(["link", "show", "itun2"])

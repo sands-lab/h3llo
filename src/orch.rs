@@ -445,9 +445,10 @@ impl Orchestrator {
         // Note: NoTransportConfigured validation moved to Config::validate()
 
         // Setup TUN
-        let (tun_reader, tun_writer) = tun::make_tun(&config.local.tun)
-            .await
-            .map_err(|err| OrchestratorError::Tun(err.to_string()))?;
+        let (tun_reader, tun_writer) =
+            tun::make_tun(&config.local.tun, config.tuning.tun_tx_queue_len)
+                .await
+                .map_err(|err| OrchestratorError::Tun(err.to_string()))?;
 
         // Control plane: unbounded to prevent deadlocks from actor cycles.
         let (events_tx, events_rx) = mpsc::unbounded_channel();

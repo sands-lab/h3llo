@@ -166,6 +166,11 @@ pub struct Tuning {
     /// Applied to all UDP sockets. Set to 0 to skip buffer configuration and use
     /// system defaults. Actual kernel buffer may be clamped by OS limits.
     pub socket_buffer_size: usize,
+    /// TUN transmit queue length in packets (default: 1000).
+    ///
+    /// Controls how many packets the kernel queues for transmission on the TUN
+    /// interface. Applied on Linux only; ignored on other platforms.
+    pub tun_tx_queue_len: u32,
     /// Minimum interval between reconnection attempts (default: 3s).
     #[serde(with = "serde_duration_secs")]
     pub reconnect_interval: Duration,
@@ -223,6 +228,7 @@ impl Default for Tuning {
         Self {
             packet_queue_depth: 2048,
             socket_buffer_size: 16,
+            tun_tx_queue_len: 1000,
             reconnect_interval: Duration::from_secs(3),
             metrics_push_interval: Duration::from_millis(1000),
             dns_query_timeout: Duration::from_secs(2),
@@ -1819,6 +1825,7 @@ peers:
         assert_eq!(cfg.tuning.h3_cc_algorithm, "bbr2");
         assert!(cfg.tuning.h3_enable_pacing);
         assert!(!cfg.tuning.h3_insecure_skip_verify);
+        assert_eq!(cfg.tuning.tun_tx_queue_len, 1000);
     }
 
     #[test]
@@ -2032,6 +2039,20 @@ peers:
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert!(cfg.tuning.h3_insecure_skip_verify);
+    }
+
+    #[test]
+    fn tuning_tun_tx_queue_len_override() {
+        let yaml = r#"
+local:
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  tun_tx_queue_len: 500
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert_eq!(cfg.tuning.tun_tx_queue_len, 500);
     }
 
     #[test]
