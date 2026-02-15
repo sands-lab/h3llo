@@ -163,6 +163,32 @@ fn encode_drop_counter_family(
     Ok(())
 }
 
+/// Encodes a congestion counter family with `event` label (queue_full / would_block).
+///
+/// Generic over the counter value type (`u64` for counts, `f64` for durations).
+fn encode_congestion_family<N, F>(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    store: &HashMap<TransportLabels, TransportMetrics>,
+    extractor: F,
+) -> Result<(), fmt::Error>
+where
+    N: EncodeCounterValue + Default,
+    F: Fn(&CongestionStats) -> (N, N),
+{
+    let counter = ConstCounter::new(N::default());
+    let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+    for m in store.values() {
+        let (queue_full, would_block) = extractor(&m.stats.congestion);
+        for (event, value) in [("queue_full", queue_full), ("would_block", would_block)] {
+            let labels = CongestionLabelSet::from_metrics(m, event);
+            ConstCounter::new(value).encode(metric_enc.encode_family(&labels)?)?;
+        }
+    }
+    Ok(())
+}
+
 /// Encodes a succeeded/dropped counter family, reducing duplication.
 fn encode_counter_family(
     encoder: &mut DescriptorEncoder,
@@ -294,32 +320,6 @@ impl CongestionLabelSet {
             event: event.to_string(),
         }
     }
-}
-
-/// Encodes a congestion counter family with `event` label (queue_full / would_block).
-///
-/// Generic over the counter value type (`u64` for counts, `f64` for durations).
-fn encode_congestion_family<N, F>(
-    encoder: &mut DescriptorEncoder,
-    name: &str,
-    help: &str,
-    store: &HashMap<TransportLabels, TransportMetrics>,
-    extractor: F,
-) -> Result<(), fmt::Error>
-where
-    N: EncodeCounterValue + Default,
-    F: Fn(&CongestionStats) -> (N, N),
-{
-    let counter = ConstCounter::new(N::default());
-    let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
-    for m in store.values() {
-        let (queue_full, would_block) = extractor(&m.stats.congestion);
-        for (event, value) in [("queue_full", queue_full), ("would_block", would_block)] {
-            let labels = CongestionLabelSet::from_metrics(m, event);
-            ConstCounter::new(value).encode(metric_enc.encode_family(&labels)?)?;
-        }
-    }
-    Ok(())
 }
 
 /// Prometheus label value for drop reason.
