@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REGISTRY_IMAGE: h3llo/h3llo
+  REGISTRY_IMAGE: nekonuts/h3llo
 
 jobs:
   linux:
@@ -40,11 +40,12 @@ jobs:
 
   docker-tests:
     runs-on: self-hosted
+    concurrency:
+      group: docker-tests
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -70,6 +71,9 @@ jobs:
   # Runs on PRs too (for cross-compilation validation) but skips push.
   docker-build:
     runs-on: self-hosted
+    concurrency:
+      group: buildx-${{ matrix.arch_label }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -97,6 +101,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
         with:
           name: builder-${{ matrix.arch_label }}
+          keep-state: true
 
       - name: Login to Docker Hub
         if: github.event_name != 'pull_request'
