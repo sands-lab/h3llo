@@ -24,7 +24,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{
-    DescriptorEncoder, EncodeLabelSet, EncodeLabelValue, EncodeMetric,
+    DescriptorEncoder, EncodeCounterValue, EncodeLabelSet, EncodeLabelValue, EncodeMetric,
 };
 use prometheus_client::metrics::counter::ConstCounter;
 use prometheus_client::registry::Registry;
@@ -120,14 +120,14 @@ impl Collector for SnapshotCollector {
             |c| c.bytes,
         )?;
 
-        encode_congestion_counter_family(
+        encode_congestion_family(
             &mut encoder,
             "h3llo_transport_congestion",
             "Cumulative congestion event count.",
             &self.0,
             |cg| (cg.queue_full_count, cg.would_block_count),
         )?;
-        encode_congestion_f64_family(
+        encode_congestion_family(
             &mut encoder,
             "h3llo_transport_congestion_wait_seconds",
             "Cumulative congestion wait time in seconds.",
@@ -296,46 +296,28 @@ impl CongestionLabelSet {
     }
 }
 
-/// Encodes a congestion u64 counter family with `event` label (queue_full / would_block).
-fn encode_congestion_counter_family(
+/// Encodes a congestion counter family with `event` label (queue_full / would_block).
+///
+/// Generic over the counter value type (`u64` for counts, `f64` for durations).
+fn encode_congestion_family<N, F>(
     encoder: &mut DescriptorEncoder,
     name: &str,
     help: &str,
     store: &HashMap<TransportLabels, TransportMetrics>,
-    extractor: fn(&CongestionStats) -> (u64, u64),
-) -> Result<(), fmt::Error> {
-    let counter = ConstCounter::new(0u64);
+    extractor: F,
+) -> Result<(), fmt::Error>
+where
+    N: EncodeCounterValue + Default,
+    F: Fn(&CongestionStats) -> (N, N),
+{
+    let counter = ConstCounter::new(N::default());
     let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
     for m in store.values() {
         let (queue_full, would_block) = extractor(&m.stats.congestion);
-        ConstCounter::new(queue_full).encode(
-            metric_enc.encode_family(&CongestionLabelSet::from_metrics(m, "queue_full"))?,
-        )?;
-        ConstCounter::new(would_block).encode(
-            metric_enc.encode_family(&CongestionLabelSet::from_metrics(m, "would_block"))?,
-        )?;
-    }
-    Ok(())
-}
-
-/// Encodes a congestion f64 counter family with `event` label (for duration in seconds).
-fn encode_congestion_f64_family(
-    encoder: &mut DescriptorEncoder,
-    name: &str,
-    help: &str,
-    store: &HashMap<TransportLabels, TransportMetrics>,
-    extractor: fn(&CongestionStats) -> (f64, f64),
-) -> Result<(), fmt::Error> {
-    let counter = ConstCounter::new(0.0f64);
-    let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
-    for m in store.values() {
-        let (queue_full, would_block) = extractor(&m.stats.congestion);
-        ConstCounter::new(queue_full).encode(
-            metric_enc.encode_family(&CongestionLabelSet::from_metrics(m, "queue_full"))?,
-        )?;
-        ConstCounter::new(would_block).encode(
-            metric_enc.encode_family(&CongestionLabelSet::from_metrics(m, "would_block"))?,
-        )?;
+        for (event, value) in [("queue_full", queue_full), ("would_block", would_block)] {
+            let labels = CongestionLabelSet::from_metrics(m, event);
+            ConstCounter::new(value).encode(metric_enc.encode_family(&labels)?)?;
+        }
     }
     Ok(())
 }
