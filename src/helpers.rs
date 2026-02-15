@@ -4,21 +4,40 @@ use std::net::IpAddr;
 
 /// Retries an async I/O expression on transient errors (`Interrupted`, `WouldBlock`).
 ///
-/// The expression is re-evaluated on each iteration, so it may include readiness
-/// waits (e.g. `socket.writable().await`) before the actual I/O call.
+/// `Interrupted` errors retry immediately (no yield). `WouldBlock` errors
+/// call `tokio::task::yield_now().await` before retrying.
+///
+/// The second argument is a closure invoked when a WouldBlock sequence
+/// completes (on both `Ok` and non-transient `Err`), receiving the total
+/// `Duration` spent waiting. Pass `|_| {}` when no tracking is needed.
 macro_rules! retry_on_transient {
-    ($expr:expr) => {{
+    ($expr:expr, $on_would_block:expr) => {{
+        let mut __wb_start: Option<std::time::Instant> = None;
+        let mut __on_wb = $on_would_block;
         loop {
             match $expr {
-                Ok(val) => break Ok(val),
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::Interrupted
-                        || err.kind() == std::io::ErrorKind::WouldBlock =>
-                {
+                Ok(val) => {
+                    if let Some(start) = __wb_start {
+                        __on_wb(start.elapsed());
+                    }
+                    break Ok(val);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    continue;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if __wb_start.is_none() {
+                        __wb_start = Some(std::time::Instant::now());
+                    }
                     tokio::task::yield_now().await;
                     continue;
                 }
-                Err(err) => break Err(err),
+                Err(err) => {
+                    if let Some(start) = __wb_start {
+                        __on_wb(start.elapsed());
+                    }
+                    break Err(err);
+                }
             }
         }
     }};
@@ -96,17 +115,20 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_clone = attempts.clone();
 
-        let result = retry_on_transient!({
-            let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
-            if count == 0 {
-                Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "injected interruption",
-                ))
-            } else {
-                Ok(5)
-            }
-        })
+        let result = retry_on_transient!(
+            {
+                let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "injected interruption",
+                    ))
+                } else {
+                    Ok(5)
+                }
+            },
+            |_| {}
+        )
         .expect("retry should eventually succeed");
 
         assert_eq!(result, 5);
@@ -118,17 +140,20 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_clone = attempts.clone();
 
-        let result = retry_on_transient!({
-            let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
-            if count < 2 {
-                Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "injected would-block",
-                ))
-            } else {
-                Ok(42)
-            }
-        })
+        let result = retry_on_transient!(
+            {
+                let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
+                if count < 2 {
+                    Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "injected would-block",
+                    ))
+                } else {
+                    Ok(42)
+                }
+            },
+            |_| {}
+        )
         .expect("retry should eventually succeed");
 
         assert_eq!(result, 42);
@@ -177,5 +202,86 @@ mod tests {
         assert_eq!(extract_dst_ip(&[0x60; 30]), None);
         // Unknown version
         assert_eq!(extract_dst_ip(&[0x30; 20]), None);
+    }
+
+    #[tokio::test]
+    async fn would_block_callback_invoked_with_duration() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let recorded_dur = Arc::new(Mutex::new(None::<Duration>));
+        let recorded_dur_clone = recorded_dur.clone();
+
+        let result = retry_on_transient!(
+            {
+                let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
+                if count < 2 {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "injected"))
+                } else {
+                    Ok(42)
+                }
+            },
+            |dur: Duration| {
+                *recorded_dur_clone.lock().unwrap() = Some(dur);
+            }
+        )
+        .expect("retry should succeed");
+
+        assert_eq!(result, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let dur = recorded_dur.lock().unwrap().expect("callback should fire");
+        assert!(dur.as_nanos() > 0, "duration should be nonzero");
+    }
+
+    #[tokio::test]
+    async fn would_block_callback_not_invoked_on_success() {
+        use std::time::Duration;
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let invoked_clone = invoked.clone();
+
+        let result: Result<i32, io::Error> =
+            retry_on_transient!(Ok::<i32, io::Error>(99), |_dur: Duration| {
+                invoked_clone.fetch_add(1, Ordering::SeqCst);
+            });
+
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn interrupted_does_not_yield() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let interloper_ran = Arc::new(AtomicUsize::new(0));
+        let interloper_ran_clone = interloper_ran.clone();
+
+        let interloper = tokio::spawn(async move {
+            loop {
+                interloper_ran_clone.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        tokio::task::yield_now().await;
+        let before = interloper_ran.load(Ordering::SeqCst);
+
+        let _result = retry_on_transient!(
+            {
+                let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
+                if count < 3 {
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {}
+        )
+        .unwrap();
+
+        let after = interloper_ran.load(Ordering::SeqCst);
+        interloper.abort();
+        assert_eq!(before, after, "Interrupted should not yield to other tasks");
     }
 }

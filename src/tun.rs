@@ -6,7 +6,7 @@ use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind}
 use crate::helpers::extract_dst_ip;
 #[cfg(not(target_os = "linux"))]
 use crate::helpers::retry_on_transient;
-use crate::metrics::TransportCounters;
+use crate::metrics::{send_or_backpressure, TransportCounters};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use ipnet_trie::IpnetTrie;
 use std::collections::HashMap;
@@ -425,7 +425,7 @@ impl TunTx for TunWriter {
         #[cfg(not(target_os = "linux"))]
         {
             for buf in bufs.iter() {
-                retry_on_transient!(self.device.send(buf.as_ref()).await)?;
+                retry_on_transient!(self.device.send(buf.as_ref()).await, |_| {})?;
             }
             Ok(bufs.len())
         }
@@ -714,7 +714,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                                 }
                             }
 
-                            if route.tx.send(batch).await.is_err() {
+                            if send_or_backpressure(route.tx, batch, &mut counters).await.is_err() {
                                 counters.record_drop(DropReason::ChannelClosed, count as u64, total_bytes);
                             } else {
                                 counters.record_success(count as u64, total_bytes);
@@ -946,18 +946,21 @@ pub mod test_support {
 
         async fn send_batch(&mut self, bufs: &mut [TunBuf]) -> io::Result<usize> {
             for buf in bufs.iter() {
-                retry_on_transient!({
-                    if let Some(kind) = self.send_errors.pop_front() {
-                        Err(io::Error::new(kind, "injected send error"))
-                    } else {
-                        self.packet_tx
-                            .send(buf.as_ref().to_vec())
-                            .await
-                            .map_err(|_| {
-                                io::Error::new(io::ErrorKind::BrokenPipe, "packet_tx closed")
-                            })
-                    }
-                })?;
+                retry_on_transient!(
+                    {
+                        if let Some(kind) = self.send_errors.pop_front() {
+                            Err(io::Error::new(kind, "injected send error"))
+                        } else {
+                            self.packet_tx
+                                .send(buf.as_ref().to_vec())
+                                .await
+                                .map_err(|_| {
+                                    io::Error::new(io::ErrorKind::BrokenPipe, "packet_tx closed")
+                                })
+                        }
+                    },
+                    |_| {}
+                )?;
             }
             Ok(bufs.len())
         }

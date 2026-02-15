@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use crate::actor::ActorExitResult;
 use crate::config::{Config, H3Endpoint, Peer, UdpEndpoint};
@@ -194,6 +195,39 @@ pub enum DropReason {
     NoHeadroom,
 }
 
+/// Tracks cumulative wait events caused by backpressure or I/O congestion.
+///
+/// Each field pair captures an event count and the total time spent waiting.
+/// These metrics are separate from drop accounting because the affected packets
+/// are ultimately delivered — they are merely delayed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CongestionStats {
+    /// Number of times a bounded mpsc `try_send` found the queue full.
+    pub queue_full_count: u64,
+    /// Cumulative wall-clock time spent waiting for queue capacity
+    /// (from `try_send` failure to `send().await` completion).
+    pub queue_full_duration: Duration,
+    /// Number of times a socket I/O operation returned `WouldBlock`.
+    pub would_block_count: u64,
+    /// Cumulative wall-clock time spent retrying after `WouldBlock`
+    /// (from first `WouldBlock` to eventual I/O success).
+    pub would_block_duration: Duration,
+}
+
+impl CongestionStats {
+    /// Records a queue-full wait event with its duration, saturating on overflow.
+    pub fn record_queue_full(&mut self, wait: Duration) {
+        self.queue_full_count = self.queue_full_count.saturating_add(1);
+        self.queue_full_duration = self.queue_full_duration.saturating_add(wait);
+    }
+
+    /// Records a WouldBlock wait event with its duration, saturating on overflow.
+    pub fn record_would_block(&mut self, wait: Duration) {
+        self.would_block_count = self.would_block_count.saturating_add(1);
+        self.would_block_duration = self.would_block_duration.saturating_add(wait);
+    }
+}
+
 /// Aggregates packet counters by outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PktCounters {
@@ -263,6 +297,41 @@ mod tests {
         assert_eq!(c.packets, 16);
         assert_eq!(c.bytes, 1600);
     }
+
+    #[test]
+    fn congestion_stats_record_queue_full() {
+        let mut c = CongestionStats::default();
+        c.record_queue_full(Duration::from_millis(5));
+        c.record_queue_full(Duration::from_millis(10));
+        assert_eq!(c.queue_full_count, 2);
+        assert_eq!(c.queue_full_duration, Duration::from_millis(15));
+        assert_eq!(c.would_block_count, 0);
+    }
+
+    #[test]
+    fn congestion_stats_record_would_block() {
+        let mut c = CongestionStats::default();
+        c.record_would_block(Duration::from_micros(100));
+        assert_eq!(c.would_block_count, 1);
+        assert_eq!(c.would_block_duration, Duration::from_micros(100));
+        assert_eq!(c.queue_full_count, 0);
+    }
+
+    #[test]
+    fn congestion_stats_saturates() {
+        let mut c = CongestionStats {
+            queue_full_count: u64::MAX - 1,
+            queue_full_duration: Duration::MAX,
+            would_block_count: u64::MAX - 1,
+            would_block_duration: Duration::MAX,
+        };
+        c.record_queue_full(Duration::from_secs(1));
+        assert_eq!(c.queue_full_count, u64::MAX);
+        assert_eq!(c.queue_full_duration, Duration::MAX);
+        c.record_would_block(Duration::from_secs(1));
+        assert_eq!(c.would_block_count, u64::MAX);
+        assert_eq!(c.would_block_duration, Duration::MAX);
+    }
 }
 
 /// Collects per-transport statistics including drop breakdowns.
@@ -274,6 +343,8 @@ pub struct TransportStats {
     pub dropped: PktCounters,
     /// Drop counters keyed by reason.
     pub drop_reasons: HashMap<DropReason, PktCounters>,
+    /// Backpressure and I/O congestion wait counters.
+    pub congestion: CongestionStats,
 }
 
 /// Labels attached to transport metrics for grouping.
