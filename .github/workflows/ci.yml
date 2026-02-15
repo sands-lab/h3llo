@@ -150,12 +150,13 @@ jobs:
           target: export
           outputs: type=local,dest=${{ runner.temp }}/binary-out
 
-      - name: Rename and upload binary artifact
+      - name: Rename binary artifact
         if: github.event_name != 'pull_request'
         run: |
           mv "${{ runner.temp }}/binary-out/h3llo" \
              "${{ runner.temp }}/binary-out/h3llo-linux-${{ matrix.arch_label }}"
-      - uses: actions/upload-artifact@v4
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
         if: github.event_name != 'pull_request'
         with:
           name: binary-${{ matrix.arch_label }}
@@ -239,6 +240,7 @@ jobs:
       - name: Publish dev release
         if: github.ref == 'refs/heads/master'
         run: |
+          ls ${{ runner.temp }}/binaries/h3llo-linux-* || { echo "::error::No binary artifacts found"; exit 1; }
           gh release delete dev --yes --cleanup-tag || true
           gh release create dev \
             ${{ runner.temp }}/binaries/h3llo-linux-* \
