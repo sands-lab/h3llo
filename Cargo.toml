@@ -43,6 +43,7 @@ mimalloc = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "process"] }
+hyper = { version = "1", features = ["client"] }
 testcontainers = "0.23"
 tempfile = "3"
 tracing-test = "0.2"
