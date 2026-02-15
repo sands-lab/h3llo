@@ -141,6 +141,28 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Export binary
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          builder: ${{ steps.buildx.outputs.name }}
+          platforms: ${{ matrix.platform }}
+          target: export
+          outputs: type=local,dest=${{ runner.temp }}/binary-out
+
+      - name: Rename and upload binary artifact
+        if: github.event_name != 'pull_request'
+        run: |
+          mv "${{ runner.temp }}/binary-out/h3llo" \
+             "${{ runner.temp }}/binary-out/h3llo-linux-${{ matrix.arch_label }}"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: binary-${{ matrix.arch_label }}
+          path: ${{ runner.temp }}/binary-out/h3llo-linux-${{ matrix.arch_label }}
+          if-no-files-found: error
+          retention-days: 1
+
   # Merge per-arch digests into a single multi-arch manifest list on Docker Hub.
   # Gates behind ALL jobs: builds must succeed AND tests must pass.
   docker-merge:
@@ -187,10 +209,10 @@ jobs:
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
 
-  # Create a GitHub release when a version tag is pushed.
+  # Create a GitHub release when a version tag is pushed or master is updated.
   # Gates behind docker-merge, which transitively requires all builds and tests.
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/master'
     runs-on: self-hosted
     needs: [docker-merge]
     permissions:
@@ -198,7 +220,31 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Create GitHub Release
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/binaries
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Create tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          files: |
+            ${{ runner.temp }}/binaries/h3llo-linux-*
+
+      - name: Publish dev release
+        if: github.ref == 'refs/heads/master'
+        run: |
+          gh release delete dev --yes --cleanup-tag || true
+          gh release create dev \
+            ${{ runner.temp }}/binaries/h3llo-linux-* \
+            --prerelease \
+            --title "Development Build ($(date -u +%Y-%m-%d))" \
+            --generate-notes \
+            --target "${{ github.sha }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
