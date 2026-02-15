@@ -40,6 +40,9 @@ jobs:
 
   docker-tests:
     runs-on: self-hosted
+    concurrency:
+      group: docker-tests
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
