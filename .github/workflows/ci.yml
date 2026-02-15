@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REGISTRY_IMAGE: h3llo/h3llo
+  REGISTRY_IMAGE: nekonuts/h3llo
 
 jobs:
   linux:
