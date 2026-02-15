@@ -324,7 +324,6 @@ pub struct Orchestrator {
     tun_cmd_tx: mpsc::UnboundedSender<TunRxCommand>,
     bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
     /// H3 listener command sender (if listening).
-    #[allow(dead_code)]
     h3_listener_cmd_tx: Option<mpsc::UnboundedSender<H3ListenerCommand>>,
     /// Packet sender to TUN TX (for H3 RX actors).
     tun_packet_tx: mpsc::Sender<Vec<PooledBuf>>,
@@ -361,6 +360,28 @@ impl Orchestrator {
                 .collect();
             if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAcceptedSources(accepted_ips)) {
                 warn!(error = %e, "failed to send accepted sources update command");
+            }
+        }
+    }
+
+    /// Sends updated peer tokens to the H3 listener actor.
+    ///
+    /// Rebuilds the full peer_id -> token map from current `self.peers` and sends
+    /// it as an `UpdatePeerTokens` command. No-op when H3 listener is not configured.
+    fn sync_h3_peer_tokens(&self) {
+        if let Some(cmd_tx) = &self.h3_listener_cmd_tx {
+            let tokens: HashMap<String, String> = self
+                .peers
+                .values()
+                .filter_map(|e| {
+                    e.config
+                        .h3
+                        .as_ref()
+                        .map(|h3| (e.config.id.clone(), h3.token.clone()))
+                })
+                .collect();
+            if let Err(e) = cmd_tx.send(H3ListenerCommand::UpdatePeerTokens(tokens)) {
+                warn!(error = %e, "failed to send peer tokens update to H3 listener");
             }
         }
     }
@@ -584,6 +605,9 @@ impl Orchestrator {
             metrics: HashMap::new(),
         };
         orch.sync_dns_hostnames();
+        // Note: sync_h3_peer_tokens is NOT called here because initial tokens
+        // are passed directly to spawn_h3_listener (lines above). Ongoing
+        // mutations via POST/DELETE API call sync_h3_peer_tokens explicitly.
         Ok(orch)
     }
 
@@ -735,6 +759,7 @@ impl Orchestrator {
         }
 
         self.sync_dns_hostnames();
+        self.sync_h3_peer_tokens();
         info!(count = count, "API: peers upserted");
         Ok(())
     }
@@ -750,6 +775,7 @@ impl Orchestrator {
         }
         if changed {
             self.sync_dns_hostnames();
+            self.sync_h3_peer_tokens();
         }
     }
 
@@ -1031,6 +1057,7 @@ mod test_support {
         pub bare_rx_cmd_rx: mpsc::UnboundedReceiver<BareUdpRxCommand>,
         pub dns_cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
         pub route_cmd_rx: mpsc::UnboundedReceiver<RouteCommand>,
+        pub h3_listener_cmd_rx: mpsc::UnboundedReceiver<H3ListenerCommand>,
     }
 
     impl TestableOrchestratorBuilder {
@@ -1073,6 +1100,7 @@ mod test_support {
             let (dns_cmd_tx, dns_cmd_rx) = mpsc::unbounded_channel();
             let (tun_packet_tx, _tun_packet_rx) = mpsc::channel(1);
             let (route_cmd_tx, route_cmd_rx) = mpsc::unbounded_channel();
+            let (h3_listener_cmd_tx, h3_listener_cmd_rx) = mpsc::unbounded_channel();
 
             let local = self.local.unwrap_or_else(|| crate::config::Local {
                 table: false,
@@ -1100,7 +1128,7 @@ mod test_support {
                 peers: self.peers,
                 tun_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
-                h3_listener_cmd_tx: None,
+                h3_listener_cmd_tx: Some(h3_listener_cmd_tx),
                 tun_packet_tx,
                 dns_cmd_tx,
                 route_cmd_tx: Some(route_cmd_tx),
@@ -1117,6 +1145,7 @@ mod test_support {
                     bare_rx_cmd_rx,
                     dns_cmd_rx,
                     route_cmd_rx,
+                    h3_listener_cmd_rx,
                 },
             )
         }
@@ -2224,5 +2253,129 @@ mod tests {
         let config = result.expect("should succeed");
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers[0].id, "keeper");
+    }
+
+    // ========== H3 peer token sync tests ==========
+
+    #[tokio::test]
+    async fn api_post_config_sends_h3_token_update() {
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default().build();
+
+        let peer = Peer {
+            id: "h3-peer".to_string(),
+            h3: Some(crate::config::PeerH3 {
+                endpoint: None,
+                token: "secure-token-12ch".to_string(),
+                bindif: None,
+                sni: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+            },
+        };
+
+        orch.handle_post_config(vec![peer]).unwrap();
+
+        let cmd = handles
+            .h3_listener_cmd_rx
+            .try_recv()
+            .expect("H3 listener should receive UpdatePeerTokens");
+        let H3ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens.get("h3-peer").unwrap(), "secure-token-12ch");
+    }
+
+    #[tokio::test]
+    async fn api_delete_config_sends_h3_token_update() {
+        let peer = Peer {
+            id: "h3-peer".to_string(),
+            h3: Some(crate::config::PeerH3 {
+                endpoint: None,
+                token: "secure-token-12ch".to_string(),
+                bindif: None,
+                sni: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            },
+        };
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        orch.handle_delete_config(&["h3-peer".to_string()]);
+
+        let cmd = handles
+            .h3_listener_cmd_rx
+            .try_recv()
+            .expect("H3 listener should receive UpdatePeerTokens after delete");
+        let H3ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        assert!(
+            tokens.is_empty(),
+            "tokens should be empty after removing the only H3 peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_delete_config_no_h3_update_when_unchanged() {
+        let peer = Peer {
+            id: "keeper".to_string(),
+            h3: Some(crate::config::PeerH3 {
+                endpoint: None,
+                token: "test-token-12ch1".to_string(),
+                bindif: None,
+                sni: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            },
+        };
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        orch.handle_delete_config(&["nonexistent".to_string()]);
+
+        // No change -> no command sent
+        assert!(
+            handles.h3_listener_cmd_rx.try_recv().is_err(),
+            "should not send UpdatePeerTokens when no peers were actually removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_post_config_h3_tokens_exclude_bare_peers() {
+        let h3_peer = Peer {
+            id: "h3-peer".to_string(),
+            h3: Some(crate::config::PeerH3 {
+                endpoint: None,
+                token: "h3-token-12chars1".to_string(),
+                bindif: None,
+                sni: None,
+            }),
+            bare: None,
+            tun: PeerTun {
+                allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+            },
+        };
+        let bare_only = bare_peer("bare-peer", &["10.0.2.0/24"]);
+
+        let (mut orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![bare_only])
+            .build();
+
+        orch.handle_post_config(vec![h3_peer]).unwrap();
+
+        let cmd = handles
+            .h3_listener_cmd_rx
+            .try_recv()
+            .expect("should receive UpdatePeerTokens");
+        let H3ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        assert_eq!(tokens.len(), 1, "only H3 peers should be included");
+        assert!(tokens.contains_key("h3-peer"));
+        assert!(!tokens.contains_key("bare-peer"));
     }
 }
