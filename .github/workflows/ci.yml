@@ -68,6 +68,9 @@ jobs:
   # Runs on PRs too (for cross-compilation validation) but skips push.
   docker-build:
     runs-on: self-hosted
+    concurrency:
+      group: buildx-${{ matrix.arch_label }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
