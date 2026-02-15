@@ -262,11 +262,15 @@ pub trait TunTx: Send + 'static {
 /// # Arguments
 ///
 /// * `local_tun` - TUN configuration including interface name, addresses, and MTU.
+/// * `tx_queue_len` - Transmit queue length in packets (applied on Linux only).
 ///
 /// # Errors
 ///
 /// Returns `TunError::DeviceBuild` when device creation or address assignment fails.
-pub async fn make_tun(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), TunError> {
+pub async fn make_tun(
+    local_tun: &LocalTun,
+    tx_queue_len: u32,
+) -> Result<(TunReader, TunWriter), TunError> {
     let (v4_addrs, v6_addrs) = split_addrs_by_version(&local_tun.addrs);
 
     let mut builder = DeviceBuilder::new()
@@ -278,8 +282,11 @@ pub async fn make_tun(local_tun: &LocalTun) -> Result<(TunReader, TunWriter), Tu
     // Enable GSO/GRO offload on Linux for batched TUN I/O.
     #[cfg(target_os = "linux")]
     {
-        builder = builder.offload(true);
+        builder = builder.offload(true).tx_queue_len(tx_queue_len);
     }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = tx_queue_len;
 
     if let Some(first_v4) = v4_addrs.first() {
         builder = builder.ipv4(first_v4.addr(), first_v4.prefix_len(), None);
