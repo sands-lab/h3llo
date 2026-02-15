@@ -595,7 +595,10 @@ async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Respons
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{PktCounters, TransportStats};
+    use crate::config::{Local, LocalDns, LocalTun, Tuning};
+    use crate::events::{ApiEvent, PktCounters, TransportStats};
+    use hyper::client::conn::http1;
+    use tokio::net::TcpStream;
 
     #[test]
     fn encode_empty_snapshot() {
@@ -846,5 +849,408 @@ mod tests {
             text.contains("h3llo_transport_congestion_wait_milliseconds_total"),
             "missing wait: {text}"
         );
+    }
+
+    // ========== Real-Network Test Helpers ==========
+
+    /// Spawns the API actor on an ephemeral port and returns the bound address,
+    /// the event receiver (to mock orchestrator replies), and the task handle.
+    fn start_api(
+        api_path: &str,
+    ) -> (
+        SocketAddr,
+        mpsc::UnboundedReceiver<Event>,
+        JoinHandle<ActorExitResult>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = TcpListener::from_std(listener).unwrap();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let handle = spawn_api(listener, api_path.to_string(), events_tx);
+        (addr, events_rx, handle)
+    }
+
+    /// Constructs a minimal `Config` for orchestrator mock replies.
+    fn test_config() -> Config {
+        Config {
+            local: Local {
+                table: false,
+                dns: LocalDns {
+                    server: "127.0.0.1:53".parse().unwrap(),
+                    bindif: None,
+                },
+                h3: None,
+                bare: None,
+                api: None,
+                tun: LocalTun {
+                    ifname: "test0".to_string(),
+                    addrs: vec!["10.0.0.1/24".parse().unwrap()],
+                    mtu: 1400,
+                },
+            },
+            tuning: Tuning::default(),
+            peers: vec![],
+        }
+    }
+
+    /// Creates a hyper HTTP/1.1 client connected to the given address.
+    async fn http_client(addr: SocketAddr) -> http1::SendRequest<Full<Bytes>> {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (sender, conn) = http1::handshake(io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+    }
+
+    /// Reads the full response body as a string.
+    async fn body_string(resp: Response<hyper::body::Incoming>) -> String {
+        let collected = resp.collect().await.unwrap();
+        String::from_utf8(collected.to_bytes().to_vec()).unwrap()
+    }
+
+    /// Receives the next event with a 2-second timeout.
+    async fn recv_event(rx: &mut mpsc::UnboundedReceiver<Event>) -> Event {
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for API event")
+            .expect("event channel closed unexpectedly")
+    }
+
+    // ========== Real-Network HTTP Tests ==========
+
+    #[tokio::test]
+    async fn get_config_returns_yaml() {
+        let (addr, mut events_rx, handle) = start_api("");
+        let mut sender = http_client(addr).await;
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/config")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let fut = sender.send_request(req);
+
+        let config = test_config();
+        let reply_config = config.clone();
+        let mock = tokio::spawn(async move {
+            let event = recv_event(&mut events_rx).await;
+            if let Event::Api(ApiEvent::GetConfig { reply_tx }) = event {
+                reply_tx.send(reply_config).ok();
+            } else {
+                panic!("expected GetConfig, got {event:?}");
+            }
+        });
+
+        let resp = fut.await.unwrap();
+        mock.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/yaml"
+        );
+        let body = body_string(resp).await;
+        let parsed: Config = serde_yaml::from_str(&body).unwrap();
+        assert_eq!(parsed, config);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn post_config_upserts_peers() {
+        let (addr, mut events_rx, handle) = start_api("");
+        let mut sender = http_client(addr).await;
+
+        let yaml_body = "peers:\n- id: peer-1\n  bare:\n    endpoint: udp://1.2.3.4:6635\n  tun:\n    allowed_ips:\n    - 10.0.1.0/24\n";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/config")
+            .body(Full::new(Bytes::from(yaml_body)))
+            .unwrap();
+        let fut = sender.send_request(req);
+
+        let mock = tokio::spawn(async move {
+            let event = recv_event(&mut events_rx).await;
+            if let Event::Api(ApiEvent::PostConfig { peers, reply_tx }) = event {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].id, "peer-1");
+                let mut config = test_config();
+                config.peers = peers;
+                reply_tx.send(Ok(config)).ok();
+            } else {
+                panic!("expected PostConfig, got {event:?}");
+            }
+        });
+
+        let resp = fut.await.unwrap();
+        mock.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let parsed: Config = serde_yaml::from_str(&body).unwrap();
+        assert_eq!(parsed.peers.len(), 1);
+        assert_eq!(parsed.peers[0].id, "peer-1");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn post_config_invalid_yaml_returns_400() {
+        let (addr, _events_rx, handle) = start_api("");
+        let mut sender = http_client(addr).await;
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/config")
+            .body(Full::new(Bytes::from("{{invalid yaml")))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(body.contains("invalid YAML"), "body: {body}");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn post_config_orchestrator_rejects_returns_400() {
+        let (addr, mut events_rx, handle) = start_api("");
+        let mut sender = http_client(addr).await;
+
+        let yaml_body = "peers: []\n";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/config")
+            .body(Full::new(Bytes::from(yaml_body)))
+            .unwrap();
+        let fut = sender.send_request(req);
+
+        let mock = tokio::spawn(async move {
+            let event = recv_event(&mut events_rx).await;
+            if let Event::Api(ApiEvent::PostConfig { reply_tx, .. }) = event {
+                reply_tx.send(Err("validation failed".to_string())).ok();
+            } else {
+                panic!("expected PostConfig, got {event:?}");
+            }
+        });
+
+        let resp = fut.await.unwrap();
+        mock.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(resp).await;
+        assert!(body.contains("validation failed"), "body: {body}");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn delete_config_removes_peers() {
+        let (addr, mut events_rx, handle) = start_api("");
+        let mut sender = http_client(addr).await;
+
+        let yaml_body = "peers:\n- id: peer-1\n";
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/config")
+            .body(Full::new(Bytes::from(yaml_body)))
+            .unwrap();
+        let fut = sender.send_request(req);
+
+        let mock = tokio::spawn(async move {
+            let event = recv_event(&mut events_rx).await;
+            if let Event::Api(ApiEvent::DeleteConfig { peer_ids, reply_tx }) = event {
+                assert_eq!(peer_ids, vec!["peer-1"]);
+                reply_tx.send(Ok(test_config())).ok();
+            } else {
+                panic!("expected DeleteConfig, got {event:?}");
+            }
+        });
+
+        let resp = fut.await.unwrap();
+        mock.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/yaml"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn get_metrics_returns_openmetrics() {
+        let (addr, mut events_rx, handle) = start_api("");
+        let mut sender = http_client(addr).await;
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/metrics")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let fut = sender.send_request(req);
+
+        let mock = tokio::spawn(async move {
+            let event = recv_event(&mut events_rx).await;
+            if let Event::Api(ApiEvent::GetMetricsSnapshot { reply_tx }) = event {
+                let mut snapshot = HashMap::new();
+                let metrics = TransportMetrics {
+                    labels: TransportLabels {
+                        kind: TransportKind::BareUdp,
+                        direction: Direction::Rx,
+                        peer_id: Some("test-peer".to_string()),
+                        remote_addr: None,
+                    },
+                    stats: TransportStats {
+                        succeeded: PktCounters {
+                            packets: 42,
+                            bytes: 12345,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                };
+                snapshot.insert(metrics.labels.clone(), metrics);
+                reply_tx.send(snapshot).ok();
+            } else {
+                panic!("expected GetMetricsSnapshot, got {event:?}");
+            }
+        });
+
+        let resp = fut.await.unwrap();
+        mock.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("openmetrics-text"),
+            "content-type should be OpenMetrics: {ct}"
+        );
+        let body = body_string(resp).await;
+        assert!(body.contains("# EOF"), "must contain EOF: {body}");
+        assert!(
+            body.contains("h3llo_transport_packets_total"),
+            "must contain packet metrics: {body}"
+        );
+        assert!(body.contains("42"), "must contain packet count: {body}");
+
+        handle.abort();
+    }
+
+    // ========== Path Routing Tests ==========
+
+    #[tokio::test]
+    async fn unknown_path_returns_404() {
+        let (addr, _events_rx, handle) = start_api("");
+        let mut sender = http_client(addr).await;
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/nonexistent")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn unsupported_method_returns_404() {
+        let (addr, _events_rx, handle) = start_api("");
+        let mut sender = http_client(addr).await;
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/config")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn api_path_prefix_strips_correctly() {
+        let (addr, mut events_rx, handle) = start_api("/api/v1");
+        let mut sender = http_client(addr).await;
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/config")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let fut = sender.send_request(req);
+
+        let mock = tokio::spawn(async move {
+            let event = recv_event(&mut events_rx).await;
+            if let Event::Api(ApiEvent::GetConfig { reply_tx }) = event {
+                reply_tx.send(test_config()).ok();
+            } else {
+                panic!("expected GetConfig, got {event:?}");
+            }
+        });
+
+        let resp = fut.await.unwrap();
+        mock.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        handle.abort();
+    }
+
+    // ========== Error Path Tests ==========
+
+    #[tokio::test]
+    async fn get_config_orchestrator_unavailable_returns_500() {
+        let (addr, events_rx, handle) = start_api("");
+        drop(events_rx);
+
+        let mut sender = http_client(addr).await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/config")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_string(resp).await;
+        assert!(body.contains("orchestrator unavailable"), "body: {body}");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn get_config_orchestrator_drops_reply_returns_500() {
+        let (addr, mut events_rx, handle) = start_api("");
+        let mut sender = http_client(addr).await;
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/config")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let fut = sender.send_request(req);
+
+        let mock = tokio::spawn(async move {
+            let event = recv_event(&mut events_rx).await;
+            if let Event::Api(ApiEvent::GetConfig { reply_tx }) = event {
+                drop(reply_tx);
+            } else {
+                panic!("expected GetConfig, got {event:?}");
+            }
+        });
+
+        let resp = fut.await.unwrap();
+        mock.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_string(resp).await;
+        assert!(body.contains("orchestrator dropped reply"), "body: {body}");
+
+        handle.abort();
     }
 }
