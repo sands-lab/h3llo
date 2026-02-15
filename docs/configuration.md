@@ -24,6 +24,7 @@ local:
 tuning: # optional, all fields have defaults
   packet_queue_depth: 2048 # optional, default: 2048
   socket_buffer_size: 16 # optional, default: 16 (MiB; 0 to use system default)
+  tun_tx_queue_len: 1000 # optional, default: 1000 (packets; Linux only)
   reconnect_interval: 3 # optional, default: 3 (seconds)
   metrics_push_interval: 1000 # optional, default: 1000 (milliseconds)
   dns_query_timeout: 2 # optional, default: 2 (seconds)
@@ -69,6 +70,7 @@ peers: # optional, default: []
 - `tuning` (optional): All fields have defaults; omit the entire section to use defaults.
 - `tuning.packet_queue_depth` (default `2048`): Bounded channel capacity for data-plane packet queues between actors. Counts batch messages, not individual packets; each batch carries one device I/O operation's worth of packets.
 - `tuning.socket_buffer_size` (default `16`): Socket buffer size in megabytes, applied to all UDP sockets via SO_RCVBUF and SO_SNDBUF. Set to `0` to skip buffer configuration and use system defaults. On Linux, the effective buffer size may be clamped by `net.core.rmem_max` / `net.core.wmem_max`; setting failures are logged as warnings without aborting.
+- `tuning.tun_tx_queue_len` (default `1000`): TUN interface transmit queue length in packets. Controls how many packets the kernel queues for transmission. Applied on Linux only; ignored on other platforms.
 - `tuning.reconnect_interval` (default `3`): Minimum seconds between `try_connect` attempts per peer.
 - `tuning.metrics_push_interval` (default `1000`): Milliseconds between periodic metric push emissions from actors to the orchestrator.
 - `tuning.dns_query_timeout` (default `2`): Seconds before a DNS query is considered timed out and retried.
