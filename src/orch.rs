@@ -364,26 +364,34 @@ impl Orchestrator {
         }
     }
 
-    /// Sends updated peer tokens to the H3 listener actor.
+    /// Synchronizes peer-derived state to downstream actors (H3 listener, DNS).
     ///
-    /// Rebuilds the full peer_id -> token map from current `self.peers` and sends
-    /// it as an `UpdatePeerTokens` command. No-op when H3 listener is not configured.
-    fn sync_h3_peer_tokens(&self) {
+    /// Called after any peer set mutation to fan out the latest snapshot.
+    fn sync_peers_to_actors(&self) {
+        // H3 listener: peer tokens
         if let Some(cmd_tx) = &self.h3_listener_cmd_tx {
-            let tokens: HashMap<String, String> = self
+            let tokens = self
                 .peers
                 .values()
-                .filter_map(|e| {
-                    e.config
+                .filter_map(|p| {
+                    p.config
                         .h3
                         .as_ref()
-                        .map(|h3| (e.config.id.clone(), h3.token.clone()))
+                        .map(|h3| (p.config.id.clone(), h3.token.clone()))
                 })
-                .collect();
+                .collect::<HashMap<_, _>>();
+
             if let Err(e) = cmd_tx.send(H3ListenerCommand::UpdatePeerTokens(tokens)) {
                 warn!(error = %e, "failed to send peer tokens update to H3 listener");
             }
         }
+
+        // DNS: hostnames
+        let peer_configs = self.peer_configs();
+        let hostnames = collect_hostnames(&peer_configs);
+        let _ = self
+            .dns_cmd_tx
+            .send(DnsCommand::SetHostnames { hosts: hostnames });
     }
 
     /// Updates internal routing table and system routes.
@@ -500,13 +508,6 @@ impl Orchestrator {
             let cert_path = Path::new(&h3_cfg.cert);
             let key_path = Path::new(&h3_cfg.key);
 
-            // Build peer tokens map for authentication
-            let peer_tokens: HashMap<String, String> = config
-                .peers
-                .iter()
-                .filter_map(|p| p.h3.as_ref().map(|h3| (p.id.clone(), h3.token.clone())))
-                .collect();
-
             // make: fallible I/O (socket bind, TLS config)
             let listener = make_h3_listener(
                 listen_addr,
@@ -517,9 +518,11 @@ impl Orchestrator {
             .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
 
             // spawn: infallible task creation; listener sends events through events_tx
+            // Initial peer tokens are empty; sync_peers_to_actors() populates them
+            // immediately after construction.
             let (cmd_tx, listener_handle, _bound_addr) = spawn_h3_listener(
                 listener,
-                peer_tokens,
+                HashMap::new(),
                 config.local.tun.mtu,
                 events_tx.clone(),
                 tuning,
@@ -586,7 +589,7 @@ impl Orchestrator {
             join_set.spawn(api_handle);
         }
 
-        let mut orch = Self {
+        let orch = Self {
             events_rx,
             events_tx,
             join_set,
@@ -604,10 +607,7 @@ impl Orchestrator {
             local: config.local,
             metrics: HashMap::new(),
         };
-        orch.sync_dns_hostnames();
-        // Note: sync_h3_peer_tokens is NOT called here because initial tokens
-        // are passed directly to spawn_h3_listener (lines above). Ongoing
-        // mutations via POST/DELETE API call sync_h3_peer_tokens explicitly.
+        orch.sync_peers_to_actors();
         Ok(orch)
     }
 
@@ -722,18 +722,6 @@ impl Orchestrator {
         }
     }
 
-    /// Sends updated hostname set to the DNS resolver after peer mutations.
-    ///
-    /// The DNS resolver will re-resolve and emit a snapshot, which triggers
-    /// routing and accepted-source updates in [`handle_dns_snapshot`].
-    fn sync_dns_hostnames(&mut self) {
-        let peer_configs = self.peer_configs();
-        let hostnames = collect_hostnames(&peer_configs);
-        let _ = self
-            .dns_cmd_tx
-            .send(DnsCommand::SetHostnames { hosts: hostnames });
-    }
-
     /// Handles POST /config — upsert peers with orchestrator-side validation.
     fn handle_post_config(&mut self, new_peers: Vec<Peer>) -> Result<(), String> {
         // Build merged peer map for validation (borrow-based, O(n+m)).
@@ -758,8 +746,7 @@ impl Orchestrator {
             }
         }
 
-        self.sync_dns_hostnames();
-        self.sync_h3_peer_tokens();
+        self.sync_peers_to_actors();
         info!(count = count, "API: peers upserted");
         Ok(())
     }
@@ -774,8 +761,7 @@ impl Orchestrator {
             }
         }
         if changed {
-            self.sync_dns_hostnames();
-            self.sync_h3_peer_tokens();
+            self.sync_peers_to_actors();
         }
     }
 
