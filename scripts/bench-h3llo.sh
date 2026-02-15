@@ -77,7 +77,7 @@ SCRIPT
     script="${script//TUN_IF/$tun}"
     script="${script//HEX_PORT/$hex_port}"
     if [[ -n "$remote" ]]; then
-        ssh "$REMOTE" "docker exec $ctr sh -c '$script'" 2>/dev/null || echo "0 0 0 0 0"
+        ssh "$REMOTE" "docker exec \"$ctr\" sh -c '$script'" 2>/dev/null || echo "0 0 0 0 0"
     else
         docker exec "$ctr" sh -c "$script" 2>/dev/null || echo "0 0 0 0 0"
     fi
@@ -106,27 +106,27 @@ done
 # --- Pull latest Docker image ---
 echo "Pulling latest image: $IMAGE ..."
 docker pull "$IMAGE"
-ssh "$REMOTE" "docker pull $IMAGE"
+ssh "$REMOTE" "docker pull \"$IMAGE\""
 
 # --- Cleanup ---
 cleanup() {
     echo "[cleanup] Stopping containers and cleaning up..."
     docker rm -f "$LOCAL_CTR" 2>/dev/null || true
-    ssh "$REMOTE" "docker rm -f $REMOTE_CTR" 2>/dev/null || true
+    ssh "$REMOTE" "docker rm -f \"$REMOTE_CTR\"" 2>/dev/null || true
     sleep 1
     # Remove leftover TUN devices (--net=host leaves them in the host namespace).
     # Requires NET_ADMIN, so use a privileged Docker container.
     docker run --rm --net=host --cap-add NET_ADMIN --entrypoint ip "$IMAGE" link del tun-bench 2>/dev/null || true
-    ssh "$REMOTE" "docker run --rm --net=host --cap-add NET_ADMIN --entrypoint ip $IMAGE link del tun-bench" 2>/dev/null || true
+    ssh "$REMOTE" "docker run --rm --net=host --cap-add NET_ADMIN --entrypoint ip \"$IMAGE\" link del tun-bench" 2>/dev/null || true
     # Remove generated cert dirs (local + remote)
     if [[ -d "$CERT_DIR" ]]; then rm -rf "$CERT_DIR"; fi
-    ssh "$REMOTE" "rm -rf $CERT_DIR" 2>/dev/null || true
+    ssh "$REMOTE" "rm -rf \"$CERT_DIR\"" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
 stop_containers() {
     docker rm -f "$LOCAL_CTR" 2>/dev/null || true
-    ssh "$REMOTE" "docker rm -f $REMOTE_CTR" 2>/dev/null || true
+    ssh "$REMOTE" "docker rm -f \"$REMOTE_CTR\"" 2>/dev/null || true
     sleep 2
 }
 
@@ -139,19 +139,19 @@ start_tunnel() {
 
     # Clean up leftover TUN devices from previous runs (requires NET_ADMIN)
     docker run --rm --net=host --cap-add NET_ADMIN "$IMAGE" sh -c "ip link del $TUN_IF" 2>/dev/null || true
-    ssh "$REMOTE" "docker run --rm --net=host --cap-add NET_ADMIN $IMAGE sh -c 'ip link del $TUN_IF'" 2>/dev/null || true
+    ssh "$REMOTE" "docker run --rm --net=host --cap-add NET_ADMIN \"$IMAGE\" sh -c 'ip link del $TUN_IF'" 2>/dev/null || true
 
-    ssh "$REMOTE" "mkdir -p $BENCH_DIR"
+    ssh "$REMOTE" "mkdir -p \"$BENCH_DIR\""
     scp -q "$BENCH_DIR/$remote_cfg" "$REMOTE:$BENCH_DIR/$remote_cfg"
 
     # Start remote container
-    ssh "$REMOTE" "docker rm -f $REMOTE_CTR 2>/dev/null; \
-        docker run -d --name $REMOTE_CTR \
+    ssh "$REMOTE" "docker rm -f \"$REMOTE_CTR\" 2>/dev/null; \
+        docker run -d --name \"$REMOTE_CTR\" \
         $DOCKER_FLAGS \
         -e RUST_LOG=h3llo=debug \
-        -v $BENCH_DIR:/etc/h3llo \
-        -v $CERT_DIR:/certs \
-        $IMAGE -c /etc/h3llo/$remote_cfg"
+        -v \"$BENCH_DIR\":/etc/h3llo \
+        -v \"$CERT_DIR\":/certs \
+        \"$IMAGE\" -c \"/etc/h3llo/$remote_cfg\""
 
     # Start local container
     docker rm -f "$LOCAL_CTR" 2>/dev/null || true
@@ -173,7 +173,7 @@ start_tunnel() {
         echo "  --- Local container logs (tail) ---"
         docker logs "$LOCAL_CTR" 2>&1 | tail -40
         echo "  --- Remote container logs (tail) ---"
-        ssh "$REMOTE" "docker logs $REMOTE_CTR 2>&1 | tail -40"
+        ssh "$REMOTE" "docker logs \"$REMOTE_CTR\" 2>&1 | tail -40"
         return 1
     fi
 }
@@ -181,14 +181,14 @@ start_tunnel() {
 # --- iperf3 helpers ---
 run_iperf_tcp() {
     echo "--- TCP ---"
-    ssh "$REMOTE" "docker exec -d $REMOTE_CTR iperf3 -s -1"
+    ssh "$REMOTE" "docker exec -d \"$REMOTE_CTR\" iperf3 -s -1"
     sleep 1
     docker exec "$LOCAL_CTR" iperf3 -c 10.0.0.2 -t "$IPERF_TIME"
 }
 
 run_iperf_udp() {
     echo "--- UDP 5Gbps (payload=${UDP_PAYLOAD}B, no frag) ---"
-    ssh "$REMOTE" "docker exec -d $REMOTE_CTR iperf3 -s -1"
+    ssh "$REMOTE" "docker exec -d \"$REMOTE_CTR\" iperf3 -s -1"
     sleep 1
     docker exec "$LOCAL_CTR" iperf3 -c 10.0.0.2 -u -b 5G -l "$UDP_PAYLOAD" -t "$IPERF_TIME"
 }
@@ -237,7 +237,7 @@ run_test() {
     echo "  --- h3llo logs: Local ($LOCAL_CTR) ---"
     docker logs "$LOCAL_CTR" 2>&1
     echo "  --- h3llo logs: Remote ($REMOTE_CTR) ---"
-    ssh "$REMOTE" "docker logs $REMOTE_CTR 2>&1"
+    ssh "$REMOTE" "docker logs \"$REMOTE_CTR\" 2>&1"
 
     stop_containers
 }
@@ -397,7 +397,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 echo "  Certificates generated in $CERT_DIR"
 
 # Copy certificates to remote node
-ssh "$REMOTE" "mkdir -p $CERT_DIR"
+ssh "$REMOTE" "mkdir -p \"$CERT_DIR\""
 scp -q "$CERT_DIR"/*.pem "$REMOTE:$CERT_DIR/"
 echo "  Certificates synced to $REMOTE:$CERT_DIR"
 
