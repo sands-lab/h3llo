@@ -78,7 +78,7 @@ RUN RUST_TARGET=$(cat /tmp/rust-target) && \
       echo "export CXX_${RUST_TARGET_ENV}=\"${TOOLCHAIN}-g++\""; \
       echo "export AR_${RUST_TARGET_ENV}=\"${TOOLCHAIN}-ar\""; \
       echo "export CARGO_TARGET_${UPPER_TARGET}_LINKER=\"${TOOLCHAIN}-gcc\""; \
-      echo "export BINDGEN_EXTRA_CLANG_ARGS=\"--sysroot=/opt/cross-toolchain/${TOOLCHAIN}/\""; \
+      echo "export BINDGEN_EXTRA_CLANG_ARGS=\"-isystem /opt/cross-toolchain/${TOOLCHAIN}/include\""; \
     } > /tmp/cross-env.sh
 
 RUN cargo install cargo-chef --locked
