@@ -100,13 +100,20 @@ async fn test_multipath_dual_subnet_mixed_transport() {
     let (node_a_cert, node_a_key) = generate_test_certs(temp_dir.path(), &name_a, ctx.network());
     let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), &name_b, ctx.network());
 
+    // Peer IDs must be unique within a config. Use "-bare"/"-h3" suffixes to
+    // distinguish the two transport peers pointing at the same container.
+    let peer_b_bare = format!("{name_b}-bare");
+    let peer_b_h3 = format!("{name_b}-h3");
+    let peer_a_bare = format!("{name_a}-bare");
+    let peer_a_h3 = format!("{name_a}-h3");
+
     // Create config files
     let node_a_config = multipath_config(
         "10.0.0.1/24",
         "10.0.1.1/24",
-        &name_b,
+        &peer_b_bare,
         &ctx.fqdn("node-b-mp"),
-        &name_b,
+        &peer_b_h3,
         &ctx.fqdn("node-b-mp"),
         "/certs/cert.pem",
         "/certs/key.pem",
@@ -114,9 +121,9 @@ async fn test_multipath_dual_subnet_mixed_transport() {
     let node_b_config = multipath_config(
         "10.0.0.2/24",
         "10.0.1.2/24",
-        &name_a,
+        &peer_a_bare,
         &ctx.fqdn("node-a-mp"),
-        &name_a,
+        &peer_a_h3,
         &ctx.fqdn("node-a-mp"),
         "/certs/cert.pem",
         "/certs/key.pem",
