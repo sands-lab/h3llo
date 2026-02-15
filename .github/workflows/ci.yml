@@ -51,6 +51,7 @@ jobs:
         with:
           name: ci-builder
           keep-state: true
+          cleanup: false
       - name: Build Docker test image
         uses: docker/build-push-action@v6
         with:
