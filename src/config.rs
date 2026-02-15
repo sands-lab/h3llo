@@ -313,6 +313,15 @@ pub enum ValidationError {
     /// `tuning.packet_queue_depth` must be > 0 (mpsc::channel(0) panics).
     #[error("tuning.packet_queue_depth must be greater than 0")]
     TuningPacketQueueDepthZero,
+    /// A tuning Duration field must be greater than zero.
+    ///
+    /// Zero values cause `tokio::time::interval` panics or semantically
+    /// broken behavior (instant timeouts, no debouncing).
+    #[error("tuning.{field} must be greater than 0")]
+    TuningDurationZero {
+        /// The field name (e.g., "reconnect_interval").
+        field: &'static str,
+    },
     /// `tuning.h3_keepalive_interval` must be strictly less than `tuning.h3_max_idle_timeout`.
     #[error(
         "tuning.h3_keepalive_interval ({keepalive:?}) must be less than \
@@ -400,6 +409,24 @@ impl Config {
         if self.tuning.packet_queue_depth == 0 {
             errors.push(ValidationError::TuningPacketQueueDepthZero);
         }
+
+        // Duration fields that must be strictly positive.
+        // dns_refresh_interval is intentionally excluded: zero disables periodic refresh.
+        let duration_checks: &[(&str, Duration)] = &[
+            ("reconnect_interval", self.tuning.reconnect_interval),
+            ("metrics_push_interval", self.tuning.metrics_push_interval),
+            ("dns_query_timeout", self.tuning.dns_query_timeout),
+            ("dns_snapshot_delay", self.tuning.dns_snapshot_delay),
+            ("h3_handshake_timeout", self.tuning.h3_handshake_timeout),
+            ("h3_max_idle_timeout", self.tuning.h3_max_idle_timeout),
+            ("h3_keepalive_interval", self.tuning.h3_keepalive_interval),
+        ];
+        for &(field, dur) in duration_checks {
+            if dur.is_zero() {
+                errors.push(ValidationError::TuningDurationZero { field });
+            }
+        }
+
         if self.tuning.h3_keepalive_interval >= self.tuning.h3_max_idle_timeout {
             errors.push(ValidationError::H3KeepaliveExceedsIdleTimeout {
                 keepalive: self.tuning.h3_keepalive_interval,
@@ -2077,5 +2104,56 @@ peers:
 "#;
         let result = Config::load_from_str(yaml);
         assert!(matches!(result, Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn rejects_zero_duration_fields() {
+        let fields: &[(&str, fn(&mut Tuning))] = &[
+            ("reconnect_interval", |t| {
+                t.reconnect_interval = Duration::ZERO
+            }),
+            ("metrics_push_interval", |t| {
+                t.metrics_push_interval = Duration::ZERO
+            }),
+            ("dns_query_timeout", |t| {
+                t.dns_query_timeout = Duration::ZERO
+            }),
+            ("dns_snapshot_delay", |t| {
+                t.dns_snapshot_delay = Duration::ZERO
+            }),
+            ("h3_handshake_timeout", |t| {
+                t.h3_handshake_timeout = Duration::ZERO
+            }),
+            ("h3_max_idle_timeout", |t| {
+                t.h3_max_idle_timeout = Duration::ZERO
+            }),
+            ("h3_keepalive_interval", |t| {
+                t.h3_keepalive_interval = Duration::ZERO
+            }),
+        ];
+        for &(field_name, setter) in fields {
+            let mut config = sample_h3_config();
+            setter(&mut config.tuning);
+            let err = config.validate().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Validation(ValidationErrors(ref errs))
+                        if errs.iter().any(|e| matches!(
+                            e,
+                            ValidationError::TuningDurationZero { field } if *field == field_name
+                        ))
+                ),
+                "expected TuningDurationZero for field '{field_name}'"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_zero_dns_refresh_interval() {
+        let mut config = sample_h3_config();
+        config.tuning.dns_refresh_interval = Duration::ZERO;
+        // dns_refresh_interval = 0 means "disable periodic refresh" — this is valid
+        assert!(config.validate().is_ok());
     }
 }
