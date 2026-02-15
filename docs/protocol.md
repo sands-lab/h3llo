@@ -33,7 +33,7 @@ h3llo intentionally omits the following optional features from RFC 9484:
 H3 connection management:
 - Build one connection per peer using `peers[].h3.endpoint` and auto-detected bindif.
 - When DNS returns multiple IPs, dial attempts are spawned in parallel for all IPs; first successful connection wins.
-- The single connection is used until it disconnects or its IP expires. Reconnection is not yet implemented.
+- The single connection is used until it disconnects or its IP expires. Reconnection is automatic, rate-limited by `tuning.reconnect_interval` (default 3 seconds).
 - Failures: TLS/handshake failures count as dial failures. Bind failures warn and fall back to unbound sockets, which can risk recursive routing if the system route points to the TUN.
 
 ```mermaid
@@ -137,7 +137,7 @@ Management API summary: a localhost-bound HTTP/1.1 server for runtime peer manag
 - `GET /config` — returns the full configuration snapshot in YAML, matching the shape documented in [docs/configuration.md](configuration.md).
 - `POST /config` — accepts a YAML `peers` list. Each entry must be a **complete** peer configuration (not a partial update); the entry **replaces** any existing peer with the same `peers[].id`. Peers not present in the payload are unchanged. Only `peers` is accepted at the top level; all other keys are rejected with `400 Bad Request`. On success, returns the full updated configuration snapshot in YAML (same format as `GET /config`).
 - `DELETE /config` — accepts a YAML body with `peers` (list of peer entries; only `id` is required per entry). Matching peers are removed. Non-existent IDs are silently ignored. On success, returns the full updated configuration snapshot in YAML (same format as `GET /config`). Only `peers` is accepted at the top level; all other keys are rejected with `400 Bad Request`.
-- `GET /events` — Server-Sent Events (SSE) stream. TBD.
+- `GET /events` — Server-Sent Events (SSE) stream. Not yet implemented.
 - `GET /metrics` — Returns transport metrics in OpenMetrics text format (`application/openmetrics-text; version=1.0.0; charset=utf-8`). Counter families are suffixed with `_total` per OpenMetrics specification. Exposes cumulative transport counters grouped by kind, direction, peer, and drop reason. Designed for Prometheus scraping at `scrape_interval` aligned with `tuning.metrics_push_interval`. Rendered by `prometheus-client` crate via the `Collector` trait.
 
 #### Semantics
