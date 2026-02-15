@@ -328,6 +328,9 @@ mod tests {
         c.record_queue_full(Duration::from_secs(1));
         assert_eq!(c.queue_full_count, u64::MAX);
         assert_eq!(c.queue_full_duration, Duration::MAX);
+        c.record_would_block(Duration::from_secs(1));
+        assert_eq!(c.would_block_count, u64::MAX);
+        assert_eq!(c.would_block_duration, Duration::MAX);
     }
 }
 

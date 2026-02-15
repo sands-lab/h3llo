@@ -203,5 +203,10 @@ mod tests {
         let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
         let result = send_or_backpressure(&tx, 1, &mut counters).await;
         assert!(result.is_err());
+        assert_eq!(counters.stats.congestion.queue_full_count, 0);
+        assert_eq!(
+            counters.stats.congestion.queue_full_duration,
+            Duration::ZERO
+        );
     }
 }

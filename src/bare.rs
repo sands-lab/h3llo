@@ -183,6 +183,7 @@ pub fn spawn_udp_rx(
                             let count = batch.len() as u64;
                             let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
                             if send_or_backpressure(&packet_tx, batch, &mut counters).await.is_err() {
+                                counters.record_drop(DropReason::ChannelClosed, count, total_bytes);
                                 return Ok(());
                             }
                             counters.record_success(count, total_bytes);
