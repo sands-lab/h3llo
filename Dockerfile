@@ -1,6 +1,11 @@
 # syntax=docker/dockerfile:1
-# Multi-stage Dockerfile for h3llo BareUDP VPN (requires Docker Buildx)
-# Debian builder + Alpine runtime for static musl binaries.
+# Multi-stage Dockerfile for h3llo BareUDP VPN (requires Docker Buildx).
+# Cross-compiles static musl binaries on the build host (no QEMU emulation
+# for Rust compilation), then copies them into a minimal Alpine runtime image
+# matching the target platform.
+#
+# Supported platforms: linux/amd64, linux/arm64, linux/riscv64
+#
 # Uses cargo-chef for Docker layer caching of dependencies, plus BuildKit
 # cache mounts to persist cargo registry and compilation artifacts across
 # builds on the same host. The two mechanisms are complementary:
@@ -12,11 +17,38 @@
 #   test              - Adds diagnostic tools for integration tests
 #
 # Usage:
-#   docker buildx build --target runtime -t h3llo:latest --load .
-#   docker buildx build --target test -t h3llo:test --load .
+#   docker buildx build --platform linux/amd64 --target runtime -t h3llo:latest --load .
+#   docker buildx build --platform linux/arm64 --target runtime -t h3llo:arm64 --load .
+#   docker buildx build --platform linux/amd64 --target test -t h3llo:test --load .
 
-# Stage 1: Chef - Install cargo-chef with Debian (supports libclang dynamic loading)
-FROM rust:slim-trixie AS chef
+# Stage 1: Chef - Install cargo-chef on native build platform (no QEMU emulation)
+FROM --platform=$BUILDPLATFORM rust:slim-trixie AS chef
+
+# Map Docker TARGETARCH to Rust target triple and musl-cross toolchain name.
+# TARGETARCH is set automatically by buildx (amd64, arm64, riscv64).
+# Note: Rust uses riscv64gc (with gc), musl-cross uses riscv64 (without gc).
+ARG TARGETARCH
+RUN <<'EOF'
+set -e
+case "$TARGETARCH" in
+  amd64)
+    echo "x86_64-unknown-linux-musl"   > /tmp/rust-target
+    echo "x86_64-unknown-linux-musl"   > /tmp/toolchain-name
+    ;;
+  arm64)
+    echo "aarch64-unknown-linux-musl"  > /tmp/rust-target
+    echo "aarch64-unknown-linux-musl"  > /tmp/toolchain-name
+    ;;
+  riscv64)
+    echo "riscv64gc-unknown-linux-musl" > /tmp/rust-target
+    echo "riscv64-unknown-linux-musl"   > /tmp/toolchain-name
+    ;;
+  *)
+    echo "Unsupported TARGETARCH: $TARGETARCH" >&2
+    exit 1
+    ;;
+esac
+EOF
 
 # Install boring-sys dependencies, curl/xz for downloading musl toolchain, and jq for parsing Cargo JSON output
 RUN apt-get update && apt-get install -y \
@@ -25,38 +57,48 @@ RUN apt-get update && apt-get install -y \
     clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Download musl cross-compilation toolchain from GitHub (auto-redirects to latest release)
+# Download musl cross-compilation toolchain for target architecture
 # Source: https://github.com/cross-tools/musl-cross
-RUN curl -sSfL https://github.com/cross-tools/musl-cross/releases/latest/download/x86_64-unknown-linux-musl.tar.xz \
-    | tar -xJf - -C /opt
-ENV PATH="/opt/x86_64-unknown-linux-musl/bin:$PATH"
+RUN TOOLCHAIN=$(cat /tmp/toolchain-name) && \
+    curl -sSfL "https://github.com/cross-tools/musl-cross/releases/latest/download/${TOOLCHAIN}.tar.xz" \
+    | tar -xJf - -C /opt && \
+    ln -sfn "/opt/${TOOLCHAIN}" /opt/cross-toolchain
+ENV PATH="/opt/cross-toolchain/bin:$PATH"
 
-# Add musl target
-RUN rustup target add x86_64-unknown-linux-musl
-
-# Configure compilers for musl target
-ENV CC_x86_64_unknown_linux_musl=x86_64-unknown-linux-musl-gcc
-ENV CXX_x86_64_unknown_linux_musl=x86_64-unknown-linux-musl-g++
-ENV AR_x86_64_unknown_linux_musl=x86_64-unknown-linux-musl-ar
-ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-unknown-linux-musl-gcc
+# Add musl target and configure cross-compiler env vars
+RUN RUST_TARGET=$(cat /tmp/rust-target) && \
+    TOOLCHAIN=$(cat /tmp/toolchain-name) && \
+    RUST_TARGET_ENV=$(echo "${RUST_TARGET}" | tr '-' '_') && \
+    UPPER_TARGET=$(echo "${RUST_TARGET_ENV}" | tr '[:lower:]' '[:upper:]') && \
+    rustup target add "${RUST_TARGET}" && \
+    { \
+      echo "export RUST_TARGET=\"${RUST_TARGET}\""; \
+      echo "export TOOLCHAIN=\"${TOOLCHAIN}\""; \
+      echo "export CC_${RUST_TARGET_ENV}=\"${TOOLCHAIN}-gcc\""; \
+      echo "export CXX_${RUST_TARGET_ENV}=\"${TOOLCHAIN}-g++\""; \
+      echo "export AR_${RUST_TARGET_ENV}=\"${TOOLCHAIN}-ar\""; \
+      echo "export CARGO_TARGET_${UPPER_TARGET}_LINKER=\"${TOOLCHAIN}-gcc\""; \
+    } > /tmp/cross-env.sh
 
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
 # Stage 2: Planner - Generate dependency recipe
-FROM chef AS planner
+FROM --platform=$BUILDPLATFORM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 3: Builder - Build dependencies then application
-FROM chef AS builder
+FROM --platform=$BUILDPLATFORM chef AS builder
+ARG TARGETARCH
 COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies (cached as long as recipe.json unchanged)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target,sharing=locked \
-    cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+    --mount=type=cache,target=/app/target,sharing=locked,id=target-$TARGETARCH \
+    . /tmp/cross-env.sh && \
+    cargo chef cook --release --target "$RUST_TARGET" --recipe-path recipe.json
 # Build application and test binaries.
 # Cache mount contents are NOT stored in image layers — we must copy
 # artifacts to /app/out/ within this same RUN instruction.
@@ -67,26 +109,29 @@ COPY src ./src
 COPY tests ./tests
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked,id=target-$TARGETARCH \
+    . /tmp/cross-env.sh && \
     set -e && \
-    cargo build --release --target x86_64-unknown-linux-musl --bin h3llo && \
+    cargo build --release --target "$RUST_TARGET" --bin h3llo && \
     TUN_BIN=$(cargo test --test integration-container-tun --release \
-        --target x86_64-unknown-linux-musl --no-run \
+        --target "$RUST_TARGET" --no-run \
         --message-format=json \
         | jq -r 'select(.target.name == "integration-container-tun") | .executable // empty') && \
     ROUTE_BIN=$(cargo test --test integration-container-route --release \
-        --target x86_64-unknown-linux-musl --no-run \
+        --target "$RUST_TARGET" --no-run \
         --message-format=json \
         | jq -r 'select(.target.name == "integration-container-route") | .executable // empty') && \
     test -n "$TUN_BIN" && test -n "$ROUTE_BIN" && \
     mkdir -p /app/out && \
-    cp /app/target/x86_64-unknown-linux-musl/release/h3llo /app/out/ && \
-    strip /app/out/h3llo && \
+    cp "/app/target/${RUST_TARGET}/release/h3llo" /app/out/ && \
+    "${TOOLCHAIN}-strip" /app/out/h3llo && \
     cp "$TUN_BIN" /app/out/integration-container-tun && \
     cp "$ROUTE_BIN" /app/out/integration-container-route && \
-    strip /app/out/*
+    "${TOOLCHAIN}-strip" /app/out/integration-container-tun && \
+    "${TOOLCHAIN}-strip" /app/out/integration-container-route
 
-# Stage 4: Runtime - Minimal Alpine production image
+# Stage 4: Runtime - Minimal Alpine production image (target platform)
+# This stage uses TARGETPLATFORM implicitly — Alpine pulls the correct arch.
 FROM alpine:3.21 AS runtime
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/out/h3llo /usr/local/bin/h3llo
