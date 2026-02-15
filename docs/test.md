@@ -210,7 +210,7 @@ cargo test --test integration -- tun --ignored --nocapture
 Container binary: `tests/integration/container/route.rs`
 Orchestrator: `tests/integration/native/route.rs`
 
-Verifies `sync_tun_routes` with real `RouteManagerHandle` (netlink API) inside
+Verifies `sync_tun_routes` with real `AsyncRouteManager` (netlink API) inside
 a privileged container. Creates dummy interfaces and performs binary-internal
 verification via `handle.list()`.
 

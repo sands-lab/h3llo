@@ -11,7 +11,8 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::{Config, Peer};
 use crate::events::{
-    ApiEvent, Direction, DropReason, Event, TransportKind, TransportLabels, TransportMetrics,
+    ApiEvent, Direction, DropReason, Event, PktCounters, TransportKind, TransportLabels,
+    TransportMetrics,
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -81,43 +82,42 @@ impl Collector for SnapshotCollector {
             |m| (m.stats.succeeded.batches, m.stats.dropped.batches),
         )?;
 
-        // --- h3llo_transport_drops ---
-        {
-            let counter = ConstCounter::new(0u64);
-            let mut metric_enc = encoder.encode_descriptor(
-                "h3llo_transport_drops",
-                "Cumulative drop count by reason.",
-                None,
-                counter.metric_type(),
-            )?;
-            for m in self.0.values() {
-                for (reason, counters) in &m.stats.drop_reasons {
-                    let labels = DropLabelSet::from_metrics(m, *reason);
-                    ConstCounter::new(counters.packets)
-                        .encode(metric_enc.encode_family(&labels)?)?;
-                }
-            }
-        }
-
-        // --- h3llo_transport_drop_bytes ---
-        {
-            let counter = ConstCounter::new(0u64);
-            let mut metric_enc = encoder.encode_descriptor(
-                "h3llo_transport_drop_bytes",
-                "Cumulative drop bytes by reason.",
-                None,
-                counter.metric_type(),
-            )?;
-            for m in self.0.values() {
-                for (reason, counters) in &m.stats.drop_reasons {
-                    let labels = DropLabelSet::from_metrics(m, *reason);
-                    ConstCounter::new(counters.bytes).encode(metric_enc.encode_family(&labels)?)?;
-                }
-            }
-        }
+        encode_drop_counter_family(
+            &mut encoder,
+            "h3llo_transport_drops",
+            "Cumulative drop count by reason.",
+            &self.0,
+            |c| c.packets,
+        )?;
+        encode_drop_counter_family(
+            &mut encoder,
+            "h3llo_transport_drop_bytes",
+            "Cumulative drop bytes by reason.",
+            &self.0,
+            |c| c.bytes,
+        )?;
 
         Ok(())
     }
+}
+
+/// Encodes a per-reason drop counter family, reducing duplication between drops and drop_bytes.
+fn encode_drop_counter_family(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    store: &HashMap<TransportLabels, TransportMetrics>,
+    field: fn(&PktCounters) -> u64,
+) -> Result<(), fmt::Error> {
+    let counter = ConstCounter::new(0u64);
+    let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+    for m in store.values() {
+        for (reason, counters) in &m.stats.drop_reasons {
+            let labels = DropLabelSet::from_metrics(m, *reason);
+            ConstCounter::new(field(counters)).encode(metric_enc.encode_family(&labels)?)?;
+        }
+    }
+    Ok(())
 }
 
 /// Encodes a succeeded/dropped counter family, reducing duplication.
@@ -387,23 +387,36 @@ fn yaml_config_response(config: &Config) -> Response<Full<Bytes>> {
     }
 }
 
-async fn handle_get_config(events_tx: &mpsc::UnboundedSender<Event>) -> Response<Full<Bytes>> {
+/// Sends an event carrying a oneshot reply channel and awaits the response.
+///
+/// Returns the orchestrator's reply or an HTTP 500 error response.
+async fn send_and_await<T>(
+    events_tx: &mpsc::UnboundedSender<Event>,
+    make_event: impl FnOnce(oneshot::Sender<T>) -> Event,
+) -> Result<T, Response<Full<Bytes>>> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    if events_tx
-        .send(Event::Api(ApiEvent::GetConfig { reply_tx }))
-        .is_err()
-    {
-        return response(
+    events_tx.send(make_event(reply_tx)).map_err(|_| {
+        response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "orchestrator unavailable",
-        );
-    }
-    match reply_rx.await {
-        Ok(config) => yaml_config_response(&config),
-        Err(_) => response(
+        )
+    })?;
+    reply_rx.await.map_err(|_| {
+        response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "orchestrator dropped reply",
-        ),
+        )
+    })
+}
+
+async fn handle_get_config(events_tx: &mpsc::UnboundedSender<Event>) -> Response<Full<Bytes>> {
+    match send_and_await(events_tx, |reply_tx| {
+        Event::Api(ApiEvent::GetConfig { reply_tx })
+    })
+    .await
+    {
+        Ok(config) => yaml_config_response(&config),
+        Err(err_resp) => err_resp,
     }
 }
 
@@ -421,26 +434,15 @@ async fn handle_post_config(
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("invalid YAML: {e}")),
     };
 
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if events_tx
-        .send(Event::Api(ApiEvent::PostConfig {
-            peers: payload.peers,
-            reply_tx,
-        }))
-        .is_err()
+    let peers = payload.peers;
+    match send_and_await(events_tx, |reply_tx| {
+        Event::Api(ApiEvent::PostConfig { peers, reply_tx })
+    })
+    .await
     {
-        return response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "orchestrator unavailable",
-        );
-    }
-    match reply_rx.await {
         Ok(Ok(config)) => yaml_config_response(&config),
         Ok(Err(e)) => response(StatusCode::BAD_REQUEST, &e),
-        Err(_) => response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "orchestrator dropped reply",
-        ),
+        Err(err_resp) => err_resp,
     }
 }
 
@@ -459,23 +461,14 @@ async fn handle_delete_config(
     };
     let peer_ids: Vec<String> = payload.peers.into_iter().map(|p| p.id).collect();
 
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if events_tx
-        .send(Event::Api(ApiEvent::DeleteConfig { peer_ids, reply_tx }))
-        .is_err()
+    match send_and_await(events_tx, |reply_tx| {
+        Event::Api(ApiEvent::DeleteConfig { peer_ids, reply_tx })
+    })
+    .await
     {
-        return response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "orchestrator unavailable",
-        );
-    }
-    match reply_rx.await {
         Ok(Ok(config)) => yaml_config_response(&config),
         Ok(Err(e)) => response(StatusCode::BAD_REQUEST, &e),
-        Err(_) => response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "orchestrator dropped reply",
-        ),
+        Err(err_resp) => err_resp,
     }
 }
 
@@ -484,17 +477,11 @@ async fn handle_delete_config(
 /// Requests a raw metrics snapshot from the orchestrator via event channel,
 /// then renders OpenMetrics text locally using `prometheus-client`.
 async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Response<Full<Bytes>> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if events_tx
-        .send(Event::Api(ApiEvent::GetMetricsSnapshot { reply_tx }))
-        .is_err()
+    match send_and_await(events_tx, |reply_tx| {
+        Event::Api(ApiEvent::GetMetricsSnapshot { reply_tx })
+    })
+    .await
     {
-        return response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "orchestrator unavailable",
-        );
-    }
-    match reply_rx.await {
         Ok(snapshot) => {
             let text = encode_metrics_snapshot(snapshot);
             Response::builder()
@@ -506,10 +493,7 @@ async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Respons
                 .body(Full::new(Bytes::from(text)))
                 .expect("infallible: response builder with valid constants")
         }
-        Err(_) => response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "orchestrator dropped reply",
-        ),
+        Err(err_resp) => err_resp,
     }
 }
 

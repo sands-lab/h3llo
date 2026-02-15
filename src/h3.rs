@@ -99,11 +99,25 @@ fn is_success_status(status: &[u8]) -> bool {
     status.len() == 3 && status[0] == b'2'
 }
 
-/// Validates that headers contain `capsule-protocol: ?1` per RFC 9484.
-fn has_capsule_protocol(headers: &[Header]) -> bool {
+/// Finds a header by case-insensitive name lookup and returns its value.
+fn find_header_value<'a>(headers: &'a [Header], name: &[u8]) -> Option<&'a [u8]> {
     headers
         .iter()
-        .any(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol") && h.value() == b"?1")
+        .find(|h| h.name().eq_ignore_ascii_case(name))
+        .map(|h| h.value())
+}
+
+/// Creates a keepalive sender from a QUIC command sender.
+fn make_keepalive_sender<C: From<QuicCommand> + Send + 'static>(
+    quic_cmd_tx: tokio_quiche::http3::driver::RequestSender<C, QuicCommand>,
+) -> KeepaliveSender {
+    Box::new(move || {
+        quic_cmd_tx
+            .send(QuicCommand::Custom(Box::new(|conn| {
+                conn.send_ack_eliciting().ok();
+            })))
+            .is_ok()
+    })
 }
 
 /// Sends HTTP/3 response headers via the OutboundFrameSender.
@@ -140,30 +154,15 @@ async fn send_response_headers(
 ///
 /// `Ok(())` if all required headers are present and valid, or an error reason.
 fn validate_connect_ip_headers(headers: &[Header]) -> Result<(), &'static str> {
-    let method = headers
-        .iter()
-        .find(|h| h.name() == b":method")
-        .map(|h| h.value());
-    if method != Some(b"CONNECT") {
+    if find_header_value(headers, b":method") != Some(b"CONNECT") {
         return Err("invalid :method, expected CONNECT");
     }
-
-    let protocol = headers
-        .iter()
-        .find(|h| h.name() == b":protocol")
-        .map(|h| h.value());
-    if protocol != Some(b"connect-ip") {
+    if find_header_value(headers, b":protocol") != Some(b"connect-ip") {
         return Err("invalid :protocol, expected connect-ip");
     }
-
-    let capsule = headers
-        .iter()
-        .find(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol"))
-        .map(|h| h.value());
-    if capsule != Some(b"?1") {
+    if find_header_value(headers, b"capsule-protocol") != Some(b"?1") {
         return Err("invalid capsule-protocol, expected ?1");
     }
-
     Ok(())
 }
 
@@ -272,14 +271,7 @@ async fn handle_h3_connection(
                 }
                 debug!(%peer_id, %remote_addr, "H3 connection established");
 
-                let cmd_tx = quic_cmd_tx.clone();
-                let keepalive_tx: KeepaliveSender = Box::new(move || {
-                    cmd_tx
-                        .send(QuicCommand::Custom(Box::new(|conn| {
-                            conn.send_ack_eliciting().ok();
-                        })))
-                        .is_ok()
-                });
+                let keepalive_tx = make_keepalive_sender(quic_cmd_tx.clone());
 
                 let conn = H3Connection {
                     peer_id,
@@ -527,6 +519,9 @@ pub async fn dial_h3<P: RouteProbe>(
 
     // Wait for response headers and NewFlow event with timeout
     let handshake_result = time::timeout(tuning.h3_handshake_timeout, async {
+        // These three fields are kept as separate Options (rather than a single
+        // Option<(_, _, _)>) because the NewFlow delivery may not be atomic —
+        // per-field errors aid debugging when a partial state is observed.
         let mut datagram_tx: Option<OutboundFrameSender> = None;
         let mut datagram_rx: Option<InboundFrameStream> = None;
         let mut flow_id: Option<u64> = None;
@@ -554,7 +549,7 @@ pub async fn dial_h3<P: RouteProbe>(
                     }
 
                     // Validate capsule-protocol header per RFC 9484
-                    if !has_capsule_protocol(&incoming.headers) {
+                    if find_header_value(&incoming.headers, b"capsule-protocol") != Some(b"?1") {
                         warn!(%remote_addr, "server response missing capsule-protocol: ?1");
                         return Err(DialError::Handshake(
                             "server response missing capsule-protocol: ?1".to_string(),
@@ -612,13 +607,7 @@ pub async fn dial_h3<P: RouteProbe>(
 
     let (datagram_tx, datagram_rx, flow_id) = handshake_result;
 
-    let keepalive_tx: KeepaliveSender = Box::new(move || {
-        quic_cmd_tx
-            .send(QuicCommand::Custom(Box::new(|conn| {
-                conn.send_ack_eliciting().ok();
-            })))
-            .is_ok()
-    });
+    let keepalive_tx = make_keepalive_sender(quic_cmd_tx);
 
     Ok(H3Connection {
         peer_id: peer_id.to_string(),
@@ -1292,39 +1281,37 @@ mod tests {
         }
     }
 
-    // ========== Capsule-Protocol Helper Tests ==========
+    // ========== find_header_value Tests ==========
 
     #[test]
-    fn has_capsule_protocol_accepts_valid_header() {
+    fn find_header_value_exact_match() {
         let headers = vec![
-            Header::new(b":status", b"200"),
+            Header::new(b":method", b"CONNECT"),
             Header::new(b"capsule-protocol", b"?1"),
         ];
-        assert!(has_capsule_protocol(&headers));
+        assert_eq!(
+            find_header_value(&headers, b":method"),
+            Some(b"CONNECT".as_slice())
+        );
+        assert_eq!(
+            find_header_value(&headers, b"capsule-protocol"),
+            Some(b"?1".as_slice())
+        );
     }
 
     #[test]
-    fn has_capsule_protocol_rejects_missing_header() {
+    fn find_header_value_case_insensitive() {
+        let headers = vec![Header::new(b"Capsule-Protocol", b"?1")];
+        assert_eq!(
+            find_header_value(&headers, b"capsule-protocol"),
+            Some(b"?1".as_slice())
+        );
+    }
+
+    #[test]
+    fn find_header_value_missing() {
         let headers = vec![Header::new(b":status", b"200")];
-        assert!(!has_capsule_protocol(&headers));
-    }
-
-    #[test]
-    fn has_capsule_protocol_rejects_wrong_value() {
-        let headers = vec![
-            Header::new(b":status", b"200"),
-            Header::new(b"capsule-protocol", b"?0"),
-        ];
-        assert!(!has_capsule_protocol(&headers));
-    }
-
-    #[test]
-    fn has_capsule_protocol_case_insensitive() {
-        let headers = vec![
-            Header::new(b":status", b"200"),
-            Header::new(b"Capsule-Protocol", b"?1"),
-        ];
-        assert!(has_capsule_protocol(&headers));
+        assert_eq!(find_header_value(&headers, b"capsule-protocol"), None);
     }
 
     // ========== dial_h3 Error Tests ==========

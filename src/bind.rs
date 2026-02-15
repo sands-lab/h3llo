@@ -238,8 +238,8 @@ pub async fn select_bind_interface<P: RouteProbe>(
 
     let mut candidates = match preferred_if {
         Some(preferred) => {
-            let filtered =
-                filter_preferred_interfaces(interfaces.clone(), Some(vec![preferred.to_string()]));
+            let preferred_vec = vec![preferred.to_string()];
+            let filtered = filter_preferred_interfaces(interfaces.clone(), Some(&preferred_vec));
             if filtered.is_empty() {
                 warn!(
                     interface = %preferred,
@@ -480,15 +480,15 @@ async fn probe_interfaces_impl(
 /// Filters probed interfaces against an optional preferred list while preserving route order.
 fn filter_preferred_interfaces(
     names: Vec<String>,
-    preferred_ifs: Option<Vec<String>>,
+    preferred_ifs: Option<&[String]>,
 ) -> Vec<String> {
     let Some(preferred) = preferred_ifs else {
         return names;
     };
 
-    let allowed: HashSet<String> = preferred
-        .into_iter()
-        .map(|iface| iface.trim().to_string())
+    let allowed: HashSet<&str> = preferred
+        .iter()
+        .map(|iface| iface.trim())
         .filter(|iface| !iface.is_empty())
         .collect();
 
@@ -498,7 +498,7 @@ fn filter_preferred_interfaces(
 
     names
         .into_iter()
-        .filter(|name| allowed.contains(name))
+        .filter(|name| allowed.contains(name.as_str()))
         .collect()
 }
 
@@ -661,14 +661,14 @@ mod tests {
     fn filters_interfaces_by_preference() {
         let names = vec!["eth0".to_string(), "eth1".to_string(), "wlan0".to_string()];
         let preferred = Some(vec![" wlan0".to_string(), "eth1".to_string()]);
-        let filtered = filter_preferred_interfaces(names, preferred);
+        let filtered = filter_preferred_interfaces(names, preferred.as_deref());
         assert_eq!(filtered, vec!["eth1".to_string(), "wlan0".to_string()]);
     }
 
     #[test]
     fn returns_empty_when_preferences_provided_but_no_match() {
         let names = vec!["eth0".to_string(), "eth1".to_string()];
-        let filtered = filter_preferred_interfaces(names, Some(Vec::new()));
+        let filtered = filter_preferred_interfaces(names, Some(&[]));
         assert!(filtered.is_empty());
     }
 

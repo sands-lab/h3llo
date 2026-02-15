@@ -6,7 +6,7 @@
 use crate::actor::ActorExitResult;
 use crate::bind::lookup_ifindex;
 use ipnet::IpNet;
-use route_manager::AsyncRouteManager;
+pub use route_manager::AsyncRouteManager;
 pub use route_manager::Route;
 use std::collections::HashSet;
 use std::io;
@@ -47,30 +47,17 @@ pub trait RouteHandle: Send + 'static {
         -> impl std::future::Future<Output = io::Result<()>> + Send;
 }
 
-/// Wrapper around `route_manager::AsyncRouteManager`.
-pub struct RouteManagerHandle {
-    inner: AsyncRouteManager,
-}
-
-impl RouteManagerHandle {
-    /// Creates a handle backed by `route_manager`'s async API.
-    pub fn new() -> io::Result<Self> {
-        let inner = AsyncRouteManager::new()?;
-        Ok(Self { inner })
-    }
-}
-
-impl RouteHandle for RouteManagerHandle {
+impl RouteHandle for AsyncRouteManager {
     async fn list(&mut self) -> io::Result<Vec<Route>> {
-        self.inner.list().await
+        AsyncRouteManager::list(self).await
     }
 
     async fn add(&mut self, route: &Route) -> io::Result<()> {
-        self.inner.add(route).await
+        AsyncRouteManager::add(self, route).await
     }
 
     async fn delete(&mut self, route: &Route) -> io::Result<()> {
-        self.inner.delete(route).await
+        AsyncRouteManager::delete(self, route).await
     }
 }
 
@@ -105,8 +92,8 @@ pub struct RouteActor<H: RouteHandle, R: IfIndexResolver> {
 /// # Errors
 ///
 /// Returns `io::Error` when the route manager handle cannot be created.
-pub fn make_route() -> io::Result<RouteActor<RouteManagerHandle, PlatformIfIndexResolver>> {
-    let handle = RouteManagerHandle::new()?;
+pub fn make_route() -> io::Result<RouteActor<AsyncRouteManager, PlatformIfIndexResolver>> {
+    let handle = AsyncRouteManager::new()?;
     Ok(RouteActor {
         handle,
         resolver: PlatformIfIndexResolver,

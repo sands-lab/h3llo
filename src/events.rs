@@ -42,8 +42,6 @@ pub enum Event {
     Dns(DnsEvent),
     /// Events originating from the management API.
     Api(ApiEvent),
-    /// Placeholder for future modules to extend the event stream without changing the channel type.
-    Other(String),
 }
 
 /// Events emitted by the management API actor.

@@ -1,6 +1,6 @@
 //! Standalone route integration test binary for Docker container execution.
 //!
-//! Exercises real route operations using `RouteManagerHandle` (real netlink API).
+//! Exercises real route operations using `AsyncRouteManager` (real netlink API).
 //! Creates dummy network interfaces and verifies route sync against the kernel
 //! route table using the same handle.
 //!
@@ -8,8 +8,7 @@
 
 use h3llo::bind::lookup_ifindex;
 use h3llo::route::{
-    ipnet_from_route, sync_tun_routes, PlatformIfIndexResolver, Route, RouteHandle,
-    RouteManagerHandle,
+    ipnet_from_route, sync_tun_routes, AsyncRouteManager, PlatformIfIndexResolver, Route,
 };
 use ipnet::IpNet;
 use std::process::Command;
@@ -65,7 +64,7 @@ async fn check_basic() -> Result<(), String> {
     ];
     let tun_addrs: Vec<IpNet> = vec![];
     let mut handle =
-        RouteManagerHandle::new().map_err(|e| format!("basic: RouteManagerHandle::new: {e}"))?;
+        AsyncRouteManager::new().map_err(|e| format!("basic: AsyncRouteManager::new: {e}"))?;
 
     sync_tun_routes(
         "dummy0",
@@ -118,8 +117,8 @@ async fn check_default_split() -> Result<(), String> {
 
     let allowed: Vec<IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
     let tun_addrs: Vec<IpNet> = vec![];
-    let mut handle = RouteManagerHandle::new()
-        .map_err(|e| format!("default_split: RouteManagerHandle::new: {e}"))?;
+    let mut handle = AsyncRouteManager::new()
+        .map_err(|e| format!("default_split: AsyncRouteManager::new: {e}"))?;
 
     sync_tun_routes(
         "dummy1",
@@ -147,7 +146,7 @@ async fn check_default_split() -> Result<(), String> {
 
 /// Lists route prefixes currently installed on the named interface.
 async fn routes_on_interface(
-    handle: &mut RouteManagerHandle,
+    handle: &mut AsyncRouteManager,
     ifname: &str,
 ) -> Result<Vec<IpNet>, String> {
     let ifindex = lookup_ifindex(ifname).ok_or_else(|| format!("interface {ifname} not found"))?;
