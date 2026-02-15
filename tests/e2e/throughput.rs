@@ -10,57 +10,12 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 use super::common::{
-    format_throughput, parse_iperf3_bps, require_image_and_network, TEST_IMAGE, TEST_NETWORK,
-    TEST_TAG,
+    bareudp_config, format_throughput, parse_iperf3_bps, TestContext, TEST_IMAGE, TEST_TAG,
 };
 use super::h3::{generate_test_certs, h3_node_config};
 
 /// iperf3 test duration in seconds.
 const IPERF_DURATION_SECS: u32 = 5;
-
-/// BareUDP node A config for throughput testing.
-const THROUGHPUT_NODE_A_CONFIG: &str = r#"
-local:
-  tun:
-    ifname: tun0
-    addrs:
-      - 10.0.0.1/32
-  dns:
-    server: udp://127.0.0.11:53
-  bare:
-    listen: "udp://0.0.0.0:5353"
-peers:
-  - id: node-b-tp
-    bare:
-      endpoint: "udp://node-b-tp.h3llo-test-net:5353"
-    tun:
-      allowed_ips:
-        - 10.0.0.2/32
-tuning:
-  dns_refresh_interval: 1
-"#;
-
-/// BareUDP node B config for throughput testing.
-const THROUGHPUT_NODE_B_CONFIG: &str = r#"
-local:
-  tun:
-    ifname: tun0
-    addrs:
-      - 10.0.0.2/32
-  dns:
-    server: udp://127.0.0.11:53
-  bare:
-    listen: "udp://0.0.0.0:5353"
-peers:
-  - id: node-a-tp
-    bare:
-      endpoint: "udp://node-a-tp.h3llo-test-net:5353"
-    tun:
-      allowed_ips:
-        - 10.0.0.1/32
-tuning:
-  dns_refresh_interval: 1
-"#;
 
 /// Runs iperf3 between two containers and returns measured throughput in bps.
 ///
@@ -130,20 +85,35 @@ async fn run_iperf3_throughput(
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_bareudp_tcp_throughput() {
-    require_image_and_network();
-
+    let ctx = TestContext::new();
     let temp_dir = tempfile::tempdir().expect("create temp dir");
+
+    let name_a = ctx.container_name("node-a-tp");
+    let name_b = ctx.container_name("node-b-tp");
+
+    let node_a_cfg = bareudp_config(
+        "10.0.0.1/32",
+        &name_b,
+        &ctx.fqdn("node-b-tp"),
+        "10.0.0.2/32",
+    );
+    let node_b_cfg = bareudp_config(
+        "10.0.0.2/32",
+        &name_a,
+        &ctx.fqdn("node-a-tp"),
+        "10.0.0.1/32",
+    );
 
     let node_a_config_path = temp_dir.path().join("node-a-tp.yaml");
     let node_b_config_path = temp_dir.path().join("node-b-tp.yaml");
-    std::fs::write(&node_a_config_path, THROUGHPUT_NODE_A_CONFIG).expect("write node-a config");
-    std::fs::write(&node_b_config_path, THROUGHPUT_NODE_B_CONFIG).expect("write node-b config");
+    std::fs::write(&node_a_config_path, &node_a_cfg).expect("write node-a config");
+    std::fs::write(&node_b_config_path, &node_b_cfg).expect("write node-b config");
 
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-a-tp")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_a)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_a_config_path.to_str().unwrap(),
@@ -156,8 +126,8 @@ async fn test_bareudp_tcp_throughput() {
     let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-b-tp")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_b)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_b_config_path.to_str().unwrap(),
@@ -184,19 +154,21 @@ async fn test_bareudp_tcp_throughput() {
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image with H3 support"]
 async fn test_h3_tcp_throughput() {
-    require_image_and_network();
-
+    let ctx = TestContext::new();
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 
+    let name_a = ctx.container_name("node-a-tp-h3");
+    let name_b = ctx.container_name("node-b-tp-h3");
+
     // Generate certificates for both nodes
-    let (node_a_cert, node_a_key) = generate_test_certs(temp_dir.path(), "node-a-tp-h3");
-    let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), "node-b-tp-h3");
+    let (node_a_cert, node_a_key) = generate_test_certs(temp_dir.path(), &name_a, ctx.network());
+    let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), &name_b, ctx.network());
 
     let shared_secret = "throughput-test-secret";
     let node_a_config = h3_node_config(
         "10.0.0.1/32",
-        "node-b-tp-h3",
-        "https://node-b-tp-h3.h3llo-test-net:443/",
+        &name_b,
+        &format!("https://{}:443/", ctx.fqdn("node-b-tp-h3")),
         shared_secret,
         "10.0.0.2/32",
         "/certs/cert.pem",
@@ -204,8 +176,8 @@ async fn test_h3_tcp_throughput() {
     );
     let node_b_config = h3_node_config(
         "10.0.0.2/32",
-        "node-a-tp-h3",
-        "https://node-a-tp-h3.h3llo-test-net:443/",
+        &name_a,
+        &format!("https://{}:443/", ctx.fqdn("node-a-tp-h3")),
         shared_secret,
         "10.0.0.1/32",
         "/certs/cert.pem",
@@ -220,8 +192,8 @@ async fn test_h3_tcp_throughput() {
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(443))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-a-tp-h3")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_a)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_a_config_path.to_str().unwrap(),
@@ -242,8 +214,8 @@ async fn test_h3_tcp_throughput() {
     let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(443))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-b-tp-h3")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_b)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_b_config_path.to_str().unwrap(),

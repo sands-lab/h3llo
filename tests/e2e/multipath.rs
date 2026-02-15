@@ -19,19 +19,39 @@ use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-use super::common::{require_image_and_network, TEST_IMAGE, TEST_NETWORK, TEST_TAG};
+use super::common::{TestContext, TEST_IMAGE, TEST_TAG};
 use super::h3::generate_test_certs;
 
-/// Node A multipath config: dual transport (BareUDP + H3) with different subnets.
-fn node_a_multipath_config(cert_path: &str, key_path: &str) -> String {
+/// Multipath node config: dual transport (BareUDP + H3) with different subnets.
+///
+/// # Arguments
+///
+/// * `bare_addr` - BareUDP subnet TUN address (e.g., "10.0.0.1/24")
+/// * `h3_addr` - H3 subnet TUN address (e.g., "10.0.1.1/24")
+/// * `peer_bare_id` - Peer's BareUDP container name
+/// * `peer_bare_fqdn` - Peer's BareUDP FQDN for DNS resolution
+/// * `peer_h3_id` - Peer's H3 container name
+/// * `peer_h3_fqdn` - Peer's H3 FQDN for DNS resolution
+/// * `cert_path` - Container path to TLS certificate
+/// * `key_path` - Container path to TLS private key
+fn multipath_config(
+    bare_addr: &str,
+    h3_addr: &str,
+    peer_bare_id: &str,
+    peer_bare_fqdn: &str,
+    peer_h3_id: &str,
+    peer_h3_fqdn: &str,
+    cert_path: &str,
+    key_path: &str,
+) -> String {
     format!(
         r#"
 local:
   tun:
     ifname: tun0
     addrs:
-      - 10.0.0.1/24
-      - 10.0.1.1/24
+      - {bare_addr}
+      - {h3_addr}
   dns:
     server: udp://127.0.0.11:53
   bare:
@@ -41,54 +61,15 @@ local:
     cert: {cert_path}
     key: {key_path}
 peers:
-  - id: node-b-mp-bare
+  - id: {peer_bare_id}
     bare:
-      endpoint: "udp://node-b-mp.h3llo-test-net:5353"
+      endpoint: "udp://{peer_bare_fqdn}:5353"
     tun:
       allowed_ips:
         - 10.0.0.0/24
-  - id: node-b-mp-h3
+  - id: {peer_h3_id}
     h3:
-      endpoint: "https://node-b-mp.h3llo-test-net:443/"
-      token: multipath-token-12ch
-    tun:
-      allowed_ips:
-        - 10.0.1.0/24
-tuning:
-  dns_refresh_interval: 1
-  h3_insecure_skip_verify: true
-"#
-    )
-}
-
-/// Node B multipath config: dual transport (BareUDP + H3) with different subnets.
-fn node_b_multipath_config(cert_path: &str, key_path: &str) -> String {
-    format!(
-        r#"
-local:
-  tun:
-    ifname: tun0
-    addrs:
-      - 10.0.0.2/24
-      - 10.0.1.2/24
-  dns:
-    server: udp://127.0.0.11:53
-  bare:
-    listen: "udp://0.0.0.0:5353"
-  h3:
-    listen: "https://0.0.0.0:443/"
-    cert: {cert_path}
-    key: {key_path}
-peers:
-  - id: node-a-mp-bare
-    bare:
-      endpoint: "udp://node-a-mp.h3llo-test-net:5353"
-    tun:
-      allowed_ips:
-        - 10.0.0.0/24
-  - id: node-a-mp-h3
-    h3:
-      endpoint: "https://node-a-mp.h3llo-test-net:443/"
+      endpoint: "https://{peer_h3_fqdn}:443/"
       token: multipath-token-12ch
     tun:
       allowed_ips:
@@ -109,17 +90,37 @@ tuning:
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_multipath_dual_subnet_mixed_transport() {
-    require_image_and_network();
-
+    let ctx = TestContext::new();
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 
+    let name_a = ctx.container_name("node-a-mp");
+    let name_b = ctx.container_name("node-b-mp");
+
     // Generate TLS certificates for both nodes
-    let (node_a_cert, node_a_key) = generate_test_certs(temp_dir.path(), "node-a-mp");
-    let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), "node-b-mp");
+    let (node_a_cert, node_a_key) = generate_test_certs(temp_dir.path(), &name_a, ctx.network());
+    let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), &name_b, ctx.network());
 
     // Create config files
-    let node_a_config = node_a_multipath_config("/certs/cert.pem", "/certs/key.pem");
-    let node_b_config = node_b_multipath_config("/certs/cert.pem", "/certs/key.pem");
+    let node_a_config = multipath_config(
+        "10.0.0.1/24",
+        "10.0.1.1/24",
+        &name_b,
+        &ctx.fqdn("node-b-mp"),
+        &name_b,
+        &ctx.fqdn("node-b-mp"),
+        "/certs/cert.pem",
+        "/certs/key.pem",
+    );
+    let node_b_config = multipath_config(
+        "10.0.0.2/24",
+        "10.0.1.2/24",
+        &name_a,
+        &ctx.fqdn("node-a-mp"),
+        &name_a,
+        &ctx.fqdn("node-a-mp"),
+        "/certs/cert.pem",
+        "/certs/key.pem",
+    );
 
     let node_a_config_path = temp_dir.path().join("node-a-mp.yaml");
     let node_b_config_path = temp_dir.path().join("node-b-mp.yaml");
@@ -131,8 +132,8 @@ async fn test_multipath_dual_subnet_mixed_transport() {
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_exposed_port(ContainerPort::Udp(443))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-a-mp")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_a)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_a_config_path.to_str().unwrap(),
@@ -155,8 +156,8 @@ async fn test_multipath_dual_subnet_mixed_transport() {
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_exposed_port(ContainerPort::Udp(443))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-b-mp")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_b)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_b_config_path.to_str().unwrap(),
