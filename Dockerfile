@@ -59,8 +59,9 @@ RUN apt-get update && apt-get install -y \
 
 # Download musl cross-compilation toolchain for target architecture
 # Source: https://github.com/cross-tools/musl-cross
+# Pinned to release 20250929 for reproducible builds.
 RUN TOOLCHAIN=$(cat /tmp/toolchain-name) && \
-    curl -sSfL "https://github.com/cross-tools/musl-cross/releases/latest/download/${TOOLCHAIN}.tar.xz" \
+    curl -sSfL "https://github.com/cross-tools/musl-cross/releases/download/20250929/${TOOLCHAIN}.tar.xz" \
     | tar -xJf - -C /opt && \
     ln -sfn "/opt/${TOOLCHAIN}" /opt/cross-toolchain
 ENV PATH="/opt/cross-toolchain/bin:$PATH"
