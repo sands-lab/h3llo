@@ -196,6 +196,49 @@ mod tests {
         let _rx = drain.await.unwrap();
     }
 
+    fn make_labels(kind: TransportKind, direction: Direction) -> TransportLabels {
+        TransportLabels {
+            kind,
+            direction,
+            peer_id: None,
+            remote_addr: None,
+        }
+    }
+
+    #[test]
+    fn log_transport_metrics_zero_stats() {
+        let metrics = TransportMetrics {
+            labels: make_labels(TransportKind::Tun, Direction::Rx),
+            stats: TransportStats::default(),
+        };
+        // Should not panic; exercises the zero-drops fast path (skips drop_reasons).
+        log_transport_metrics(&metrics);
+    }
+
+    #[test]
+    fn log_transport_metrics_with_drops() {
+        let mut stats = TransportStats::default();
+        stats.succeeded.record(10, 5000);
+        stats.dropped.record(2, 300);
+        stats
+            .drop_reasons
+            .entry(DropReason::DisallowedSource)
+            .or_default()
+            .record(2, 300);
+
+        let metrics = TransportMetrics {
+            labels: TransportLabels {
+                kind: TransportKind::BareUdp,
+                direction: Direction::Tx,
+                peer_id: Some("peer1".to_string()),
+                remote_addr: None,
+            },
+            stats,
+        };
+        // Should not panic; exercises the drop-reason iteration branch.
+        log_transport_metrics(&metrics);
+    }
+
     #[tokio::test]
     async fn send_or_backpressure_closed_returns_err() {
         let (tx, rx) = mpsc::channel::<u32>(4);

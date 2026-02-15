@@ -619,7 +619,7 @@ impl Orchestrator {
         // Run maintenance at half the connect interval so closed channels and
         // newly resolved IPs are detected promptly.
         let mut maintenance_ticker = tokio::time::interval(self.tuning.reconnect_interval / 2);
-        let mut quic_metrics_ticker = tokio::time::interval(self.tuning.metrics_push_interval);
+        let mut metrics_log_ticker = tokio::time::interval(self.tuning.metrics_log_interval);
         loop {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {
@@ -628,8 +628,11 @@ impl Orchestrator {
                 _ = maintenance_ticker.tick() => {
                     self.run_maintenance();
                 }
-                _ = quic_metrics_ticker.tick() => {
+                _ = metrics_log_ticker.tick() => {
                     log_quic_metrics();
+                    for m in self.metrics.values() {
+                        log_transport_metrics(m);
+                    }
                 }
                 result = self.join_set.join_next() => {
                     match result {
@@ -775,7 +778,6 @@ impl Orchestrator {
                 self.handle_api_event(api_event);
             }
             Event::Transport(TransportEvent::Metrics(metrics)) => {
-                log_transport_metrics(&metrics);
                 self.metrics.insert(metrics.labels.clone(), metrics);
             }
             Event::Transport(TransportEvent::H3Connected(event)) => {

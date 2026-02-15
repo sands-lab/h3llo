@@ -177,6 +177,13 @@ pub struct Tuning {
     /// Metrics push interval in milliseconds (default: 1000ms).
     #[serde(with = "serde_duration_millis")]
     pub metrics_push_interval: Duration,
+    /// Metrics log interval in seconds (default: 3s).
+    ///
+    /// Controls how often the orchestrator logs QUIC and transport metrics at
+    /// `debug!` level. Independent of `metrics_push_interval`, which controls
+    /// how often actors emit metrics events.
+    #[serde(with = "serde_duration_secs")]
+    pub metrics_log_interval: Duration,
     /// DNS query timeout (default: 2s).
     #[serde(with = "serde_duration_secs")]
     pub dns_query_timeout: Duration,
@@ -231,6 +238,7 @@ impl Default for Tuning {
             tun_tx_queue_len: 1000,
             reconnect_interval: Duration::from_secs(3),
             metrics_push_interval: Duration::from_millis(1000),
+            metrics_log_interval: Duration::from_secs(3),
             dns_query_timeout: Duration::from_secs(2),
             dns_refresh_interval: Duration::from_secs(60),
             dns_snapshot_delay: Duration::from_millis(100),
@@ -421,6 +429,7 @@ impl Config {
         let duration_checks: &[(&str, Duration)] = &[
             ("reconnect_interval", self.tuning.reconnect_interval),
             ("metrics_push_interval", self.tuning.metrics_push_interval),
+            ("metrics_log_interval", self.tuning.metrics_log_interval),
             ("dns_query_timeout", self.tuning.dns_query_timeout),
             ("dns_snapshot_delay", self.tuning.dns_snapshot_delay),
             ("h3_handshake_timeout", self.tuning.h3_handshake_timeout),
@@ -1815,6 +1824,7 @@ peers:
             cfg.tuning.metrics_push_interval,
             Duration::from_millis(1000)
         );
+        assert_eq!(cfg.tuning.metrics_log_interval, Duration::from_secs(3));
         assert_eq!(cfg.tuning.dns_query_timeout, Duration::from_secs(2));
         assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(60));
         assert_eq!(cfg.tuning.dns_snapshot_delay, Duration::from_millis(100));
@@ -2136,6 +2146,9 @@ peers:
             ("metrics_push_interval", |t| {
                 t.metrics_push_interval = Duration::ZERO
             }),
+            ("metrics_log_interval", |t| {
+                t.metrics_log_interval = Duration::ZERO
+            }),
             ("dns_query_timeout", |t| {
                 t.dns_query_timeout = Duration::ZERO
             }),
@@ -2168,6 +2181,31 @@ peers:
                 "expected TuningDurationZero for field '{field_name}'"
             );
         }
+    }
+
+    #[test]
+    fn metrics_log_interval_secs_override() {
+        let yaml = r#"
+local:
+  h3:
+    listen: https://[::]:443/
+    cert: ./cert.pem
+    key: ./key.pem
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  metrics_log_interval: 5
+peers:
+- id: example-node-2
+  h3:
+    token: example-node-2-token
+  tun:
+    allowed_ips:
+      - 192.168.180.2/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert_eq!(cfg.tuning.metrics_log_interval, Duration::from_secs(5));
     }
 
     #[test]

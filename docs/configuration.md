@@ -27,6 +27,7 @@ tuning: # optional, all fields have defaults
   tun_tx_queue_len: 1000 # optional, default: 1000 (packets; Linux only)
   reconnect_interval: 3 # optional, default: 3 (seconds)
   metrics_push_interval: 1000 # optional, default: 1000 (milliseconds)
+  metrics_log_interval: 3 # optional, default: 3 (seconds)
   dns_query_timeout: 2 # optional, default: 2 (seconds)
   dns_refresh_interval: 60 # optional, default: 60 (seconds; 0 disables)
   dns_snapshot_delay: 100 # optional, default: 100 (milliseconds)
@@ -73,6 +74,7 @@ peers: # optional, default: []
 - `tuning.tun_tx_queue_len` (default `1000`): TUN interface transmit queue length in packets. Controls how many packets the kernel queues for transmission. Applied on Linux only; ignored on other platforms.
 - `tuning.reconnect_interval` (default `3`): Minimum seconds between `try_connect` attempts per peer.
 - `tuning.metrics_push_interval` (default `1000`): Milliseconds between periodic metric push emissions from actors to the orchestrator.
+- `tuning.metrics_log_interval` (default `3`): Seconds between periodic `debug!`-level logging of QUIC and transport metrics by the orchestrator. Independent of `metrics_push_interval`, which controls actor emission cadence.
 - `tuning.dns_query_timeout` (default `2`): Seconds before a DNS query is considered timed out and retried.
 - `tuning.dns_refresh_interval` (default `60`): DNS refresh timer in seconds (`0` disables). The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)).
 - `tuning.dns_snapshot_delay` (default `100`): Milliseconds to wait after the first DNS state change before emitting a snapshot to the orchestrator. Coalesces bursts of DNS replies into a single event.
