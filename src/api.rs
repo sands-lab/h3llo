@@ -129,13 +129,13 @@ impl Collector for SnapshotCollector {
         )?;
         encode_congestion_family(
             &mut encoder,
-            "h3llo_transport_congestion_wait_seconds",
-            "Cumulative congestion wait time in seconds.",
+            "h3llo_transport_congestion_wait_milliseconds",
+            "Cumulative congestion wait time in milliseconds.",
             &self.0,
             |cg| {
                 (
-                    cg.queue_full_duration.as_secs_f64(),
-                    cg.would_block_duration.as_secs_f64(),
+                    cg.queue_full_duration.as_secs_f64() * 1000.0,
+                    cg.would_block_duration.as_secs_f64() * 1000.0,
                 )
             },
         )?;
@@ -843,7 +843,7 @@ mod tests {
             "missing would_block label: {text}"
         );
         assert!(
-            text.contains("h3llo_transport_congestion_wait_seconds_total"),
+            text.contains("h3llo_transport_congestion_wait_milliseconds_total"),
             "missing wait: {text}"
         );
     }
