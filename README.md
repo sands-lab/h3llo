@@ -60,6 +60,8 @@ Save the configuration as `host/config.yaml`, then start the h3llo container:
 docker run -d --name h3llo --restart always --network host --cap-add=NET_ADMIN -v host/config.yaml:/config.yaml h3llo/h3llo -c /config.yaml
 ```
 
+Multi-architecture images are available for `linux/amd64`, `linux/arm64`, and `linux/riscv64`. Docker automatically pulls the correct image for your platform.
+
 ## Configuration Overview
 
 High-level connection/auth/routing summary; see [docs/protocol.md](docs/protocol.md) for auth/transport semantics and [docs/internals.md](docs/internals.md) for runtime behavior.

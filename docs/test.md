@@ -71,13 +71,22 @@ Multi-node BareUDP testing using Docker containers with real TUN devices.
 
 1. Docker daemon running
 2. Docker Buildx installed (`docker buildx version` to verify)
-3. Build the test image:
+3. QEMU user-mode emulation registered (for multi-arch builds):
+   ```bash
+   docker run --privileged --rm tonistiigi/binfmt --install all
+   ```
+4. Build the test image:
    ```bash
    docker buildx build --target test -t h3llo:test --load .
    ```
    **Rebuild required**: The test image embeds compiled h3llo and test binaries.
    You must rebuild after any change to `src/`, `tests/integration/container/`,
    `Cargo.toml`, or `Cargo.lock`.
+
+   For a specific platform (cross-compilation):
+   ```bash
+   docker buildx build --platform linux/arm64 --target runtime -t h3llo:arm64 --load .
+   ```
 
 ### Running Tests
 
@@ -174,9 +183,18 @@ When tests with real side effects are needed:
 
 #### Static Binary Injection
 
-Container test binaries are built inside Docker with `--target x86_64-unknown-linux-musl` to produce
+Container test binaries are built inside Docker with the appropriate musl target to produce
 fully static executables. Static musl binaries run on any Linux distribution without
 runtime library dependencies, eliminating GLIBC version compatibility concerns.
+
+Supported cross-compilation targets:
+- `x86_64-unknown-linux-musl` (linux/amd64)
+- `aarch64-unknown-linux-musl` (linux/arm64)
+- `riscv64gc-unknown-linux-musl` (linux/riscv64)
+
+The Dockerfile automatically selects the correct musl-cross toolchain from
+[cross-tools/musl-cross](https://github.com/cross-tools/musl-cross) based on
+the Docker `TARGETARCH` build argument.
 
 The global allocator is set to mimalloc for musl builds to avoid potential performance
 issues with musl's default allocator in multi-threaded workloads.
