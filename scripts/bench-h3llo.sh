@@ -5,6 +5,9 @@
 #
 # Test matrix: BareUDP → H3(none) → H3(cubic) → H3(bbr2) → H3(bbr2+pacing)
 #
+# Raw network counters (softnet, tc qdisc, ethtool -S) are dumped to a
+# timestamped file in BENCH_DIR for post-hoc packet-loss diagnosis.
+#
 # Prerequisites:
 #   - Docker image (IMAGE) available on both nodes
 #   - Passwordless SSH access to REMOTE
@@ -52,6 +55,43 @@ REMOTE_CTR="h3llo-bench-remote"
 DOCKER_FLAGS="--net=host --cap-add NET_ADMIN --device /dev/net/tun"
 
 # --- Counter collection helpers ---
+
+# Dump raw network counters (softnet, tc qdisc/class, ethtool -S) to the
+# counters file. Runs on the host directly (not via docker exec) because
+# --net=host shares the network namespace, and softnet_stat is host-global.
+# Usage: collect_raw_counters <label> <phy_if> [remote]
+# Output is appended to $COUNTERS_FILE.
+collect_raw_counters() {
+    local label="$1" phy_if="$2" remote="${3:-}"
+    local run_prefix=""
+    local node_label="local"
+    if [[ -n "$remote" ]]; then
+        run_prefix="ssh $REMOTE"
+        node_label="remote"
+    fi
+
+    {
+        echo ""
+        echo "======== $label ($node_label) | $(date -Iseconds) ========"
+        echo ""
+        echo "---- /proc/net/softnet_stat ----"
+        $run_prefix cat /proc/net/softnet_stat 2>&1 || echo "(unavailable)"
+        echo ""
+        echo "---- tc -s qdisc show dev $phy_if ----"
+        $run_prefix tc -s qdisc show dev "$phy_if" 2>&1 || echo "(unavailable)"
+        echo ""
+        echo "---- tc -s qdisc show dev $TUN_IF ----"
+        $run_prefix tc -s qdisc show dev "$TUN_IF" 2>&1 || echo "(unavailable)"
+        echo ""
+        echo "---- tc -s class show dev $phy_if ----"
+        $run_prefix tc -s class show dev "$phy_if" 2>&1 || echo "(no classes)"
+        echo ""
+        echo "---- ethtool -S $phy_if ----"
+        $run_prefix ethtool -S "$phy_if" 2>&1 || echo "(unavailable)"
+        echo ""
+    } >> "$COUNTERS_FILE"
+}
+
 # Collect TUN drops, UDP socket drops, nstat UDP errors in a single docker exec.
 # Usage: collect_counters <container> <tun_if> <udp_port> [remote]
 # Output: "tun_rx_drop tun_tx_drop udp_sock_drops nstat_rcvbuf nstat_sndbuf"
@@ -111,6 +151,7 @@ ssh "$REMOTE" "docker pull \"$IMAGE\""
 # --- Cleanup ---
 cleanup() {
     echo "[cleanup] Stopping containers and cleaning up..."
+    [[ -n "${COUNTERS_FILE:-}" ]] && echo "[cleanup] Raw counters (partial): $COUNTERS_FILE"
     docker rm -f "$LOCAL_CTR" 2>/dev/null || true
     ssh "$REMOTE" "docker rm -f \"$REMOTE_CTR\"" 2>/dev/null || true
     sleep 1
@@ -219,6 +260,8 @@ run_test() {
     local local_before remote_before
     local_before=$(collect_counters "$LOCAL_CTR" "$TUN_IF" "$udp_port")
     remote_before=$(collect_counters "$REMOTE_CTR" "$TUN_IF" "$udp_port" remote)
+    collect_raw_counters "$label - BEFORE" "$LOCAL_IF"
+    collect_raw_counters "$label - BEFORE" "$REMOTE_IF" remote
 
     run_iperf_tcp
     echo ""
@@ -228,6 +271,8 @@ run_test() {
     local local_after remote_after
     local_after=$(collect_counters "$LOCAL_CTR" "$TUN_IF" "$udp_port")
     remote_after=$(collect_counters "$REMOTE_CTR" "$TUN_IF" "$udp_port" remote)
+    collect_raw_counters "$label - AFTER" "$LOCAL_IF"
+    collect_raw_counters "$label - AFTER" "$REMOTE_IF" remote
     echo ""
     report_counters "Local ($LOCAL_CTR)" "$local_before" "$local_after"
     report_counters "Remote ($REMOTE_CTR)" "$remote_before" "$remote_after"
@@ -372,9 +417,17 @@ EOF
 # --- Smoke test ---
 # When BENCH_DRY_RUN=1, validate helper functions and exit.
 if [[ "${BENCH_DRY_RUN:-0}" == "1" ]]; then
+    mkdir -p "$BENCH_DIR"
     echo "[dry-run] Testing report_counters..."
     report_counters "TEST" "0 0 0 0 0" "10 5 3 2 1"
     echo "[dry-run] Expected: [TEST] TUN rx_drop=+10 tx_drop=+5 | UDP sock_drops=+3 | nstat RcvbufErr=+2 SndbufErr=+1"
+    echo "[dry-run] Testing collect_raw_counters..."
+    COUNTERS_FILE="$BENCH_DIR/counters-dryrun.txt"
+    echo "# dry-run" > "$COUNTERS_FILE"
+    collect_raw_counters "DRY-RUN TEST" "lo"
+    echo "[dry-run] Counters file contents:"
+    cat "$COUNTERS_FILE"
+    rm -f "$COUNTERS_FILE"
     echo "[dry-run] OK"
     exit 0
 fi
@@ -383,6 +436,15 @@ fi
 # Main
 # ============================================================
 mkdir -p "$BENCH_DIR"
+
+# --- Initialize raw counters file ---
+COUNTERS_FILE="$BENCH_DIR/counters-$(date +%Y%m%dT%H%M%S).txt"
+{
+    echo "# h3llo benchmark raw counters - $(date -Iseconds)"
+    echo "# Local: $LOCAL_IP ($LOCAL_IF) | Remote: $REMOTE_IP ($REMOTE_IF)"
+    echo "# TUN: $TUN_IF | MTU: $TUN_MTU"
+} > "$COUNTERS_FILE"
+echo "  Raw counters file: $COUNTERS_FILE"
 
 # --- Generate self-signed TLS certificates ---
 mkdir -p "$CERT_DIR"
@@ -433,4 +495,5 @@ run_test "H3 (bbr2 + pacing)" "local-h3-bbr2-pacing.yaml" "remote-h3-bbr2-pacing
 echo ""
 echo "================================================================"
 echo "  All benchmarks completed."
+echo "  Raw counters saved to: $COUNTERS_FILE"
 echo "================================================================"
