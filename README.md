@@ -57,7 +57,7 @@ peers:
 Save the configuration as `host/config.yaml`, then start the h3llo container:
 
 ```bash
-docker run -d --name h3llo --restart always --network host --cap-add=NET_ADMIN -v host/config.yaml:/config.yaml h3llo/h3llo -c /config.yaml
+docker run -d --name h3llo --restart always --network host --cap-add NET_ADMIN --device /dev/net/tun -v host/config.yaml:/etc/h3llo/config.yaml nekonuts/h3llo
 ```
 
 Multi-architecture images are available for `linux/amd64`, `linux/arm64`, and `linux/riscv64`. Docker automatically pulls the correct image for your platform.
