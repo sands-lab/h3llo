@@ -19,7 +19,7 @@
 #   LOCAL_IF            - local outbound interface (default: bf3p1)
 #   REMOTE_IF           - remote outbound interface (default: bf3p1)
 #   TUN_MTU             - TUN interface MTU (default: 8980)
-#   IMAGE               - Docker image name (default: h3llo:test)
+#   IMAGE               - Docker image name (default: nekonuts/h3llo)
 #   CERT_DIR            - certificate directory on both nodes (default: auto-created temp dir)
 #   IPERF_TIME          - iperf3 test duration in seconds (default: 10)
 #   PACKET_QUEUE_DEPTH  - packet queue depth (default: 256)
@@ -32,13 +32,14 @@ REMOTE_IP="${REMOTE_IP:-10.200.2.126}"
 LOCAL_IF="${LOCAL_IF:-bf3p1}"
 REMOTE_IF="${REMOTE_IF:-bf3p1}"
 TUN_MTU="${TUN_MTU:-1393}"
-IMAGE="${IMAGE:-h3llo:test}"
+IMAGE="${IMAGE:-nekonuts/h3llo}"
 CERT_DIR="${CERT_DIR:-$(mktemp -d /tmp/h3llo-bench-certs.XXXXXX)}"
 IPERF_TIME="${IPERF_TIME:-10}"
 PACKET_QUEUE_DEPTH="${PACKET_QUEUE_DEPTH:-256}"
 
 UDP_PAYLOAD=$((TUN_MTU - 28))  # Subtract IP+UDP overhead to avoid fragmentation
 H3_PORT=4433
+BAREUDP_PORT=5353
 H3_PATH="/bench"
 H3_TOKEN="bench-token-12ch"  # Test-only token, NOT for production
 
@@ -50,10 +51,62 @@ REMOTE_CTR="h3llo-bench-remote"
 # Intentionally unquoted at call sites to allow word splitting into separate args.
 DOCKER_FLAGS="--net=host --cap-add NET_ADMIN --device /dev/net/tun"
 
+# --- Counter collection helpers ---
+# Collect TUN drops, UDP socket drops, nstat UDP errors in a single docker exec.
+# Usage: collect_counters <container> <tun_if> <udp_port> [remote]
+# Output: "tun_rx_drop tun_tx_drop udp_sock_drops nstat_rcvbuf nstat_sndbuf"
+collect_counters() {
+    local ctr="$1" tun="$2" port="$3" remote="${4:-}"
+    local hex_port
+    hex_port=$(printf '%04X' "$port")
+    local script
+    script=$(cat <<'SCRIPT'
+tun_stats=$(ip -s link show TUN_IF 2>/dev/null || echo "")
+tun_rx_drop=0; tun_tx_drop=0
+if [ -n "$tun_stats" ]; then
+    tun_rx_drop=$(echo "$tun_stats" | awk '/RX:/{getline; print $4; exit}')
+    tun_tx_drop=$(echo "$tun_stats" | awk '/TX:/{getline; print $4; exit}')
+fi
+udp_drops=$(awk -v hp="HEX_PORT" 'NR>1 && toupper(substr($2, index($2,":")+1)) == hp {t+=$NF} END{print t+0}' /proc/1/net/udp 2>/dev/null || echo 0)
+nstat_out=$(nstat -az 2>/dev/null || echo "")
+rcvbuf=$(echo "$nstat_out" | awk '/UdpRcvbufErrors/{print $2}')
+sndbuf=$(echo "$nstat_out" | awk '/UdpSndbufErrors/{print $2}')
+echo "${tun_rx_drop:-0} ${tun_tx_drop:-0} ${udp_drops:-0} ${rcvbuf:-0} ${sndbuf:-0}"
+SCRIPT
+    )
+    script="${script//TUN_IF/$tun}"
+    script="${script//HEX_PORT/$hex_port}"
+    if [[ -n "$remote" ]]; then
+        ssh "$REMOTE" "docker exec $ctr sh -c '$script'" 2>/dev/null || echo "0 0 0 0 0"
+    else
+        docker exec "$ctr" sh -c "$script" 2>/dev/null || echo "0 0 0 0 0"
+    fi
+}
+
+# Report delta between two counter snapshots.
+# Usage: report_counters <label> "<before>" "<after>"
+report_counters() {
+    local label="$1"
+    local -a before after
+    read -ra before <<< "$2"
+    read -ra after <<< "$3"
+    local d_rx=$(( after[0] - before[0] ))
+    local d_tx=$(( after[1] - before[1] ))
+    local d_udp=$(( after[2] - before[2] ))
+    local d_rcvbuf=$(( after[3] - before[3] ))
+    local d_sndbuf=$(( after[4] - before[4] ))
+    echo "  [$label] TUN rx_drop=+$d_rx tx_drop=+$d_tx | UDP sock_drops=+$d_udp | nstat RcvbufErr=+$d_rcvbuf SndbufErr=+$d_sndbuf"
+}
+
 # --- Prerequisites ---
 for cmd in docker ssh scp iperf3 openssl; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "Error: $cmd not found" >&2; exit 1; }
 done
+
+# --- Pull latest Docker image ---
+echo "Pulling latest image: $IMAGE ..."
+docker pull "$IMAGE"
+ssh "$REMOTE" "docker pull $IMAGE"
 
 # --- Cleanup ---
 cleanup() {
@@ -117,10 +170,10 @@ start_tunnel() {
         echo "OK"
     else
         echo "FAILED"
-        echo "  --- Local container logs ---"
-        docker logs "$LOCAL_CTR" 2>&1 | tail -20
-        echo "  --- Remote container logs ---"
-        ssh "$REMOTE" "docker logs $REMOTE_CTR 2>&1 | tail -20"
+        echo "  --- Local container logs (tail) ---"
+        docker logs "$LOCAL_CTR" 2>&1 | tail -40
+        echo "  --- Remote container logs (tail) ---"
+        ssh "$REMOTE" "docker logs $REMOTE_CTR 2>&1 | tail -40"
         return 1
     fi
 }
@@ -145,6 +198,11 @@ run_test() {
     local label="$1"
     local local_cfg="$2"
     local remote_cfg="$3"
+    # Determine the underlay UDP port for socket drop collection.
+    local udp_port="$BAREUDP_PORT"
+    if [[ "$local_cfg" == *h3* ]]; then
+        udp_port="$H3_PORT"
+    fi
 
     echo ""
     echo "================================================================"
@@ -157,9 +215,29 @@ run_test() {
         return
     fi
 
+    # --- Capture baseline counters ---
+    local local_before remote_before
+    local_before=$(collect_counters "$LOCAL_CTR" "$TUN_IF" "$udp_port")
+    remote_before=$(collect_counters "$REMOTE_CTR" "$TUN_IF" "$udp_port" remote)
+
     run_iperf_tcp
     echo ""
     run_iperf_udp
+
+    # --- Capture post-test counters and report deltas ---
+    local local_after remote_after
+    local_after=$(collect_counters "$LOCAL_CTR" "$TUN_IF" "$udp_port")
+    remote_after=$(collect_counters "$REMOTE_CTR" "$TUN_IF" "$udp_port" remote)
+    echo ""
+    report_counters "Local ($LOCAL_CTR)" "$local_before" "$local_after"
+    report_counters "Remote ($REMOTE_CTR)" "$remote_before" "$remote_after"
+
+    # --- Print h3llo debug logs (includes congestion metrics) ---
+    echo ""
+    echo "  --- h3llo logs: Local ($LOCAL_CTR) ---"
+    docker logs "$LOCAL_CTR" 2>&1
+    echo "  --- h3llo logs: Remote ($REMOTE_CTR) ---"
+    ssh "$REMOTE" "docker logs $REMOTE_CTR 2>&1"
 
     stop_containers
 }
@@ -180,6 +258,7 @@ local:
     listen: "udp://0.0.0.0:5353"
 tuning:
   packet_queue_depth: $PACKET_QUEUE_DEPTH
+  metrics_log_interval: 1
 peers:
   - id: remote
     bare:
@@ -204,6 +283,7 @@ local:
     listen: "udp://0.0.0.0:5353"
 tuning:
   packet_queue_depth: $PACKET_QUEUE_DEPTH
+  metrics_log_interval: 1
 peers:
   - id: local
     bare:
@@ -245,7 +325,8 @@ local:
 tuning:
   h3_cc_algorithm: $cc
   h3_insecure_skip_verify: true
-  packet_queue_depth: ${PACKET_QUEUE_DEPTH}${pacing_line}
+  packet_queue_depth: ${PACKET_QUEUE_DEPTH}
+  metrics_log_interval: 1${pacing_line}
 peers:
   - id: remote
     h3:
@@ -274,7 +355,8 @@ local:
 tuning:
   h3_cc_algorithm: $cc
   h3_insecure_skip_verify: true
-  packet_queue_depth: ${PACKET_QUEUE_DEPTH}${pacing_line}
+  packet_queue_depth: ${PACKET_QUEUE_DEPTH}
+  metrics_log_interval: 1${pacing_line}
 peers:
   - id: local
     h3:
@@ -286,6 +368,16 @@ peers:
         - 10.0.0.1/32
 EOF
 }
+
+# --- Smoke test ---
+# When BENCH_DRY_RUN=1, validate helper functions and exit.
+if [[ "${BENCH_DRY_RUN:-0}" == "1" ]]; then
+    echo "[dry-run] Testing report_counters..."
+    report_counters "TEST" "0 0 0 0 0" "10 5 3 2 1"
+    echo "[dry-run] Expected: [TEST] TUN rx_drop=+10 tx_drop=+5 | UDP sock_drops=+3 | nstat RcvbufErr=+2 SndbufErr=+1"
+    echo "[dry-run] OK"
+    exit 0
+fi
 
 # ============================================================
 # Main
