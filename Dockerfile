@@ -78,6 +78,7 @@ RUN RUST_TARGET=$(cat /tmp/rust-target) && \
       echo "export CXX_${RUST_TARGET_ENV}=\"${TOOLCHAIN}-g++\""; \
       echo "export AR_${RUST_TARGET_ENV}=\"${TOOLCHAIN}-ar\""; \
       echo "export CARGO_TARGET_${UPPER_TARGET}_LINKER=\"${TOOLCHAIN}-gcc\""; \
+      echo "export BINDGEN_EXTRA_CLANG_ARGS=\"--sysroot=/opt/cross-toolchain/${TOOLCHAIN}/\""; \
     } > /tmp/cross-env.sh
 
 RUN cargo install cargo-chef --locked
@@ -94,8 +95,8 @@ FROM --platform=$BUILDPLATFORM chef AS builder
 ARG TARGETARCH
 COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies (cached as long as recipe.json unchanged)
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=registry-$TARGETARCH \
+    --mount=type=cache,target=/usr/local/cargo/git,id=git-$TARGETARCH \
     --mount=type=cache,target=/app/target,sharing=locked,id=target-$TARGETARCH \
     . /tmp/cross-env.sh && \
     cargo chef cook --release --target "$RUST_TARGET" --recipe-path recipe.json
@@ -107,8 +108,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=registry-$TARGETARCH \
+    --mount=type=cache,target=/usr/local/cargo/git,id=git-$TARGETARCH \
     --mount=type=cache,target=/app/target,sharing=locked,id=target-$TARGETARCH \
     . /tmp/cross-env.sh && \
     set -e && \
