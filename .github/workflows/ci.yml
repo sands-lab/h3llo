@@ -101,6 +101,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
         with:
           name: builder-${{ matrix.arch_label }}
+          keep-state: true
 
       - name: Login to Docker Hub
         if: github.event_name != 'pull_request'
