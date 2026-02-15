@@ -28,6 +28,7 @@ ipnet-trie = "0.3"
 tokio-quiche = "0.14"
 futures-util = "0.3"
 prometheus-client = "0.22"
+foundations = { version = "5", default-features = false, features = ["metrics"] }
 rustls-pemfile = "2"
 http = "1"
 bytes = "1"

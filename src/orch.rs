@@ -13,6 +13,7 @@ use crate::events::{
 use crate::h3::{
     dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
 };
+use crate::metrics::{log_quic_metrics, log_transport_metrics};
 use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::tun::{self, RoutingTable, TunRxCommand};
 use ipnet::IpNet;
@@ -617,6 +618,7 @@ impl Orchestrator {
         // Run maintenance at half the connect interval so closed channels and
         // newly resolved IPs are detected promptly.
         let mut maintenance_ticker = tokio::time::interval(self.tuning.reconnect_interval / 2);
+        let mut quic_metrics_ticker = tokio::time::interval(self.tuning.metrics_push_interval);
         loop {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {
@@ -624,6 +626,9 @@ impl Orchestrator {
                 }
                 _ = maintenance_ticker.tick() => {
                     self.run_maintenance();
+                }
+                _ = quic_metrics_ticker.tick() => {
+                    log_quic_metrics();
                 }
                 result = self.join_set.join_next() => {
                     match result {
@@ -769,30 +774,7 @@ impl Orchestrator {
                 self.handle_api_event(api_event);
             }
             Event::Transport(TransportEvent::Metrics(metrics)) => {
-                let labels = &metrics.labels;
-                let stats = &metrics.stats;
-                debug!(
-                    "{:?} {:?} {}: {} batches/{} pkts/{} bytes ok, {} batches/{} pkts/{} bytes dropped",
-                    labels.kind,
-                    labels.direction,
-                    labels.peer_id.as_deref().unwrap_or("local"),
-                    stats.succeeded.batches,
-                    stats.succeeded.packets,
-                    stats.succeeded.bytes,
-                    stats.dropped.batches,
-                    stats.dropped.packets,
-                    stats.dropped.bytes,
-                );
-                if stats.dropped.packets > 0 {
-                    for (reason, counters) in &stats.drop_reasons {
-                        if counters.packets > 0 {
-                            debug!(
-                                "  drop reason {:?}: {} pkts/{} bytes",
-                                reason, counters.packets, counters.bytes
-                            );
-                        }
-                    }
-                }
+                log_transport_metrics(&metrics);
                 self.metrics.insert(metrics.labels.clone(), metrics);
             }
             Event::Transport(TransportEvent::H3Connected(event)) => {

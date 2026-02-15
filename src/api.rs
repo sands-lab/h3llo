@@ -14,6 +14,7 @@ use crate::events::{
     ApiEvent, Direction, DropReason, Event, PktCounters, TransportKind, TransportLabels,
     TransportMetrics,
 };
+use crate::metrics::collect_quic_metrics;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
@@ -35,6 +36,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
+/// OpenMetrics text format EOF marker.
+const OPENMETRICS_EOF: &str = "# EOF\n";
+
 // ---------------------------------------------------------------------------
 // Snapshot-based Collector (lock-free, owned data)
 // ---------------------------------------------------------------------------
@@ -47,6 +51,10 @@ use tracing::debug;
 struct SnapshotCollector(HashMap<TransportLabels, TransportMetrics>);
 
 /// Encodes a metrics snapshot into OpenMetrics text format.
+///
+/// Combines application-level transport metrics (via `prometheus-client`) with
+/// QUIC-level metrics (via `foundations::telemetry::metrics`) into a single
+/// Prometheus-compatible text response.
 pub(crate) fn encode_metrics_snapshot(
     snapshot: HashMap<TransportLabels, TransportMetrics>,
 ) -> String {
@@ -55,6 +63,21 @@ pub(crate) fn encode_metrics_snapshot(
     let mut text = String::new();
     prometheus_client::encoding::text::encode(&mut text, &registry)
         .expect("infallible: encoding to String cannot fail");
+
+    // Append QUIC-level metrics from foundations global registry.
+    let quic_text = collect_quic_metrics();
+    if !quic_text.is_empty() {
+        // Strip EOF from both sources and re-add a single EOF at the end.
+        if text.ends_with(OPENMETRICS_EOF) {
+            text.truncate(text.len() - OPENMETRICS_EOF.len());
+        }
+        let quic_text = quic_text
+            .strip_suffix(OPENMETRICS_EOF)
+            .unwrap_or(&quic_text);
+        text.push_str(quic_text);
+        text.push_str(OPENMETRICS_EOF);
+    }
+
     text
 }
 
@@ -695,5 +718,18 @@ mod tests {
         let body = "peers:\n- peer-1\n- peer-2\n";
         let result: Result<super::DeletePayload, _> = serde_yaml::from_str(body);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn encode_snapshot_ends_with_eof() {
+        let text = encode_metrics_snapshot(HashMap::new());
+        assert!(text.ends_with("# EOF\n"), "must end with # EOF: {text}");
+    }
+
+    #[test]
+    fn encode_snapshot_has_single_eof() {
+        let text = encode_metrics_snapshot(HashMap::new());
+        let eof_count = text.matches("# EOF").count();
+        assert_eq!(eof_count, 1, "should have exactly one EOF marker: {text}");
     }
 }
