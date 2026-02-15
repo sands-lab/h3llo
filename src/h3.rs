@@ -843,6 +843,7 @@ pub fn spawn_h3_tx(
                 reason: "datagram channel closed before TX loop started".to_string(),
             })?
             .clone();
+        drop(datagram_tx); // Release PollSender; inner_tx owns the only Sender handle.
 
         loop {
             tokio::select! {
