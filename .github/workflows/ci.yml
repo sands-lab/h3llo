@@ -102,6 +102,7 @@ jobs:
         with:
           name: builder-${{ matrix.arch_label }}
           keep-state: true
+          cleanup: false
 
       - name: Login to Docker Hub
         if: github.event_name != 'pull_request'
