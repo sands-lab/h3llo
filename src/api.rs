@@ -11,8 +11,8 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::{Config, Peer};
 use crate::events::{
-    ApiEvent, Direction, DropReason, Event, PktCounters, TransportKind, TransportLabels,
-    TransportMetrics,
+    ApiEvent, CongestionStats, Direction, DropReason, Event, PktCounters, TransportKind,
+    TransportLabels, TransportMetrics,
 };
 use crate::metrics::collect_quic_metrics;
 use bytes::Bytes;
@@ -118,6 +118,26 @@ impl Collector for SnapshotCollector {
             "Cumulative drop bytes by reason.",
             &self.0,
             |c| c.bytes,
+        )?;
+
+        encode_congestion_counter_family(
+            &mut encoder,
+            "h3llo_transport_congestion",
+            "Cumulative congestion event count.",
+            &self.0,
+            |cg| (cg.queue_full_count, cg.would_block_count),
+        )?;
+        encode_congestion_f64_family(
+            &mut encoder,
+            "h3llo_transport_congestion_wait_seconds",
+            "Cumulative congestion wait time in seconds.",
+            &self.0,
+            |cg| {
+                (
+                    cg.queue_full_duration.as_secs_f64(),
+                    cg.would_block_duration.as_secs_f64(),
+                )
+            },
         )?;
 
         Ok(())
@@ -248,6 +268,76 @@ impl EncodeLabelValue for DirectionLabel {
         };
         EncodeLabelValue::encode(&s, encoder)
     }
+}
+
+/// Label set for congestion counter families with `event` dimension.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct CongestionLabelSet {
+    kind: TransportKindLabel,
+    direction: DirectionLabel,
+    peer_id: String,
+    remote_addr: String,
+    event: String,
+}
+
+impl CongestionLabelSet {
+    fn from_metrics(m: &TransportMetrics, event: &str) -> Self {
+        Self {
+            kind: TransportKindLabel(m.labels.kind),
+            direction: DirectionLabel(m.labels.direction),
+            peer_id: m.labels.peer_id.clone().unwrap_or_default(),
+            remote_addr: m
+                .labels
+                .remote_addr
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
+            event: event.to_string(),
+        }
+    }
+}
+
+/// Encodes a congestion u64 counter family with `event` label (queue_full / would_block).
+fn encode_congestion_counter_family(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    store: &HashMap<TransportLabels, TransportMetrics>,
+    extractor: fn(&CongestionStats) -> (u64, u64),
+) -> Result<(), fmt::Error> {
+    let counter = ConstCounter::new(0u64);
+    let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+    for m in store.values() {
+        let (queue_full, would_block) = extractor(&m.stats.congestion);
+        ConstCounter::new(queue_full).encode(
+            metric_enc.encode_family(&CongestionLabelSet::from_metrics(m, "queue_full"))?,
+        )?;
+        ConstCounter::new(would_block).encode(
+            metric_enc.encode_family(&CongestionLabelSet::from_metrics(m, "would_block"))?,
+        )?;
+    }
+    Ok(())
+}
+
+/// Encodes a congestion f64 counter family with `event` label (for duration in seconds).
+fn encode_congestion_f64_family(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    store: &HashMap<TransportLabels, TransportMetrics>,
+    extractor: fn(&CongestionStats) -> (f64, f64),
+) -> Result<(), fmt::Error> {
+    let counter = ConstCounter::new(0.0f64);
+    let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+    for m in store.values() {
+        let (queue_full, would_block) = extractor(&m.stats.congestion);
+        ConstCounter::new(queue_full).encode(
+            metric_enc.encode_family(&CongestionLabelSet::from_metrics(m, "queue_full"))?,
+        )?;
+        ConstCounter::new(would_block).encode(
+            metric_enc.encode_family(&CongestionLabelSet::from_metrics(m, "would_block"))?,
+        )?;
+    }
+    Ok(())
 }
 
 /// Prometheus label value for drop reason.
@@ -553,6 +643,7 @@ mod tests {
                     ..Default::default()
                 },
                 drop_reasons: HashMap::new(),
+                ..Default::default()
             },
         };
         snapshot.insert(metrics.labels.clone(), metrics);
@@ -604,6 +695,7 @@ mod tests {
                     ..Default::default()
                 },
                 drop_reasons,
+                ..Default::default()
             },
         };
         snapshot.insert(metrics.labels.clone(), metrics);
@@ -662,6 +754,7 @@ mod tests {
                 },
                 dropped: PktCounters::default(),
                 drop_reasons: HashMap::new(),
+                ..Default::default()
             },
         };
         snapshot.insert(metrics.labels.clone(), metrics);
@@ -731,5 +824,45 @@ mod tests {
         let text = encode_metrics_snapshot(HashMap::new());
         let eof_count = text.matches("# EOF").count();
         assert_eq!(eof_count, 1, "should have exactly one EOF marker: {text}");
+    }
+
+    #[test]
+    fn encode_snapshot_with_congestion_metrics() {
+        use std::time::Duration;
+
+        let mut snapshot = HashMap::new();
+        let mut stats = TransportStats::default();
+        stats.congestion.record_queue_full(Duration::from_millis(5));
+        stats
+            .congestion
+            .record_would_block(Duration::from_micros(200));
+        let labels = TransportLabels {
+            kind: TransportKind::Tun,
+            direction: Direction::Rx,
+            peer_id: None,
+            remote_addr: None,
+        };
+        let metrics = TransportMetrics {
+            labels: labels.clone(),
+            stats,
+        };
+        snapshot.insert(labels, metrics);
+        let text = encode_metrics_snapshot(snapshot);
+        assert!(
+            text.contains("h3llo_transport_congestion_total"),
+            "missing congestion: {text}"
+        );
+        assert!(
+            text.contains("event=\"queue_full\""),
+            "missing queue_full label: {text}"
+        );
+        assert!(
+            text.contains("event=\"would_block\""),
+            "missing would_block label: {text}"
+        );
+        assert!(
+            text.contains("h3llo_transport_congestion_wait_seconds_total"),
+            "missing wait: {text}"
+        );
     }
 }

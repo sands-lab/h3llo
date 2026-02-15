@@ -4,7 +4,7 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_transient;
-use crate::metrics::TransportCounters;
+use crate::metrics::{send_or_backpressure, TransportCounters};
 use crate::tun::alloc_packet_buf;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::collections::HashSet;
@@ -180,14 +180,12 @@ pub fn spawn_udp_rx(
                                 continue;
                             }
 
-                            // Pre-send metrics (Option 3A): channel send failure
-                            // means shutdown, so pre-recording is acceptable.
                             let count = batch.len() as u64;
                             let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
-                            counters.record_success(count, total_bytes);
-                            if packet_tx.send(batch).await.is_err() {
+                            if send_or_backpressure(&packet_tx, batch, &mut counters).await.is_err() {
                                 return Ok(());
                             }
+                            counters.record_success(count, total_bytes);
                         }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -299,6 +297,8 @@ pub fn spawn_udp_tx(
                             socket.try_io(Interest::WRITABLE, || {
                                 state.try_send(UdpSockRef::from(&socket), &transmit)
                             })
+                        }, |dur| {
+                            counters.record_would_block(dur);
                         }) {
                             Ok(()) => {
                                 counters.record_success(chunk.len() as u64, gso_buf.len() as u64);

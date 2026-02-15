@@ -18,7 +18,7 @@ use crate::config::{PeerH3, Tuning};
 use crate::events::{
     ConnectionDirection, Direction, Event, H3ConnectedEvent, TransportEvent, TransportKind,
 };
-use crate::metrics::TransportCounters;
+use crate::metrics::{send_or_backpressure, TransportCounters};
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -696,7 +696,7 @@ pub fn spawn_h3_rx(
                         );
                     }
 
-                    if packet_tx.send(batch).await.is_err() {
+                    if send_or_backpressure(&packet_tx, batch, &mut counters).await.is_err() {
                         counters.record_drop(
                             crate::events::DropReason::ChannelClosed,
                             ok_pkts, ok_bytes,
