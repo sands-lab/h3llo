@@ -1,6 +1,6 @@
 # Testing Guide
 
-Practical testing guide for h3llo BareUDP VPN. Audience: Rust developers who need quick, repeatable checks across unit tests, mocked components, and multi-node integration tests.
+Practical testing guide for h3llo. Audience: Rust developers who need quick, repeatable checks across unit tests, mocked components, and multi-node integration tests.
 
 - Layered: unit → local component (mocked network) → Docker integration (testcontainers-rs) → E2E.
 - Decoupled: user-level transports (BareUDP, H3) do not need to be mocked.
@@ -16,6 +16,8 @@ tests/
     main.rs
     native/
       mod.rs
+      common/
+        mod.rs    # Shared test utilities (image checks, container helpers)
       dns.rs    # CoreDNS integration (requires Docker)
       route.rs  # Route sync orchestrator (Container Test Pattern)
       tun.rs    # TUN device orchestrator (Container Test Pattern)
@@ -28,6 +30,7 @@ tests/
     common.rs     # Shared E2E utilities (Docker helpers, iperf3 parsing)
     bareudp.rs    # BareUDP E2E (requires Docker + privileged)
     h3.rs         # HTTP/3 E2E (requires Docker + privileged)
+    multipath.rs  # Multipath E2E: dual-subnet mixed BareUDP + H3 (requires Docker + privileged)
     throughput.rs # iperf3 throughput tests (BareUDP + H3)
 ```
 
@@ -156,6 +159,10 @@ Prerequisites: `iperf3` is included in the Docker test image. Run with:
 cargo test --test e2e -- --ignored --nocapture throughput
 ```
 
+### E2E Test Scenarios (`tests/e2e/multipath.rs`)
+
+1. **Dual-subnet mixed transport**: Verifies two nodes routing 10.0.0.0/24 through BareUDP and 10.0.1.0/24 through HTTP/3 concurrently, with bidirectional ping validation.
+
 ### Integration Test Scenarios (`tests/integration/native/dns.rs`)
 
 DNS resolver validation against a containerized CoreDNS server with deterministic zone data.
@@ -267,11 +274,20 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Linux CI: `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, Docker integration tests.
 - Unit: `src/config.rs` tests for defaults, H3/API config validation, peer transport exclusivity.
 - Unit: `src/h3.rs` tests for datagram encoding, error display, CONNECT-IP header validation, and listener spawn/shutdown.
-- Unit: `src/auth.rs` tests for Basic Auth generation and validation.
+- Unit: `src/auth.rs` tests for Bearer Token generation and validation.
 - Unit: `src/dns.rs` real-network DNS resolver tests.
 - Unit: `src/bare.rs` real-network BareUDP tests.
+- Unit: `src/orch.rs` tests for peer management, DNS snapshot handling, config updates, connection pruning, and routing refresh.
+- Unit: `src/route.rs` tests for route sync logic with mock route managers (add/remove/split/dedup).
+- Unit: `src/tun.rs` tests for routing table operations, memory TUN send/receive, and buffer allocation.
+- Unit: `src/bind.rs` tests for UDP socket creation, route probing, and interface binding.
+- Unit: `src/api.rs` tests for metrics encoding and snapshot collection.
+- Unit: `src/actor.rs` tests for actor error classification and display formatting.
+- Unit: `src/events.rs` tests for event type construction and label formatting.
+- Unit: `src/helpers.rs` tests for IP packet destination extraction and retry logic.
 - Docker E2E: `tests/e2e/bareudp.rs` multi-node BareUDP connectivity, source IP filtering, and MTU boundary checks via testcontainers-rs.
 - Docker E2E: `tests/e2e/h3.rs` multi-node HTTP/3 connectivity via testcontainers-rs.
+- Docker E2E: `tests/e2e/multipath.rs` dual-subnet mixed transport (BareUDP + HTTP/3) via testcontainers-rs.
 - Docker E2E: `tests/e2e/throughput.rs` iperf3 TCP throughput tests for BareUDP and HTTP/3 tunnels.
 - Docker Integration: `tests/integration/native/dns.rs` DNS resolver integration tests against CoreDNS container.
 - Docker Integration: `tests/integration/native/tun.rs` TUN device creation and addressing via Container Test Pattern.
