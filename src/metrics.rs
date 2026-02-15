@@ -104,12 +104,17 @@ pub(crate) async fn send_or_backpressure<T>(
 pub(crate) fn log_transport_metrics(metrics: &TransportMetrics) {
     let labels = &metrics.labels;
     let stats = &metrics.stats;
+    let remote = labels
+        .remote_addr
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "-".into());
     debug!(
-        "{:?} {:?} {}: {} batches/{} pkts/{} bytes ok, \
+        "{:?} {:?} {} {}: {} batches/{} pkts/{} bytes ok, \
          {} batches/{} pkts/{} bytes dropped",
         labels.kind,
         labels.direction,
         labels.peer_id.as_deref().unwrap_or("local"),
+        remote,
         stats.succeeded.batches,
         stats.succeeded.packets,
         stats.succeeded.bytes,
@@ -194,6 +199,45 @@ mod tests {
         assert_eq!(counters.stats.congestion.queue_full_count, 1);
         assert!(counters.stats.congestion.queue_full_duration > Duration::ZERO);
         let _rx = drain.await.unwrap();
+    }
+
+    #[test]
+    fn log_transport_metrics_zero_stats() {
+        let metrics = TransportMetrics {
+            labels: TransportLabels {
+                kind: TransportKind::Tun,
+                direction: Direction::Rx,
+                peer_id: None,
+                remote_addr: None,
+            },
+            stats: TransportStats::default(),
+        };
+        // Should not panic; exercises the zero-drops fast path (skips drop_reasons).
+        log_transport_metrics(&metrics);
+    }
+
+    #[test]
+    fn log_transport_metrics_with_drops() {
+        let mut stats = TransportStats::default();
+        stats.succeeded.record(10, 5000);
+        stats.dropped.record(2, 300);
+        stats
+            .drop_reasons
+            .entry(DropReason::DisallowedSource)
+            .or_default()
+            .record(2, 300);
+
+        let metrics = TransportMetrics {
+            labels: TransportLabels {
+                kind: TransportKind::BareUdp,
+                direction: Direction::Tx,
+                peer_id: Some("peer1".to_string()),
+                remote_addr: None,
+            },
+            stats,
+        };
+        // Should not panic; exercises the drop-reason iteration branch.
+        log_transport_metrics(&metrics);
     }
 
     #[tokio::test]
