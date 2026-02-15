@@ -1,7 +1,7 @@
 //! Shared utilities for E2E integration tests.
 //!
-//! Provides common constants, Docker helpers, and iperf3 output parsing
-//! shared across all E2E test modules.
+//! Provides common constants, Docker helpers, per-test isolation context,
+//! and iperf3 output parsing shared across all E2E test modules.
 
 use std::process::Command;
 
@@ -11,26 +11,86 @@ pub const TEST_IMAGE: &str = "h3llo";
 /// Default test image tag.
 pub const TEST_TAG: &str = "test";
 
-/// Docker network for E2E tests.
-pub const TEST_NETWORK: &str = "h3llo-test-net";
-
-/// Panics with build instructions if the test Docker image is not available.
+/// Per-test isolation context providing unique container names and Docker network.
 ///
-/// Also ensures the test Docker network exists. Call at the start of every
-/// E2E test to fail fast with actionable diagnostics.
-pub fn require_image_and_network() {
-    if !ensure_image_exists() {
-        eprintln!(
-            "Docker image {}:{} not found. Build with:",
-            TEST_IMAGE, TEST_TAG
-        );
-        eprintln!(
-            "  docker buildx build --target test -t {}:{} --load .",
-            TEST_IMAGE, TEST_TAG
-        );
-        panic!("Missing Docker image");
+/// Each E2E test creates a `TestContext` that generates a unique suffix,
+/// creates an isolated Docker network, and provides helpers for deriving
+/// globally-unique container names and their FQDNs within the network.
+/// The Docker network is removed when the context is dropped.
+///
+/// # Examples
+///
+/// ```ignore
+/// let ctx = TestContext::new();
+/// let name_a = ctx.container_name("node-a");  // e.g. "node-a-a1b2c3d4"
+/// let fqdn_a = ctx.fqdn("node-a");            // e.g. "node-a-a1b2c3d4.h3llo-e2e-a1b2c3d4"
+/// ```
+pub struct TestContext {
+    suffix: String,
+    network: String,
+}
+
+impl TestContext {
+    /// Creates a new test context with unique suffix, verifies the Docker image,
+    /// and creates an isolated Docker network.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Docker test image is not found or the network cannot be created.
+    pub fn new() -> Self {
+        if !ensure_image_exists() {
+            eprintln!(
+                "Docker image {}:{} not found. Build with:",
+                TEST_IMAGE, TEST_TAG
+            );
+            eprintln!(
+                "  docker buildx build --target test -t {}:{} --load .",
+                TEST_IMAGE, TEST_TAG
+            );
+            panic!("Missing Docker image");
+        }
+
+        let suffix = format!("{:08x}", rand::random::<u32>());
+        let network = format!("h3llo-e2e-{suffix}");
+
+        let result = Command::new("docker")
+            .args(["network", "create", &network])
+            .output()
+            .expect("create network");
+
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            panic!("Failed to create network {network}: {stderr}");
+        }
+
+        Self { suffix, network }
     }
-    ensure_network_exists();
+
+    /// Returns the Docker network name for this test.
+    pub fn network(&self) -> &str {
+        &self.network
+    }
+
+    /// Generates a globally-unique container name from a logical role name.
+    pub fn container_name(&self, role: &str) -> String {
+        format!("{role}-{}", self.suffix)
+    }
+
+    /// Generates the FQDN for a container within this test's Docker network.
+    ///
+    /// Docker user-defined bridge networks resolve `{container_name}.{network_name}`
+    /// via the embedded DNS server.
+    pub fn fqdn(&self, role: &str) -> String {
+        format!("{}-{}.{}", role, self.suffix, self.network)
+    }
+}
+
+impl Drop for TestContext {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["network", "rm", &self.network])
+            .output();
+    }
 }
 
 /// Checks if the Docker test image exists locally.
@@ -44,30 +104,42 @@ fn ensure_image_exists() -> bool {
     }
 }
 
-/// Creates the test Docker network if it doesn't exist.
+/// Generates a BareUDP node config with dynamic peer endpoint FQDN.
 ///
-/// Handles race conditions when multiple tests run in parallel.
-fn ensure_network_exists() {
-    let check = Command::new("docker")
-        .args(["network", "inspect", TEST_NETWORK])
-        .output();
-
-    if check.map(|o| o.status.success()).unwrap_or(false) {
-        return;
-    }
-
-    let result = Command::new("docker")
-        .args(["network", "create", TEST_NETWORK])
-        .output()
-        .expect("create network");
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        if stderr.contains("already exists") {
-            return;
-        }
-        panic!("Failed to create network: {}", stderr);
-    }
+/// # Arguments
+///
+/// * `tun_addr` - Local TUN IP address (e.g., "10.0.0.1/32")
+/// * `peer_id` - Peer's container name (used as peer ID)
+/// * `peer_fqdn` - Peer's FQDN for DNS resolution in Docker network
+/// * `peer_allowed_ip` - CIDR for peer traffic
+pub fn bareudp_config(
+    tun_addr: &str,
+    peer_id: &str,
+    peer_fqdn: &str,
+    peer_allowed_ip: &str,
+) -> String {
+    format!(
+        r#"
+local:
+  tun:
+    ifname: tun0
+    addrs:
+      - {tun_addr}
+  dns:
+    server: udp://127.0.0.11:53
+  bare:
+    listen: "udp://0.0.0.0:5353"
+peers:
+  - id: {peer_id}
+    bare:
+      endpoint: "udp://{peer_fqdn}:5353"
+    tun:
+      allowed_ips:
+        - {peer_allowed_ip}
+tuning:
+  dns_refresh_interval: 1
+"#
+    )
 }
 
 /// Parses iperf3 JSON output to extract received throughput in bits/second.

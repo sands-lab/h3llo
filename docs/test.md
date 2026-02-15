@@ -120,6 +120,16 @@ NOT side effects (safe for inline tests):
 - Each test creates isolated containers with bind-mounted configs
 - Cleanup is automatic when containers go out of scope
 
+#### Concurrency Safety
+
+Each E2E test creates a `TestContext` that generates a unique 8-hex suffix,
+creates a dedicated Docker network (`h3llo-e2e-{suffix}`), and derives
+globally-unique container names (`{role}-{suffix}`). Config files are
+dynamically generated with FQDNs matching the unique container names.
+This ensures tests are safe to run in parallel — both within a single
+`cargo test` invocation and across concurrent CI runs. The Docker network
+is cleaned up when `TestContext` is dropped.
+
 ### Container Test Logging Requirements
 
 All Docker container tests MUST output container logs on failure:

@@ -11,9 +11,15 @@ use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-use super::common::{require_image_and_network, TEST_IMAGE, TEST_NETWORK, TEST_TAG};
+use super::common::{TestContext, TEST_IMAGE, TEST_TAG};
 
 /// Generates self-signed certificates for testing.
+///
+/// # Arguments
+///
+/// * `temp_dir` - Directory to write PEM files into
+/// * `hostname` - Primary hostname for the certificate
+/// * `network` - Docker network name for FQDN SAN entry
 ///
 /// # Returns
 ///
@@ -21,12 +27,13 @@ use super::common::{require_image_and_network, TEST_IMAGE, TEST_NETWORK, TEST_TA
 pub(super) fn generate_test_certs(
     temp_dir: &std::path::Path,
     hostname: &str,
+    network: &str,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
     use rcgen::{generate_simple_self_signed, CertifiedKey};
 
     let subject_alt_names = vec![
         hostname.to_string(),
-        format!("{}.{}", hostname, TEST_NETWORK),
+        format!("{}.{}", hostname, network),
         "localhost".to_string(),
         "127.0.0.1".to_string(),
     ];
@@ -101,19 +108,21 @@ tuning:
 ///
 /// This test:
 /// 1. Generates self-signed certificates for both nodes
-/// 2. Creates a custom Docker network for container DNS resolution
+/// 2. Creates a per-test Docker network for container DNS resolution
 /// 3. Starts two h3llo containers with H3 transport
 /// 4. Verifies bidirectional ping over the VPN tunnel
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image with H3 support"]
 async fn test_two_node_h3_tunnel() {
-    require_image_and_network();
-
+    let ctx = TestContext::new();
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 
+    let name_a = ctx.container_name("node-a-h3");
+    let name_b = ctx.container_name("node-b-h3");
+
     // Generate certificates for both nodes
-    let (node_a_cert, node_a_key) = generate_test_certs(temp_dir.path(), "node-a-h3");
-    let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), "node-b-h3");
+    let (node_a_cert, node_a_key) = generate_test_certs(temp_dir.path(), &name_a, ctx.network());
+    let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), &name_b, ctx.network());
 
     // Create config files
     // The token must match cross-wise: Node_A.peers[B].token == Node_B.peers[A].token
@@ -121,8 +130,8 @@ async fn test_two_node_h3_tunnel() {
     let shared_secret = "shared-tunnel-secret";
     let node_a_config = h3_node_config(
         "10.0.0.1/32",
-        "node-b-h3",
-        "https://node-b-h3.h3llo-test-net:443/",
+        &name_b,
+        &format!("https://{}:443/", ctx.fqdn("node-b-h3")),
         shared_secret,
         "10.0.0.2/32",
         "/certs/cert.pem",
@@ -131,8 +140,8 @@ async fn test_two_node_h3_tunnel() {
 
     let node_b_config = h3_node_config(
         "10.0.0.2/32",
-        "node-a-h3",
-        "https://node-a-h3.h3llo-test-net:443/",
+        &name_a,
+        &format!("https://{}:443/", ctx.fqdn("node-a-h3")),
         shared_secret,
         "10.0.0.1/32",
         "/certs/cert.pem",
@@ -148,8 +157,8 @@ async fn test_two_node_h3_tunnel() {
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(443))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-a-h3")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_a)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_a_config_path.to_str().unwrap(),
@@ -170,8 +179,8 @@ async fn test_two_node_h3_tunnel() {
     let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(443))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-b-h3")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_b)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_b_config_path.to_str().unwrap(),

@@ -11,82 +11,38 @@ use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-use super::common::{require_image_and_network, TEST_IMAGE, TEST_NETWORK, TEST_TAG};
-
-/// Test configuration for node A (server role).
-/// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
-/// Short `tuning.dns_refresh_interval` (1s) handles startup order automatically.
-const NODE_A_CONFIG: &str = r#"
-local:
-  tun:
-    ifname: tun0
-    addrs:
-      - 10.0.0.1/32
-  dns:
-    server: udp://127.0.0.11:53
-  bare:
-    listen: "udp://0.0.0.0:5353"
-peers:
-  - id: node-b
-    bare:
-      endpoint: "udp://node-b.h3llo-test-net:5353"
-    tun:
-      allowed_ips:
-        - 10.0.0.2/32
-tuning:
-  dns_refresh_interval: 1
-"#;
-
-/// Test configuration for node B (client role).
-/// Uses FQDN container hostname for peer endpoint (Docker DNS requires FQDN format).
-/// Short `tuning.dns_refresh_interval` (1s) handles startup order automatically.
-const NODE_B_CONFIG: &str = r#"
-local:
-  tun:
-    ifname: tun0
-    addrs:
-      - 10.0.0.2/32
-  dns:
-    server: udp://127.0.0.11:53
-  bare:
-    listen: "udp://0.0.0.0:5353"
-peers:
-  - id: node-a
-    bare:
-      endpoint: "udp://node-a.h3llo-test-net:5353"
-    tun:
-      allowed_ips:
-        - 10.0.0.1/32
-tuning:
-  dns_refresh_interval: 1
-"#;
+use super::common::{bareudp_config, TestContext, TEST_IMAGE, TEST_TAG};
 
 /// Integration test: Two-node BareUDP tunnel connectivity.
 ///
 /// This test:
-/// 1. Creates a custom Docker network for container DNS resolution
+/// 1. Creates a per-test Docker network for container DNS resolution
 /// 2. Starts two h3llo containers with named hostnames
 /// 3. Verifies bidirectional ping over the VPN tunnel
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_two_node_bareudp_tunnel() {
-    require_image_and_network();
-
-    // Create temporary config files (TempDir auto-cleans on drop)
+    let ctx = TestContext::new();
     let temp_dir = tempfile::tempdir().expect("create temp dir");
+
+    let name_a = ctx.container_name("node-a");
+    let name_b = ctx.container_name("node-b");
+
+    let node_a_cfg = bareudp_config("10.0.0.1/32", &name_b, &ctx.fqdn("node-b"), "10.0.0.2/32");
+    let node_b_cfg = bareudp_config("10.0.0.2/32", &name_a, &ctx.fqdn("node-a"), "10.0.0.1/32");
 
     let node_a_config_path = temp_dir.path().join("node-a.yaml");
     let node_b_config_path = temp_dir.path().join("node-b.yaml");
-    std::fs::write(&node_a_config_path, NODE_A_CONFIG).expect("write node-a config");
-    std::fs::write(&node_b_config_path, NODE_B_CONFIG).expect("write node-b config");
+    std::fs::write(&node_a_config_path, &node_a_cfg).expect("write node-a config");
+    std::fs::write(&node_b_config_path, &node_b_cfg).expect("write node-b config");
 
     // Start both nodes - h3llo handles DNS resolution timing via refresh interval.
     // No need to control startup order; DNS refresh (1s) ensures eventual resolution.
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-a")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_a)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_a_config_path.to_str().unwrap(),
@@ -99,8 +55,8 @@ async fn test_two_node_bareudp_tunnel() {
     let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-b")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_b)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_b_config_path.to_str().unwrap(),
@@ -153,7 +109,6 @@ async fn test_two_node_bareudp_tunnel() {
         "ping b->a failed (exit={ping_ba_exit:?})"
     );
 
-    // Cleanup happens automatically when containers and temp_dir go out of scope
     drop(node_b);
     drop(node_a);
     drop(temp_dir);
@@ -166,65 +121,39 @@ async fn test_two_node_bareudp_tunnel() {
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_source_ip_filtering() {
-    require_image_and_network();
-
+    let ctx = TestContext::new();
     let temp_dir = tempfile::tempdir().expect("create temp dir");
 
+    let name_a = ctx.container_name("node-a-filter");
+    let name_c = ctx.container_name("node-c");
+
     // Node C has a different VPN IP (10.0.0.3) not in node-a's allowed_ips
-    let node_c_config = r#"
-local:
-  tun:
-    ifname: tun0
-    addrs:
-      - 10.0.0.3/32
-  dns:
-    server: udp://127.0.0.11:53
-  bare:
-    listen: "udp://0.0.0.0:5353"
-peers:
-  - id: node-a-filter
-    bare:
-      endpoint: "udp://node-a-filter.h3llo-test-net:5353"
-    tun:
-      allowed_ips:
-        - 10.0.0.1/32
-tuning:
-  dns_refresh_interval: 1
-"#;
+    let node_c_cfg = bareudp_config(
+        "10.0.0.3/32",
+        &name_a,
+        &ctx.fqdn("node-a-filter"),
+        "10.0.0.1/32",
+    );
 
     // Node A only allows 10.0.0.2, not 10.0.0.3
-    let node_a_config = r#"
-local:
-  tun:
-    ifname: tun0
-    addrs:
-      - 10.0.0.1/32
-  dns:
-    server: udp://127.0.0.11:53
-  bare:
-    listen: "udp://0.0.0.0:5353"
-peers:
-  - id: node-b
-    bare:
-      endpoint: "udp://node-b.h3llo-test-net:5353"
-    tun:
-      allowed_ips:
-        - 10.0.0.2/32
-tuning:
-  dns_refresh_interval: 1
-"#;
+    // (peer id is "node-b" but the actual peer is node-c with wrong IP)
+    let node_a_cfg = bareudp_config(
+        "10.0.0.1/32",
+        &ctx.container_name("node-b"),
+        &ctx.fqdn("node-b"),
+        "10.0.0.2/32",
+    );
 
     let node_a_config_path = temp_dir.path().join("node-a-filter.yaml");
     let node_c_config_path = temp_dir.path().join("node-c.yaml");
-    std::fs::write(&node_a_config_path, node_a_config).expect("write node-a config");
-    std::fs::write(&node_c_config_path, node_c_config).expect("write node-c config");
+    std::fs::write(&node_a_config_path, &node_a_cfg).expect("write node-a config");
+    std::fs::write(&node_c_config_path, &node_c_cfg).expect("write node-c config");
 
-    // Start both nodes - h3llo handles DNS resolution timing via refresh interval.
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-a-filter")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_a)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_a_config_path.to_str().unwrap(),
@@ -237,8 +166,8 @@ tuning:
     let node_c = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-c")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_c)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_c_config_path.to_str().unwrap(),
@@ -284,65 +213,35 @@ tuning:
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_mtu_boundary_drop() {
-    require_image_and_network();
-
-    // Dedicated configs with container names matching the endpoints.
-    // Short `tuning.dns_refresh_interval` (1s) handles startup order automatically.
-    let node_a_mtu_config = r#"
-local:
-  tun:
-    ifname: tun0
-    addrs:
-      - 10.0.0.1/32
-  dns:
-    server: udp://127.0.0.11:53
-  bare:
-    listen: "udp://0.0.0.0:5353"
-peers:
-  - id: node-b-mtu
-    bare:
-      endpoint: "udp://node-b-mtu.h3llo-test-net:5353"
-    tun:
-      allowed_ips:
-        - 10.0.0.2/32
-tuning:
-  dns_refresh_interval: 1
-"#;
-
-    let node_b_mtu_config = r#"
-local:
-  tun:
-    ifname: tun0
-    addrs:
-      - 10.0.0.2/32
-  dns:
-    server: udp://127.0.0.11:53
-  bare:
-    listen: "udp://0.0.0.0:5353"
-peers:
-  - id: node-a-mtu
-    bare:
-      endpoint: "udp://node-a-mtu.h3llo-test-net:5353"
-    tun:
-      allowed_ips:
-        - 10.0.0.1/32
-tuning:
-  dns_refresh_interval: 1
-"#;
-
+    let ctx = TestContext::new();
     let temp_dir = tempfile::tempdir().expect("create temp dir");
+
+    let name_a = ctx.container_name("node-a-mtu");
+    let name_b = ctx.container_name("node-b-mtu");
+
+    let node_a_cfg = bareudp_config(
+        "10.0.0.1/32",
+        &name_b,
+        &ctx.fqdn("node-b-mtu"),
+        "10.0.0.2/32",
+    );
+    let node_b_cfg = bareudp_config(
+        "10.0.0.2/32",
+        &name_a,
+        &ctx.fqdn("node-a-mtu"),
+        "10.0.0.1/32",
+    );
+
     let node_a_config_path = temp_dir.path().join("node-a-mtu.yaml");
     let node_b_config_path = temp_dir.path().join("node-b-mtu.yaml");
-    std::fs::write(&node_a_config_path, node_a_mtu_config).expect("write node-a config");
-    std::fs::write(&node_b_config_path, node_b_mtu_config).expect("write node-b config");
+    std::fs::write(&node_a_config_path, &node_a_cfg).expect("write node-a config");
+    std::fs::write(&node_b_config_path, &node_b_cfg).expect("write node-b config");
 
-    // Start both nodes - h3llo handles DNS resolution timing via refresh interval.
-    // No need to control startup order; DNS refresh (1s) ensures eventual resolution.
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-a-mtu")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_a)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_a_config_path.to_str().unwrap(),
@@ -355,8 +254,8 @@ tuning:
     let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
-        .with_container_name("node-b-mtu")
-        .with_network(TEST_NETWORK)
+        .with_container_name(&name_b)
+        .with_network(ctx.network())
         .with_privileged(true)
         .with_mount(Mount::bind_mount(
             node_b_config_path.to_str().unwrap(),
