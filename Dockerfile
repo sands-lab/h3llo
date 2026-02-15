@@ -14,11 +14,13 @@
 #
 # Targets:
 #   runtime (default) - Minimal Alpine production image
+#   export            - Bare binary for release asset extraction
 #   test              - Adds diagnostic tools for integration tests
 #
 # Usage:
 #   docker buildx build --platform linux/amd64 --target runtime -t h3llo:latest --load .
 #   docker buildx build --platform linux/arm64 --target runtime -t h3llo:arm64 --load .
+#   docker buildx build --target export --output type=local,dest=./out .
 #   docker buildx build --platform linux/amd64 --target test -t h3llo:test --load .
 
 # Stage 1: Chef - Install cargo-chef on native build platform (no QEMU emulation)
@@ -141,6 +143,11 @@ RUN mkdir -p /etc/h3llo
 WORKDIR /etc/h3llo
 ENTRYPOINT ["/usr/local/bin/h3llo"]
 CMD ["-c", "/etc/h3llo/config.yaml"]
+
+# Stage: Export - Bare binary for release asset extraction.
+# Usage: docker buildx build --target export --output type=local,dest=./out .
+FROM scratch AS export
+COPY --from=builder /app/out/h3llo /h3llo
 
 # Stage 5: Test - Adds diagnostic tools for integration tests
 FROM runtime AS test
