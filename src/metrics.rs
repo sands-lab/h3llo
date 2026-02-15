@@ -51,7 +51,7 @@ impl TransportCounters {
     }
 
     /// Records a queue-full congestion event with the elapsed wait duration.
-    fn record_queue_full(&mut self, dur: std::time::Duration) {
+    pub(crate) fn record_queue_full(&mut self, dur: std::time::Duration) {
         self.stats.congestion.record_queue_full(dur);
     }
 

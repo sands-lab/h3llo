@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tokio::time;
 #[cfg(test)]
@@ -791,6 +792,16 @@ impl std::fmt::Debug for H3Tx {
 /// Receives packets from TUN-Rx and sends as datagrams with Context ID 0
 /// through the outbound datagram sender.
 ///
+/// # Batch Counting
+///
+/// Uses `try_send` on the underlying `mpsc::Sender` for non-blocking sends.
+/// All packets that succeed via `try_send` within a single `Vec<PooledBuf>`
+/// form one batch. When the channel is full (`TrySendError::Full`), the
+/// current sub-batch is flushed, the blocked packet is sent via
+/// `Sender::send().await` (recording queue-full duration), and a new
+/// sub-batch begins. This yields accurate `packets / batches` ratios that
+/// reflect actual channel saturation rather than always 1:1.
+///
 /// Creates a bounded packet channel internally (actor owns the receiver).
 /// Returns the packet sender and join handle.
 ///
@@ -811,7 +822,7 @@ pub fn spawn_h3_tx(
     let H3Tx {
         peer_id,
         remote_addr,
-        mut datagram_tx,
+        datagram_tx,
         flow_id,
         keepalive_tx,
     } = tx;
@@ -823,12 +834,28 @@ pub fn spawn_h3_tx(
         let mut keepalive_ticker = time::interval(keepalive_interval);
         keepalive_ticker.tick().await; // Skip first immediate tick
 
+        // Bypass PollSender's Sink abstraction: use the underlying mpsc::Sender
+        // directly for try_send/send, avoiding per-packet poll_ready+flush overhead.
+        let inner_tx = datagram_tx
+            .get_ref()
+            .ok_or_else(|| ActorError::H3TxSend {
+                peer_id: peer.clone(),
+                reason: "datagram channel closed before TX loop started".to_string(),
+            })?
+            .clone();
+
         loop {
             tokio::select! {
                 maybe_batch = packet_rx.recv() => {
                     let Some(packets) = maybe_batch else {
                         return Ok(()); // Channel closed, exit gracefully
                     };
+
+                    // Batch-aware sending: use try_send for non-blocking path,
+                    // fall back to inner_tx.send().await on channel-full.
+                    // Each channel-full boundary starts a new batch for metrics.
+                    let mut seg_pkts: u64 = 0;
+                    let mut seg_bytes: u64 = 0;
 
                     for mut packet in packets {
                         let len = packet.len();
@@ -839,14 +866,48 @@ pub fn spawn_h3_tx(
                         }
                         let frame = OutboundFrame::Datagram(packet, flow_id);
 
-                        if datagram_tx.send(frame).await.is_err() {
-                            counters.record_drop(crate::events::DropReason::SendError, 1, len as u64);
-                            return Err(ActorError::H3TxSend {
-                                peer_id: peer.clone(),
-                                reason: "datagram channel closed".to_string(),
-                            });
+                        match inner_tx.try_send(frame) {
+                            Ok(()) => {
+                                seg_pkts += 1;
+                                seg_bytes += len as u64;
+                            }
+                            Err(TrySendError::Full(val)) => {
+                                // Flush current segment as a completed batch.
+                                if seg_pkts > 0 {
+                                    counters.record_success(seg_pkts, seg_bytes);
+                                }
+
+                                // Backpressure: await capacity, record wait duration.
+                                let start = std::time::Instant::now();
+                                if inner_tx.send(val).await.is_err() {
+                                    counters.record_drop(
+                                        crate::events::DropReason::SendError, 1, len as u64,
+                                    );
+                                    return Err(ActorError::H3TxSend {
+                                        peer_id: peer.clone(),
+                                        reason: "datagram channel closed".to_string(),
+                                    });
+                                }
+                                counters.record_queue_full(start.elapsed());
+                                // The blocking-sent packet starts a new segment.
+                                seg_pkts = 1;
+                                seg_bytes = len as u64;
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                counters.record_drop(
+                                    crate::events::DropReason::SendError, 1, len as u64,
+                                );
+                                return Err(ActorError::H3TxSend {
+                                    peer_id: peer.clone(),
+                                    reason: "datagram channel closed".to_string(),
+                                });
+                            }
                         }
-                        counters.record_success(1, len as u64);
+                    }
+
+                    // Record the final segment of this batch.
+                    if seg_pkts > 0 {
+                        counters.record_success(seg_pkts, seg_bytes);
                     }
                 }
                 _ = ticker.tick() => {
@@ -2042,5 +2103,149 @@ mod tests {
             total <= 1500,
             "default MTU {total} exceeds 1500-byte Ethernet frame"
         );
+    }
+
+    // ========== H3 TX Batch Counting Tests ==========
+
+    /// Verifies that H3 TX batch counting uses try_send semantics:
+    /// a batch of packets that all succeed via try_send -> 1 batch count.
+    #[tokio::test]
+    async fn h3_tx_batch_counting_try_send() {
+        use crate::events::{Event, TransportEvent};
+        use crate::tun::alloc_packet_buf;
+        use tokio_util::sync::PollSender;
+
+        // Large capacity ensures all try_send calls succeed without backpressure.
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<OutboundFrame>(64);
+        let datagram_tx: OutboundFrameSender = PollSender::new(outbound_tx);
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let keepalive_tx: KeepaliveSender = Box::new(|| true);
+
+        let tx = H3Tx {
+            peer_id: "batch-test".to_string(),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            datagram_tx,
+            flow_id: 0,
+            keepalive_tx,
+        };
+
+        let (packet_tx, tx_handle) = spawn_h3_tx(
+            tx,
+            events_tx,
+            Duration::from_millis(50), // short interval for metrics emission
+            16,
+            Duration::from_secs(60),
+        );
+
+        // Drain outbound frames in background.
+        let drain = tokio::spawn(async move { while outbound_rx.recv().await.is_some() {} });
+
+        // Send a batch of 5 packets — capacity=64 so all try_send succeed.
+        let payload = vec![0u8; 100];
+        let batch: Vec<PooledBuf> = (0..5).map(|_| alloc_packet_buf(&payload)).collect();
+        packet_tx.send(batch).await.unwrap();
+
+        // Wait for a metrics tick.
+        let metrics = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(Event::Transport(TransportEvent::Metrics(m))) = events_rx.recv().await {
+                    if m.stats.succeeded.packets > 0 {
+                        return m;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("metrics timeout");
+
+        // All 5 packets sent via try_send in one batch -> batches == 1.
+        assert_eq!(metrics.stats.succeeded.packets, 5);
+        assert_eq!(metrics.stats.succeeded.batches, 1);
+        // No queue-full events.
+        assert_eq!(metrics.stats.congestion.queue_full_count, 0);
+
+        drop(packet_tx);
+        let _ = tx_handle.await;
+        drain.abort();
+    }
+
+    /// Verifies that when the outbound channel is full, H3 TX:
+    /// 1. Records queue_full congestion events
+    /// 2. Splits the batch into multiple segments (batch count > 1)
+    #[tokio::test]
+    async fn h3_tx_backpressure_splits_batch() {
+        use crate::events::{Event, TransportEvent};
+        use crate::tun::alloc_packet_buf;
+        use tokio_util::sync::PollSender;
+
+        // Channel capacity = 1 to guarantee backpressure on batch of 3.
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<OutboundFrame>(1);
+        let datagram_tx: OutboundFrameSender = PollSender::new(outbound_tx);
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let keepalive_tx: KeepaliveSender = Box::new(|| true);
+
+        let tx = H3Tx {
+            peer_id: "bp-peer".to_string(),
+            remote_addr: "127.0.0.1:5678".parse().unwrap(),
+            datagram_tx,
+            flow_id: 0,
+            keepalive_tx,
+        };
+
+        let (packet_tx, tx_handle) = spawn_h3_tx(
+            tx,
+            events_tx,
+            Duration::from_millis(50),
+            16,
+            Duration::from_secs(60),
+        );
+
+        // Drain slowly to trigger backpressure.
+        let drain = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if outbound_rx.recv().await.is_none() {
+                    break;
+                }
+            }
+        });
+
+        // Send batch of 3 packets with capacity=1 -> at least 2 backpressure events.
+        let payload = vec![0u8; 100];
+        let batch: Vec<PooledBuf> = (0..3).map(|_| alloc_packet_buf(&payload)).collect();
+        packet_tx.send(batch).await.unwrap();
+
+        // Wait for metrics.
+        let metrics = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(Event::Transport(TransportEvent::Metrics(m))) = events_rx.recv().await {
+                    if m.stats.succeeded.packets >= 3 {
+                        return m;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("metrics timeout");
+
+        assert_eq!(metrics.stats.succeeded.packets, 3);
+        // With capacity=1 and slow drain, batch count should be > 1.
+        assert!(
+            metrics.stats.succeeded.batches > 1,
+            "expected batch splitting from backpressure, got batches={}",
+            metrics.stats.succeeded.batches
+        );
+        // Queue full events should have been recorded.
+        assert!(
+            metrics.stats.congestion.queue_full_count > 0,
+            "expected queue_full events"
+        );
+        assert!(metrics.stats.congestion.queue_full_duration > Duration::ZERO);
+
+        drop(packet_tx);
+        let _ = tx_handle.await;
+        drain.abort();
     }
 }
