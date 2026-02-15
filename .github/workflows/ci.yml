@@ -47,6 +47,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
         with:
           name: ci-builder
@@ -55,6 +56,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          builder: ${{ steps.buildx.outputs.name }}
           push: false
           tags: h3llo:test
           target: test
@@ -98,6 +100,7 @@ jobs:
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
         with:
           name: builder-${{ matrix.arch_label }}
@@ -115,6 +118,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          builder: ${{ steps.buildx.outputs.name }}
           platforms: ${{ matrix.platform }}
           target: runtime
           labels: ${{ steps.meta.outputs.labels }}
