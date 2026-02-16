@@ -159,9 +159,9 @@ pub struct PeerTun {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Tuning {
-    /// Data-plane packet queue depth for bounded backpressure channels (default: 2048).
+    /// Data-plane packet queue depth for bounded backpressure channels (default: 256).
     pub packet_queue_depth: usize,
-    /// Socket buffer size in megabytes for SO_RCVBUF and SO_SNDBUF (default: 16).
+    /// Socket buffer size in megabytes for SO_RCVBUF and SO_SNDBUF (default: 8).
     ///
     /// Applied to all UDP sockets. Set to 0 to skip buffer configuration and use
     /// system defaults. Actual kernel buffer may be clamped by OS limits.
@@ -171,7 +171,7 @@ pub struct Tuning {
     /// Controls how many packets the kernel queues for transmission on the TUN
     /// interface. Applied on Linux only; ignored on other platforms.
     pub tun_tx_queue_len: u32,
-    /// Minimum interval between reconnection attempts (default: 3s).
+    /// Minimum interval between reconnection attempts (default: 10s).
     #[serde(with = "serde_duration_secs")]
     pub reconnect_interval: Duration,
     /// Metrics push interval in milliseconds (default: 1000ms).
@@ -202,7 +202,7 @@ pub struct Tuning {
     /// DNS responses with TTL below this value are raised to this floor
     /// to prevent excessive re-queries.
     pub dns_min_ttl: u32,
-    /// HTTP/3 handshake timeout (default: 30s).
+    /// HTTP/3 handshake timeout (default: 5s).
     #[serde(with = "serde_duration_secs")]
     pub h3_handshake_timeout: Duration,
     /// HTTP/3 max idle timeout (default: 60s).
@@ -211,12 +211,12 @@ pub struct Tuning {
     /// HTTP/3 keepalive interval (default: 20s). Sends QUIC PING frames to prevent idle timeout.
     #[serde(with = "serde_duration_secs")]
     pub h3_keepalive_interval: Duration,
-    /// QUIC congestion control algorithm (default: `"bbr2"`).
+    /// QUIC congestion control algorithm (default: `"none"`).
     ///
     /// Accepted values: `"reno"`, `"cubic"`, `"bbr"`, `"bbr2"`, `"none"`.
     /// Applied to both client (dial) and server (listener) QUIC connections.
     pub h3_cc_algorithm: String,
-    /// Enable QUIC packet pacing (default: `true`).
+    /// Enable QUIC packet pacing (default: `false`).
     ///
     /// Smooths out bursty sends at the cost of slight latency increase.
     /// Requires OS-level pacing support (e.g., `SO_TXTIME` on Linux).
@@ -233,21 +233,21 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Self {
         Self {
-            packet_queue_depth: 2048,
-            socket_buffer_size: 16,
+            packet_queue_depth: 256,
+            socket_buffer_size: 8,
             tun_tx_queue_len: 1000,
-            reconnect_interval: Duration::from_secs(3),
+            reconnect_interval: Duration::from_secs(10),
             metrics_push_interval: Duration::from_millis(1000),
             metrics_log_interval: Duration::from_secs(3),
             dns_query_timeout: Duration::from_secs(2),
             dns_refresh_interval: Duration::from_secs(60),
             dns_snapshot_delay: Duration::from_millis(100),
             dns_min_ttl: 60,
-            h3_handshake_timeout: Duration::from_secs(30),
+            h3_handshake_timeout: Duration::from_secs(5),
             h3_max_idle_timeout: Duration::from_secs(60),
             h3_keepalive_interval: Duration::from_secs(20),
-            h3_cc_algorithm: "bbr2".to_string(),
-            h3_enable_pacing: true,
+            h3_cc_algorithm: "none".to_string(),
+            h3_enable_pacing: false,
             h3_insecure_skip_verify: false,
         }
     }
@@ -1817,9 +1817,9 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.packet_queue_depth, 2048);
-        assert_eq!(cfg.tuning.socket_buffer_size, 16);
-        assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(3));
+        assert_eq!(cfg.tuning.packet_queue_depth, 256);
+        assert_eq!(cfg.tuning.socket_buffer_size, 8);
+        assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(10));
         assert_eq!(
             cfg.tuning.metrics_push_interval,
             Duration::from_millis(1000)
@@ -1829,11 +1829,11 @@ peers:
         assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(60));
         assert_eq!(cfg.tuning.dns_snapshot_delay, Duration::from_millis(100));
         assert_eq!(cfg.tuning.dns_min_ttl, 60);
-        assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(5));
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
         assert_eq!(cfg.tuning.h3_keepalive_interval, Duration::from_secs(20));
-        assert_eq!(cfg.tuning.h3_cc_algorithm, "bbr2");
-        assert!(cfg.tuning.h3_enable_pacing);
+        assert_eq!(cfg.tuning.h3_cc_algorithm, "none");
+        assert!(!cfg.tuning.h3_enable_pacing);
         assert!(!cfg.tuning.h3_insecure_skip_verify);
         assert_eq!(cfg.tuning.tun_tx_queue_len, 1000);
     }
@@ -1914,7 +1914,7 @@ peers:
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.tuning.packet_queue_depth, 512);
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(120));
-        assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(3));
+        assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(10));
         assert_eq!(
             cfg.tuning.metrics_push_interval,
             Duration::from_millis(1000)
@@ -2011,7 +2011,7 @@ peers:
     #[test]
     fn socket_buffer_bytes_conversion() {
         let tuning = Tuning::default();
-        assert_eq!(tuning.socket_buffer_bytes(), 16 * 1024 * 1024);
+        assert_eq!(tuning.socket_buffer_bytes(), 8 * 1024 * 1024);
 
         let tuning = Tuning {
             socket_buffer_size: 0,
