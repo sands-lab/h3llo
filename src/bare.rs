@@ -4,7 +4,7 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_transient;
-use crate::metrics::{send_or_backpressure, TransportCounters};
+use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
 use crate::tun::alloc_packet_buf;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::collections::HashSet;
@@ -182,7 +182,13 @@ pub fn spawn_udp_rx(
 
                             let count = batch.len() as u64;
                             let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
-                            if send_or_backpressure(&packet_tx, batch, &mut counters).await.is_err() {
+                            if send_with_backpressure(&packet_tx, batch, |event| match event {
+                                SendEvent::Waited(waited) => counters.record_queue_full(waited),
+                                SendEvent::Fast | SendEvent::Full => {}
+                            })
+                            .await
+                            .is_err()
+                            {
                                 counters.record_drop(DropReason::ChannelClosed, count, total_bytes);
                                 return Ok(());
                             }
