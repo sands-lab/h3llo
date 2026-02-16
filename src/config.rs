@@ -492,6 +492,27 @@ impl Config {
             });
         }
 
+        // H3-peer-conditional warnings (non-fatal best-practice checks).
+        let has_h3_peers = self.peers.iter().any(|p| p.h3.is_some());
+        if has_h3_peers {
+            if self.local.tun.mtu > MAX_H3_IPV4_MTU {
+                tracing::warn!(
+                    mtu = self.local.tun.mtu,
+                    max_safe = MAX_H3_IPV4_MTU,
+                    "local.tun.mtu exceeds safe maximum for IPv4 CONNECT-IP with H3 peers; \
+                     oversized QUIC DATAGRAMs may fail to send"
+                );
+            }
+            if self.tuning.reconnect_interval <= self.tuning.h3_handshake_timeout {
+                tracing::warn!(
+                    reconnect_interval = ?self.tuning.reconnect_interval,
+                    h3_handshake_timeout = ?self.tuning.h3_handshake_timeout,
+                    "tuning.reconnect_interval should be greater than \
+                     tuning.h3_handshake_timeout to prevent unbounded connection growth"
+                );
+            }
+        }
+
         // H3 validation: cert/key must not be empty when local.h3 is set
         if let Some(h3) = self.local.h3.as_ref() {
             if h3.cert.trim().is_empty() || h3.key.trim().is_empty() {
@@ -631,6 +652,13 @@ fn default_ifname() -> String {
 pub fn default_mtu() -> u16 {
     1393
 }
+
+/// Maximum safe TUN MTU for HTTP/3 CONNECT-IP over a 1500-byte IPv4 WAN path.
+///
+/// 1500 (Ethernet MTU) − 28 (IPv4 + UDP) − 59 (CONNECT-IP overhead) = 1413.
+/// Exceeding this value may cause oversized QUIC DATAGRAM frames that fail
+/// to send. See `docs/protocol.md` § MTU Guidance.
+pub const MAX_H3_IPV4_MTU: u16 = 1413;
 
 /// Deserializes a DNS server from a `udp://` URI string to `SocketAddr`.
 fn deserialize_dns_server<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
@@ -856,6 +884,7 @@ pub fn parse_udp_uri(raw: &str) -> Result<UdpEndpoint, String> {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tracing_test::traced_test;
 
     fn sample_h3_config() -> Config {
         Config {
@@ -2312,5 +2341,102 @@ tuning:
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert!(cfg.tuning.tun_enable_offload); // still default
         assert!(!cfg.tuning.udp_enable_offload);
+    }
+
+    // ========== H3 validation warning tests ==========
+
+    #[test]
+    #[traced_test]
+    fn warns_mtu_exceeds_h3_ipv4_safe_max() {
+        let mut config = sample_h3_config();
+        config.local.tun.mtu = 1414;
+        assert!(config.validate().is_ok());
+        assert!(logs_contain("exceeds safe maximum"));
+        assert!(logs_contain("mtu=1414"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn no_mtu_warning_at_boundary() {
+        let mut config = sample_h3_config();
+        config.local.tun.mtu = 1413;
+        assert!(config.validate().is_ok());
+        assert!(!logs_contain("exceeds safe maximum"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn no_mtu_warning_without_h3_peers() {
+        let mut config = sample_h3_config();
+        config.local.tun.mtu = 1500;
+        config.peers[0].h3 = None;
+        config.peers[0].bare = Some(PeerBare {
+            endpoint: UdpEndpoint {
+                host: "peer.example.com".to_string(),
+                port: 6635,
+            },
+            bindif: None,
+        });
+        assert!(config.validate().is_ok());
+        assert!(!logs_contain("exceeds safe maximum"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn warns_reconnect_interval_equals_handshake_timeout() {
+        let mut config = sample_h3_config();
+        config.tuning.reconnect_interval = Duration::from_secs(5);
+        config.tuning.h3_handshake_timeout = Duration::from_secs(5);
+        assert!(config.validate().is_ok());
+        assert!(logs_contain("reconnect_interval should be greater"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn warns_reconnect_interval_less_than_handshake_timeout() {
+        let mut config = sample_h3_config();
+        config.tuning.reconnect_interval = Duration::from_secs(3);
+        config.tuning.h3_handshake_timeout = Duration::from_secs(5);
+        assert!(config.validate().is_ok());
+        assert!(logs_contain("reconnect_interval should be greater"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn no_reconnect_warning_when_interval_longer() {
+        let config = sample_h3_config();
+        // Default: reconnect=10s, handshake=5s
+        assert!(config.validate().is_ok());
+        assert!(!logs_contain("reconnect_interval should be greater"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn no_reconnect_warning_without_h3_peers() {
+        let mut config = sample_h3_config();
+        config.tuning.reconnect_interval = Duration::from_secs(1);
+        config.tuning.h3_handshake_timeout = Duration::from_secs(5);
+        config.peers[0].h3 = None;
+        config.peers[0].bare = Some(PeerBare {
+            endpoint: UdpEndpoint {
+                host: "peer.example.com".to_string(),
+                port: 6635,
+            },
+            bindif: None,
+        });
+        assert!(config.validate().is_ok());
+        assert!(!logs_contain("reconnect_interval should be greater"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn emits_both_warnings_simultaneously() {
+        let mut config = sample_h3_config();
+        config.local.tun.mtu = 1500;
+        config.tuning.reconnect_interval = Duration::from_secs(3);
+        config.tuning.h3_handshake_timeout = Duration::from_secs(5);
+        assert!(config.validate().is_ok());
+        assert!(logs_contain("exceeds safe maximum"));
+        assert!(logs_contain("reconnect_interval should be greater"));
     }
 }
