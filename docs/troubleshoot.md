@@ -94,7 +94,7 @@ If the chosen interface is **not** the one whose IP is used in `local.h3.listen`
 
 **Diagnostic clues**:
 
-- Log line: `WARN h3llo::bind: multiple interfaces found, using first chosen=<wrong-iface> alternatives=[...]`
+- Log line: `WARN h3llo::bind: multiple interfaces found, using first; if policy routing is active, this heuristic may differ from the kernel's route selection — set bindif explicitly chosen=<wrong-iface> alternatives=[...]`
 - No `H3 connection established` or `CONNECT-IP accepted` log entries.
 - The peer's `endpoint` IP belongs to an interface listed in `alternatives`, not `chosen`.
 
@@ -119,7 +119,7 @@ The same applies to `peers[].bare.bindif` for BareUDP and `local.dns.bindif` for
 
 ### Interface Selection Mismatch with Policy Routing
 
-**Symptom**: h3llo selects the wrong outbound interface when the host has policy routing rules (`ip rule`) that direct traffic to custom routing tables. The log shows `multiple interfaces found, using first chosen=<iface>` but the kernel would route via a different interface.
+**Symptom**: h3llo selects the wrong outbound interface when the host has policy routing rules (`ip rule`) that direct traffic to custom routing tables. The log shows `multiple interfaces found, using first; if policy routing is active, this heuristic may differ from the kernel's route selection — set bindif explicitly chosen=<iface>` but the kernel would route via a different interface.
 
 **Root cause**: h3llo probes all routing tables via `route_manager` and applies a heuristic: longest prefix match → main table (254) preferred → lower metric within the same table. This heuristic does not evaluate `ip rule` priorities, source-based routing, or fwmark-based rules. When policy routing is configured, the kernel's actual route selection follows the RPDB rule chain, which may pick a different table (and therefore a different interface) than h3llo's heuristic.
 

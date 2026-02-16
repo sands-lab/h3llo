@@ -557,8 +557,8 @@ fn route_match(route: &Route, target: IpAddr) -> Option<(u8, bool, Option<u32>, 
     let is_main = {
         #[cfg(target_os = "linux")]
         {
-            route.table() == 254
-        } // RT_TABLE_MAIN
+            route.table() == libc::RT_TABLE_MAIN
+        }
         #[cfg(not(target_os = "linux"))]
         {
             true
@@ -1020,6 +1020,27 @@ mod tests {
 
         let indexes = matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), None);
         assert_eq!(indexes, vec![2, 1]);
+    }
+
+    /// Lower metric wins among non-main tables (both share is_main=false).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matching_routes_metric_compared_within_non_main() {
+        use std::net::Ipv4Addr;
+
+        let routes = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(1)
+                .with_table(100)
+                .with_metric(200),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(2)
+                .with_table(176)
+                .with_metric(50),
+        ];
+
+        let indexes = matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), None);
+        assert_eq!(indexes, vec![2, 1]); // lower metric wins among non-main
     }
 
     /// Longest prefix match always wins over table priority.
