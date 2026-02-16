@@ -112,17 +112,14 @@ fn find_header_value<'a>(headers: &'a [Header], name: &[u8]) -> Option<&'a [u8]>
         .map(|h| h.value())
 }
 
-/// Creates a keepalive sender from a QUIC command sender.
-fn make_keepalive_sender<C: From<QuicCommand> + Send + 'static>(
+/// Type-erased callback for issuing QUIC control commands.
+type QuicCommandSender = Box<dyn Fn(QuicCommand) -> bool + Send + Sync>;
+
+/// Creates a QUIC command sender from a typed driver command channel.
+fn make_quic_command_sender<C: From<QuicCommand> + Send + 'static>(
     quic_cmd_tx: tokio_quiche::http3::driver::RequestSender<C, QuicCommand>,
-) -> KeepaliveSender {
-    Box::new(move || {
-        quic_cmd_tx
-            .send(QuicCommand::Custom(Box::new(|conn| {
-                conn.send_ack_eliciting().ok();
-            })))
-            .is_ok()
-    })
+) -> QuicCommandSender {
+    Box::new(move |cmd| quic_cmd_tx.send(cmd).is_ok())
 }
 
 /// Requests a graceful QUIC connection close via the driver command channel.
@@ -291,7 +288,7 @@ async fn handle_h3_connection(
                 }
                 debug!(%peer_id, %remote_addr, "H3 connection established");
 
-                let keepalive_tx = make_keepalive_sender(quic_cmd_tx.clone());
+                let quic_cmd_send = make_quic_command_sender(quic_cmd_tx.clone());
 
                 let conn = H3Connection {
                     peer_id,
@@ -299,7 +296,7 @@ async fn handle_h3_connection(
                     datagram_tx: dgram_tx,
                     datagram_rx: dgram_rx,
                     flow_id,
-                    keepalive_tx,
+                    quic_cmd_send,
                 };
                 let event = Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
                     connection: conn,
@@ -367,9 +364,6 @@ pub enum ListenerError {
 
 // ========== Connection Handle ==========
 
-/// Callback that sends a QUIC PING frame. Returns `false` when the channel is closed.
-pub type KeepaliveSender = Box<dyn Fn() -> bool + Send + Sync>;
-
 /// Established HTTP/3 CONNECT-IP connection with datagram channels.
 ///
 /// Holds the peer identifier, remote address, and tokio-quiche datagram
@@ -385,8 +379,8 @@ pub struct H3Connection {
     pub datagram_rx: InboundFrameStream,
     /// DATAGRAM flow ID for this connection.
     pub flow_id: u64,
-    /// Sends keepalive PING; returns `false` when the cmd channel is closed.
-    pub keepalive_tx: KeepaliveSender,
+    /// QUIC command sender used for keepalive and explicit close.
+    pub quic_cmd_send: QuicCommandSender,
 }
 
 impl std::fmt::Debug for H3Connection {
@@ -415,7 +409,7 @@ impl H3Connection {
             remote_addr: self.remote_addr,
             datagram_tx: self.datagram_tx,
             flow_id: self.flow_id,
-            keepalive_tx: self.keepalive_tx,
+            quic_cmd_send: self.quic_cmd_send,
         };
         (rx, tx)
     }
@@ -651,7 +645,7 @@ pub async fn dial_h3<P: RouteProbe>(
 
     let (datagram_tx, datagram_rx, flow_id) = handshake_result;
 
-    let keepalive_tx = make_keepalive_sender(quic_cmd_tx);
+    let quic_cmd_send = make_quic_command_sender(quic_cmd_tx);
 
     Ok(H3Connection {
         peer_id: peer_id.to_string(),
@@ -659,7 +653,7 @@ pub async fn dial_h3<P: RouteProbe>(
         datagram_tx,
         datagram_rx,
         flow_id,
-        keepalive_tx,
+        quic_cmd_send,
     })
 }
 
@@ -809,7 +803,7 @@ fn handle_inbound_frame(
 
 /// H3 transmit actor state.
 ///
-/// Holds the datagram sender, flow ID, and keepalive callback for the transmit loop.
+/// Holds the datagram sender, flow ID, and QUIC command sender for the transmit loop.
 pub struct H3Tx {
     /// Peer identifier for logging and metrics.
     pub peer_id: String,
@@ -819,8 +813,8 @@ pub struct H3Tx {
     pub datagram_tx: OutboundFrameSender,
     /// DATAGRAM flow ID for this connection.
     pub flow_id: u64,
-    /// Sends keepalive PING; returns `false` when the cmd channel is closed.
-    pub keepalive_tx: KeepaliveSender,
+    /// QUIC command sender used for keepalive and explicit close.
+    pub quic_cmd_send: QuicCommandSender,
 }
 
 impl std::fmt::Debug for H3Tx {
@@ -870,7 +864,7 @@ pub fn spawn_h3_tx(
         remote_addr,
         datagram_tx,
         flow_id,
-        keepalive_tx,
+        quic_cmd_send,
     } = tx;
     let peer = peer_id.clone();
 
@@ -895,6 +889,13 @@ pub fn spawn_h3_tx(
             tokio::select! {
                 maybe_batch = packet_rx.recv() => {
                     let Some(packets) = maybe_batch else {
+                        let _ = quic_cmd_send(QuicCommand::ConnectionClose(
+                            ConnectionShutdownBehaviour {
+                                send_application_close: false,
+                                error_code: 0,
+                                reason: Vec::new(),
+                            },
+                        ));
                         return Ok(()); // Channel closed, exit gracefully
                     };
 
@@ -957,7 +958,9 @@ pub fn spawn_h3_tx(
                     }
                 }
                 _ = keepalive_ticker.tick() => {
-                    if !(keepalive_tx)() {
+                    if !quic_cmd_send(QuicCommand::Custom(Box::new(|conn| {
+                        conn.send_ack_eliciting().ok();
+                    }))) {
                         debug!(peer = %peer, "keepalive: cmd channel closed");
                         return Ok(());
                     }
@@ -2179,14 +2182,14 @@ mod tests {
         let datagram_tx: OutboundFrameSender = PollSender::new(outbound_tx);
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let keepalive_tx: KeepaliveSender = Box::new(|| true);
+        let quic_cmd_send: QuicCommandSender = Box::new(|_| true);
 
         let tx = H3Tx {
             peer_id: "batch-test".to_string(),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
             datagram_tx,
             flow_id: 0,
-            keepalive_tx,
+            quic_cmd_send,
         };
 
         let (packet_tx, tx_handle) = spawn_h3_tx(
@@ -2243,14 +2246,14 @@ mod tests {
         let datagram_tx: OutboundFrameSender = PollSender::new(outbound_tx);
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let keepalive_tx: KeepaliveSender = Box::new(|| true);
+        let quic_cmd_send: QuicCommandSender = Box::new(|_| true);
 
         let tx = H3Tx {
             peer_id: "bp-peer".to_string(),
             remote_addr: "127.0.0.1:5678".parse().unwrap(),
             datagram_tx,
             flow_id: 0,
-            keepalive_tx,
+            quic_cmd_send,
         };
 
         let (packet_tx, tx_handle) = spawn_h3_tx(
