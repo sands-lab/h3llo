@@ -23,7 +23,7 @@ local:
     mtu: 1393 # optional, default: 1393 (see docs/protocol.md for MTU sizing)
 tuning: # optional, all fields have defaults
   packet_queue_depth: 256 # optional, default: 256
-  socket_buffer_size: 8 # optional, default: 8 (MiB; 0 to use system default)
+  socket_buffer_size: 16 # optional, default: 16 (MiB; 0 to use system default)
   tun_tx_queue_len: 1000 # optional, default: 1000 (packets; Linux only)
   reconnect_interval: 10 # optional, default: 10 (seconds)
   metrics_push_interval: 1000 # optional, default: 1000 (milliseconds)
@@ -70,7 +70,7 @@ peers: # optional, default: []
 - `local.tun.mtu` (default `1393`): MTU for the TUN interface; see [docs/protocol.md](protocol.md) for sizing guidance.
 - `tuning` (optional): All fields have defaults; omit the entire section to use defaults.
 - `tuning.packet_queue_depth` (default `256`): Bounded channel capacity for data-plane packet queues between actors. Counts batch messages, not individual packets; each batch carries one device I/O operation's worth of packets.
-- `tuning.socket_buffer_size` (default `8`): Socket buffer size in megabytes, applied to all UDP sockets via SO_RCVBUF and SO_SNDBUF. Set to `0` to skip buffer configuration and use system defaults. On Linux, the effective buffer size may be clamped by `net.core.rmem_max` / `net.core.wmem_max`; setting failures are logged as warnings without aborting.
+- `tuning.socket_buffer_size` (default `16`): Socket buffer size in megabytes, applied to all UDP sockets via SO_RCVBUF and SO_SNDBUF. Set to `0` to skip buffer configuration and use system defaults. On Linux, the effective buffer size may be clamped by `net.core.rmem_max` / `net.core.wmem_max`; setting failures are logged as warnings without aborting.
 - `tuning.tun_tx_queue_len` (default `1000`): TUN interface transmit queue length in packets. Controls how many packets the kernel queues for transmission. Applied on Linux only; ignored on other platforms.
 - `tuning.reconnect_interval` (default `10`): Minimum seconds between `try_connect` attempts per peer.
 - `tuning.metrics_push_interval` (default `1000`): Milliseconds between periodic metric push emissions from actors to the orchestrator.

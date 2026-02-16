@@ -161,7 +161,7 @@ pub struct PeerTun {
 pub struct Tuning {
     /// Data-plane packet queue depth for bounded backpressure channels (default: 256).
     pub packet_queue_depth: usize,
-    /// Socket buffer size in megabytes for SO_RCVBUF and SO_SNDBUF (default: 8).
+    /// Socket buffer size in megabytes for SO_RCVBUF and SO_SNDBUF (default: 16).
     ///
     /// Applied to all UDP sockets. Set to 0 to skip buffer configuration and use
     /// system defaults. Actual kernel buffer may be clamped by OS limits.
@@ -234,7 +234,7 @@ impl Default for Tuning {
     fn default() -> Self {
         Self {
             packet_queue_depth: 256,
-            socket_buffer_size: 8,
+            socket_buffer_size: 16,
             tun_tx_queue_len: 1000,
             reconnect_interval: Duration::from_secs(10),
             metrics_push_interval: Duration::from_millis(1000),
@@ -1818,7 +1818,7 @@ peers:
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.tuning.packet_queue_depth, 256);
-        assert_eq!(cfg.tuning.socket_buffer_size, 8);
+        assert_eq!(cfg.tuning.socket_buffer_size, 16);
         assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(10));
         assert_eq!(
             cfg.tuning.metrics_push_interval,
@@ -2011,7 +2011,7 @@ peers:
     #[test]
     fn socket_buffer_bytes_conversion() {
         let tuning = Tuning::default();
-        assert_eq!(tuning.socket_buffer_bytes(), 8 * 1024 * 1024);
+        assert_eq!(tuning.socket_buffer_bytes(), 16 * 1024 * 1024);
 
         let tuning = Tuning {
             socket_buffer_size: 0,
