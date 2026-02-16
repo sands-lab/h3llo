@@ -94,7 +94,7 @@ If the chosen interface is **not** the one whose IP is used in `local.h3.listen`
 
 **Diagnostic clues**:
 
-- Log line: `WARN h3llo::bind: multiple interfaces found, using first chosen=<wrong-iface> alternatives=[...]`
+- Log line: `WARN h3llo::bind: multiple interfaces found, using first; if policy routing is active, this heuristic may differ from the kernel's route selection — set bindif explicitly chosen=<wrong-iface> alternatives=[...]`
 - No `H3 connection established` or `CONNECT-IP accepted` log entries.
 - The peer's `endpoint` IP belongs to an interface listed in `alternatives`, not `chosen`.
 
@@ -116,6 +116,36 @@ peers:
 The same applies to `peers[].bare.bindif` for BareUDP and `local.dns.bindif` for DNS resolution.
 
 **Affected topology**: Hosts with multiple NICs on the same IP subnet (common with SmartNICs like NVIDIA BlueField where `cx7p0`, `bf3p0`, `bf3p1` may all sit on the same `/24`).
+
+### Interface Selection Mismatch with Policy Routing
+
+**Symptom**: h3llo selects the wrong outbound interface when the host has policy routing rules (`ip rule`) that direct traffic to custom routing tables. The log shows `multiple interfaces found, using first; if policy routing is active, this heuristic may differ from the kernel's route selection — set bindif explicitly chosen=<iface>` but the kernel would route via a different interface.
+
+**Root cause**: h3llo probes all routing tables via `route_manager` and applies a heuristic: longest prefix match → main table (254) preferred → lower metric within the same table category (main vs. non-main). This heuristic does not evaluate `ip rule` priorities, source-based routing, or fwmark-based rules. When policy routing is configured, the kernel's actual route selection follows the RPDB rule chain, which may pick a different table (and therefore a different interface) than h3llo's heuristic.
+
+**Example**: A host with three default routes across tables `1444579712`, `176`, and `main (254)`. h3llo prefers the main table route (correct for most cases), but the kernel may follow a higher-priority `ip rule` that directs traffic to table `176` based on source address.
+
+**Fix**: Explicitly set `bindif` for each transport when policy routing is active:
+
+```yaml
+local:
+  dns:
+    bindif: enp0s6
+peers:
+  - id: remote
+    h3:
+      bindif: enp0s6
+    bare:
+      bindif: enp0s6
+```
+
+**Diagnostic**: Check which routing tables and rules exist:
+
+```bash
+ip rule show
+ip route show table main
+ip route show table all
+```
 
 ### TLS Certificate Errors on NFS-Mounted Paths
 

@@ -258,7 +258,9 @@ pub async fn select_bind_interface<P: RouteProbe>(
         warn!(
             chosen = %chosen,
             alternatives = ?candidates,
-            "multiple interfaces found, using first"
+            "multiple interfaces found, using first; \
+             if policy routing is active, this heuristic may differ from \
+             the kernel's route selection — set bindif explicitly"
         );
     }
     Some(chosen)
@@ -503,30 +505,81 @@ fn filter_preferred_interfaces(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-/// Returns interface indexes ordered by longest-prefix match while skipping the TUN index.
+/// Returns interface indexes ordered by route selection priority, skipping the TUN index.
+///
+/// Selection order (highest priority first):
+/// 1. Longest prefix match (most specific route wins).
+/// 2. Among equal prefixes, main routing table (254) preferred over custom tables.
+/// 3. Lower metric wins within the same table category (main or non-main). Absent
+///    metric is treated as 0 (highest priority), matching Linux kernel behavior.
+///    Routes from different non-main tables (e.g., table 100 and 176) are grouped
+///    together and compared by metric — per-table-ID isolation is not performed because
+///    h3llo prioritizes cross-platform compatibility with minimal code; for hosts with
+///    policy routing, explicit `bindif` configuration is the recommended fallback.
+///
+/// This heuristic approximates Linux routing behavior but cannot replicate the kernel's
+/// RPDB (routing policy database) evaluation. When policy routing is configured, the
+/// result may differ from the kernel's actual route selection. Use `bindif` to override.
 fn matching_route_indexes(routes: &[Route], target: IpAddr, tun_index: Option<u32>) -> Vec<u32> {
-    let mut matches: Vec<(u8, u32)> = routes
+    let mut matches: Vec<(u8, bool, Option<u32>, u32)> = routes
         .iter()
         .filter_map(|route| route_match(route, target))
         .collect();
-    matches.sort_by(|a, b| b.0.cmp(&a.0));
+
+    matches.sort_by(|a, b| {
+        b.0.cmp(&a.0) // prefix_len descending
+            .then(b.1.cmp(&a.1)) // is_main descending (true before false)
+            .then(a.2.unwrap_or(0).cmp(&b.2.unwrap_or(0))) // metric ascending (None = 0)
+    });
 
     let mut seen = HashSet::new();
     matches
         .into_iter()
-        .map(|(_, idx)| idx)
+        .map(|(_, _, _, idx)| idx)
         .filter(|idx| tun_index != Some(*idx))
         .filter(|idx| seen.insert(*idx))
         .collect()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-/// Returns the route's prefix length and ifindex when `target` fits the destination network.
-fn route_match(route: &Route, target: IpAddr) -> Option<(u8, u32)> {
+/// Returns route match data when `target` fits the destination network.
+///
+/// The returned tuple is `(prefix_len, is_main_table, metric, ifindex)`:
+/// - `prefix_len`: network prefix length (longer = more specific = higher priority).
+/// - `is_main_table`: `true` for main routing table (254). On platforms without
+///   routing table support, all routes are treated as main.
+/// - `metric`: route metric; `None` is treated as 0 (highest priority).
+/// - `ifindex`: outbound interface index.
+fn route_match(route: &Route, target: IpAddr) -> Option<(u8, bool, Option<u32>, u32)> {
     let ifindex = route.if_index()?;
     let prefix = route.prefix();
     let net = IpNet::new(route.destination(), prefix).ok()?;
-    net.contains(&target).then_some((prefix, ifindex))
+    if !net.contains(&target) {
+        return None;
+    }
+
+    let is_main = {
+        #[cfg(target_os = "linux")]
+        {
+            route.table() == libc::RT_TABLE_MAIN
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
+    };
+    let metric = {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            route.metric()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            None::<u32>
+        }
+    };
+
+    Some((prefix, is_main, metric, ifindex))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -905,5 +958,184 @@ mod tests {
         if let Ok(socket) = result {
             assert!(socket.local_addr().unwrap().is_ipv6());
         }
+    }
+
+    // ========== Table-Aware Route Selection Tests (Linux only) ==========
+
+    /// Main-table routes are preferred over custom-table routes at equal prefix length.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matching_routes_prefers_main_table() {
+        use std::net::Ipv4Addr;
+
+        let routes = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(10)
+                .with_table(176),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(20)
+                .with_table(100),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(30)
+                .with_table(254),
+        ];
+
+        let indexes = matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), None);
+        assert_eq!(indexes, vec![30, 10, 20]);
+    }
+
+    /// Within the same routing table, lower metric routes are preferred.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matching_routes_prefers_lower_metric_same_table() {
+        use std::net::Ipv4Addr;
+
+        let routes = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(1)
+                .with_table(254)
+                .with_metric(200),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(2)
+                .with_table(254)
+                .with_metric(100),
+        ];
+
+        let indexes = matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), None);
+        assert_eq!(indexes, vec![2, 1]);
+    }
+
+    /// Metric comparison does not apply across different tables — table priority wins.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matching_routes_metric_not_compared_cross_table() {
+        use std::net::Ipv4Addr;
+
+        let routes = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(1)
+                .with_table(100)
+                .with_metric(1),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(2)
+                .with_table(254)
+                .with_metric(9999),
+        ];
+
+        let indexes = matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), None);
+        assert_eq!(indexes, vec![2, 1]);
+    }
+
+    /// Lower metric wins among non-main tables (both share is_main=false).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matching_routes_metric_compared_within_non_main() {
+        use std::net::Ipv4Addr;
+
+        let routes = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(1)
+                .with_table(100)
+                .with_metric(200),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(2)
+                .with_table(176)
+                .with_metric(50),
+        ];
+
+        let indexes = matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), None);
+        assert_eq!(indexes, vec![2, 1]); // lower metric wins among non-main
+    }
+
+    /// Longest prefix match always wins over table priority.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matching_routes_prefix_beats_table_priority() {
+        use std::net::Ipv4Addr;
+
+        let routes = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(1)
+                .with_table(254),
+            Route::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 24)
+                .with_if_index(2)
+                .with_table(100),
+        ];
+
+        let indexes = matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), None);
+        assert_eq!(indexes, vec![2, 1]);
+    }
+
+    /// Routes with no metric (None) are treated as metric 0 (highest priority).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matching_routes_none_metric_beats_some_metric() {
+        use std::net::Ipv4Addr;
+
+        let routes = vec![
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(1)
+                .with_table(254)
+                .with_metric(100),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(2)
+                .with_table(254),
+        ];
+
+        let indexes = matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), None);
+        assert_eq!(indexes, vec![2, 1]);
+    }
+
+    /// Reproduces the issue scenario: three default routes across different tables.
+    /// Main table (254) should be preferred even though it appears last.
+    ///
+    /// Note: table 1444579712 is > u8 range. The kernel sets `rtm_table` to
+    /// `RT_TABLE_COMPAT` (252) for large table IDs, but `route_manager` may
+    /// read the truncated value. Either way, the value is not 254, so the
+    /// route is correctly classified as non-main.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matching_routes_issue_scenario_three_default_routes() {
+        use std::net::Ipv4Addr;
+
+        let routes = vec![
+            // table 1444579712 — kernel provides RT_TABLE_COMPAT (252) in rtm_table
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(42)
+                .with_table(252),
+            // table 176
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(41)
+                .with_table(176),
+            // main table (254)
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(43)
+                .with_table(254),
+        ];
+
+        let indexes = matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), None);
+        assert_eq!(indexes[0], 43);
+        assert_eq!(indexes.len(), 3);
+    }
+
+    /// Routes with truncated table IDs (>255, kernel provides RT_TABLE_COMPAT=252)
+    /// are treated as non-main.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn matching_routes_truncated_table_id_not_main() {
+        use std::net::Ipv4Addr;
+
+        let routes = vec![
+            // RT_TABLE_COMPAT (252) — kernel value for large table IDs
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(1)
+                .with_table(252),
+            Route::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                .with_if_index(2)
+                .with_table(254), // main table
+        ];
+
+        let indexes = matching_route_indexes(&routes, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), None);
+        assert_eq!(indexes, vec![2, 1]); // main table wins
     }
 }
