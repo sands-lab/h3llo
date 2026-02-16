@@ -98,6 +98,50 @@ The drop location tells you where the bottleneck is:
 
 ## Common Issues
 
+### DNS Resolution Failure Due to Query Burst Rate Limiting
+
+**Symptom**: Some or all peer endpoints fail to resolve on startup. Logs show `dns: response truncated` warnings and/or `dns: query timed out, retrying` for multiple hostnames. Affected peers never establish QUIC connections. The issue is intermittent — restarting may resolve a different subset of hostnames each time.
+
+**Root cause**: On startup, h3llo issues A and AAAA queries for every peer endpoint hostname simultaneously. With many peers (e.g., 20+ peers = 40+ concurrent queries), the burst of UDP packets sent to a remote public DNS resolver (e.g., `1.1.1.1`, `8.8.8.8`) can trigger server-side rate limiting. The resolver responds with truncated (`TC=1`) or empty responses for the excess queries. h3llo logs the truncation warning but does not retry via TCP or re-query with EDNS0 — the affected hostnames remain unresolved until the next refresh cycle.
+
+The severity depends on the number of peers and the DNS server's rate-limiting policy. A mesh with 5 peers may work fine; a mesh with 20+ peers will likely hit the limit on remote resolvers.
+
+**Diagnostic clues**:
+
+With 20+ peers and `dns.server: udp://1.1.1.1:53`, startup logs will show a burst of truncation warnings within the same millisecond:
+
+```
+WARN h3llo::dns: dns: response truncated host=peer1.example.com
+WARN h3llo::dns: dns: response truncated host=peer2.example.com
+WARN h3llo::dns: dns: response truncated host=peer3.example.com
+WARN h3llo::dns: dns: response truncated host=peer4.example.com
+WARN h3llo::dns: dns: response truncated host=peer5.example.com
+...  (28 warnings in <3ms)
+```
+
+To confirm:
+
+```bash
+# Look for truncation warnings in logs
+docker logs <container> 2>&1 | grep -i "truncated"
+
+# Check if some peers have no resolved IPs (no "dialing H3 endpoint" log for those peers)
+docker logs <container> 2>&1 | grep "dialing H3 endpoint"
+```
+
+**Fix**: Use a local caching resolver instead of a remote public resolver:
+
+```yaml
+local:
+  dns:
+    server: udp://127.0.0.53:53    # systemd-resolved (local cache)
+    # server: udp://1.1.1.1:53     # avoid: rate-limited under burst
+```
+
+The local resolver (e.g., systemd-resolved at `127.0.0.53`) absorbs the query burst locally, deduplicates identical queries, and handles upstream TCP fallback transparently. This eliminates both the rate-limiting and truncation issues.
+
+> **Note**: h3llo's DNS implementation uses plain UDP without EDNS0 and does not fall back to TCP on truncation. The `dns: response truncated` warning (logged at line 557 of `dns.rs`) is informational only — no recovery action is taken. Hostnames affected by truncation will eventually resolve on the next `dns_refresh_interval` cycle, but initial connectivity is delayed.
+
 ### Silent H3/QUIC Connection Failure on Multi-NIC Hosts
 
 **Symptom**: H3 tunnel shows no connection errors in logs, but ping through the tunnel fails with 100% packet loss. Logs only show TUN setup and route warnings — no QUIC handshake attempt or TLS error.
@@ -199,6 +243,84 @@ docker run -d \
 ```
 
 Alternatively, if NFS is unavoidable, either disable `root_squash` on the export or `chmod 644` the key file (less secure — only acceptable for test environments).
+
+### Silent QUIC Handshake Timeout Due to TLS Certificate SAN Mismatch
+
+**Symptom**: All outbound QUIC handshakes time out. Logs show `H3 dial failed peer=<name> addr=<ip>:443 error=handshake failed: QUIC connect failed: connection <scid> timed out`. Inbound connections from peers fail with `QUIC handshake failed in IQC::start, error: connection closed during Handshake stage`. tcpdump confirms packets are exchanged in both directions (Initial and Handshake packets flow normally), yet no connection is ever established.
+
+**Root cause**: The TLS certificate's Subject Alternative Name (SAN) does not cover the hostnames used in `peers[].h3.endpoint`. For example, the cert has `DNS:*.api.example.com` but endpoints use `https://node.v4.example.com:443/h3llo`. When `tuning.h3_insecure_skip_verify` is `false` (the default), quiche's BoringSSL backend verifies the server certificate against the SNI and silently rejects the handshake when the SAN doesn't match.
+
+"Silently" is the key word: **no TLS error, alert code, or certificate detail is logged at any level** — not even at `quiche=trace`. BoringSSL rejects the cert internally, the client simply stops progressing the handshake, and the connection eventually times out. The only observable difference between this failure and a network blackhole is that tcpdump shows Handshake packets being exchanged (the server sends its certificate, the client ACKs it, then goes silent).
+
+**Diagnostic steps**:
+
+```bash
+# 1. Check the cert's SAN
+openssl x509 -in /path/to/cert -noout -ext subjectAltName
+# Output: DNS:*.api.example.com
+# Compare with the endpoint hostnames (e.g., node.v4.example.com) — they must match.
+
+# 2. Confirm packets flow but handshake stalls
+# If tcpdump shows Initial+Handshake exchange in both directions but
+# no 1-RTT packets follow, TLS verification failure is the likely cause.
+tcpdump -i <iface> -n 'udp port 443 and host <peer-ip>' -c 20
+
+# 3. (Optional) Enable quiche=trace to see the handshake stall point
+# You will see rx/tx of Handshake packets, then silence — no "send alert" or
+# certificate error. This confirms BoringSSL rejects the cert without logging.
+RUST_LOG=h3llo=debug,quiche=trace
+```
+
+**Fix**: Either issue a certificate whose SAN covers the endpoint hostnames, or disable verification:
+
+```yaml
+tuning:
+  h3_insecure_skip_verify: true   # disables TLS peer verification
+```
+
+> **Note on observability**: This is a known gap — quiche and BoringSSL do not surface TLS verification failure reasons. Even `quiche=trace` only shows packet-level events (rx/tx pkt) without any TLS error detail. If you see a normal Initial → Handshake packet exchange followed by silence, suspect certificate SAN mismatch first.
+
+### GSO (UDP_SEGMENT) sendto EINVAL on aarch64
+
+**Symptom**: All outbound QUIC handshakes time out. Logs show only `H3 dial failed ... timed out` with **no send errors visible in h3llo's default log output**. tcpdump shows zero outbound QUIC packets — the node appears completely silent on the network.
+
+**Root cause**: On Linux, tokio-quiche calls `apply_max_capabilities()` on client QUIC sockets, which enables `UDP_SEGMENT` (Generic Segmentation Offload). On certain aarch64 kernels (observed on Oracle Cloud Linux 6.5 aarch64), the kernel does not support `UDP_SEGMENT` on the socket path used, causing every subsequent `sendto()` to fail with `EINVAL` (errno 22). No QUIC packets are ever transmitted.
+
+This error is particularly hard to diagnose because:
+1. tokio-quiche logs the `EINVAL` via `foundations::telemetry::log` (a slog-based logger), **not** the standard `log` crate or `tracing`. Unless the application initializes `foundations::telemetry::init()`, all such log messages are silently discarded to `slog::Discard`.
+2. h3llo uses `tracing` for its own logging, which does not bridge to foundations/slog.
+3. quiche itself has no visibility into socket errors (they occur in the tokio-quiche layer).
+
+As a result, the default h3llo log output shows timeouts with no indication that packets are failing to send.
+
+**Diagnostic steps**:
+
+```bash
+# 1. Check if ANY outbound QUIC packets leave the host
+tcpdump -i <iface> -n 'udp port 443' -c 5
+# If zero outbound packets appear, sendto() is likely failing.
+
+# 2. Confirm EINVAL with strace
+strace -e sendto -p $(pgrep h3llo) 2>&1 | head -10
+# Look for: sendto(...) = -1 EINVAL (Invalid argument)
+
+# 3. Check architecture — this affects aarch64 primarily
+uname -m   # aarch64
+
+# 4. (If you have foundations logging initialized) look for the send error:
+# "error sending client Initial packets to peer, error: Invalid argument (os error 22)"
+```
+
+**Fix**: Disable GSO by commenting out the `apply_max_capabilities()` call in `src/h3.rs`:
+
+```rust
+// GSO disabled: apply_max_capabilities() sets UDP_SEGMENT which causes
+// sendto() EINVAL on some aarch64 kernels.
+// #[cfg(target_os = "linux")]
+// socket.apply_max_capabilities();
+```
+
+> **Note on observability**: To make tokio-quiche's send errors visible without code changes, initialize foundations telemetry in `main.rs` and set `RUST_LOG=h3llo=debug`. The error `"error sending client Initial packets to peer"` will then appear via the slog backend. Without this initialization, the error is silently dropped — this is a known logging gap between h3llo (tracing) and tokio-quiche (foundations/slog).
 
 ### BareUDP Checksum Errors with NIC TX Offload
 
