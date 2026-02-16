@@ -54,12 +54,14 @@ tracing target name to `RUST_LOG`:
 | hyper-util | `hyper_util` | tracing | HTTP server lifecycle |
 | quinn-udp | `quinn_udp` | tracing | UDP socket send/receive operations |
 | quiche | `quiche` | log (bridged) | QUIC protocol core: handshake, congestion, frames |
-| tokio-quiche | `tokio_quiche` | slog (not captured) | QUIC async runtime — uses `slog-scope`; NOT visible via `RUST_LOG` without slog initialization |
+| tokio-quiche | `tokio_quiche` | foundations (bridged to tracing) | QUIC async runtime: connection lifecycle, send errors, GSO failures |
 | tun-rs | `tun_rs` | log (bridged) | TUN device creation and I/O |
 | route_manager | `route_manager` | none | Route management — no log output currently emitted |
 
 Crate names containing `-` become `_` in tracing targets. Libraries using the `log` crate are
-automatically bridged to tracing via `tracing-log`.
+automatically bridged to tracing via `tracing-log`. tokio-quiche uses `foundations::telemetry::log`
+macros (slog-based); h3llo bridges these to tracing via `foundations::telemetry::init()` with
+`LogOutput::TracingRsCompat`.
 
 **Examples**:
 
@@ -69,6 +71,12 @@ RUST_LOG=warn,h3llo=info,hickory_proto=debug
 
 # Debug QUIC connection issues
 RUST_LOG=warn,h3llo=info,quiche=debug
+
+# Debug tokio-quiche runtime (connection lifecycle, send errors)
+RUST_LOG=warn,h3llo=info,tokio_quiche=info
+
+# Debug both QUIC layers together
+RUST_LOG=warn,h3llo=info,quiche=debug,tokio_quiche=debug
 
 # Debug TUN device issues
 RUST_LOG=warn,h3llo=info,tun_rs=debug
@@ -326,12 +334,8 @@ tuning:
 
 **Root cause**: On Linux, h3llo calls `apply_max_capabilities()` on QUIC sockets when `tuning.udp_enable_offload` is `true` (the default), which enables `UDP_SEGMENT` (Generic Segmentation Offload). On certain aarch64 kernels (observed on Oracle Cloud Linux 6.5 aarch64), the kernel does not support `UDP_SEGMENT` on the socket path used, causing every subsequent `sendto()` to fail with `EINVAL` (errno 22). No QUIC packets are ever transmitted.
 
-This error is particularly hard to diagnose because:
-1. tokio-quiche logs the `EINVAL` via `foundations::telemetry::log` (a slog-based logger), **not** the standard `log` crate or `tracing`. Unless the application initializes `foundations::telemetry::init()`, all such log messages are silently discarded to `slog::Discard`.
-2. h3llo uses `tracing` for its own logging, which does not bridge to foundations/slog.
-3. quiche itself has no visibility into socket errors (they occur in the tokio-quiche layer).
-
-As a result, the default h3llo log output shows timeouts with no indication that packets are failing to send.
+tokio-quiche logs the `EINVAL` via `foundations::telemetry::log` (slog-based), bridged to tracing.
+The error appears at `warn` level by default: `WARN tokio_quiche: error sending client Initial packets to peer, error: Invalid argument (os error 22)`.
 
 **Diagnostic steps**:
 
@@ -347,8 +351,9 @@ strace -e sendto -p $(pgrep h3llo) 2>&1 | head -10
 # 3. Check architecture — this affects aarch64 primarily
 uname -m   # aarch64
 
-# 4. (If you have foundations logging initialized) look for the send error:
-# "error sending client Initial packets to peer, error: Invalid argument (os error 22)"
+# 4. Look for the tokio-quiche send error:
+RUST_LOG=warn,h3llo=info,tokio_quiche=info docker restart h3llo
+docker logs h3llo 2>&1 | grep "error sending"
 ```
 
 **Fix**: Disable UDP offload in the configuration:
@@ -358,7 +363,7 @@ tuning:
   udp_enable_offload: false
 ```
 
-> **Note on observability**: To make tokio-quiche's send errors visible without code changes, initialize foundations telemetry in `main.rs` and set `RUST_LOG=h3llo=debug`. The error `"error sending client Initial packets to peer"` will then appear via the slog backend. Without this initialization, the error is silently dropped — this is a known logging gap between h3llo (tracing) and tokio-quiche (foundations/slog).
+> **Note on observability**: tokio-quiche's send errors are bridged to tracing and visible at `warn` level by default. Set `RUST_LOG=warn,h3llo=info,tokio_quiche=info` for additional QUIC runtime detail.
 
 ### BareUDP Checksum Errors with NIC TX Offload
 
