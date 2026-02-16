@@ -510,8 +510,12 @@ fn filter_preferred_interfaces(
 /// Selection order (highest priority first):
 /// 1. Longest prefix match (most specific route wins).
 /// 2. Among equal prefixes, main routing table (254) preferred over custom tables.
-/// 3. Lower metric wins within the same table category. Absent metric is treated as 0
-///    (highest priority), matching Linux kernel behavior.
+/// 3. Lower metric wins within the same table category (main or non-main). Absent
+///    metric is treated as 0 (highest priority), matching Linux kernel behavior.
+///    Routes from different non-main tables (e.g., table 100 and 176) are grouped
+///    together and compared by metric — per-table-ID isolation is not performed because
+///    h3llo prioritizes cross-platform compatibility with minimal code; for hosts with
+///    policy routing, explicit `bindif` configuration is the recommended fallback.
 ///
 /// This heuristic approximates Linux routing behavior but cannot replicate the kernel's
 /// RPDB (routing policy database) evaluation. When policy routing is configured, the
