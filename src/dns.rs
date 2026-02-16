@@ -112,11 +112,6 @@ impl DnsState {
         let _ = events_tx.send(Event::Dns(DnsEvent { state }));
     }
 
-    /// Checks if a hostname is registered.
-    fn is_registered(&self, host: &str) -> bool {
-        self.entries.contains_key(host)
-    }
-
     /// Returns an iterator over registered hostnames.
     fn hostnames(&self) -> impl Iterator<Item = &String> {
         self.entries.keys()
@@ -148,6 +143,7 @@ pub struct DnsActor {
     refresh_interval: Duration,
     snapshot_delay: Duration,
     min_ttl_secs: u32,
+    query_interval: Duration,
 }
 
 /// Creates a DNS resolver actor state from configuration.
@@ -190,6 +186,7 @@ pub async fn make_dns<P: RouteProbe>(
         refresh_interval: tuning.dns_refresh_interval,
         snapshot_delay: tuning.dns_snapshot_delay,
         min_ttl_secs: tuning.dns_min_ttl,
+        query_interval: tuning.dns_query_interval,
     })
 }
 
@@ -219,6 +216,7 @@ pub fn spawn_dns(
         refresh_interval,
         snapshot_delay,
         min_ttl_secs,
+        query_interval,
     } = actor;
 
     let server_str = server.to_string();
@@ -265,7 +263,7 @@ pub fn spawn_dns(
                 maybe_cmd = cmd_rx.recv() => {
                     match maybe_cmd {
                         Some(DnsCommand::SetHostnames { hosts }) => {
-                            handle_set_hostnames(hosts, &mut state, &mut pending, &socket).await;
+                            handle_set_hostnames(hosts, &mut state, &mut pending, &socket, query_interval).await;
                         }
                         None => {
                             cmd_rx_closed = true;
@@ -295,12 +293,12 @@ pub fn spawn_dns(
                     state.emit_snapshot(&events_tx);
                 }
                 _ = ticker.tick() => {
-                    handle_tick(&mut pending, &socket, timeout).await;
+                    handle_tick(&mut pending, &socket, timeout, query_interval).await;
                     state.expire_stale();
                     arm_snapshot_timer!();
                 }
                 _ = refresh_ticker.tick(), if !refresh_interval.is_zero() => {
-                    trigger_refresh(&state, &mut pending, &socket).await;
+                    trigger_refresh(&state, &mut pending, &socket, query_interval).await;
                 }
             }
 
@@ -327,97 +325,75 @@ async fn handle_set_hostnames(
     state: &mut DnsState,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
+    query_interval: Duration,
 ) {
-    // Find added hostnames
-    let added: Vec<String> = new_hosts
-        .iter()
-        .filter(|h| !state.is_registered(h))
-        .cloned()
-        .collect();
-
-    // Update state (handles adds + removes + dirty flag)
     state.set_hostnames(&new_hosts);
 
-    // Issue queries for added hostnames
-    for host in added {
-        resolve_hostname(&host, state, pending, socket).await;
+    // Record IP literals immediately (trigger_refresh skips them)
+    for host in &new_hosts {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            state.record_ip(host, ip, u32::MAX);
+        }
     }
+
+    trigger_refresh(state, pending, socket, query_interval).await;
 }
 
-/// Issues DNS queries for a hostname (handling IP literals).
-async fn resolve_hostname(
-    host: &str,
-    state: &mut DnsState,
-    pending: &mut HashMap<u16, PendingRequest>,
-    socket: &UdpSocket,
-) {
-    // Fast path: IP literal detection
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        // IP literals use max TTL (effectively never expire)
-        state.record_ip(host, ip, u32::MAX);
-    } else {
-        issue_query(host.to_string(), RecordType::A, pending, socket).await;
-        issue_query(host.to_string(), RecordType::AAAA, pending, socket).await;
-    }
-}
-
-/// Triggers refresh for all registered hostnames.
+/// Sends A+AAAA queries for all registered non-literal hostnames.
 async fn trigger_refresh(
     state: &DnsState,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
+    query_interval: Duration,
 ) {
     for host in state.hostnames() {
         // Skip IP literals (never need refresh)
         if host.parse::<IpAddr>().is_err() {
-            issue_query(host.clone(), RecordType::A, pending, socket).await;
-            issue_query(host.clone(), RecordType::AAAA, pending, socket).await;
+            time::sleep(query_interval).await;
+            send_query(host.clone(), RecordType::A, pending, socket).await;
+            time::sleep(query_interval).await;
+            send_query(host.clone(), RecordType::AAAA, pending, socket).await;
         }
     }
 }
 
-/// Issues a query for `host` and `record_type`, logging on error.
-async fn issue_query(
-    host: String,
-    record_type: RecordType,
-    pending: &mut HashMap<u16, PendingRequest>,
-    socket: &UdpSocket,
-) {
-    if let Err(err) = send_query(host.clone(), record_type, pending, socket).await {
-        warn!(host = %host, record_type = ?record_type, error = %err, "dns: query send failed");
-    }
-}
-
-/// Sends a DNS query packet and records it as pending.
+/// Sends a DNS query packet and records it as pending. Logs on error.
 async fn send_query(
     host: String,
     record_type: RecordType,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
-) -> Result<(), String> {
-    let name = Name::from_ascii(&host).map_err(|e| e.to_string())?;
+) {
+    let result: Result<(), String> = async {
+        let name = Name::from_ascii(&host).map_err(|e| e.to_string())?;
 
-    let mut message = Message::new();
-    let id = allocate_id(pending);
-    message.set_id(id);
-    message.set_message_type(MessageType::Query);
-    message.set_op_code(OpCode::Query);
-    message.set_recursion_desired(true);
-    message.add_query(record_type_query(name, record_type));
+        let mut message = Message::new();
+        let id = allocate_id(pending);
+        message.set_id(id);
+        message.set_message_type(MessageType::Query);
+        message.set_op_code(OpCode::Query);
+        message.set_recursion_desired(true);
+        message.add_query(record_type_query(name, record_type));
 
-    let outbound = message.to_vec().map_err(|e| e.to_string())?;
-    socket.send(&outbound).await.map_err(|e| e.to_string())?;
+        let outbound = message.to_vec().map_err(|e| e.to_string())?;
+        socket.send(&outbound).await.map_err(|e| e.to_string())?;
 
-    pending.insert(
-        id,
-        PendingRequest {
-            host,
-            record_type,
-            last_sent: Instant::now(),
-        },
-    );
+        pending.insert(
+            id,
+            PendingRequest {
+                host: host.clone(),
+                record_type,
+                last_sent: Instant::now(),
+            },
+        );
 
-    Ok(())
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = result {
+        warn!(host = %host, record_type = ?record_type, error = %err, "dns: query send failed");
+    }
 }
 
 /// Allocates a transaction ID unique among current pending requests.
@@ -460,11 +436,16 @@ fn handle_decoded_packet(message: Message, request: PendingRequest, state: &mut 
     let records = extract_records(&message, request.record_type);
 
     if message.response_code() == ResponseCode::NoError && records.is_empty() {
-        if let Some(unexpected_type) = first_nonmatching_answer(&message, request.record_type) {
+        if let Some(got) = message
+            .answers()
+            .iter()
+            .map(|a| a.record_type())
+            .find(|&rt| rt != request.record_type)
+        {
             warn!(
                 host = %request.host,
                 expected = ?request.record_type,
-                got = ?unexpected_type,
+                got = ?got,
                 "dns: unexpected record type in response"
             );
             return;
@@ -482,6 +463,7 @@ async fn handle_tick(
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
     timeout: Duration,
+    query_interval: Duration,
 ) {
     let now = Instant::now();
     let expired: Vec<(u16, PendingRequest)> = pending
@@ -489,12 +471,9 @@ async fn handle_tick(
         .collect();
 
     for (_id, request) in expired {
+        time::sleep(query_interval).await;
         warn!(host = %request.host, record_type = ?request.record_type, "dns: query timed out, retrying");
-        if let Err(err) =
-            send_query(request.host.clone(), request.record_type, pending, socket).await
-        {
-            warn!(host = %request.host, error = %err, "dns: retry send failed");
-        }
+        send_query(request.host.clone(), request.record_type, pending, socket).await;
     }
 }
 
@@ -525,17 +504,6 @@ fn extract_records(message: &Message, expected: RecordType) -> Vec<(IpAddr, u32)
     }
 
     records.into_iter().collect()
-}
-
-/// Finds the first answer whose record type does not match `expected`.
-fn first_nonmatching_answer(message: &Message, expected: RecordType) -> Option<RecordType> {
-    for answer in message.answers() {
-        let record_type = answer.record_type();
-        if record_type != expected {
-            return Some(record_type);
-        }
-    }
-    None
 }
 
 /// Logs DNS response warnings at origin (not sent as events).
