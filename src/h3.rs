@@ -38,7 +38,7 @@ use tokio_quiche::http3::driver::{
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::listen_with_capabilities;
 use tokio_quiche::metrics::DefaultMetrics;
-use tokio_quiche::quic::QuicCommand;
+use tokio_quiche::quic::{ConnectionShutdownBehaviour, QuicCommand};
 use tokio_quiche::quiche::h3::{Header, NameValue};
 use tokio_quiche::settings::{
     CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
@@ -55,6 +55,7 @@ fn make_quic_settings(tuning: &Tuning, tun_mtu: u16) -> QuicSettings {
     let quic_udp_payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
     let mut s = QuicSettings::default();
     s.enable_dgram = true;
+    s.handshake_timeout = Some(tuning.h3_handshake_timeout);
     s.max_idle_timeout = Some(tuning.h3_max_idle_timeout);
     s.max_send_udp_payload_size = quic_udp_payload_size;
     s.max_recv_udp_payload_size = quic_udp_payload_size;
@@ -124,6 +125,17 @@ fn make_keepalive_sender<C: From<QuicCommand> + Send + 'static>(
     })
 }
 
+/// Requests a graceful QUIC connection close via the driver command channel.
+fn close_quic_connection<C: From<QuicCommand> + Send + 'static>(
+    quic_cmd_tx: &tokio_quiche::http3::driver::RequestSender<C, QuicCommand>,
+) {
+    let _ = quic_cmd_tx.send(QuicCommand::ConnectionClose(ConnectionShutdownBehaviour {
+        send_application_close: false,
+        error_code: 0,
+        reason: Vec::new(),
+    }));
+}
+
 /// Sends HTTP/3 response headers via the OutboundFrameSender.
 ///
 /// Per RFC 9297 Section 2.1, the `capsule-protocol` header MUST only be included
@@ -183,10 +195,10 @@ async fn handle_h3_connection(
     events_tx: mpsc::UnboundedSender<Event>,
     h3_handshake_timeout: Duration,
 ) {
-    let handshake = async {
-        // Extract cmd_sender before the handshake loop consumes event_receiver_mut().
-        let quic_cmd_tx = controller.cmd_sender();
+    // Extract cmd_sender before the handshake loop consumes event_receiver_mut().
+    let quic_cmd_tx = controller.cmd_sender();
 
+    let handshake = async {
         // State for auth/flow handshake. Each handshake expects exactly one
         // Headers event and one NewFlow event. Duplicates are detected via
         // Option presence and cause immediate connection rejection.
@@ -202,6 +214,7 @@ async fn handle_h3_connection(
                     // Reject duplicate Headers event - use Option presence check
                     if pending_auth.is_some() || pending_sender.is_some() {
                         warn!(%remote_addr, "duplicate Headers event, rejecting connection");
+                        close_quic_connection(&quic_cmd_tx);
                         return;
                     }
 
@@ -234,6 +247,7 @@ async fn handle_h3_connection(
                     // Reject duplicate NewFlow event - use Option presence check
                     if pending_flow.is_some() {
                         warn!(%remote_addr, "duplicate NewFlow event, rejecting connection");
+                        close_quic_connection(&quic_cmd_tx);
                         return;
                     }
 
@@ -267,10 +281,12 @@ async fn handle_h3_connection(
                     pending_sender.take(),
                 ) else {
                     error!(%remote_addr, "internal error: handshake state inconsistent");
+                    close_quic_connection(&quic_cmd_tx);
                     return;
                 };
                 if send_response_headers(&mut sender, b"200").await.is_err() {
                     warn!(%remote_addr, "failed to send 200 response");
+                    close_quic_connection(&quic_cmd_tx);
                     return;
                 }
                 debug!(%peer_id, %remote_addr, "H3 connection established");
@@ -291,6 +307,7 @@ async fn handle_h3_connection(
                 }));
                 if events_tx.send(event).is_err() {
                     debug!(%remote_addr, "events channel closed");
+                    close_quic_connection(&quic_cmd_tx);
                 }
                 return;
             }
@@ -299,6 +316,7 @@ async fn handle_h3_connection(
         // Event stream closed before handshake completed
         if pending_auth.is_some() || pending_flow.is_some() {
             debug!(%remote_addr, "H3 handshake incomplete: connection closed");
+            close_quic_connection(&quic_cmd_tx);
         }
     };
 
@@ -307,6 +325,7 @@ async fn handle_h3_connection(
         .is_err()
     {
         warn!(%remote_addr, "H3 handshake timeout");
+        close_quic_connection(&quic_cmd_tx);
     }
 }
 
@@ -514,17 +533,20 @@ pub async fn dial_h3<P: RouteProbe>(
     ];
 
     // Send CONNECT request
-    controller
-        .request_sender()
-        .send(NewClientRequest {
-            request_id: 0,
-            headers,
-            body_writer: None,
-        })
-        .map_err(|e| DialError::Handshake(format!("send CONNECT failed: {:?}", e)))?;
+    if let Err(e) = controller.request_sender().send(NewClientRequest {
+        request_id: 0,
+        headers,
+        body_writer: None,
+    }) {
+        close_quic_connection(&quic_cmd_tx);
+        return Err(DialError::Handshake(format!(
+            "send CONNECT failed: {:?}",
+            e
+        )));
+    }
 
     // Wait for response headers and NewFlow event with timeout
-    let handshake_result = time::timeout(tuning.h3_handshake_timeout, async {
+    let handshake_result = match time::timeout(tuning.h3_handshake_timeout, async {
         // These three fields are kept as separate Options (rather than a single
         // Option<(_, _, _)>) because the NewFlow delivery may not be atomic —
         // per-field errors aid debugging when a partial state is observed.
@@ -599,6 +621,12 @@ pub async fn dial_h3<P: RouteProbe>(
             }
         }
 
+        if !status_validated {
+            return Err(DialError::Handshake(
+                "missing successful CONNECT-IP response status".to_string(),
+            ));
+        }
+
         let datagram_tx = datagram_tx
             .ok_or_else(|| DialError::Handshake("no datagram_tx from NewFlow".to_string()))?;
         let datagram_rx = datagram_rx
@@ -609,7 +637,17 @@ pub async fn dial_h3<P: RouteProbe>(
         Ok((datagram_tx, datagram_rx, flow_id))
     })
     .await
-    .map_err(|_| DialError::Timeout(tuning.h3_handshake_timeout))??;
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => {
+            close_quic_connection(&quic_cmd_tx);
+            return Err(err);
+        }
+        Err(_) => {
+            close_quic_connection(&quic_cmd_tx);
+            return Err(DialError::Timeout(tuning.h3_handshake_timeout));
+        }
+    };
 
     let (datagram_tx, datagram_rx, flow_id) = handshake_result;
 
@@ -1218,6 +1256,16 @@ mod tests {
         assert_eq!(buf[0], CONTEXT_ID_IP);
         buf.pop_front(1);
         assert_eq!(&buf[..], original);
+    }
+
+    #[test]
+    fn make_quic_settings_applies_handshake_timeout() {
+        let mut tuning = Tuning::default();
+        tuning.h3_handshake_timeout = Duration::from_secs(7);
+
+        let settings = make_quic_settings(&tuning, crate::config::default_mtu());
+
+        assert_eq!(settings.handshake_timeout, Some(Duration::from_secs(7)));
     }
 
     // ========== CONNECT-IP Header Validation Tests ==========
