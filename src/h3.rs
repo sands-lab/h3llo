@@ -138,6 +138,8 @@ fn close_quic_connection<C: From<QuicCommand> + Send + 'static>(
 /// Per RFC 9297 Section 2.1, the `capsule-protocol` header MUST only be included
 /// on 2xx (Successful) responses. Error responses (400, 401, etc.) MUST NOT
 /// include this header to avoid protocol fingerprinting.
+///
+/// This only sends response headers and does not close the request stream.
 async fn send_response_headers(
     sender: &mut OutboundFrameSender,
     status: &[u8],
@@ -154,6 +156,23 @@ async fn send_response_headers(
         .send(OutboundFrame::Headers(headers, None))
         .await
         .map_err(|_| "failed to send response headers")
+}
+
+/// Sends a non-2xx response and closes the request stream with FIN.
+///
+/// Uses Trailers to end the stream explicitly without forcing connection close.
+async fn send_error_response_and_finish_stream(
+    sender: &mut OutboundFrameSender,
+    status: &[u8],
+) -> Result<(), &'static str> {
+    if is_success_status(status) {
+        return Err("status must be non-2xx for error response");
+    }
+    send_response_headers(sender, status).await?;
+    sender
+        .send(OutboundFrame::Trailers(Vec::new(), None))
+        .await
+        .map_err(|_| "failed to finish error response stream")
 }
 
 /// Validates CONNECT-IP protocol headers per RFC 9484.
@@ -219,7 +238,16 @@ async fn handle_h3_connection(
                     if let Err(reason) = validate_connect_ip_headers(&incoming_headers.headers) {
                         warn!(%remote_addr, %reason, "CONNECT-IP protocol validation failed");
                         let mut sender = incoming_headers.send;
-                        let _ = send_response_headers(&mut sender, b"400").await;
+                        if let Err(send_err) =
+                            send_error_response_and_finish_stream(&mut sender, b"400").await
+                        {
+                            warn!(
+                                %remote_addr,
+                                %send_err,
+                                "failed to send/finish 400 response stream"
+                            );
+                            close_quic_connection(&quic_cmd_tx);
+                        }
                         return;
                     }
 
@@ -231,7 +259,16 @@ async fn handle_h3_connection(
                         Err(reason) => {
                             warn!(%remote_addr, %reason, "CONNECT-IP auth rejected");
                             let mut sender = incoming_headers.send;
-                            let _ = send_response_headers(&mut sender, b"401").await;
+                            if let Err(send_err) =
+                                send_error_response_and_finish_stream(&mut sender, b"401").await
+                            {
+                                warn!(
+                                    %remote_addr,
+                                    %send_err,
+                                    "failed to send/finish 401 response stream"
+                                );
+                                close_quic_connection(&quic_cmd_tx);
+                            }
                             return;
                         }
                     }
