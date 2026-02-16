@@ -277,6 +277,11 @@ pub fn spawn_udp_tx(
         let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Tx);
         let mut ticker = time::interval(interval);
         let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
+        let max_segs = if enable_offload {
+            state.max_gso_segments()
+        } else {
+            1
+        };
 
         loop {
             tokio::select! {
@@ -288,12 +293,6 @@ pub fn spawn_udp_tx(
                     if packets.is_empty() {
                         continue;
                     }
-
-                    let max_segs = if enable_offload {
-                        state.max_gso_segments()
-                    } else {
-                        1
-                    };
                     // TUN GSO guarantees all non-tail packets in a batch share
                     // the same size; segment_size from the first packet is safe.
                     let segment_size = packets[0].len();
