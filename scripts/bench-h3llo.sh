@@ -39,6 +39,7 @@ IMAGE="${IMAGE:-nekonuts/h3llo}"
 CERT_DIR="${CERT_DIR:-$(mktemp -d /tmp/h3llo-bench-certs.XXXXXX)}"
 IPERF_TIME="${IPERF_TIME:-10}"
 PACKET_QUEUE_DEPTH="${PACKET_QUEUE_DEPTH:-256}"
+TUN_TX_QUEUE_LEN="${TUN_TX_QUEUE_LEN:-1000}"
 
 UDP_PAYLOAD=$((TUN_MTU - 28))  # Subtract IP+UDP overhead to avoid fragmentation
 H3_PORT=4433
@@ -92,50 +93,45 @@ collect_raw_counters() {
     } >> "$COUNTERS_FILE"
 }
 
-# Collect TUN drops, UDP socket drops, nstat UDP errors in a single docker exec.
-# Usage: collect_counters <container> <tun_if> <udp_port> [remote]
-# Output: "tun_rx_drop tun_tx_drop udp_sock_drops nstat_rcvbuf nstat_sndbuf"
-collect_counters() {
-    local ctr="$1" tun="$2" port="$3" remote="${4:-}"
+# Dump raw container-level counters (TUN link stats, UDP socket drops, nstat)
+# to the counters file via docker exec.
+# Usage: collect_container_counters <label> <container> <tun_if> <udp_port> [remote]
+# Output is appended to $COUNTERS_FILE.
+collect_container_counters() {
+    local label="$1" ctr="$2" tun="$3" port="$4" remote="${5:-}"
     local hex_port
     hex_port=$(printf '%04X' "$port")
     local script
     script=$(cat <<'SCRIPT'
-tun_stats=$(ip -s link show TUN_IF 2>/dev/null || echo "")
-tun_rx_drop=0; tun_tx_drop=0
-if [ -n "$tun_stats" ]; then
-    tun_rx_drop=$(echo "$tun_stats" | awk '/RX:/{getline; print $4; exit}')
-    tun_tx_drop=$(echo "$tun_stats" | awk '/TX:/{getline; print $4; exit}')
-fi
-udp_drops=$(awk -v hp="HEX_PORT" 'NR>1 && toupper(substr($2, index($2,":")+1)) == hp {t+=$NF} END{print t+0}' /proc/1/net/udp 2>/dev/null || echo 0)
-nstat_out=$(nstat -az 2>/dev/null || echo "")
-rcvbuf=$(echo "$nstat_out" | awk '/UdpRcvbufErrors/{print $2}')
-sndbuf=$(echo "$nstat_out" | awk '/UdpSndbufErrors/{print $2}')
-echo "${tun_rx_drop:-0} ${tun_tx_drop:-0} ${udp_drops:-0} ${rcvbuf:-0} ${sndbuf:-0}"
+echo "---- ip -s link show TUN_IF ----"
+ip -s link show TUN_IF 2>&1 || echo "(unavailable)"
+echo ""
+echo "---- /proc/1/net/udp (port HEX_PORT) ----"
+cat /proc/1/net/udp 2>&1 || echo "(unavailable)"
+echo ""
+echo "---- nstat -az ----"
+nstat -az 2>&1 || echo "(unavailable)"
 SCRIPT
     )
     script="${script//TUN_IF/$tun}"
     script="${script//HEX_PORT/$hex_port}"
-    if [[ -n "$remote" ]]; then
-        ssh "$REMOTE" "docker exec \"$ctr\" sh -c '$script'" 2>/dev/null || echo "0 0 0 0 0"
-    else
-        docker exec "$ctr" sh -c "$script" 2>/dev/null || echo "0 0 0 0 0"
-    fi
-}
 
-# Report delta between two counter snapshots.
-# Usage: report_counters <label> "<before>" "<after>"
-report_counters() {
-    local label="$1"
-    local -a before after
-    read -ra before <<< "$2"
-    read -ra after <<< "$3"
-    local d_rx=$(( after[0] - before[0] ))
-    local d_tx=$(( after[1] - before[1] ))
-    local d_udp=$(( after[2] - before[2] ))
-    local d_rcvbuf=$(( after[3] - before[3] ))
-    local d_sndbuf=$(( after[4] - before[4] ))
-    echo "  [$label] TUN rx_drop=+$d_rx tx_drop=+$d_tx | UDP sock_drops=+$d_udp | nstat RcvbufErr=+$d_rcvbuf SndbufErr=+$d_sndbuf"
+    local node_label="local"
+    if [[ -n "$remote" ]]; then
+        node_label="remote"
+    fi
+
+    {
+        echo ""
+        echo "======== $label ($node_label / $ctr) | $(date -Iseconds) ========"
+        echo ""
+        if [[ -n "$remote" ]]; then
+            ssh "$REMOTE" "docker exec \"$ctr\" sh -c '$script'" 2>&1 || echo "(docker exec failed)"
+        else
+            docker exec "$ctr" sh -c "$script" 2>&1 || echo "(docker exec failed)"
+        fi
+        echo ""
+    } >> "$COUNTERS_FILE"
 }
 
 # --- Prerequisites ---
@@ -143,10 +139,19 @@ for cmd in docker ssh scp iperf3 openssl; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "Error: $cmd not found" >&2; exit 1; }
 done
 
-# --- Pull latest Docker image ---
+# --- Pull latest Docker image and build bench variant ---
 echo "Pulling latest image: $IMAGE ..."
 docker pull "$IMAGE"
 ssh "$REMOTE" "docker pull \"$IMAGE\""
+
+# Build a derived image with benchmark dependencies (iperf3, iproute2, ping).
+# The production image is minimal; we layer tools on top to avoid modifying it.
+BENCH_IMAGE="${IMAGE}:bench"
+echo "Building benchmark image: $BENCH_IMAGE ..."
+printf 'FROM %s\nRUN apk add --no-cache iperf3 iputils-ping iproute2\n' "$IMAGE" \
+    | docker build --quiet -t "$BENCH_IMAGE" -
+printf 'FROM %s\nRUN apk add --no-cache iperf3 iputils-ping iproute2\n' "$IMAGE" \
+    | ssh "$REMOTE" "docker build --quiet -t \"$BENCH_IMAGE\" -"
 
 # --- Cleanup ---
 cleanup() {
@@ -157,8 +162,8 @@ cleanup() {
     sleep 1
     # Remove leftover TUN devices (--net=host leaves them in the host namespace).
     # Requires NET_ADMIN, so use a privileged Docker container.
-    docker run --rm --net=host --cap-add NET_ADMIN --entrypoint ip "$IMAGE" link del tun-bench 2>/dev/null || true
-    ssh "$REMOTE" "docker run --rm --net=host --cap-add NET_ADMIN --entrypoint ip \"$IMAGE\" link del tun-bench" 2>/dev/null || true
+    docker run --rm --net=host --cap-add NET_ADMIN --entrypoint ip "$BENCH_IMAGE" link del tun-bench 2>/dev/null || true
+    ssh "$REMOTE" "docker run --rm --net=host --cap-add NET_ADMIN --entrypoint ip \"$BENCH_IMAGE\" link del tun-bench" 2>/dev/null || true
     # Remove generated cert dirs (local + remote)
     if [[ -d "$CERT_DIR" ]]; then rm -rf "$CERT_DIR"; fi
     ssh "$REMOTE" "rm -rf \"$CERT_DIR\"" 2>/dev/null || true
@@ -179,8 +184,8 @@ start_tunnel() {
     local remote_cfg="$2"
 
     # Clean up leftover TUN devices from previous runs (requires NET_ADMIN)
-    docker run --rm --net=host --cap-add NET_ADMIN "$IMAGE" sh -c "ip link del $TUN_IF" 2>/dev/null || true
-    ssh "$REMOTE" "docker run --rm --net=host --cap-add NET_ADMIN \"$IMAGE\" sh -c 'ip link del $TUN_IF'" 2>/dev/null || true
+    docker run --rm --net=host --cap-add NET_ADMIN "$BENCH_IMAGE" sh -c "ip link del $TUN_IF" 2>/dev/null || true
+    ssh "$REMOTE" "docker run --rm --net=host --cap-add NET_ADMIN \"$BENCH_IMAGE\" sh -c 'ip link del $TUN_IF'" 2>/dev/null || true
 
     ssh "$REMOTE" "mkdir -p \"$BENCH_DIR\""
     scp -q "$BENCH_DIR/$remote_cfg" "$REMOTE:$BENCH_DIR/$remote_cfg"
@@ -192,7 +197,7 @@ start_tunnel() {
         -e RUST_LOG=h3llo=debug \
         -v \"$BENCH_DIR\":/etc/h3llo \
         -v \"$CERT_DIR\":/certs \
-        \"$IMAGE\" -c \"/etc/h3llo/$remote_cfg\""
+        \"$BENCH_IMAGE\" -c \"/etc/h3llo/$remote_cfg\""
 
     # Start local container
     docker rm -f "$LOCAL_CTR" 2>/dev/null || true
@@ -201,7 +206,7 @@ start_tunnel() {
         -e RUST_LOG=h3llo=debug \
         -v "$BENCH_DIR":/etc/h3llo \
         -v "$CERT_DIR":/certs \
-        "$IMAGE" -c "/etc/h3llo/$local_cfg"
+        "$BENCH_IMAGE" -c "/etc/h3llo/$local_cfg"
 
     sleep 5  # Wait for TUN creation and tunnel setup
 
@@ -257,9 +262,8 @@ run_test() {
     fi
 
     # --- Capture baseline counters ---
-    local local_before remote_before
-    local_before=$(collect_counters "$LOCAL_CTR" "$TUN_IF" "$udp_port")
-    remote_before=$(collect_counters "$REMOTE_CTR" "$TUN_IF" "$udp_port" remote)
+    collect_container_counters "$label - BEFORE" "$LOCAL_CTR" "$TUN_IF" "$udp_port"
+    collect_container_counters "$label - BEFORE" "$REMOTE_CTR" "$TUN_IF" "$udp_port" remote
     collect_raw_counters "$label - BEFORE" "$LOCAL_IF"
     collect_raw_counters "$label - BEFORE" "$REMOTE_IF" remote
 
@@ -267,15 +271,11 @@ run_test() {
     echo ""
     run_iperf_udp
 
-    # --- Capture post-test counters and report deltas ---
-    local local_after remote_after
-    local_after=$(collect_counters "$LOCAL_CTR" "$TUN_IF" "$udp_port")
-    remote_after=$(collect_counters "$REMOTE_CTR" "$TUN_IF" "$udp_port" remote)
+    # --- Capture post-test counters ---
+    collect_container_counters "$label - AFTER" "$LOCAL_CTR" "$TUN_IF" "$udp_port"
+    collect_container_counters "$label - AFTER" "$REMOTE_CTR" "$TUN_IF" "$udp_port" remote
     collect_raw_counters "$label - AFTER" "$LOCAL_IF"
     collect_raw_counters "$label - AFTER" "$REMOTE_IF" remote
-    echo ""
-    report_counters "Local ($LOCAL_CTR)" "$local_before" "$local_after"
-    report_counters "Remote ($REMOTE_CTR)" "$remote_before" "$remote_after"
 
     # --- Print h3llo debug logs (includes congestion metrics) ---
     echo ""
@@ -303,6 +303,7 @@ local:
     listen: "udp://0.0.0.0:5353"
 tuning:
   packet_queue_depth: $PACKET_QUEUE_DEPTH
+  tun_tx_queue_len: $TUN_TX_QUEUE_LEN
   metrics_log_interval: 1
 peers:
   - id: remote
@@ -328,6 +329,7 @@ local:
     listen: "udp://0.0.0.0:5353"
 tuning:
   packet_queue_depth: $PACKET_QUEUE_DEPTH
+  tun_tx_queue_len: $TUN_TX_QUEUE_LEN
   metrics_log_interval: 1
 peers:
   - id: local
@@ -371,6 +373,7 @@ tuning:
   h3_cc_algorithm: $cc
   h3_insecure_skip_verify: true
   packet_queue_depth: ${PACKET_QUEUE_DEPTH}
+  tun_tx_queue_len: ${TUN_TX_QUEUE_LEN}
   metrics_log_interval: 1${pacing_line}
 peers:
   - id: remote
@@ -401,6 +404,7 @@ tuning:
   h3_cc_algorithm: $cc
   h3_insecure_skip_verify: true
   packet_queue_depth: ${PACKET_QUEUE_DEPTH}
+  tun_tx_queue_len: ${TUN_TX_QUEUE_LEN}
   metrics_log_interval: 1${pacing_line}
 peers:
   - id: local
@@ -418,12 +422,9 @@ EOF
 # When BENCH_DRY_RUN=1, validate helper functions and exit.
 if [[ "${BENCH_DRY_RUN:-0}" == "1" ]]; then
     mkdir -p "$BENCH_DIR"
-    echo "[dry-run] Testing report_counters..."
-    report_counters "TEST" "0 0 0 0 0" "10 5 3 2 1"
-    echo "[dry-run] Expected: [TEST] TUN rx_drop=+10 tx_drop=+5 | UDP sock_drops=+3 | nstat RcvbufErr=+2 SndbufErr=+1"
-    echo "[dry-run] Testing collect_raw_counters..."
     COUNTERS_FILE="$BENCH_DIR/counters-dryrun.txt"
     echo "# dry-run" > "$COUNTERS_FILE"
+    echo "[dry-run] Testing collect_raw_counters..."
     collect_raw_counters "DRY-RUN TEST" "lo"
     echo "[dry-run] Counters file contents:"
     cat "$COUNTERS_FILE"
