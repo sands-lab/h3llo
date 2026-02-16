@@ -56,7 +56,8 @@ async fn main() {
 }
 
 fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("h3llo=info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,h3llo=info"));
 
     fmt()
         .with_env_filter(filter)
@@ -65,6 +66,7 @@ fn init_logging() {
         .init();
 }
 
+/// Parses the config file path from command-line arguments (`-c` / `--config`).
 fn parse_config_path() -> Result<PathBuf, String> {
     let mut args = env::args().skip(1);
     let mut config_path = None;
@@ -86,4 +88,17 @@ fn parse_config_path() -> Result<PathBuf, String> {
     }
 
     config_path.ok_or_else(|| "missing -c/--config".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing_subscriber::EnvFilter;
+
+    #[test]
+    fn default_filter_parses() {
+        // Ensure the hardcoded default filter string is syntactically valid.
+        let filter = EnvFilter::new("warn,h3llo=info");
+        // EnvFilter::new panics on invalid syntax, so reaching here is success.
+        drop(filter);
+    }
 }

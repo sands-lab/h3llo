@@ -211,7 +211,7 @@ start_tunnel() {
     ssh "$REMOTE" "docker rm -f \"$REMOTE_CTR\" 2>/dev/null; \
         docker run -d --name \"$REMOTE_CTR\" \
         $DOCKER_FLAGS \
-        -e RUST_LOG=h3llo=debug \
+        -e RUST_LOG=warn,h3llo=debug \
         -v \"$BENCH_DIR\":/etc/h3llo \
         -v \"$CERT_DIR\":/certs \
         \"$BENCH_IMAGE\" -c \"/etc/h3llo/$remote_cfg\""
@@ -220,7 +220,7 @@ start_tunnel() {
     docker rm -f "$LOCAL_CTR" 2>/dev/null || true
     docker run -d --name "$LOCAL_CTR" \
         $DOCKER_FLAGS \
-        -e RUST_LOG=h3llo=debug \
+        -e RUST_LOG=warn,h3llo=debug \
         -v "$BENCH_DIR":/etc/h3llo \
         -v "$CERT_DIR":/certs \
         "$BENCH_IMAGE" -c "/etc/h3llo/$local_cfg"
