@@ -658,7 +658,7 @@ pub fn default_mtu() -> u16 {
 /// 1500 (Ethernet MTU) − 28 (IPv4 + UDP) − 59 (CONNECT-IP overhead) = 1413.
 /// Exceeding this value may cause oversized QUIC DATAGRAM frames that fail
 /// to send. See `docs/protocol.md` § MTU Guidance.
-pub const MAX_H3_IPV4_MTU: u16 = 1413;
+const MAX_H3_IPV4_MTU: u16 = 1413;
 
 /// Deserializes a DNS server from a `udp://` URI string to `SocketAddr`.
 fn deserialize_dns_server<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
