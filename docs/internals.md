@@ -267,6 +267,8 @@ Observability summary: two metric sources are exposed. (1) Transport-level: inte
 
 Logging summary: h3llo uses the `tracing` crate for structured logging. Warnings are logged directly at origin points rather than propagated through return values.
 
+Logging bridge: tokio-quiche logs via `foundations::telemetry::log` macros (slog-based). h3llo bridges these to the tracing subscriber by calling `foundations::telemetry::init()` with `LogOutput::TracingRsCompat` during startup. This installs `TracingSlogDrain` as foundations' root slog drain, forwarding all slog records into the active tracing subscriber. Init order: (1) `fmt().init()` sets tracing subscriber, (2) `foundations::telemetry::init()` bridges slog → tracing. The init call is one-shot — subsequent calls return `Err`.
+
 Warning handling design principles:
 - **Log at origin**: Modules log warnings directly via `warn!` at the point where the condition is detected, using structured fields for context (e.g., `warn!(prefix = %net, error = %err, "route add failed")`).
 - **No warning enums for logging**: Warning enums like `BindWarning` and `RouteSyncWarning` have been removed in favor of direct logging. This simplifies function signatures and eliminates boilerplate warning propagation code.
