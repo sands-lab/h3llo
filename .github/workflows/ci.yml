@@ -16,6 +16,7 @@ env:
 jobs:
   linux:
     runs-on: self-hosted
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,6 +41,7 @@ jobs:
 
   docker-tests:
     runs-on: self-hosted
+    timeout-minutes: 30
     concurrency:
       group: docker-tests
       cancel-in-progress: false
@@ -73,6 +75,7 @@ jobs:
   # Runs on PRs too (for cross-compilation validation) but skips push.
   docker-build:
     runs-on: self-hosted
+    timeout-minutes: 60
     concurrency:
       group: buildx-${{ matrix.arch_label }}
       cancel-in-progress: false
@@ -87,6 +90,11 @@ jobs:
           - platform: linux/riscv64
             arch_label: riscv64
     steps:
+      - name: Isolate Docker config per arch
+        run: |
+          mkdir -p "$HOME/.docker-${{ matrix.arch_label }}"
+          echo "DOCKER_CONFIG=$HOME/.docker-${{ matrix.arch_label }}" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -169,6 +177,7 @@ jobs:
   docker-merge:
     if: github.event_name != 'pull_request'
     runs-on: self-hosted
+    timeout-minutes: 10
     needs: [docker-build, linux, docker-tests]
     steps:
       - name: Download digests
@@ -215,6 +224,7 @@ jobs:
   release:
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/master'
     runs-on: self-hosted
+    timeout-minutes: 10
     needs: [docker-merge]
     permissions:
       contents: write
