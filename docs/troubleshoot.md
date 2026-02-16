@@ -17,13 +17,17 @@ If the container exits immediately, check the log for initialization errors (TUN
 
 ### 2. Enable debug logging
 
-Set `RUST_LOG=h3llo=debug` to expose QUIC handshake steps, socket binding, and packet counters:
+h3llo's default log filter is `warn,h3llo=info` — it shows warnings and errors from all
+dependencies plus info-level messages from h3llo itself. Set `RUST_LOG=h3llo=debug` to expose
+QUIC handshake steps, socket binding, and packet counters:
 
 ```bash
 docker run -d --name h3llo-debug \
   -e RUST_LOG=h3llo=debug \
   ... h3llo:test
 ```
+
+This enables debug-level output from h3llo while keeping third-party crates at the default `warn`.
 
 Key log lines to look for:
 
@@ -36,6 +40,42 @@ Key log lines to look for:
 | `multiple interfaces found` | Interface auto-detection ambiguity (see [Multi-NIC binding](#silent-h3quic-connection-failure-on-multi-nic-hosts)) |
 
 If none of the connection log lines appear, the handshake is failing silently — check `bindif`, TLS certs, and network reachability.
+
+#### Third-party library logging
+
+h3llo depends on libraries that emit their own log messages. By default, only `warn` and `error`
+from these libraries are shown. To enable more verbose output from a specific library, add its
+tracing target name to `RUST_LOG`:
+
+| Library | Target name | Framework | What it logs |
+|---------|-------------|-----------|--------------|
+| hickory-proto | `hickory_proto` | tracing | DNS resolution: query failures, NXDOMAIN, truncation |
+| h2 | `h2` | tracing | HTTP/2 framing (used internally by hyper) |
+| hyper-util | `hyper_util` | tracing | HTTP server lifecycle |
+| quinn-udp | `quinn_udp` | tracing | UDP socket send/receive operations |
+| quiche | `quiche` | log (bridged) | QUIC protocol core: handshake, congestion, frames |
+| tokio-quiche | `tokio_quiche` | slog (not captured) | QUIC async runtime — uses `slog-scope`; NOT visible via `RUST_LOG` without slog initialization |
+| tun-rs | `tun_rs` | log (bridged) | TUN device creation and I/O |
+| route_manager | `route_manager` | none | Route management — no log output currently emitted |
+
+Crate names containing `-` become `_` in tracing targets. Libraries using the `log` crate are
+automatically bridged to tracing via `tracing-log`.
+
+**Examples**:
+
+```bash
+# Debug DNS resolution issues
+RUST_LOG=warn,h3llo=info,hickory_proto=debug
+
+# Debug QUIC connection issues
+RUST_LOG=warn,h3llo=info,quiche=debug
+
+# Debug TUN device issues
+RUST_LOG=warn,h3llo=info,tun_rs=debug
+
+# Full trace from all dependencies (very verbose)
+RUST_LOG=trace
+```
 
 ### 3. Verify underlay reachability
 
@@ -264,4 +304,4 @@ docker run -d --name h3llo-h3 \
 
 - **Config updates**: The config file is bind-mounted, so `docker cp` cannot overwrite it (`device or resource busy`). Edit the host-side file and `docker restart` instead.
 - **Stale containers**: `docker run` fails if a container with the same `--name` already exists (even if stopped). Remove first with `docker rm -f <name>`.
-- **Debug logging**: Pass `-e RUST_LOG=h3llo=debug` for verbose output; this is an environment variable, not a config file option.
+- **Debug logging**: Pass `-e RUST_LOG=h3llo=debug` for verbose h3llo output. For third-party library logs, add targets like `quiche=debug`; see [Enable debug logging](#2-enable-debug-logging) for the full target list. `RUST_LOG` is an environment variable, not a config file option.
