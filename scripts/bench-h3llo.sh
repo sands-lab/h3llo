@@ -50,6 +50,7 @@ H3_TOKEN="bench-token-12ch"  # Test-only token, NOT for production
 BENCH_DIR="/tmp/h3llo-bench"
 LOCAL_CTR="h3llo-bench-local"
 REMOTE_CTR="h3llo-bench-remote"
+TUN_IF="tun-bench"
 
 # Docker flags: host networking + TUN device access.
 # Intentionally unquoted at call sites to allow word splitting into separate args.
@@ -64,10 +65,10 @@ DOCKER_FLAGS="--net=host --cap-add NET_ADMIN --device /dev/net/tun"
 # Output is appended to $COUNTERS_FILE.
 collect_raw_counters() {
     local label="$1" phy_if="$2" remote="${3:-}"
-    local run_prefix=""
+    local -a run_cmd=()
     local node_label="local"
     if [[ -n "$remote" ]]; then
-        run_prefix="ssh $REMOTE"
+        run_cmd=(ssh "$REMOTE")
         node_label="remote"
     fi
 
@@ -76,19 +77,19 @@ collect_raw_counters() {
         echo "======== $label ($node_label) | $(date -Iseconds) ========"
         echo ""
         echo "---- /proc/net/softnet_stat ----"
-        $run_prefix cat /proc/net/softnet_stat 2>&1 || echo "(unavailable)"
+        "${run_cmd[@]}" cat /proc/net/softnet_stat 2>&1 || echo "(unavailable)"
         echo ""
         echo "---- tc -s qdisc show dev $phy_if ----"
-        $run_prefix tc -s qdisc show dev "$phy_if" 2>&1 || echo "(unavailable)"
+        "${run_cmd[@]}" tc -s qdisc show dev "$phy_if" 2>&1 || echo "(unavailable)"
         echo ""
         echo "---- tc -s qdisc show dev $TUN_IF ----"
-        $run_prefix tc -s qdisc show dev "$TUN_IF" 2>&1 || echo "(unavailable)"
+        "${run_cmd[@]}" tc -s qdisc show dev "$TUN_IF" 2>&1 || echo "(unavailable)"
         echo ""
         echo "---- tc -s class show dev $phy_if ----"
-        $run_prefix tc -s class show dev "$phy_if" 2>&1 || echo "(no classes)"
+        "${run_cmd[@]}" tc -s class show dev "$phy_if" 2>&1 || echo "(no classes)"
         echo ""
         echo "---- ethtool -S $phy_if ----"
-        $run_prefix ethtool -S "$phy_if" 2>&1 || echo "(unavailable)"
+        "${run_cmd[@]}" ethtool -S "$phy_if" 2>&1 || echo "(unavailable)"
         echo ""
     } >> "$COUNTERS_FILE"
 }
@@ -134,6 +135,24 @@ SCRIPT
     } >> "$COUNTERS_FILE"
 }
 
+# --- Smoke test ---
+# When BENCH_DRY_RUN=1, validate helper functions and exit early
+# (before any remote operations or Docker image pulls).
+if [[ "${BENCH_DRY_RUN:-0}" == "1" ]]; then
+    mkdir -p "$BENCH_DIR"
+    COUNTERS_FILE="$BENCH_DIR/counters-dryrun.txt"
+    echo "# dry-run" > "$COUNTERS_FILE"
+    echo "[dry-run] Testing collect_raw_counters..."
+    collect_raw_counters "DRY-RUN TEST" "lo"
+    echo "[dry-run] Counters file contents:"
+    cat "$COUNTERS_FILE"
+    rm -f "$COUNTERS_FILE"
+    # Clean up auto-created temp cert dir (cleanup trap not registered yet)
+    [[ "$CERT_DIR" == /tmp/h3llo-bench-certs.* ]] && rm -rf "$CERT_DIR"
+    echo "[dry-run] OK"
+    exit 0
+fi
+
 # --- Prerequisites ---
 for cmd in docker ssh scp iperf3 openssl; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "Error: $cmd not found" >&2; exit 1; }
@@ -177,8 +196,6 @@ stop_containers() {
 }
 
 # --- Tunnel lifecycle ---
-TUN_IF="tun-bench"
-
 start_tunnel() {
     local local_cfg="$1"
     local remote_cfg="$2"
@@ -417,21 +434,6 @@ peers:
         - 10.0.0.1/32
 EOF
 }
-
-# --- Smoke test ---
-# When BENCH_DRY_RUN=1, validate helper functions and exit.
-if [[ "${BENCH_DRY_RUN:-0}" == "1" ]]; then
-    mkdir -p "$BENCH_DIR"
-    COUNTERS_FILE="$BENCH_DIR/counters-dryrun.txt"
-    echo "# dry-run" > "$COUNTERS_FILE"
-    echo "[dry-run] Testing collect_raw_counters..."
-    collect_raw_counters "DRY-RUN TEST" "lo"
-    echo "[dry-run] Counters file contents:"
-    cat "$COUNTERS_FILE"
-    rm -f "$COUNTERS_FILE"
-    echo "[dry-run] OK"
-    exit 0
-fi
 
 # ============================================================
 # Main
