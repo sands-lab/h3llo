@@ -12,6 +12,8 @@ concurrency:
 
 env:
   REGISTRY_IMAGE: nekonuts/h3llo
+  DOCKER_BUILD_SUMMARY: false
+  DOCKER_BUILD_RECORD_UPLOAD: false
 
 jobs:
   linux:
