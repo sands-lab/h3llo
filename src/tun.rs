@@ -6,7 +6,7 @@ use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind}
 use crate::helpers::extract_dst_ip;
 #[cfg(not(target_os = "linux"))]
 use crate::helpers::retry_on_transient;
-use crate::metrics::{send_or_backpressure, TransportCounters};
+use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use ipnet_trie::IpnetTrie;
 use std::collections::HashMap;
@@ -714,7 +714,13 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                                 }
                             }
 
-                            if send_or_backpressure(route.tx, batch, &mut counters).await.is_err() {
+                            if send_with_backpressure(route.tx, batch, |event| match event {
+                                SendEvent::Waited(waited) => counters.record_queue_full(waited),
+                                SendEvent::Fast | SendEvent::Full => {}
+                            })
+                            .await
+                            .is_err()
+                            {
                                 counters.record_drop(DropReason::ChannelClosed, count as u64, total_bytes);
                             } else {
                                 counters.record_success(count as u64, total_bytes);

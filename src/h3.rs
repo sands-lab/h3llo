@@ -18,7 +18,7 @@ use crate::config::{PeerH3, Tuning};
 use crate::events::{
     ConnectionDirection, Direction, Event, H3ConnectedEvent, TransportEvent, TransportKind,
 };
-use crate::metrics::{send_or_backpressure, TransportCounters};
+use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -26,7 +26,6 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tokio::time;
 #[cfg(test)]
@@ -697,7 +696,13 @@ pub fn spawn_h3_rx(
                         );
                     }
 
-                    if send_or_backpressure(&packet_tx, batch, &mut counters).await.is_err() {
+                    if send_with_backpressure(&packet_tx, batch, |event| match event {
+                        SendEvent::Waited(waited) => counters.record_queue_full(waited),
+                        SendEvent::Fast | SendEvent::Full => {}
+                    })
+                    .await
+                    .is_err()
+                    {
                         counters.record_drop(
                             crate::events::DropReason::ChannelClosed,
                             ok_pkts, ok_bytes,
@@ -867,43 +872,36 @@ pub fn spawn_h3_tx(
                         }
                         let frame = OutboundFrame::Datagram(packet, flow_id);
 
-                        match inner_tx.try_send(frame) {
-                            Ok(()) => {
+                        send_with_backpressure(&inner_tx, frame, |event| match event {
+                            SendEvent::Fast => {
                                 seg_pkts += 1;
                                 seg_bytes += len as u64;
                             }
-                            Err(TrySendError::Full(val)) => {
+                            SendEvent::Full => {
                                 // Flush current segment as a completed batch.
                                 if seg_pkts > 0 {
                                     counters.record_success(seg_pkts, seg_bytes);
                                 }
-
-                                // Backpressure: await capacity, record wait duration.
-                                let start = std::time::Instant::now();
-                                if inner_tx.send(val).await.is_err() {
-                                    counters.record_drop(
-                                        crate::events::DropReason::SendError, 1, len as u64,
-                                    );
-                                    return Err(ActorError::H3TxSend {
-                                        peer_id: peer.clone(),
-                                        reason: "datagram channel closed".to_string(),
-                                    });
-                                }
-                                counters.record_queue_full(start.elapsed());
+                            }
+                            // Keep existing semantics: queue-full wait is only recorded
+                            // when the awaited send succeeds.
+                            SendEvent::Waited(waited) => {
+                                counters.record_queue_full(waited);
                                 // The blocking-sent packet starts a new segment.
                                 seg_pkts = 1;
                                 seg_bytes = len as u64;
                             }
-                            Err(TrySendError::Closed(_)) => {
-                                counters.record_drop(
-                                    crate::events::DropReason::SendError, 1, len as u64,
-                                );
-                                return Err(ActorError::H3TxSend {
-                                    peer_id: peer.clone(),
-                                    reason: "datagram channel closed".to_string(),
-                                });
+                        })
+                        .await
+                        .map_err(|_| {
+                            counters.record_drop(
+                                crate::events::DropReason::SendError, 1, len as u64,
+                            );
+                            ActorError::H3TxSend {
+                                peer_id: peer.clone(),
+                                reason: "datagram channel closed".to_string(),
                             }
-                        }
+                        })?;
                     }
 
                     // Record the final segment of this batch.
