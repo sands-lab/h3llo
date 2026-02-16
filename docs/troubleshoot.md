@@ -324,7 +324,7 @@ tuning:
 
 **Symptom**: All outbound QUIC handshakes time out. Logs show only `H3 dial failed ... timed out` with **no send errors visible in h3llo's default log output**. tcpdump shows zero outbound QUIC packets — the node appears completely silent on the network.
 
-**Root cause**: On Linux, tokio-quiche calls `apply_max_capabilities()` on client QUIC sockets, which enables `UDP_SEGMENT` (Generic Segmentation Offload). On certain aarch64 kernels (observed on Oracle Cloud Linux 6.5 aarch64), the kernel does not support `UDP_SEGMENT` on the socket path used, causing every subsequent `sendto()` to fail with `EINVAL` (errno 22). No QUIC packets are ever transmitted.
+**Root cause**: On Linux, h3llo calls `apply_max_capabilities()` on QUIC sockets when `tuning.udp_enable_offload` is `true` (the default), which enables `UDP_SEGMENT` (Generic Segmentation Offload). On certain aarch64 kernels (observed on Oracle Cloud Linux 6.5 aarch64), the kernel does not support `UDP_SEGMENT` on the socket path used, causing every subsequent `sendto()` to fail with `EINVAL` (errno 22). No QUIC packets are ever transmitted.
 
 This error is particularly hard to diagnose because:
 1. tokio-quiche logs the `EINVAL` via `foundations::telemetry::log` (a slog-based logger), **not** the standard `log` crate or `tracing`. Unless the application initializes `foundations::telemetry::init()`, all such log messages are silently discarded to `slog::Discard`.
@@ -351,13 +351,11 @@ uname -m   # aarch64
 # "error sending client Initial packets to peer, error: Invalid argument (os error 22)"
 ```
 
-**Fix**: Disable GSO by commenting out the `apply_max_capabilities()` call in `src/h3.rs`:
+**Fix**: Disable UDP offload in the configuration:
 
-```rust
-// GSO disabled: apply_max_capabilities() sets UDP_SEGMENT which causes
-// sendto() EINVAL on some aarch64 kernels.
-// #[cfg(target_os = "linux")]
-// socket.apply_max_capabilities();
+```yaml
+tuning:
+  udp_enable_offload: false
 ```
 
 > **Note on observability**: To make tokio-quiche's send errors visible without code changes, initialize foundations telemetry in `main.rs` and set `RUST_LOG=h3llo=debug`. The error `"error sending client Initial packets to peer"` will then appear via the slog backend. Without this initialization, the error is silently dropped — this is a known logging gap between h3llo (tracing) and tokio-quiche (foundations/slog).
@@ -380,13 +378,20 @@ ethtool -k <iface> | grep tx-udp-segmentation
 
 If `UdpInCsumErrors` grows rapidly during BareUDP transfers but not during H3 transfers, this is almost certainly the cause.
 
-**Fix**: Disable hardware UDP segmentation offload on the **sending** interface:
+**Fix**: Either disable hardware UDP segmentation offload on the **sending** interface:
 
 ```bash
 ethtool -K <iface> tx-udp-segmentation off
 ```
 
 The kernel software GSO path computes checksums correctly and can still achieve multi-Gbps throughput.
+
+Alternatively, disable software GSO in h3llo to avoid triggering the NIC offload path entirely:
+
+```yaml
+tuning:
+  udp_enable_offload: false
+```
 
 ### Docker Container Missing Required Flags
 

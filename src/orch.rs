@@ -176,6 +176,7 @@ impl PeerEntry {
                 let metrics_interval = tuning.metrics_push_interval;
                 let packet_queue_depth = tuning.packet_queue_depth;
                 let socket_buffer_bytes = tuning.socket_buffer_bytes();
+                let enable_offload = tuning.udp_enable_offload;
 
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
@@ -185,6 +186,7 @@ impl PeerEntry {
                         Some(&tun_if),
                         &probe,
                         socket_buffer_bytes,
+                        enable_offload,
                     )
                     .await
                     {
@@ -448,10 +450,13 @@ impl Orchestrator {
         // Note: NoTransportConfigured validation moved to Config::validate()
 
         // Setup TUN
-        let (tun_reader, tun_writer) =
-            tun::make_tun(&config.local.tun, config.tuning.tun_tx_queue_len)
-                .await
-                .map_err(|err| OrchestratorError::Tun(err.to_string()))?;
+        let (tun_reader, tun_writer) = tun::make_tun(
+            &config.local.tun,
+            config.tuning.tun_tx_queue_len,
+            config.tuning.tun_enable_offload,
+        )
+        .await
+        .map_err(|err| OrchestratorError::Tun(err.to_string()))?;
 
         // Control plane: unbounded to prevent deadlocks from actor cycles.
         let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -484,8 +489,13 @@ impl Orchestrator {
             // Endpoint already parsed during config deserialization
             let listen_addr = resolve_listen_addr(&local_bare.listen.host, local_bare.listen.port)?;
 
-            let bare_rx = make_bare_rx(listen_addr, mtu, tuning.socket_buffer_bytes())
-                .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
+            let bare_rx = make_bare_rx(
+                listen_addr,
+                mtu,
+                tuning.socket_buffer_bytes(),
+                tuning.udp_enable_offload,
+            )
+            .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
 
             let (cmd_tx, bare_rx_handle) = spawn_udp_rx(
                 bare_rx,

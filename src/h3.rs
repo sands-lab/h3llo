@@ -36,13 +36,14 @@ use tokio_quiche::http3::driver::{
     OutboundFrame, OutboundFrameSender, ServerH3Driver, ServerH3Event,
 };
 use tokio_quiche::http3::settings::Http3Settings;
-use tokio_quiche::listen;
+use tokio_quiche::listen_with_capabilities;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::QuicCommand;
 use tokio_quiche::quiche::h3::{Header, NameValue};
 use tokio_quiche::settings::{
     CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
 };
+use tokio_quiche::socket::QuicListener;
 use tracing::{debug, error, warn};
 
 /// Builds common `QuicSettings` from `Tuning` and TUN MTU.
@@ -487,9 +488,11 @@ pub async fn dial_h3<P: RouteProbe>(
     let mut socket: tokio_quiche::socket::Socket<_, _> = socket
         .try_into()
         .map_err(|e: std::io::Error| DialError::Socket(e.to_string()))?;
-    // Enable GSO/GRO on Linux for better UDP throughput.
+    // Enable GSO/GRO on Linux for better UDP throughput when configured.
     #[cfg(target_os = "linux")]
-    socket.apply_max_capabilities();
+    if tuning.udp_enable_offload {
+        socket.apply_max_capabilities();
+    }
 
     let _quic_conn =
         tokio_quiche::quic::connect_with_config(socket, Some(server_name), &params, h3_driver)
@@ -1050,8 +1053,17 @@ pub fn spawn_h3_listener(
 
     let conn_params = ConnectionParams::new_server(quic_settings, tls_config, Default::default());
 
-    // Create tokio-quiche listener (infallible after socket is bound)
-    let mut listeners = listen(vec![socket], conn_params, DefaultMetrics)
+    // Convert to QuicListener and conditionally enable GSO/GRO offload.
+    // Using listen_with_capabilities avoids the implicit apply_max_capabilities
+    // that listen() performs, giving us control via the udp_enable_offload flag.
+    let mut quic_listener: QuicListener = socket
+        .try_into()
+        .expect("infallible: already-bound socket -> QuicListener");
+    #[cfg(target_os = "linux")]
+    if tuning.udp_enable_offload {
+        quic_listener.apply_max_capabilities();
+    }
+    let mut listeners = listen_with_capabilities([quic_listener], conn_params, DefaultMetrics)
         .expect("infallible: listen on already-bound socket");
 
     let mut accept_stream = listeners.remove(0);

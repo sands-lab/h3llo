@@ -171,6 +171,29 @@ pub struct Tuning {
     /// Controls how many packets the kernel queues for transmission on the TUN
     /// interface. Applied on Linux only; ignored on other platforms.
     pub tun_tx_queue_len: u32,
+    /// Enable GSO/GRO offload on the TUN device (default: `true`).
+    ///
+    /// When `true` on Linux, the TUN device uses batched I/O with
+    /// `virtio_net_hdr` for GSO/GRO, significantly improving throughput.
+    /// When `false` or on non-Linux platforms, single-packet I/O is used.
+    /// Disable if TUN offload causes issues with specific kernel versions
+    /// or virtualization layers.
+    pub tun_enable_offload: bool,
+    /// Enable GSO/GRO offload for UDP transports (default: `true`).
+    ///
+    /// Controls software GSO/GRO for BareUDP via quinn-udp. When `true`,
+    /// BareUDP uses `UdpSocketState` for batched sends (GSO) and receives
+    /// (GRO) on supported platforms. When `false`, GSO/GRO segment counts
+    /// are capped to 1, resulting in per-packet I/O through the same
+    /// quinn-udp code path.
+    ///
+    /// Also controls HTTP/3 client (dial) socket GSO/GRO via
+    /// `apply_max_capabilities()`. HTTP/3 **listener** sockets are managed
+    /// internally by tokio-quiche and are not affected by this switch.
+    ///
+    /// Disable as a software-level workaround when NIC hardware offload
+    /// produces incorrect checksums (see troubleshooting guide).
+    pub udp_enable_offload: bool,
     /// Minimum interval between reconnection attempts (default: 10s).
     #[serde(with = "serde_duration_secs")]
     pub reconnect_interval: Duration,
@@ -243,6 +266,8 @@ impl Default for Tuning {
             packet_queue_depth: 256,
             socket_buffer_size: 16,
             tun_tx_queue_len: 1000,
+            tun_enable_offload: true,
+            udp_enable_offload: true,
             reconnect_interval: Duration::from_secs(10),
             metrics_push_interval: Duration::from_millis(1000),
             metrics_log_interval: Duration::from_secs(3),
@@ -1846,6 +1871,8 @@ peers:
         assert!(!cfg.tuning.h3_enable_pacing);
         assert!(!cfg.tuning.h3_insecure_skip_verify);
         assert_eq!(cfg.tuning.tun_tx_queue_len, 1000);
+        assert!(cfg.tuning.tun_enable_offload);
+        assert!(cfg.tuning.udp_enable_offload);
     }
 
     #[test]
@@ -2241,5 +2268,49 @@ peers:
         config.tuning.dns_refresh_interval = Duration::ZERO;
         // dns_refresh_interval = 0 means "disable periodic refresh" — this is valid
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn tuning_offload_defaults_true() {
+        let yaml = r#"
+local:
+  tun:
+    addrs:
+      - 192.168.180.1/32
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert!(cfg.tuning.tun_enable_offload);
+        assert!(cfg.tuning.udp_enable_offload);
+    }
+
+    #[test]
+    fn tuning_offload_override_false() {
+        let yaml = r#"
+local:
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  tun_enable_offload: false
+  udp_enable_offload: false
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert!(!cfg.tuning.tun_enable_offload);
+        assert!(!cfg.tuning.udp_enable_offload);
+    }
+
+    #[test]
+    fn tuning_offload_partial_override() {
+        let yaml = r#"
+local:
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  udp_enable_offload: false
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert!(cfg.tuning.tun_enable_offload); // still default
+        assert!(!cfg.tuning.udp_enable_offload);
     }
 }

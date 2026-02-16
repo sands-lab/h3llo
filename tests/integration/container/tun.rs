@@ -68,6 +68,7 @@ async fn check_device_creation() -> Result<(), String> {
     let (_reader, _writer) = h3llo::tun::make_tun(
         &local_tun,
         h3llo::config::Tuning::default().tun_tx_queue_len,
+        true,
     )
     .await
     .map_err(|e| format!("device_creation: make_tun failed: {e}"))?;
@@ -123,6 +124,7 @@ async fn check_multi_address() -> Result<(), String> {
     let (_reader, _writer) = h3llo::tun::make_tun(
         &local_tun,
         h3llo::config::Tuning::default().tun_tx_queue_len,
+        true,
     )
     .await
     .map_err(|e| format!("multi_address: make_tun failed: {e}"))?;
@@ -156,7 +158,7 @@ async fn check_tx_queue_len() -> Result<(), String> {
         mtu: h3llo::config::default_mtu(),
     };
 
-    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun, 2000)
+    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun, 2000, true)
         .await
         .map_err(|e| format!("tx_queue_len: make_tun failed: {e}"))?;
 
@@ -191,6 +193,7 @@ async fn check_send_recv() -> Result<(), String> {
     let (mut reader, mut writer) = h3llo::tun::make_tun(
         &local_tun,
         h3llo::config::Tuning::default().tun_tx_queue_len,
+        true,
     )
     .await
     .map_err(|e| format!("send_recv: make_tun failed: {e}"))?;
@@ -331,6 +334,7 @@ async fn check_mtu_configuration() -> Result<(), String> {
     let (_reader, _writer) = h3llo::tun::make_tun(
         &local_tun,
         h3llo::config::Tuning::default().tun_tx_queue_len,
+        true,
     )
     .await
     .map_err(|e| format!("mtu_configuration: make_tun failed: {e}"))?;
