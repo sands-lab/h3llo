@@ -140,7 +140,7 @@ local:
 
 The local resolver (e.g., systemd-resolved at `127.0.0.53`) absorbs the query burst locally, deduplicates identical queries, and handles upstream TCP fallback transparently. This eliminates both the rate-limiting and truncation issues.
 
-> **Note**: h3llo's DNS implementation uses plain UDP without EDNS0 and does not fall back to TCP on truncation. The `dns: response truncated` warning (logged at line 557 of `dns.rs`) is informational only — no recovery action is taken. Hostnames affected by truncation will eventually resolve on the next `dns_refresh_interval` cycle, but initial connectivity is delayed.
+> **Note**: h3llo's DNS implementation uses plain UDP without EDNS0 and does not fall back to TCP on truncation. The `dns: response truncated` warning (logged in `dns.rs`) is informational only — no recovery action is taken. Hostnames affected by truncation will eventually resolve on the next `dns_refresh_interval` cycle, but initial connectivity is delayed.
 
 ### Silent H3/QUIC Connection Failure on Multi-NIC Hosts
 
