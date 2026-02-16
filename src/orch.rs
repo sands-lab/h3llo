@@ -800,34 +800,34 @@ impl Orchestrator {
                 self.handle_api_event(api_event);
             }
             Event::Transport(TransportEvent::Metrics(metrics)) => {
-                if let (Some(pid), Some(addr)) = (
-                    metrics.labels.peer_id.as_deref(),
-                    metrics.labels.remote_addr,
-                ) {
-                    if let Some(entry) = self.peers.get_mut(pid) {
-                        if let Some(bound) = entry.bounds.iter_mut().find(|b| b.dest == addr) {
-                            match metrics.labels.direction {
-                                Direction::Rx => bound.rx_metrics = Some(metrics),
-                                Direction::Tx => bound.tx_metrics = Some(metrics),
-                            }
-                        } else {
-                            warn!(
-                                peer = %pid,
-                                addr = %addr,
-                                "metrics for unknown bound (already pruned?)"
-                            );
-                        }
-                    } else {
+                let labels = &metrics.labels;
+
+                let (Some(pid), Some(addr)) = (labels.peer_id.as_deref(), labels.remote_addr)
+                else {
+                    // Non-peer-scoped (TUN, BareUDP RX)
+                    self.non_peer_metrics.insert(labels.clone(), metrics);
+                    return;
+                };
+
+                let bound = match self
+                    .peers
+                    .get_mut(pid)
+                    .and_then(|entry| entry.bounds.iter_mut().find(|b| b.dest == addr))
+                {
+                    Some(bound) => bound,
+                    None => {
                         warn!(
                             peer = %pid,
                             addr = %addr,
-                            "metrics for unknown peer (already removed?)"
+                            "metrics for unknown peer or bound (already removed/pruned?)"
                         );
+                        return;
                     }
-                } else {
-                    // Non-peer-scoped (TUN, BareUDP RX)
-                    self.non_peer_metrics
-                        .insert(metrics.labels.clone(), metrics);
+                };
+
+                match labels.direction {
+                    Direction::Rx => bound.rx_metrics = Some(metrics),
+                    Direction::Tx => bound.tx_metrics = Some(metrics),
                 }
             }
             Event::Transport(TransportEvent::H3Connected(event)) => {
