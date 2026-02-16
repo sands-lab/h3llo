@@ -4,7 +4,6 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::config::{LocalTun, Peer};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::extract_dst_ip;
-#[cfg(not(target_os = "linux"))]
 use crate::helpers::retry_on_transient;
 use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
@@ -263,6 +262,7 @@ pub trait TunTx: Send + 'static {
 ///
 /// * `local_tun` - TUN configuration including interface name, addresses, and MTU.
 /// * `tx_queue_len` - Transmit queue length in packets (applied on Linux only).
+/// * `enable_offload` - Enable GSO/GRO offload (applied on Linux only).
 ///
 /// # Errors
 ///
@@ -270,6 +270,7 @@ pub trait TunTx: Send + 'static {
 pub async fn make_tun(
     local_tun: &LocalTun,
     tx_queue_len: u32,
+    enable_offload: bool,
 ) -> Result<(TunReader, TunWriter), TunError> {
     let (v4_addrs, v6_addrs) = split_addrs_by_version(&local_tun.addrs);
 
@@ -282,11 +283,11 @@ pub async fn make_tun(
     // Enable GSO/GRO offload on Linux for batched TUN I/O.
     #[cfg(target_os = "linux")]
     {
-        builder = builder.offload(true).tx_queue_len(tx_queue_len);
+        builder = builder.offload(enable_offload).tx_queue_len(tx_queue_len);
     }
 
     #[cfg(not(target_os = "linux"))]
-    let _ = tx_queue_len;
+    let _ = (tx_queue_len, enable_offload);
 
     if let Some(first_v4) = v4_addrs.first() {
         builder = builder.ipv4(first_v4.addr(), first_v4.prefix_len(), None);
@@ -322,19 +323,27 @@ pub async fn make_tun(
         tun = %name,
         tcp_gso = device.tcp_gso(),
         udp_gso = device.udp_gso(),
+        offload = enable_offload,
         "TUN offload status"
     );
+
+    #[cfg(target_os = "linux")]
+    let offload_active = enable_offload;
+    #[cfg(not(target_os = "linux"))]
+    let offload_active = false;
 
     let device = Arc::new(device);
     let reader = TunReader {
         device: device.clone(),
         mtu,
         name: name.clone(),
+        offload: offload_active,
     };
     let writer = TunWriter {
         device,
         mtu,
         name,
+        offload: offload_active,
         #[cfg(target_os = "linux")]
         gro_table: GROTable::default(),
     };
@@ -347,6 +356,7 @@ pub struct TunReader {
     device: Arc<AsyncDevice>,
     mtu: usize,
     name: String,
+    offload: bool,
 }
 
 impl TunRx for TunReader {
@@ -360,12 +370,20 @@ impl TunRx for TunReader {
 
     #[cfg(target_os = "linux")]
     fn batch_size(&self) -> usize {
-        IDEAL_BATCH_SIZE
+        if self.offload {
+            IDEAL_BATCH_SIZE
+        } else {
+            1
+        }
     }
 
     #[cfg(target_os = "linux")]
     fn scratch_buf_size(&self) -> usize {
-        VIRTIO_NET_HDR_LEN + u16::MAX as usize
+        if self.offload {
+            VIRTIO_NET_HDR_LEN + u16::MAX as usize
+        } else {
+            self.mtu
+        }
     }
 
     async fn recv_batch(
@@ -376,7 +394,14 @@ impl TunRx for TunReader {
     ) -> io::Result<usize> {
         #[cfg(target_os = "linux")]
         {
-            self.device.recv_multiple(scratch, bufs, sizes, 0).await
+            if self.offload {
+                self.device.recv_multiple(scratch, bufs, sizes, 0).await
+            } else {
+                let _ = scratch;
+                let len = self.device.recv(bufs[0].as_mut()).await?;
+                sizes[0] = len;
+                Ok(1)
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -393,6 +418,7 @@ pub struct TunWriter {
     device: Arc<AsyncDevice>,
     mtu: usize,
     name: String,
+    offload: bool,
     #[cfg(target_os = "linux")]
     gro_table: GROTable,
 }
@@ -408,19 +434,30 @@ impl TunTx for TunWriter {
 
     #[cfg(target_os = "linux")]
     fn batch_size(&self) -> usize {
-        IDEAL_BATCH_SIZE
+        if self.offload {
+            IDEAL_BATCH_SIZE
+        } else {
+            1
+        }
     }
 
     async fn send_batch(&mut self, bufs: &mut [TunBuf]) -> io::Result<usize> {
         #[cfg(target_os = "linux")]
         {
-            for buf in bufs.iter_mut() {
-                buf.prepend_hdr();
+            if self.offload {
+                for buf in bufs.iter_mut() {
+                    buf.prepend_hdr();
+                }
+                self.device
+                    .send_multiple(&mut self.gro_table, bufs, VIRTIO_NET_HDR_LEN)
+                    .await?;
+                Ok(bufs.len())
+            } else {
+                for buf in bufs.iter() {
+                    retry_on_transient!(self.device.send(buf.as_ref()).await, |_| {})?;
+                }
+                Ok(bufs.len())
             }
-            self.device
-                .send_multiple(&mut self.gro_table, bufs, VIRTIO_NET_HDR_LEN)
-                .await?;
-            Ok(bufs.len())
         }
         #[cfg(not(target_os = "linux"))]
         {

@@ -487,9 +487,11 @@ pub async fn dial_h3<P: RouteProbe>(
     let mut socket: tokio_quiche::socket::Socket<_, _> = socket
         .try_into()
         .map_err(|e: std::io::Error| DialError::Socket(e.to_string()))?;
-    // Enable GSO/GRO on Linux for better UDP throughput.
+    // Enable GSO/GRO on Linux for better UDP throughput when configured.
     #[cfg(target_os = "linux")]
-    socket.apply_max_capabilities();
+    if tuning.udp_enable_offload {
+        socket.apply_max_capabilities();
+    }
 
     let _quic_conn =
         tokio_quiche::quic::connect_with_config(socket, Some(server_name), &params, h3_driver)
