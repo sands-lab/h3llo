@@ -7,8 +7,8 @@ use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::ApiEvent;
 use crate::events::{
-    BareConnectedEvent, ConnectionDirection, DnsEvent, Endpoint, Event, H3ConnectedEvent,
-    TransportEvent, TransportLabels, TransportMetrics,
+    BareConnectedEvent, ConnectionDirection, Direction, DnsEvent, Endpoint, Event,
+    H3ConnectedEvent, TransportEvent, TransportLabels, TransportMetrics,
 };
 use crate::h3::{
     dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
@@ -39,6 +39,10 @@ struct BoundState {
     dest: SocketAddr,
     /// TX channel for sending packet batches.
     tx: mpsc::Sender<Vec<PooledBuf>>,
+    /// Latest cumulative RX metrics for this connection.
+    rx_metrics: Option<TransportMetrics>,
+    /// Latest cumulative TX metrics for this connection.
+    tx_metrics: Option<TransportMetrics>,
 }
 
 /// Entry for a single peer in the unified pool.
@@ -333,11 +337,10 @@ pub struct Orchestrator {
     /// Stored local config for GET /config snapshot reconstruction.
     local: Local,
 
-    /// Cumulative metrics snapshot, keyed by transport label set.
+    /// Metrics from non-peer-scoped actors (TUN RX/TX, BareUDP RX).
     ///
-    /// Owned exclusively by the orchestrator — no `Arc<Mutex<_>>` sharing.
-    /// Updated on `TransportEvent::Metrics`; cloned on `ApiEvent::GetMetricsSnapshot`.
-    metrics: HashMap<TransportLabels, TransportMetrics>,
+    /// At most 3 entries. Peer-scoped metrics live in `BoundState`.
+    non_peer_metrics: HashMap<TransportLabels, TransportMetrics>,
 }
 
 impl Orchestrator {
@@ -601,7 +604,7 @@ impl Orchestrator {
             route_cmd_tx,
             tun_addrs,
             local: config.local,
-            metrics: HashMap::new(),
+            non_peer_metrics: HashMap::new(),
         };
         orch.sync_peers_to_actors();
         Ok(orch)
@@ -630,7 +633,7 @@ impl Orchestrator {
                 }
                 _ = metrics_log_ticker.tick() => {
                     log_quic_metrics();
-                    for m in self.metrics.values() {
+                    for m in self.collect_metrics_snapshot().values() {
                         log_transport_metrics(m);
                     }
                 }
@@ -692,6 +695,25 @@ impl Orchestrator {
         }
     }
 
+    /// Collects all transport metrics from BoundState and non-peer sources into a snapshot.
+    ///
+    /// Called on Prometheus scrape (`GetMetricsSnapshot`) and periodic metrics logging.
+    /// Only includes metrics from currently live connections — pruned bounds are absent.
+    fn collect_metrics_snapshot(&self) -> HashMap<TransportLabels, TransportMetrics> {
+        let mut snapshot = self.non_peer_metrics.clone();
+        for entry in self.peers.values() {
+            for bound in &entry.bounds {
+                if let Some(ref m) = bound.rx_metrics {
+                    snapshot.insert(m.labels.clone(), m.clone());
+                }
+                if let Some(ref m) = bound.tx_metrics {
+                    snapshot.insert(m.labels.clone(), m.clone());
+                }
+            }
+        }
+        snapshot
+    }
+
     /// Handles management API events.
     fn handle_api_event(&mut self, event: ApiEvent) {
         match event {
@@ -709,7 +731,7 @@ impl Orchestrator {
                 let _ = reply_tx.send(Ok(self.config_snapshot()));
             }
             ApiEvent::GetMetricsSnapshot { reply_tx } => {
-                let _ = reply_tx.send(self.metrics.clone());
+                let _ = reply_tx.send(self.collect_metrics_snapshot());
             }
         }
     }
@@ -778,7 +800,35 @@ impl Orchestrator {
                 self.handle_api_event(api_event);
             }
             Event::Transport(TransportEvent::Metrics(metrics)) => {
-                self.metrics.insert(metrics.labels.clone(), metrics);
+                let labels = &metrics.labels;
+
+                let (Some(pid), Some(addr)) = (labels.peer_id.as_deref(), labels.remote_addr)
+                else {
+                    // Non-peer-scoped (TUN, BareUDP RX)
+                    self.non_peer_metrics.insert(labels.clone(), metrics);
+                    return;
+                };
+
+                let bound = match self
+                    .peers
+                    .get_mut(pid)
+                    .and_then(|entry| entry.bounds.iter_mut().find(|b| b.dest == addr))
+                {
+                    Some(bound) => bound,
+                    None => {
+                        warn!(
+                            peer = %pid,
+                            addr = %addr,
+                            "metrics for unknown peer or bound (already removed/pruned?)"
+                        );
+                        return;
+                    }
+                };
+
+                match labels.direction {
+                    Direction::Rx => bound.rx_metrics = Some(metrics),
+                    Direction::Tx => bound.tx_metrics = Some(metrics),
+                }
             }
             Event::Transport(TransportEvent::H3Connected(event)) => {
                 self.handle_h3_connection(event).await;
@@ -828,7 +878,13 @@ impl Orchestrator {
             return;
         };
         let was_empty = entry.bounds.is_empty();
-        entry.bounds.push(BoundState { endpoint, dest, tx });
+        entry.bounds.push(BoundState {
+            endpoint,
+            dest,
+            tx,
+            rx_metrics: None,
+            tx_metrics: None,
+        });
         let first_changed = entry.prune();
         if was_empty || first_changed {
             self.update_routing();
@@ -1033,7 +1089,13 @@ mod test_support {
         ) -> Self {
             if let Some(entry) = self.peers.get_mut(peer_id) {
                 let endpoint = entry.config_endpoint();
-                entry.bounds.push(BoundState { endpoint, dest, tx });
+                entry.bounds.push(BoundState {
+                    endpoint,
+                    dest,
+                    tx,
+                    rx_metrics: None,
+                    tx_metrics: None,
+                });
             }
             self
         }
@@ -1090,7 +1152,7 @@ mod test_support {
                 route_cmd_tx: Some(route_cmd_tx),
                 tun_addrs: self.tun_addrs,
                 local,
-                metrics: HashMap::new(),
+                non_peer_metrics: HashMap::new(),
             };
 
             (
@@ -1321,16 +1383,16 @@ mod tests {
     #[tokio::test]
     async fn handle_metrics_event_stores_snapshot() {
         let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
-        assert!(orch.metrics.is_empty());
+        assert!(orch.non_peer_metrics.is_empty());
         orch.handle_event(make_metrics_event()).await;
-        assert_eq!(orch.metrics.len(), 1);
+        assert_eq!(orch.non_peer_metrics.len(), 1);
     }
 
     #[tokio::test]
     async fn handle_metrics_event_replaces_on_same_labels() {
         let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
         orch.handle_event(make_metrics_event()).await;
-        assert_eq!(orch.metrics.len(), 1);
+        assert_eq!(orch.non_peer_metrics.len(), 1);
 
         // Push again with different values but same labels
         let event = Event::Transport(TransportEvent::Metrics(TransportMetrics {
@@ -1349,20 +1411,58 @@ mod tests {
             },
         }));
         orch.handle_event(event).await;
-        assert_eq!(orch.metrics.len(), 1);
-        let stored = orch.metrics.values().next().unwrap();
+        assert_eq!(orch.non_peer_metrics.len(), 1);
+        let stored = orch.non_peer_metrics.values().next().unwrap();
         assert_eq!(stored.stats.succeeded.packets, 42);
+    }
+
+    /// Helper to create a peer-scoped metrics event for a specific bound.
+    fn make_peer_metrics_event(
+        peer_id: &str,
+        remote_addr: SocketAddr,
+        direction: Direction,
+        packets: u64,
+    ) -> Event {
+        Event::Transport(TransportEvent::Metrics(TransportMetrics {
+            labels: TransportLabels {
+                kind: TransportKind::BareUdp,
+                direction,
+                peer_id: Some(peer_id.to_string()),
+                remote_addr: Some(remote_addr),
+            },
+            stats: TransportStats {
+                succeeded: crate::events::PktCounters {
+                    packets,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        }))
     }
 
     #[tokio::test]
     async fn api_get_metrics_returns_prometheus_text() {
-        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let (tx, _rx) = mpsc::channel(1);
+        let dest: SocketAddr = "1.2.3.4:5353".parse().unwrap();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_tx("peer1", dest, tx)
+            .with_resolved_ips("peer1", HashSet::from([ip]))
+            .build();
+
+        // Add both non-peer and peer-scoped metrics
         orch.handle_event(make_metrics_event()).await;
+        orch.handle_event(make_peer_metrics_event("peer1", dest, Direction::Tx, 10))
+            .await;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         orch.handle_api_event(ApiEvent::GetMetricsSnapshot { reply_tx });
 
         let snapshot = reply_rx.await.expect("should receive metrics snapshot");
+        assert_eq!(snapshot.len(), 2);
         let text = crate::api::encode_metrics_snapshot(snapshot);
         assert!(
             text.contains("h3llo_transport_packets_total"),
@@ -1377,6 +1477,106 @@ mod tests {
             "missing batches metric: {text}"
         );
         assert!(text.contains("# EOF"), "missing EOF marker: {text}");
+    }
+
+    #[tokio::test]
+    async fn handle_metrics_stores_in_bound_state() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let (tx, _rx) = mpsc::channel(1);
+        let dest: SocketAddr = "1.2.3.4:5353".parse().unwrap();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_tx("peer1", dest, tx)
+            .with_resolved_ips("peer1", HashSet::from([ip]))
+            .build();
+
+        let event = make_peer_metrics_event("peer1", dest, Direction::Tx, 100);
+        orch.handle_event(event).await;
+
+        let bound = &orch.peers.get("peer1").unwrap().bounds[0];
+        assert!(bound.tx_metrics.is_some());
+        assert_eq!(
+            bound.tx_metrics.as_ref().unwrap().stats.succeeded.packets,
+            100
+        );
+        assert!(bound.rx_metrics.is_none());
+
+        let event = make_peer_metrics_event("peer1", dest, Direction::Rx, 50);
+        orch.handle_event(event).await;
+
+        let bound = &orch.peers.get("peer1").unwrap().bounds[0];
+        assert!(bound.rx_metrics.is_some());
+        assert_eq!(
+            bound.rx_metrics.as_ref().unwrap().stats.succeeded.packets,
+            50
+        );
+
+        assert!(orch.non_peer_metrics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_pruned_with_bound_state() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let (tx, rx) = mpsc::channel(1);
+        let dest: SocketAddr = "1.2.3.4:5353".parse().unwrap();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_tx("peer1", dest, tx)
+            .with_resolved_ips("peer1", HashSet::from([ip]))
+            .build();
+
+        let event = make_peer_metrics_event("peer1", dest, Direction::Tx, 100);
+        orch.handle_event(event).await;
+
+        let snapshot = orch.collect_metrics_snapshot();
+        assert!(snapshot.values().any(|m| m.stats.succeeded.packets == 100));
+
+        drop(rx);
+        orch.peers.get_mut("peer1").unwrap().prune();
+
+        let snapshot = orch.collect_metrics_snapshot();
+        assert!(!snapshot.values().any(|m| m.stats.succeeded.packets == 100));
+    }
+
+    #[tokio::test]
+    async fn collect_metrics_snapshot_combines_sources() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let (tx, _rx) = mpsc::channel(1);
+        let dest: SocketAddr = "1.2.3.4:5353".parse().unwrap();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_tx("peer1", dest, tx)
+            .with_resolved_ips("peer1", HashSet::from([ip]))
+            .build();
+
+        orch.handle_event(make_metrics_event()).await;
+        orch.handle_event(make_peer_metrics_event("peer1", dest, Direction::Tx, 200))
+            .await;
+
+        let snapshot = orch.collect_metrics_snapshot();
+        assert_eq!(snapshot.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn handle_metrics_warns_unknown_peer() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+
+        let event = make_peer_metrics_event(
+            "nonexistent",
+            "1.2.3.4:5353".parse().unwrap(),
+            Direction::Tx,
+            42,
+        );
+        orch.handle_event(event).await;
+
+        assert!(orch.non_peer_metrics.is_empty());
+        assert!(orch.collect_metrics_snapshot().is_empty());
     }
 
     fn make_dns_snapshot_event(state: HashMap<String, HashSet<IpAddr>>) -> Event {
@@ -1551,6 +1751,8 @@ mod tests {
                 endpoint: None,
                 dest,
                 tx,
+                rx_metrics: None,
+                tx_metrics: None,
             });
 
         assert!(!orch.peers.get("peer1").unwrap().bounds.is_empty());
@@ -1902,6 +2104,8 @@ mod tests {
             endpoint: ep,
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx,
+            rx_metrics: None,
+            tx_metrics: None,
         });
 
         assert!(!entry.bounds.is_empty());
@@ -1926,6 +2130,8 @@ mod tests {
             endpoint: ep,
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx,
+            rx_metrics: None,
+            tx_metrics: None,
         });
 
         let changed = entry.prune();
@@ -1947,11 +2153,15 @@ mod tests {
             endpoint: ep.clone(),
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx: tx1,
+            rx_metrics: None,
+            tx_metrics: None,
         });
         entry.bounds.push(BoundState {
             endpoint: ep,
             dest: "5.6.7.8:5353".parse().unwrap(),
             tx: tx2,
+            rx_metrics: None,
+            tx_metrics: None,
         });
 
         // Drop first receiver -> first bound becomes invalid
@@ -1980,11 +2190,15 @@ mod tests {
             endpoint: ep.clone(),
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx: tx1,
+            rx_metrics: None,
+            tx_metrics: None,
         });
         entry.bounds.push(BoundState {
             endpoint: ep,
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx: tx2,
+            rx_metrics: None,
+            tx_metrics: None,
         });
 
         // Drop first receiver -> first bound becomes invalid
@@ -2006,6 +2220,8 @@ mod tests {
             endpoint: None,
             dest: "9.8.7.6:12345".parse().unwrap(),
             tx,
+            rx_metrics: None,
+            tx_metrics: None,
         });
 
         let changed = entry.prune();
