@@ -71,6 +71,16 @@ nstat -az | grep -E 'UdpRcvbufErrors|UdpSndbufErrors|UdpInCsumErrors'
 
 # Socket buffer size and current drops (d=N at the end)
 ss -unmap src :<port>
+
+# Softnet statistics (per-CPU softirq queue overflow and time squeeze)
+cat /proc/net/softnet_stat
+
+# Qdisc drops on physical interface and TUN
+tc -s qdisc show dev <phy-interface>
+tc -s qdisc show dev <tun-ifname>
+
+# NIC driver-level drops and errors
+ethtool -S <phy-interface>
 ```
 
 The drop location tells you where the bottleneck is:
@@ -81,6 +91,10 @@ The drop location tells you where the bottleneck is:
 | UDP socket drops | `/proc/net/udp` `drops` column | h3llo reads socket too slowly; increase `socket_buffer_size` |
 | UdpRcvbufErrors | `nstat` | Kernel UDP receive buffer overflow; increase `socket_buffer_size` or `net.core.rmem_max` |
 | UdpInCsumErrors | `nstat` | NIC checksum offload incompatibility (see [BareUDP Checksum Errors](#bareudp-checksum-errors-with-nic-tx-offload)) |
+| softnet dropped | `/proc/net/softnet_stat` col 2 | CPU softirq overload; tune RPS/RFS, increase `netdev_budget`, or rebalance IRQ affinity |
+| softnet time_squeeze | `/proc/net/softnet_stat` col 3 | Softirq ran out of time/budget; increase `net.core.netdev_budget_usecs` |
+| qdisc drops | `tc -s qdisc show` | Egress queue overflow; switch to `fq` qdisc, tune pacing, or increase queue length |
+| NIC rx_missed/rx_dropped | `ethtool -S` | NIC ring buffer full; increase with `ethtool -G <if> rx <size>` |
 
 ## Common Issues
 
