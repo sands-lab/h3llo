@@ -64,6 +64,33 @@ fn init_logging() {
         .with_target(true)
         .with_writer(std::io::stderr)
         .init();
+
+    // Bridge foundations/slog → tracing subscriber.
+    // tokio-quiche logs via foundations::telemetry::log macros, which use an
+    // internal OnceLock<LogHarness>. The tracing-rs-compat feature installs
+    // TracingSlogDrain as the root slog drain, forwarding all slog records
+    // into the active tracing subscriber. This is a one-shot call.
+    let service_info = foundations::ServiceInfo {
+        name: "h3llo",
+        ..Default::default()
+    };
+    let settings = foundations::telemetry::settings::TelemetrySettings {
+        logging: foundations::telemetry::settings::LoggingSettings {
+            output: foundations::telemetry::settings::LogOutput::TracingRsCompat,
+            // Let tracing's EnvFilter handle all level filtering.
+            // Default LogVerbosity::Info would silently discard debug/trace
+            // slog records before they reach the tracing subscriber.
+            verbosity: foundations::telemetry::settings::LogVerbosity::Trace,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    if let Err(e) = foundations::telemetry::init(foundations::telemetry::TelemetryConfig {
+        service_info: &service_info,
+        settings: &settings,
+    }) {
+        eprintln!("failed to init foundations telemetry: {e}");
+    }
 }
 
 /// Parses the config file path from command-line arguments (`-c` / `--config`).
