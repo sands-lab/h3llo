@@ -197,6 +197,13 @@ pub struct Tuning {
     /// the window are coalesced into the same snapshot.
     #[serde(with = "serde_duration_millis")]
     pub dns_snapshot_delay: Duration,
+    /// Minimum interval between consecutive DNS query sends (default: 10ms).
+    ///
+    /// Serializes outbound DNS queries to avoid triggering rate limits on
+    /// public resolvers (e.g., Cloudflare 1.1.1.1). A sleep of this duration
+    /// is inserted before each outbound query send.
+    #[serde(with = "serde_duration_millis")]
+    pub dns_query_interval: Duration,
     /// Minimum TTL floor in seconds for DNS records (default: 60).
     ///
     /// DNS responses with TTL below this value are raised to this floor
@@ -242,6 +249,7 @@ impl Default for Tuning {
             dns_query_timeout: Duration::from_secs(2),
             dns_refresh_interval: Duration::from_secs(60),
             dns_snapshot_delay: Duration::from_millis(100),
+            dns_query_interval: Duration::from_millis(10),
             dns_min_ttl: 60,
             h3_handshake_timeout: Duration::from_secs(5),
             h3_max_idle_timeout: Duration::from_secs(60),
@@ -432,6 +440,7 @@ impl Config {
             ("metrics_log_interval", self.tuning.metrics_log_interval),
             ("dns_query_timeout", self.tuning.dns_query_timeout),
             ("dns_snapshot_delay", self.tuning.dns_snapshot_delay),
+            ("dns_query_interval", self.tuning.dns_query_interval),
             ("h3_handshake_timeout", self.tuning.h3_handshake_timeout),
             ("h3_max_idle_timeout", self.tuning.h3_max_idle_timeout),
             ("h3_keepalive_interval", self.tuning.h3_keepalive_interval),
@@ -1828,6 +1837,7 @@ peers:
         assert_eq!(cfg.tuning.dns_query_timeout, Duration::from_secs(2));
         assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(60));
         assert_eq!(cfg.tuning.dns_snapshot_delay, Duration::from_millis(100));
+        assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(10));
         assert_eq!(cfg.tuning.dns_min_ttl, 60);
         assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(5));
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
@@ -2066,6 +2076,20 @@ tuning:
     }
 
     #[test]
+    fn dns_query_interval_millis_override() {
+        let yaml = r#"
+local:
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  dns_query_interval: 50
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(50));
+    }
+
+    #[test]
     fn metrics_push_interval_millis_override() {
         let yaml = r#"
 local:
@@ -2154,6 +2178,9 @@ peers:
             }),
             ("dns_snapshot_delay", |t| {
                 t.dns_snapshot_delay = Duration::ZERO
+            }),
+            ("dns_query_interval", |t| {
+                t.dns_query_interval = Duration::ZERO
             }),
             ("h3_handshake_timeout", |t| {
                 t.h3_handshake_timeout = Duration::ZERO

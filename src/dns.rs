@@ -148,6 +148,7 @@ pub struct DnsActor {
     refresh_interval: Duration,
     snapshot_delay: Duration,
     min_ttl_secs: u32,
+    query_interval: Duration,
 }
 
 /// Creates a DNS resolver actor state from configuration.
@@ -190,6 +191,7 @@ pub async fn make_dns<P: RouteProbe>(
         refresh_interval: tuning.dns_refresh_interval,
         snapshot_delay: tuning.dns_snapshot_delay,
         min_ttl_secs: tuning.dns_min_ttl,
+        query_interval: tuning.dns_query_interval,
     })
 }
 
@@ -219,6 +221,7 @@ pub fn spawn_dns(
         refresh_interval,
         snapshot_delay,
         min_ttl_secs,
+        query_interval,
     } = actor;
 
     let server_str = server.to_string();
@@ -265,7 +268,7 @@ pub fn spawn_dns(
                 maybe_cmd = cmd_rx.recv() => {
                     match maybe_cmd {
                         Some(DnsCommand::SetHostnames { hosts }) => {
-                            handle_set_hostnames(hosts, &mut state, &mut pending, &socket).await;
+                            handle_set_hostnames(hosts, &mut state, &mut pending, &socket, query_interval).await;
                         }
                         None => {
                             cmd_rx_closed = true;
@@ -295,12 +298,12 @@ pub fn spawn_dns(
                     state.emit_snapshot(&events_tx);
                 }
                 _ = ticker.tick() => {
-                    handle_tick(&mut pending, &socket, timeout).await;
+                    handle_tick(&mut pending, &socket, timeout, query_interval).await;
                     state.expire_stale();
                     arm_snapshot_timer!();
                 }
                 _ = refresh_ticker.tick(), if !refresh_interval.is_zero() => {
-                    trigger_refresh(&state, &mut pending, &socket).await;
+                    trigger_refresh(&state, &mut pending, &socket, query_interval).await;
                 }
             }
 
@@ -327,6 +330,7 @@ async fn handle_set_hostnames(
     state: &mut DnsState,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
+    query_interval: Duration,
 ) {
     // Find added hostnames
     let added: Vec<String> = new_hosts
@@ -340,7 +344,7 @@ async fn handle_set_hostnames(
 
     // Issue queries for added hostnames
     for host in added {
-        resolve_hostname(&host, state, pending, socket).await;
+        resolve_hostname(&host, state, pending, socket, query_interval).await;
     }
 }
 
@@ -350,13 +354,16 @@ async fn resolve_hostname(
     state: &mut DnsState,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
+    query_interval: Duration,
 ) {
     // Fast path: IP literal detection
     if let Ok(ip) = host.parse::<IpAddr>() {
         // IP literals use max TTL (effectively never expire)
         state.record_ip(host, ip, u32::MAX);
     } else {
+        time::sleep(query_interval).await;
         issue_query(host.to_string(), RecordType::A, pending, socket).await;
+        time::sleep(query_interval).await;
         issue_query(host.to_string(), RecordType::AAAA, pending, socket).await;
     }
 }
@@ -366,11 +373,14 @@ async fn trigger_refresh(
     state: &DnsState,
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
+    query_interval: Duration,
 ) {
     for host in state.hostnames() {
         // Skip IP literals (never need refresh)
         if host.parse::<IpAddr>().is_err() {
+            time::sleep(query_interval).await;
             issue_query(host.clone(), RecordType::A, pending, socket).await;
+            time::sleep(query_interval).await;
             issue_query(host.clone(), RecordType::AAAA, pending, socket).await;
         }
     }
@@ -482,6 +492,7 @@ async fn handle_tick(
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
     timeout: Duration,
+    query_interval: Duration,
 ) {
     let now = Instant::now();
     let expired: Vec<(u16, PendingRequest)> = pending
@@ -489,6 +500,7 @@ async fn handle_tick(
         .collect();
 
     for (_id, request) in expired {
+        time::sleep(query_interval).await;
         warn!(host = %request.host, record_type = ?request.record_type, "dns: query timed out, retrying");
         if let Err(err) =
             send_query(request.host.clone(), request.record_type, pending, socket).await
