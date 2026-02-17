@@ -20,6 +20,7 @@ use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -703,33 +704,8 @@ impl Orchestrator {
                     }
                 }
                 result = self.join_set.join_next() => {
-                    match result {
-                        Some(Ok(Ok(Ok(())))) => {
-                            // Graceful shutdown of one actor; continue running
-                            debug!("an actor exited gracefully");
-                        }
-                        Some(Ok(Ok(Err(actor_error)))) => {
-                            match actor_error.kind() {
-                                ActorKind::Critical => {
-                                    // Critical actor failure - exit h3llo
-                                    error!("critical actor failed: {}", actor_error);
-                                    return Err(OrchestratorError::ActorError(actor_error));
-                                }
-                                ActorKind::Restartable => {
-                                    warn!("peer actor failed: {}", actor_error);
-                                    self.reconcile();
-                                }
-                            }
-                        }
-                        Some(Ok(Err(join_err)) | Err(join_err)) => {
-                            // Task panicked or was cancelled
-                            error!("task join failed (panic/cancel): {}", join_err);
-                            return Err(OrchestratorError::TaskJoin(join_err.to_string()));
-                        }
-                        None => {
-                            // All actors have exited
-                            return Ok(());
-                        }
+                    if let ControlFlow::Break(outcome) = self.handle_actor_exit(result) {
+                        return outcome;
                     }
                 }
                 result = tokio::signal::ctrl_c() => {
@@ -746,6 +722,49 @@ impl Orchestrator {
             }
         }
         Ok(())
+    }
+
+    /// Handles the result of a completed actor task from the join set.
+    ///
+    /// Returns `ControlFlow::Continue` to keep the event loop running,
+    /// or `ControlFlow::Break` with the final result to exit.
+    fn handle_actor_exit(
+        &mut self,
+        result: Option<
+            Result<Result<ActorExitResult, tokio::task::JoinError>, tokio::task::JoinError>,
+        >,
+    ) -> ControlFlow<Result<(), OrchestratorError>> {
+        let Some(result) = result else {
+            // All actors have exited
+            return ControlFlow::Break(Ok(()));
+        };
+
+        // Flatten the two JoinError layers (outer from JoinSet, inner from nested spawn)
+        let actor_result = match result {
+            Ok(Ok(r)) => r,
+            Ok(Err(join_err)) | Err(join_err) => {
+                error!("task join failed (panic/cancel): {}", join_err);
+                return ControlFlow::Break(Err(OrchestratorError::TaskJoin(join_err.to_string())));
+            }
+        };
+
+        match actor_result {
+            Ok(()) => {
+                debug!("an actor exited gracefully");
+                self.reconcile();
+            }
+            Err(actor_error) => match actor_error.kind() {
+                ActorKind::Critical => {
+                    error!("critical actor failed: {}", actor_error);
+                    return ControlFlow::Break(Err(OrchestratorError::ActorError(actor_error)));
+                }
+                ActorKind::Restartable => {
+                    warn!("peer actor failed: {}", actor_error);
+                    self.reconcile();
+                }
+            },
+        }
+        ControlFlow::Continue(())
     }
 
     /// Periodic reconciliation: prune stale bounds and attempt reconnection.
