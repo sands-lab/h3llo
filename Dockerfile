@@ -128,11 +128,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=registry-$TARGETARCH 
     test -n "$TUN_BIN" && test -n "$ROUTE_BIN" && \
     mkdir -p /app/out && \
     cp "/app/target/${RUST_TARGET}/release/h3llo" /app/out/ && \
-    "${TOOLCHAIN}-strip" /app/out/h3llo && \
+    # Stripped binaries are kept for production builds; disabled for now to
+    # preserve debug symbols (backtraces, perf profiling, GDB/LLDB attach).
+    # "${TOOLCHAIN}-strip" /app/out/h3llo && \
     cp "$TUN_BIN" /app/out/integration-container-tun && \
-    cp "$ROUTE_BIN" /app/out/integration-container-route && \
-    "${TOOLCHAIN}-strip" /app/out/integration-container-tun && \
-    "${TOOLCHAIN}-strip" /app/out/integration-container-route
+    cp "$ROUTE_BIN" /app/out/integration-container-route
+    # "${TOOLCHAIN}-strip" /app/out/integration-container-tun && \
+    # "${TOOLCHAIN}-strip" /app/out/integration-container-route
 
 # Stage 4: Runtime - Minimal Alpine production image (target platform)
 # This stage uses TARGETPLATFORM implicitly — Alpine pulls the correct arch.
