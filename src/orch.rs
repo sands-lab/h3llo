@@ -215,19 +215,17 @@ impl PeerEntry {
                 .and_modify(|s| s.in_flight = true)
                 .or_insert_with(DialState::new_in_flight);
 
+            // Common bindings for the spawned task (only one branch runs).
+            let events_tx = events_tx.clone();
+            let tun_if = tun_if.to_string();
+            let peer_id = peer_id.clone();
+            let tuning = tuning.clone();
+            let dial_ip = *ip;
+
             if let Some(bare) = self.config.bare.as_ref() {
-                let port = bare.endpoint.port;
-                let destination = SocketAddr::new(*ip, port);
-                let events_tx = events_tx.clone();
-                let tun_if = tun_if.to_string();
-                let peer_id = peer_id.clone();
+                let destination = SocketAddr::new(dial_ip, bare.endpoint.port);
                 let bindif = bare.bindif.clone();
                 let endpoint = Endpoint::Udp(bare.endpoint.clone());
-                let metrics_interval = tuning.metrics_push_interval;
-                let packet_queue_depth = tuning.packet_queue_depth;
-                let socket_buffer_bytes = tuning.socket_buffer_bytes();
-                let enable_offload = tuning.udp_enable_offload;
-                let dial_ip = *ip;
 
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
@@ -236,8 +234,7 @@ impl PeerEntry {
                         bindif.as_deref(),
                         Some(&tun_if),
                         &probe,
-                        socket_buffer_bytes,
-                        enable_offload,
+                        &tuning,
                     )
                     .await
                     {
@@ -246,19 +243,17 @@ impl PeerEntry {
                                 tx_socket,
                                 peer_id.clone(),
                                 events_tx.clone(),
-                                metrics_interval,
-                                packet_queue_depth,
+                                &tuning,
                             );
-                            let event = Event::Transport(TransportEvent::BareConnected(
-                                BareConnectedEvent {
+                            let _ = events_tx.send(Event::Transport(
+                                TransportEvent::BareConnected(BareConnectedEvent {
                                     peer_id,
                                     endpoint,
                                     dest: destination,
                                     tx: packet_tx,
                                     tx_handle,
-                                },
+                                }),
                             ));
-                            let _ = events_tx.send(event);
                         }
                         Err(err) => {
                             warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
@@ -276,15 +271,9 @@ impl PeerEntry {
                     self.dials.remove(ip);
                     continue;
                 };
-                let port = h3_endpoint.port;
-                let destination = SocketAddr::new(*ip, port);
+                let destination = SocketAddr::new(dial_ip, h3_endpoint.port);
                 let tun_mtu = mtu as u16;
-                let events_tx = events_tx.clone();
-                let tun_if = tun_if.to_string();
-                let peer_id = peer_id.clone();
                 let peer_h3 = h3.clone();
-                let tuning = tuning.clone();
-                let dial_ip = *ip;
 
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
@@ -301,12 +290,12 @@ impl PeerEntry {
                     {
                         Ok(conn) => {
                             debug!(peer = %peer_id, addr = %destination, "H3 connection established");
-                            let event =
-                                Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
+                            let _ = events_tx.send(Event::Transport(TransportEvent::H3Connected(
+                                H3ConnectedEvent {
                                     connection: conn,
                                     direction: ConnectionDirection::Outbound,
-                                }));
-                            let _ = events_tx.send(event);
+                                },
+                            )));
                         }
                         Err(e) => {
                             warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
