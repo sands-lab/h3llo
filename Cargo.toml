@@ -39,7 +39,7 @@ http-body-util = "0.1"
 
 # Use mimalloc for musl targets to avoid musl's slow default allocator
 [target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = { version = "0.1", features = ["debug"] }
+mimalloc = { version = "0.1", features = ["debug", "override"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "process"] }
