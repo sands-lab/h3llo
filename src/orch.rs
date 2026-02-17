@@ -73,9 +73,10 @@ impl DialState {
     /// computes the next allowed time using capped exponential backoff.
     fn record_failure(&mut self, backoff_min: Duration, backoff_max: Duration) {
         self.in_flight = false;
-        self.attempt = self.attempt.saturating_add(1);
+        // delay = min(max, min * 2^attempt); first failure (attempt 0) → backoff_min.
         let multiplier = 1u32.checked_shl(self.attempt.min(30)).unwrap_or(u32::MAX);
         let delay = std::cmp::min(backoff_max, backoff_min.saturating_mul(multiplier));
+        self.attempt = self.attempt.saturating_add(1);
         self.next_allowed_at = Instant::now() + delay;
     }
 }
@@ -154,6 +155,10 @@ impl PeerEntry {
             }
             true
         });
+
+        // Clean up dial state for IPs no longer in resolved_ips to prevent
+        // stale backoff from blocking reconnection when DNS re-resolves an IP.
+        self.dials.retain(|ip, _| self.resolved_ips.contains(ip));
 
         match (&old_first_tx, self.bounds.first()) {
             (Some(old), Some(new)) => !old.same_channel(&new.tx),
@@ -1005,6 +1010,11 @@ impl Orchestrator {
                 attempt = state.attempt,
                 next_allowed_at = ?state.next_allowed_at,
                 "dial failed, backoff updated"
+            );
+        } else {
+            debug!(
+                peer = %event.peer_id, ip = %event.ip,
+                "dial failed but no dial state found (already connected?)"
             );
         }
     }
@@ -2330,6 +2340,26 @@ mod tests {
         assert_eq!(entry.bounds.len(), 1);
     }
 
+    #[test]
+    fn prune_cleans_up_stale_dial_state() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let mut entry = PeerEntry::new(peer);
+
+        let old_ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let new_ip: IpAddr = "5.6.7.8".parse().unwrap();
+
+        // Insert dial state for old IP and set resolved_ips to new IP only.
+        entry.dials.insert(old_ip, DialState::new_in_flight());
+        entry.dials.insert(new_ip, DialState::new_in_flight());
+        entry.resolved_ips.insert(new_ip);
+
+        entry.prune();
+
+        // old_ip dial state removed; new_ip dial state preserved.
+        assert!(!entry.dials.contains_key(&old_ip));
+        assert!(entry.dials.contains_key(&new_ip));
+    }
+
     #[tokio::test]
     async fn try_connect_skips_in_flight() {
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
@@ -2404,13 +2434,34 @@ mod tests {
 
         state.record_failure(min, max);
         assert!(!state.in_flight);
-        assert_eq!(state.attempt, 1); // delay = min(60, 3*2) = 6s
+        assert_eq!(state.attempt, 1); // delay = min(60, 3*1) = 3s
 
         state.record_failure(min, max);
-        assert_eq!(state.attempt, 2); // delay = min(60, 3*4) = 12s
+        assert_eq!(state.attempt, 2); // delay = min(60, 3*2) = 6s
 
         state.record_failure(min, max);
-        assert_eq!(state.attempt, 3); // delay = min(60, 3*8) = 24s
+        assert_eq!(state.attempt, 3); // delay = min(60, 3*4) = 12s
+    }
+
+    #[test]
+    fn dial_state_backoff_caps_at_max() {
+        let min = Duration::from_secs(3);
+        let max = Duration::from_secs(60);
+        let mut state = DialState::new_in_flight();
+
+        // Drive through enough failures to exceed max (3*2^5 = 96 > 60).
+        for _ in 0..10 {
+            let before = Instant::now();
+            state.record_failure(min, max);
+            let delay = state.next_allowed_at.duration_since(before);
+            assert!(delay <= max + Duration::from_millis(10));
+        }
+        // After many attempts, delay must be capped at max.
+        let before = Instant::now();
+        state.record_failure(min, max);
+        let delay = state.next_allowed_at.duration_since(before);
+        assert!(delay >= max - Duration::from_millis(10));
+        assert!(delay <= max + Duration::from_millis(10));
     }
 
     #[tokio::test]

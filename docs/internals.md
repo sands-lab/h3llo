@@ -202,7 +202,12 @@ Connection management:
 - Each peer maintains multiple active connections (`Vec<BoundState>`), one per resolved IP.
 - The first element in the bounds Vec is the preferred TX path for outbound data.
 - When DNS answers change or an endpoint is reconfigured, stale bounds are pruned and new connections are attempted via `try_connect`.
-- `try_connect` uses per-IP dial state tracking (`HashMap<IpAddr, DialState>`). Each IP has independent in-flight detection and exponential backoff (`tuning.reconnect_backoff_min` to `tuning.reconnect_backoff_max`). IPs with an in-flight dial or unexpired backoff are skipped. Dial failure events (`DialFailed`) are sent from spawned tasks back to the orchestrator, which clears the in-flight flag and increments the backoff counter. Successful connections (`update_bound`) remove the dial state entirely, resetting backoff for future reconnection.
+- `try_connect` uses per-IP dial state tracking (`HashMap<IpAddr, DialState>`):
+    - Each IP has independent in-flight detection and exponential backoff (`tuning.reconnect_backoff_min` to `tuning.reconnect_backoff_max`).
+    - IPs with an in-flight dial or unexpired backoff are skipped.
+    - Dial failure events (`DialFailed`) are sent from spawned tasks back to the orchestrator, which clears the in-flight flag and increments the backoff counter.
+    - Successful connections (`update_bound`) remove the dial state entirely, resetting backoff for future reconnection.
+    - Stale dial state is cleaned up during pruning when IPs leave `resolved_ips`.
 - Listener-originated (inbound) connections have `endpoint: None` and are never pruned by DNS or endpoint changes.
 - When a restartable actor fails, all peers are pruned (closed TX channels detected via `tx.is_closed()`), and routing is updated if the preferred TX changed.
 
