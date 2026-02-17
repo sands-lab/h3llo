@@ -7,7 +7,7 @@ use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::ApiEvent;
 use crate::events::{
-    BareConnectedEvent, ConnectionDirection, Direction, DnsEvent, Endpoint, Event,
+    BareConnectedEvent, ConnectionDirection, DialFailedEvent, Direction, DnsEvent, Endpoint, Event,
     H3ConnectedEvent, TransportEvent, TransportLabels, TransportMetrics,
 };
 use crate::h3::{
@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -45,6 +45,41 @@ struct BoundState {
     tx_metrics: Option<TransportMetrics>,
 }
 
+/// Per-IP dial state for tracking in-flight connections and exponential backoff.
+///
+/// Created when a dial attempt is initiated for a specific IP.
+/// Removed when `update_bound` registers a successful outbound connection.
+#[derive(Debug)]
+struct DialState {
+    /// Number of consecutive failed dial attempts (reset on success via removal).
+    attempt: u32,
+    /// Earliest instant at which the next dial attempt is permitted.
+    next_allowed_at: Instant,
+    /// Whether a dial task is currently in flight for this IP.
+    in_flight: bool,
+}
+
+impl DialState {
+    /// Creates initial dial state with in-flight flag set.
+    fn new_in_flight() -> Self {
+        Self {
+            attempt: 0,
+            next_allowed_at: Instant::now(),
+            in_flight: true,
+        }
+    }
+
+    /// Records a dial failure: clears in-flight, increments attempt, and
+    /// computes the next allowed time using capped exponential backoff.
+    fn record_failure(&mut self, backoff_min: Duration, backoff_max: Duration) {
+        self.in_flight = false;
+        self.attempt = self.attempt.saturating_add(1);
+        let multiplier = 1u32.checked_shl(self.attempt.min(30)).unwrap_or(u32::MAX);
+        let delay = std::cmp::min(backoff_max, backoff_min.saturating_mul(multiplier));
+        self.next_allowed_at = Instant::now() + delay;
+    }
+}
+
 /// Entry for a single peer in the unified pool.
 #[derive(Debug)]
 struct PeerEntry {
@@ -54,8 +89,11 @@ struct PeerEntry {
     bounds: Vec<BoundState>,
     /// Current DNS-resolved IPs for this peer's endpoint.
     resolved_ips: HashSet<IpAddr>,
-    /// Last time `try_connect` actually spawned connections.
-    last_try_connect: Option<Instant>,
+    /// Per-IP dial tracking: in-flight status, attempt count, and backoff timing.
+    ///
+    /// An entry exists while a dial is in progress or has failed with pending backoff.
+    /// Removed on successful connection registration via `update_bound`.
+    dials: HashMap<IpAddr, DialState>,
 }
 
 impl PeerEntry {
@@ -65,7 +103,7 @@ impl PeerEntry {
             config,
             bounds: Vec::new(),
             resolved_ips: HashSet::new(),
-            last_try_connect: None,
+            dials: HashMap::new(),
         }
     }
 
@@ -124,11 +162,11 @@ impl PeerEntry {
         }
     }
 
-    /// Spawns connections for resolved IPs not already covered by an existing bound.
+    /// Spawns connections for resolved IPs not already covered by an existing bound
+    /// or blocked by in-flight / backoff state.
     ///
-    /// Rate-limited: only attempts if `tuning.reconnect_interval` has elapsed since last attempt.
-    /// Does nothing if `resolved_ips` is empty. Only updates `last_try_connect` when at
-    /// least one connection task is actually spawned.
+    /// Per-IP rate-limited: skips IPs with an in-flight dial or whose backoff
+    /// `next_allowed_at` has not yet elapsed. Does nothing if `resolved_ips` is empty.
     fn try_connect(
         &mut self,
         events_tx: &mpsc::UnboundedSender<Event>,
@@ -136,47 +174,55 @@ impl PeerEntry {
         mtu: usize,
         tuning: &Tuning,
     ) {
-        // Rate limit
-        if let Some(last) = self.last_try_connect {
-            if last.elapsed() < tuning.reconnect_interval {
-                return;
-            }
-        }
-
         if self.resolved_ips.is_empty() {
             return;
         }
 
-        // Collect IPs already covered by existing bounds
         let covered_ips: HashSet<IpAddr> = self.bounds.iter().map(|b| b.dest.ip()).collect();
 
-        // Determine which IPs need connections
         let uncovered: Vec<IpAddr> = self
             .resolved_ips
             .difference(&covered_ips)
             .copied()
+            .filter(|ip| match self.dials.get(ip) {
+                Some(state) if state.in_flight => {
+                    debug!(ip = %ip, "skipping dial: in-flight");
+                    false
+                }
+                Some(state) if Instant::now() < state.next_allowed_at => {
+                    debug!(ip = %ip, "skipping dial: backoff active");
+                    false
+                }
+                _ => true,
+            })
             .collect();
 
         if uncovered.is_empty() {
             return;
         }
 
-        self.last_try_connect = Some(Instant::now());
+        let peer_id = self.config.id.clone();
 
-        if let Some(bare) = self.config.bare.as_ref() {
-            let port = bare.endpoint.port;
+        for ip in &uncovered {
+            // Mark in-flight (preserving attempt count from prior failures)
+            self.dials
+                .entry(*ip)
+                .and_modify(|s| s.in_flight = true)
+                .or_insert_with(DialState::new_in_flight);
 
-            for ip in &uncovered {
+            if let Some(bare) = self.config.bare.as_ref() {
+                let port = bare.endpoint.port;
                 let destination = SocketAddr::new(*ip, port);
                 let events_tx = events_tx.clone();
                 let tun_if = tun_if.to_string();
-                let peer_id = self.config.id.clone();
+                let peer_id = peer_id.clone();
                 let bindif = bare.bindif.clone();
                 let endpoint = Endpoint::Udp(bare.endpoint.clone());
                 let metrics_interval = tuning.metrics_push_interval;
                 let packet_queue_depth = tuning.packet_queue_depth;
                 let socket_buffer_bytes = tuning.socket_buffer_bytes();
                 let enable_offload = tuning.udp_enable_offload;
+                let dial_ip = *ip;
 
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
@@ -211,24 +257,29 @@ impl PeerEntry {
                         }
                         Err(err) => {
                             warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
+                            let _ = events_tx.send(Event::Transport(TransportEvent::DialFailed(
+                                DialFailedEvent {
+                                    peer_id,
+                                    ip: dial_ip,
+                                },
+                            )));
                         }
                     }
                 });
-            }
-        } else if let Some(h3) = self.config.h3.as_ref() {
-            let Some(h3_endpoint) = h3.endpoint.as_ref() else {
-                return;
-            };
-            let port = h3_endpoint.port;
-            let tun_mtu = mtu as u16;
-
-            for ip in &uncovered {
+            } else if let Some(h3) = self.config.h3.as_ref() {
+                let Some(h3_endpoint) = h3.endpoint.as_ref() else {
+                    self.dials.remove(ip);
+                    continue;
+                };
+                let port = h3_endpoint.port;
                 let destination = SocketAddr::new(*ip, port);
+                let tun_mtu = mtu as u16;
                 let events_tx = events_tx.clone();
                 let tun_if = tun_if.to_string();
-                let peer_id = self.config.id.clone();
+                let peer_id = peer_id.clone();
                 let peer_h3 = h3.clone();
                 let tuning = tuning.clone();
+                let dial_ip = *ip;
 
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
@@ -254,9 +305,18 @@ impl PeerEntry {
                         }
                         Err(e) => {
                             warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
+                            let _ = events_tx.send(Event::Transport(TransportEvent::DialFailed(
+                                DialFailedEvent {
+                                    peer_id,
+                                    ip: dial_ip,
+                                },
+                            )));
                         }
                     }
                 });
+            } else {
+                // No transport configured; remove in-flight marker
+                self.dials.remove(ip);
             }
         }
     }
@@ -629,17 +689,17 @@ impl Orchestrator {
     ///
     /// Returns `OrchestratorError` when a child task exits unexpectedly.
     pub async fn run(mut self) -> Result<(), OrchestratorError> {
-        // Run maintenance at half the connect interval so closed channels and
-        // newly resolved IPs are detected promptly.
-        let mut maintenance_ticker = tokio::time::interval(self.tuning.reconnect_interval / 2);
+        // Reconcile at the configured interval to detect closed channels and
+        // attempt reconnection for uncovered IPs.
+        let mut reconcile_ticker = tokio::time::interval(self.tuning.reconcile_interval);
         let mut metrics_log_ticker = tokio::time::interval(self.tuning.metrics_log_interval);
         loop {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {
                     self.handle_event(event).await;
                 }
-                _ = maintenance_ticker.tick() => {
-                    self.run_maintenance();
+                _ = reconcile_ticker.tick() => {
+                    self.reconcile();
                 }
                 _ = metrics_log_ticker.tick() => {
                     log_quic_metrics();
@@ -662,7 +722,7 @@ impl Orchestrator {
                                 }
                                 ActorKind::Restartable => {
                                     warn!("peer actor failed: {}", actor_error);
-                                    self.run_maintenance();
+                                    self.reconcile();
                                 }
                             }
                         }
@@ -693,8 +753,8 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Periodic maintenance: prune stale bounds and attempt reconnection.
-    fn run_maintenance(&mut self) {
+    /// Periodic reconciliation: prune stale bounds and attempt reconnection.
+    fn reconcile(&mut self) {
         let mut routing_changed = false;
         for entry in self.peers.values_mut() {
             routing_changed |= entry.prune();
@@ -846,6 +906,9 @@ impl Orchestrator {
             Event::Transport(TransportEvent::BareConnected(event)) => {
                 self.handle_bare_connection(event);
             }
+            Event::Transport(TransportEvent::DialFailed(event)) => {
+                self.handle_dial_failed(event);
+            }
         }
     }
 
@@ -887,6 +950,11 @@ impl Orchestrator {
             warn!(peer = %peer_id, addr = %dest, "connection for unknown peer");
             return;
         };
+        // Clear dial state on successful outbound connection.
+        // Inbound connections (endpoint: None) do not have dial state.
+        if endpoint.is_some() {
+            entry.dials.remove(&dest.ip());
+        }
         let was_empty = entry.bounds.is_empty();
         entry.bounds.push(BoundState {
             endpoint,
@@ -916,6 +984,29 @@ impl Orchestrator {
         // Always register: actor is already running, must be supervised
         self.join_set.spawn(tx_handle);
         self.update_bound(&peer_id, Some(endpoint), dest, tx);
+    }
+
+    /// Handles a dial failure event: clears in-flight flag and updates backoff.
+    fn handle_dial_failed(&mut self, event: DialFailedEvent) {
+        let Some(entry) = self.peers.get_mut(&event.peer_id) else {
+            debug!(
+                peer = %event.peer_id, ip = %event.ip,
+                "dial failed for unknown peer (removed?)"
+            );
+            return;
+        };
+        if let Some(state) = entry.dials.get_mut(&event.ip) {
+            state.record_failure(
+                self.tuning.reconnect_backoff_min,
+                self.tuning.reconnect_backoff_max,
+            );
+            debug!(
+                peer = %event.peer_id, ip = %event.ip,
+                attempt = state.attempt,
+                next_allowed_at = ?state.next_allowed_at,
+                "dial failed, backoff updated"
+            );
+        }
     }
 
     /// Handles an H3 connection event (inbound or outbound).
@@ -2240,22 +2331,176 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_connect_rate_limited() {
+    async fn try_connect_skips_in_flight() {
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
         let mut entry = PeerEntry::new(peer);
-        entry.resolved_ips.insert("127.0.0.1".parse().unwrap());
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        entry.resolved_ips.insert(ip);
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        // First call should set last_try_connect
+        // First call should mark IP as in-flight
         entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
-        assert!(entry.last_try_connect.is_some());
+        assert!(entry.dials.contains_key(&ip));
+        assert!(entry.dials[&ip].in_flight);
 
-        let first_time = entry.last_try_connect.unwrap();
-
-        // Second immediate call should be rate-limited (timestamp unchanged)
+        // Second immediate call should skip (in-flight)
+        let attempt_before = entry.dials[&ip].attempt;
         entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
-        assert_eq!(entry.last_try_connect.unwrap(), first_time);
+        assert_eq!(entry.dials[&ip].attempt, attempt_before);
+    }
+
+    #[tokio::test]
+    async fn try_connect_skips_backoff_not_elapsed() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let mut entry = PeerEntry::new(peer);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        entry.resolved_ips.insert(ip);
+
+        entry.dials.insert(
+            ip,
+            DialState {
+                attempt: 1,
+                next_allowed_at: Instant::now() + Duration::from_secs(60),
+                in_flight: false,
+            },
+        );
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
+
+        assert!(!entry.dials[&ip].in_flight);
+        assert_eq!(entry.dials[&ip].attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn try_connect_allows_after_backoff_elapsed() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let mut entry = PeerEntry::new(peer);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        entry.resolved_ips.insert(ip);
+
+        entry.dials.insert(
+            ip,
+            DialState {
+                attempt: 2,
+                next_allowed_at: Instant::now() - Duration::from_secs(1),
+                in_flight: false,
+            },
+        );
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
+
+        // Should have re-triggered: in_flight set, attempt preserved
+        assert!(entry.dials[&ip].in_flight);
+    }
+
+    #[test]
+    fn dial_state_exponential_backoff() {
+        let min = Duration::from_secs(3);
+        let max = Duration::from_secs(60);
+        let mut state = DialState::new_in_flight();
+
+        state.record_failure(min, max);
+        assert!(!state.in_flight);
+        assert_eq!(state.attempt, 1); // delay = min(60, 3*2) = 6s
+
+        state.record_failure(min, max);
+        assert_eq!(state.attempt, 2); // delay = min(60, 3*4) = 12s
+
+        state.record_failure(min, max);
+        assert_eq!(state.attempt, 3); // delay = min(60, 3*8) = 24s
+    }
+
+    #[tokio::test]
+    async fn handle_dial_failed_updates_backoff() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .build();
+
+        orch.peers
+            .get_mut("peer1")
+            .unwrap()
+            .dials
+            .insert(ip, DialState::new_in_flight());
+
+        orch.handle_dial_failed(DialFailedEvent {
+            peer_id: "peer1".to_string(),
+            ip,
+        });
+
+        let state = &orch.peers.get("peer1").unwrap().dials[&ip];
+        assert!(!state.in_flight);
+        assert_eq!(state.attempt, 1);
+        assert!(state.next_allowed_at > Instant::now());
+    }
+
+    #[tokio::test]
+    async fn handle_dial_failed_ignores_unknown_peer() {
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+
+        // Should not panic
+        orch.handle_dial_failed(DialFailedEvent {
+            peer_id: "nonexistent".to_string(),
+            ip: "1.2.3.4".parse().unwrap(),
+        });
+    }
+
+    #[tokio::test]
+    async fn update_bound_clears_dial_state() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_resolved_ips("peer1", HashSet::from([ip]))
+            .build();
+
+        orch.peers
+            .get_mut("peer1")
+            .unwrap()
+            .dials
+            .insert(ip, DialState::new_in_flight());
+
+        let (tx, _rx) = mpsc::channel(1);
+        orch.update_bound(
+            "peer1",
+            Some(Endpoint::Udp(crate::config::UdpEndpoint {
+                host: "example.com".to_string(),
+                port: 5353,
+            })),
+            SocketAddr::new(ip, 5353),
+            tx,
+        );
+
+        assert!(!orch.peers.get("peer1").unwrap().dials.contains_key(&ip));
+    }
+
+    #[tokio::test]
+    async fn update_bound_preserves_dial_state_for_inbound() {
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_resolved_ips("peer1", HashSet::from([ip]))
+            .build();
+
+        orch.peers
+            .get_mut("peer1")
+            .unwrap()
+            .dials
+            .insert(ip, DialState::new_in_flight());
+
+        let (tx, _rx) = mpsc::channel(1);
+        orch.update_bound("peer1", None, SocketAddr::new(ip, 5353), tx);
+
+        // Inbound should NOT clear dial state
+        assert!(orch.peers.get("peer1").unwrap().dials.contains_key(&ip));
     }
 
     // ========== API event handling tests ==========

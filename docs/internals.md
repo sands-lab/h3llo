@@ -202,7 +202,7 @@ Connection management:
 - Each peer maintains multiple active connections (`Vec<BoundState>`), one per resolved IP.
 - The first element in the bounds Vec is the preferred TX path for outbound data.
 - When DNS answers change or an endpoint is reconfigured, stale bounds are pruned and new connections are attempted via `try_connect`.
-- `try_connect` is rate-limited to one attempt per `tuning.reconnect_interval` seconds (default 3) per peer (only updates timestamp when connections are actually spawned).
+- `try_connect` uses per-IP dial state tracking (`HashMap<IpAddr, DialState>`). Each IP has independent in-flight detection and exponential backoff (`tuning.reconnect_backoff_min` to `tuning.reconnect_backoff_max`). IPs with an in-flight dial or unexpired backoff are skipped. Dial failure events (`DialFailed`) are sent from spawned tasks back to the orchestrator, which clears the in-flight flag and increments the backoff counter. Successful connections (`update_bound`) remove the dial state entirely, resetting backoff for future reconnection.
 - Listener-originated (inbound) connections have `endpoint: None` and are never pruned by DNS or endpoint changes.
 - When a restartable actor fails, all peers are pruned (closed TX channels detected via `tx.is_closed()`), and routing is updated if the preferred TX changed.
 
@@ -221,7 +221,7 @@ DNS lifecycle management:
   2. Prune stale bounds and attempt reconnection for each peer.
   3. Update accepted-source filter (unconditionally, from `resolved_ips` of bare peers).
   - Routing is updated only when prune detects a change in the preferred TX (first bound).
-- A periodic maintenance timer (every 1.5 seconds) runs prune + try_connect for all peers, ensuring self-healing even without DNS events.
+- A periodic reconciliation loop (`reconcile`, every `tuning.reconcile_interval`) runs prune + try_connect for all peers, ensuring self-healing even without DNS events.
 - Refreshing an existing IP extends its TTL without changing the snapshot (no duplicate events).
 - DNS warnings (NXDOMAIN, truncation, recursion refusal) are logged via `warn!` at the DNS module (origin) rather than propagating through events.
 

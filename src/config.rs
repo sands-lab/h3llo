@@ -194,9 +194,23 @@ pub struct Tuning {
     /// Disable as a software-level workaround when NIC hardware offload
     /// produces incorrect checksums (see troubleshooting guide).
     pub udp_enable_offload: bool,
-    /// Minimum interval between reconnection attempts (default: 10s).
+    /// Interval for the periodic reconciliation cycle (default: 10s).
+    ///
+    /// Controls how often the orchestrator prunes stale bounds and attempts
+    /// reconnections for uncovered IPs.
     #[serde(with = "serde_duration_secs")]
-    pub reconnect_interval: Duration,
+    pub reconcile_interval: Duration,
+    /// Minimum backoff duration between reconnection attempts per IP (default: 3s).
+    ///
+    /// The backoff grows exponentially from this base value after each failed attempt.
+    #[serde(with = "serde_duration_secs")]
+    pub reconnect_backoff_min: Duration,
+    /// Maximum backoff duration between reconnection attempts per IP (default: 60s).
+    ///
+    /// The exponential backoff is capped at this ceiling.
+    /// Must be greater than or equal to `reconnect_backoff_min`.
+    #[serde(with = "serde_duration_secs")]
+    pub reconnect_backoff_max: Duration,
     /// Metrics push interval in milliseconds (default: 1000ms).
     #[serde(with = "serde_duration_millis")]
     pub metrics_push_interval: Duration,
@@ -268,7 +282,9 @@ impl Default for Tuning {
             tun_tx_queue_len: 1000,
             tun_enable_offload: true,
             udp_enable_offload: true,
-            reconnect_interval: Duration::from_secs(10),
+            reconcile_interval: Duration::from_secs(10),
+            reconnect_backoff_min: Duration::from_secs(3),
+            reconnect_backoff_max: Duration::from_secs(60),
             metrics_push_interval: Duration::from_millis(1000),
             metrics_log_interval: Duration::from_secs(3),
             dns_query_timeout: Duration::from_secs(2),
@@ -366,7 +382,7 @@ pub enum ValidationError {
     /// broken behavior (instant timeouts, no debouncing).
     #[error("tuning.{field} must be greater than 0")]
     TuningDurationZero {
-        /// The field name (e.g., "reconnect_interval").
+        /// The field name (e.g., "reconcile_interval").
         field: &'static str,
     },
     /// `tuning.h3_keepalive_interval` must be strictly less than `tuning.h3_max_idle_timeout`.
@@ -431,6 +447,17 @@ pub enum ValidationError {
         /// The unrecognized algorithm name.
         algorithm: String,
     },
+    /// `reconnect_backoff_min` must not exceed `reconnect_backoff_max`.
+    #[error(
+        "tuning.reconnect_backoff_min ({min:?}) must not exceed \
+         tuning.reconnect_backoff_max ({max:?})"
+    )]
+    BackoffMinExceedsMax {
+        /// Configured minimum.
+        min: Duration,
+        /// Configured maximum.
+        max: Duration,
+    },
 }
 
 impl Config {
@@ -460,7 +487,9 @@ impl Config {
         // Duration fields that must be strictly positive.
         // dns_refresh_interval is intentionally excluded: zero disables periodic refresh.
         let duration_checks: &[(&str, Duration)] = &[
-            ("reconnect_interval", self.tuning.reconnect_interval),
+            ("reconcile_interval", self.tuning.reconcile_interval),
+            ("reconnect_backoff_min", self.tuning.reconnect_backoff_min),
+            ("reconnect_backoff_max", self.tuning.reconnect_backoff_max),
             ("metrics_push_interval", self.tuning.metrics_push_interval),
             ("metrics_log_interval", self.tuning.metrics_log_interval),
             ("dns_query_timeout", self.tuning.dns_query_timeout),
@@ -503,14 +532,21 @@ impl Config {
                      oversized QUIC DATAGRAMs may fail to send"
                 );
             }
-            if self.tuning.reconnect_interval <= self.tuning.h3_handshake_timeout {
+            if self.tuning.reconnect_backoff_min <= self.tuning.h3_handshake_timeout {
                 tracing::warn!(
-                    reconnect_interval = ?self.tuning.reconnect_interval,
+                    reconnect_backoff_min = ?self.tuning.reconnect_backoff_min,
                     h3_handshake_timeout = ?self.tuning.h3_handshake_timeout,
-                    "tuning.reconnect_interval should be greater than \
-                     tuning.h3_handshake_timeout to prevent unbounded connection growth"
+                    "tuning.reconnect_backoff_min should be greater than \
+                     tuning.h3_handshake_timeout to prevent overlapping handshake attempts"
                 );
             }
+        }
+
+        if self.tuning.reconnect_backoff_min > self.tuning.reconnect_backoff_max {
+            errors.push(ValidationError::BackoffMinExceedsMax {
+                min: self.tuning.reconnect_backoff_min,
+                max: self.tuning.reconnect_backoff_max,
+            });
         }
 
         // H3 validation: cert/key must not be empty when local.h3 is set
@@ -1882,7 +1918,9 @@ peers:
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.tuning.packet_queue_depth, 256);
         assert_eq!(cfg.tuning.socket_buffer_size, 16);
-        assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(10));
+        assert_eq!(cfg.tuning.reconcile_interval, Duration::from_secs(10));
+        assert_eq!(cfg.tuning.reconnect_backoff_min, Duration::from_secs(3));
+        assert_eq!(cfg.tuning.reconnect_backoff_max, Duration::from_secs(60));
         assert_eq!(
             cfg.tuning.metrics_push_interval,
             Duration::from_millis(1000)
@@ -1980,7 +2018,7 @@ peers:
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.tuning.packet_queue_depth, 512);
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(120));
-        assert_eq!(cfg.tuning.reconnect_interval, Duration::from_secs(10));
+        assert_eq!(cfg.tuning.reconcile_interval, Duration::from_secs(10));
         assert_eq!(
             cfg.tuning.metrics_push_interval,
             Duration::from_millis(1000)
@@ -2220,8 +2258,14 @@ peers:
     #[test]
     fn rejects_zero_duration_fields() {
         let fields: &[(&str, fn(&mut Tuning))] = &[
-            ("reconnect_interval", |t| {
-                t.reconnect_interval = Duration::ZERO
+            ("reconcile_interval", |t| {
+                t.reconcile_interval = Duration::ZERO
+            }),
+            ("reconnect_backoff_min", |t| {
+                t.reconnect_backoff_min = Duration::ZERO
+            }),
+            ("reconnect_backoff_max", |t| {
+                t.reconnect_backoff_max = Duration::ZERO
             }),
             ("metrics_push_interval", |t| {
                 t.metrics_push_interval = Duration::ZERO
@@ -2383,38 +2427,38 @@ tuning:
 
     #[test]
     #[traced_test]
-    fn warns_reconnect_interval_equals_handshake_timeout() {
+    fn warns_backoff_min_equals_handshake_timeout() {
         let mut config = sample_h3_config();
-        config.tuning.reconnect_interval = Duration::from_secs(5);
+        config.tuning.reconnect_backoff_min = Duration::from_secs(5);
         config.tuning.h3_handshake_timeout = Duration::from_secs(5);
         assert!(config.validate().is_ok());
-        assert!(logs_contain("reconnect_interval should be greater"));
+        assert!(logs_contain("reconnect_backoff_min should be greater"));
     }
 
     #[test]
     #[traced_test]
-    fn warns_reconnect_interval_less_than_handshake_timeout() {
+    fn warns_backoff_min_less_than_handshake_timeout() {
         let mut config = sample_h3_config();
-        config.tuning.reconnect_interval = Duration::from_secs(3);
+        config.tuning.reconnect_backoff_min = Duration::from_secs(2);
         config.tuning.h3_handshake_timeout = Duration::from_secs(5);
         assert!(config.validate().is_ok());
-        assert!(logs_contain("reconnect_interval should be greater"));
+        assert!(logs_contain("reconnect_backoff_min should be greater"));
     }
 
     #[test]
     #[traced_test]
-    fn no_reconnect_warning_when_interval_longer() {
-        let config = sample_h3_config();
-        // Default: reconnect=10s, handshake=5s
-        assert!(config.validate().is_ok());
-        assert!(!logs_contain("reconnect_interval should be greater"));
-    }
-
-    #[test]
-    #[traced_test]
-    fn no_reconnect_warning_without_h3_peers() {
+    fn no_backoff_warning_when_min_longer() {
         let mut config = sample_h3_config();
-        config.tuning.reconnect_interval = Duration::from_secs(1);
+        config.tuning.reconnect_backoff_min = Duration::from_secs(10);
+        assert!(config.validate().is_ok());
+        assert!(!logs_contain("reconnect_backoff_min should be greater"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn no_backoff_warning_without_h3_peers() {
+        let mut config = sample_h3_config();
+        config.tuning.reconnect_backoff_min = Duration::from_secs(1);
         config.tuning.h3_handshake_timeout = Duration::from_secs(5);
         config.peers[0].h3 = None;
         config.peers[0].bare = Some(PeerBare {
@@ -2425,7 +2469,7 @@ tuning:
             bindif: None,
         });
         assert!(config.validate().is_ok());
-        assert!(!logs_contain("reconnect_interval should be greater"));
+        assert!(!logs_contain("reconnect_backoff_min should be greater"));
     }
 
     #[test]
@@ -2433,10 +2477,23 @@ tuning:
     fn emits_both_warnings_simultaneously() {
         let mut config = sample_h3_config();
         config.local.tun.mtu = 1500;
-        config.tuning.reconnect_interval = Duration::from_secs(3);
+        config.tuning.reconnect_backoff_min = Duration::from_secs(2);
         config.tuning.h3_handshake_timeout = Duration::from_secs(5);
         assert!(config.validate().is_ok());
         assert!(logs_contain("exceeds safe maximum"));
-        assert!(logs_contain("reconnect_interval should be greater"));
+        assert!(logs_contain("reconnect_backoff_min should be greater"));
+    }
+
+    #[test]
+    fn rejects_backoff_min_exceeds_max() {
+        let mut config = sample_h3_config();
+        config.tuning.reconnect_backoff_min = Duration::from_secs(120);
+        config.tuning.reconnect_backoff_max = Duration::from_secs(60);
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation(ValidationErrors(ref errs))
+                if errs.iter().any(|e| matches!(e, ValidationError::BackoffMinExceedsMax { .. }))
+        ));
     }
 }

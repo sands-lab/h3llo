@@ -27,7 +27,9 @@ tuning: # optional, all fields have defaults
   tun_tx_queue_len: 1000 # optional, default: 1000 (packets; Linux only)
   tun_enable_offload: true # optional, default: true (TUN GSO/GRO; Linux only)
   udp_enable_offload: true # optional, default: true (UDP GSO/GRO; Linux only)
-  reconnect_interval: 10 # optional, default: 10 (seconds)
+  reconcile_interval: 10 # optional, default: 10 (seconds)
+  reconnect_backoff_min: 3 # optional, default: 3 (seconds)
+  reconnect_backoff_max: 60 # optional, default: 60 (seconds)
   metrics_push_interval: 1000 # optional, default: 1000 (milliseconds)
   metrics_log_interval: 3 # optional, default: 3 (seconds)
   dns_query_timeout: 2 # optional, default: 2 (seconds)
@@ -77,7 +79,9 @@ peers: # optional, default: []
 - `tuning.tun_tx_queue_len` (default `1000`): TUN interface transmit queue length in packets. Controls how many packets the kernel queues for transmission. Applied on Linux only; ignored on other platforms.
 - `tuning.tun_enable_offload` (default `true`): Enable GSO/GRO offload on the TUN device for batched I/O. When disabled, TUN reads and writes fall back to single-packet operations. Linux only; ignored on other platforms.
 - `tuning.udp_enable_offload` (default `true`): Enable GSO/GRO offload for BareUDP and HTTP/3 transports (both client and listener). When disabled, GSO/GRO segment counts are capped to 1, resulting in per-packet I/O. Linux only; ignored on other platforms. Disabling may help work around NIC TX checksum offload bugs (see [troubleshooting](troubleshoot.md#bareudp-checksum-errors-with-nic-tx-offload)) or GSO `EINVAL` on aarch64 (see [troubleshooting](troubleshoot.md#gso-udp_segment-sendto-einval-on-aarch64)).
-- `tuning.reconnect_interval` (default `10`): Minimum seconds between `try_connect` attempts per peer. When H3 peers are configured, a warning is emitted if this value is not greater than `tuning.h3_handshake_timeout` (default `5`) to prevent overlapping handshake attempts from causing unbounded connection growth.
+- `tuning.reconcile_interval` (default `10`): Seconds between periodic reconciliation cycles (prune stale bounds + attempt reconnection). Controls how often the orchestrator scans all peers for stale bounds and uncovered IPs.
+- `tuning.reconnect_backoff_min` (default `3`): Minimum backoff duration in seconds between reconnection attempts for a specific IP. The backoff grows exponentially from this base value after each failed attempt. When H3 peers are configured, a warning is emitted if this value is not greater than `tuning.h3_handshake_timeout` (default `5`) to prevent overlapping handshake attempts.
+- `tuning.reconnect_backoff_max` (default `60`): Maximum backoff duration in seconds for reconnection attempts per IP. The exponential backoff is capped at this ceiling. Must be greater than or equal to `reconnect_backoff_min`.
 - `tuning.metrics_push_interval` (default `1000`): Milliseconds between periodic metric push emissions from actors to the orchestrator.
 - `tuning.metrics_log_interval` (default `3`): Seconds between periodic `debug!`-level logging of QUIC and transport metrics by the orchestrator. Independent of `metrics_push_interval`, which controls actor emission cadence.
 - `tuning.dns_query_timeout` (default `2`): Seconds before a DNS query is considered timed out and retried.

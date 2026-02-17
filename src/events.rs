@@ -92,6 +92,18 @@ impl std::fmt::Debug for ApiEvent {
     }
 }
 
+/// Dial failure notification from a spawned connection task.
+///
+/// Sent back to the orchestrator when `make_bare_tx` or `dial_h3` fails,
+/// allowing the orchestrator to clear the in-flight flag and advance backoff.
+#[derive(Debug)]
+pub struct DialFailedEvent {
+    /// Peer identifier from configuration.
+    pub peer_id: String,
+    /// The IP address that failed to connect.
+    pub ip: IpAddr,
+}
+
 /// Describes transport-level events.
 pub enum TransportEvent {
     /// Latest cumulative metrics for a transport direction.
@@ -100,6 +112,8 @@ pub enum TransportEvent {
     H3Connected(H3ConnectedEvent),
     /// BareUDP TX connection established, ready for bound registration.
     BareConnected(BareConnectedEvent),
+    /// A dial attempt failed; orchestrator should clear in-flight state and update backoff.
+    DialFailed(DialFailedEvent),
 }
 
 impl std::fmt::Debug for TransportEvent {
@@ -108,6 +122,7 @@ impl std::fmt::Debug for TransportEvent {
             Self::Metrics(m) => f.debug_tuple("Metrics").field(m).finish(),
             Self::H3Connected(e) => f.debug_tuple("H3Connected").field(e).finish(),
             Self::BareConnected(e) => f.debug_tuple("BareConnected").field(e).finish(),
+            Self::DialFailed(e) => f.debug_tuple("DialFailed").field(e).finish(),
         }
     }
 }
