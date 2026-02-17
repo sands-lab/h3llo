@@ -166,6 +166,8 @@ pub enum RouteSyncError {
 ///   address (e.g., `10.0.0.1/24`), the network prefix (`10.0.0.0/24`), host route
 ///   (`10.0.0.1/32`), and IPv4 broadcast routes (`10.0.0.0/32`, `10.0.0.255/32`) are
 ///   protected from deletion. The limited broadcast `255.255.255.255/32` is also protected.
+/// - IPv6 kernel-managed routes (link-local `fe80::/10` and multicast `ff00::/8`) are
+///   always preserved regardless of `tun_addrs` or `allowed`.
 /// - Any other route on the TUN interface is considered stale and will be deleted.
 /// - If a desired prefix already exists on another interface, a conflict warning is logged.
 /// - Failures when adding or deleting are logged as warnings.
@@ -184,12 +186,13 @@ pub async fn sync_tun_routes<H: RouteHandle, R: IfIndexResolver>(
 
     let desired_routes: HashSet<IpNet> = expand_allowed_prefixes(allowed);
 
-    // OS-managed routes to preserve (never added, only protected from deletion).
+    // IPv4 OS-managed routes to preserve (never added, only protected from deletion).
     // For each TUN address (e.g., 192.168.1.2/24), include:
     // - the network prefix (192.168.1.0/24) — kernel connected route
     // - the host address (192.168.1.2/32) — kernel host route
-    // - IPv4 broadcast routes (192.168.1.0/32, 192.168.1.255/32) — kernel broadcast routes
-    let mut tun_addr_set: HashSet<IpNet> = tun_addrs
+    // - broadcast routes (192.168.1.0/32, 192.168.1.255/32) — kernel broadcast routes
+    // IPv6 kernel routes (link-local, multicast) are handled by is_ipv6_kernel_route().
+    let mut tun_v4_kernel_routes: HashSet<IpNet> = tun_addrs
         .iter()
         .flat_map(|addr| {
             let mut nets = vec![addr.trunc(), addr.addr().into()];
@@ -203,7 +206,7 @@ pub async fn sync_tun_routes<H: RouteHandle, R: IfIndexResolver>(
         })
         .collect();
     // Limited broadcast (255.255.255.255/32) — some systems add this to local table
-    tun_addr_set.insert(IpAddr::V4(Ipv4Addr::BROADCAST).into());
+    tun_v4_kernel_routes.insert(IpAddr::V4(Ipv4Addr::BROADCAST).into());
 
     let mut existing_routes: HashSet<IpNet> = HashSet::new();
 
@@ -216,23 +219,23 @@ pub async fn sync_tun_routes<H: RouteHandle, R: IfIndexResolver>(
             continue;
         };
 
-        if desired_routes.contains(&net) || tun_addr_set.contains(&net) {
-            if route.if_index() == Some(tun_ifindex) {
+        if route.if_index() == Some(tun_ifindex) {
+            if desired_routes.contains(&net) {
                 existing_routes.insert(net);
-            } else {
-                let ifindex = route
-                    .if_index()
-                    .map_or("unknown".to_string(), |i| i.to_string());
-                warn!(prefix = %net, existing_ifindex = ifindex, "route conflict with existing interface");
-            }
-        } else if route.if_index() == Some(tun_ifindex) {
-            if let Err(err) = handle.delete(route).await {
+            } else if tun_v4_kernel_routes.contains(&net) || is_ipv6_kernel_route(&net) {
+                // OS/kernel-managed: preserve but no need to track in existing_routes
+            } else if let Err(err) = handle.delete(route).await {
                 warn!(prefix = %net, error = %err, "route delete failed");
             }
+        } else if desired_routes.contains(&net) {
+            let ifindex = route
+                .if_index()
+                .map_or("unknown".to_string(), |i| i.to_string());
+            warn!(prefix = %net, existing_ifindex = ifindex, "route conflict with existing interface");
         }
     }
 
-    // Add missing desired routes. tun_addr_set routes are OS-managed, never added by us.
+    // Add missing desired routes. tun_v4_kernel_routes routes are OS-managed, never added by us.
     for net in &desired_routes {
         if existing_routes.contains(net) {
             continue;
@@ -288,6 +291,21 @@ fn resolve_ifindex(name: &str) -> Result<u32, RouteSyncError> {
         interface: name.to_string(),
         error: "interface not found".to_string(),
     })
+}
+
+/// Returns `true` for IPv6 routes auto-managed by the kernel.
+///
+/// These include:
+/// - Link-local routes (`fe80::/10` range) — connected and host routes
+/// - Multicast routes (`ff00::/8` range)
+fn is_ipv6_kernel_route(net: &IpNet) -> bool {
+    match net {
+        IpNet::V6(v6) => {
+            let addr = v6.network();
+            addr.is_unicast_link_local() || addr.is_multicast()
+        }
+        IpNet::V4(_) => false,
+    }
 }
 
 /// Converts a `route_manager::Route` into `IpNet` when the address family is supported.
@@ -600,7 +618,7 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    /// Kernel connected route (network prefix) preserved via tun_addr_set.
+    /// Kernel connected route (network prefix) preserved via tun_v4_kernel_routes.
     async fn kernel_connected_route_preserved() {
         let resolver = FakeResolver { idx: 10 };
         // Kernel creates 192.168.1.0/24 when TUN addr is 192.168.1.2/24
@@ -618,7 +636,7 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    /// Kernel host route (/32) preserved via tun_addr_set.
+    /// Kernel host route (/32) preserved via tun_v4_kernel_routes.
     async fn kernel_host_route_preserved() {
         let resolver = FakeResolver { idx: 10 };
         // Kernel creates host route 192.168.1.2/32 for the assigned address
@@ -723,6 +741,94 @@ mod tests {
         // 10.0.0.0/31 (connected) and 10.0.0.1/32 (host) are protected,
         // but 10.0.0.0/32 is NOT — it gets deleted as stale
         assert_eq!(handle.ops(), vec!["del 10.0.0.0/32"]);
+    }
+
+    // ========== IPv6 kernel route preservation tests ==========
+
+    #[tokio::test]
+    #[traced_test]
+    /// Link-local connected route (fe80::/64) preserved on TUN interface.
+    async fn ipv6_link_local_connected_preserved() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![route("fe80::/64", Some(10))]);
+        let tun_addrs: Vec<IpNet> = vec![];
+        let allowed: Vec<IpNet> = vec![];
+
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        assert!(handle.ops().is_empty());
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// Link-local host route (fe80::xxx/128) preserved on TUN interface.
+    async fn ipv6_link_local_host_preserved() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![route("fe80::ef04:f217:fba2:1858/128", Some(10))]);
+        let tun_addrs: Vec<IpNet> = vec![];
+        let allowed: Vec<IpNet> = vec![];
+
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        assert!(handle.ops().is_empty());
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// Multicast route (ff00::/8) preserved on TUN interface.
+    async fn ipv6_multicast_preserved() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![route("ff00::/8", Some(10))]);
+        let tun_addrs: Vec<IpNet> = vec![];
+        let allowed: Vec<IpNet> = vec![];
+
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        assert!(handle.ops().is_empty());
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// Non-kernel IPv6 routes on TUN are still deleted as stale.
+    async fn ipv6_non_kernel_route_deleted() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![route("2001:db8::/32", Some(10))]);
+        let tun_addrs: Vec<IpNet> = vec![];
+        let allowed: Vec<IpNet> = vec![];
+
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        assert_eq!(handle.ops(), vec!["del 2001:db8::/32"]);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// IPv6 kernel routes on other interfaces do not trigger conflict warnings.
+    async fn ipv6_kernel_routes_on_other_if_no_conflict() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![
+            route("fe80::/64", Some(2)),   // link-local on eth0
+            route("fe80::1/128", Some(2)), // link-local host on eth0
+            route("ff00::/8", Some(2)),    // multicast on eth0
+            route("ff02::1/128", Some(3)), // multicast host on wlan0
+        ]);
+        let tun_addrs: Vec<IpNet> = vec![];
+        let allowed: Vec<IpNet> = vec![];
+
+        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
+            .await
+            .unwrap();
+
+        assert!(handle.ops().is_empty());
+        assert!(!logs_contain("route conflict"));
     }
 
     /// Always fails interface resolution (for error path tests).
