@@ -140,18 +140,19 @@ impl PeerEntry {
                 debug!(dest = %bound.dest, "pruned: tx channel closed");
                 return false;
             }
-            // Only check endpoint-based invalidation for outbound connections
-            if let Some(ref bound_ep) = bound.endpoint {
-                // Endpoint changed (dynamic reconfig)
-                if config_ep.as_ref() != Some(bound_ep) {
-                    debug!(dest = %bound.dest, "pruned: endpoint changed");
-                    return false;
-                }
-                // Dest IP no longer in resolved_ips (DNS changed)
-                if !self.resolved_ips.contains(&bound.dest.ip()) {
-                    debug!(dest = %bound.dest, "pruned: IP no longer in DNS");
-                    return false;
-                }
+            // Inbound connections (endpoint: None) are never pruned by DNS/endpoint checks
+            let Some(ref bound_ep) = bound.endpoint else {
+                return true;
+            };
+            // Endpoint changed (dynamic reconfig)
+            if config_ep.as_ref() != Some(bound_ep) {
+                debug!(dest = %bound.dest, "pruned: endpoint changed");
+                return false;
+            }
+            // Dest IP no longer in resolved_ips (DNS changed)
+            if !self.resolved_ips.contains(&bound.dest.ip()) {
+                debug!(dest = %bound.dest, "pruned: IP no longer in DNS");
+                return false;
             }
             true
         });
