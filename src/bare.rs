@@ -2,6 +2,7 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
+use crate::config::Tuning;
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_transient;
 use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
@@ -104,18 +105,23 @@ pub async fn make_bare_tx<P: RouteProbe>(
     bindif: Option<&str>,
     tun_if: Option<&str>,
     probe: &P,
-    socket_buffer_bytes: usize,
-    enable_offload: bool,
+    tuning: &Tuning,
 ) -> Result<BareUdpTx, UdpError> {
-    let socket =
-        make_unbound_udp_socket(destination, tun_if, bindif, probe, socket_buffer_bytes).await?;
+    let socket = make_unbound_udp_socket(
+        destination,
+        tun_if,
+        bindif,
+        probe,
+        tuning.socket_buffer_bytes(),
+    )
+    .await?;
     let state = UdpSocketState::new(UdpSockRef::from(&socket))
         .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
     Ok(BareUdpTx {
         socket,
         state,
         destination,
-        enable_offload,
+        enable_offload: tuning.udp_enable_offload,
     })
 }
 
@@ -258,11 +264,10 @@ pub fn spawn_udp_tx(
     tx: BareUdpTx,
     peer_id: String,
     events_tx: mpsc::UnboundedSender<Event>,
-    interval: Duration,
-    packet_queue_depth: usize,
+    tuning: &Tuning,
 ) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
+    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.packet_queue_depth);
     let dest_addr = tx.destination;
     let dest_str = dest_addr.to_string();
 
@@ -273,9 +278,10 @@ pub fn spawn_udp_tx(
         enable_offload,
     } = tx;
 
+    let metrics_interval = tuning.metrics_push_interval;
     let handle = tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Tx);
-        let mut ticker = time::interval(interval);
+        let mut ticker = time::interval(metrics_interval);
         let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
         let max_segs = if enable_offload {
             state.max_gso_segments()
@@ -376,6 +382,14 @@ mod tests {
         }
     }
 
+    /// Creates a test `Tuning` with a custom metrics push interval.
+    fn test_tuning(metrics_interval: Duration) -> Tuning {
+        Tuning {
+            metrics_push_interval: metrics_interval,
+            ..Default::default()
+        }
+    }
+
     /// Creates a `BareUdpTx` with an unconnected socket for testing.
     fn test_bare_tx(socket: UdpSocket, destination: SocketAddr) -> BareUdpTx {
         let state = UdpSocketState::new(UdpSockRef::from(&socket)).unwrap();
@@ -408,7 +422,7 @@ mod tests {
         let dest = receiver.local_addr().unwrap();
 
         let probe = FakeRouteProbe::noop();
-        let result = make_bare_tx(dest, None, None, &probe, 0, true).await;
+        let result = make_bare_tx(dest, None, None, &probe, &Tuning::default()).await;
         assert!(result.is_ok());
         let tx = result.unwrap();
         assert_eq!(tx.destination, dest);
@@ -513,8 +527,7 @@ mod tests {
             context,
             "test-peer".to_string(),
             events_tx,
-            Duration::from_millis(200),
-            256,
+            &test_tuning(Duration::from_millis(200)),
         );
 
         packet_tx
@@ -600,8 +613,7 @@ mod tests {
             context,
             "test-peer".to_string(),
             events_tx,
-            Duration::from_millis(10),
-            256,
+            &test_tuning(Duration::from_millis(10)),
         );
 
         packet_tx
@@ -710,8 +722,7 @@ mod tests {
             context,
             "test-peer".to_string(),
             events_tx,
-            Duration::from_secs(60),
-            256,
+            &test_tuning(Duration::from_secs(60)),
         );
 
         // Verify packet_tx is functional by sending a batch
@@ -737,8 +748,7 @@ mod tests {
             context,
             "test-peer".to_string(),
             events_tx,
-            Duration::from_secs(60),
-            256,
+            &test_tuning(Duration::from_secs(60)),
         );
 
         // Drop sender to signal shutdown
@@ -771,8 +781,7 @@ mod tests {
             test_bare_tx(tx_socket, dest),
             "test-peer".to_string(),
             events_tx.clone(),
-            Duration::from_secs(60),
-            256,
+            &test_tuning(Duration::from_secs(60)),
         );
 
         // Spawn RX with TX's packet channel as output (direct wiring, no forwarder)
@@ -816,8 +825,7 @@ mod tests {
             context,
             "test-peer".to_string(),
             events_tx,
-            Duration::from_millis(200),
-            256,
+            &test_tuning(Duration::from_millis(200)),
         );
 
         // Send a batch of 3 equal-sized packets (simulates TUN GSO output)
@@ -862,8 +870,7 @@ mod tests {
             context,
             "test-peer".to_string(),
             events_tx,
-            Duration::from_millis(200),
-            256,
+            &test_tuning(Duration::from_millis(200)),
         );
 
         // Last packet is shorter (e.g., TCP stream tail)
@@ -907,8 +914,7 @@ mod tests {
             context,
             "test-peer".to_string(),
             events_tx,
-            Duration::from_millis(10),
-            256,
+            &test_tuning(Duration::from_millis(10)),
         );
 
         let batch = vec![

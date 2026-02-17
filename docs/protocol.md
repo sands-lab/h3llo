@@ -33,7 +33,7 @@ h3llo intentionally omits the following optional features from RFC 9484:
 H3 connection management:
 - Build one connection per peer using `peers[].h3.endpoint` and auto-detected bindif.
 - When DNS returns multiple IPs, dial attempts are spawned in parallel for all IPs; first successful connection wins.
-- The single connection is used until it disconnects or its IP expires. Reconnection is automatic, rate-limited by `tuning.reconnect_interval` (default 3 seconds).
+- The single connection is used until it disconnects or its IP expires. Reconnection is automatic with per-IP exponential backoff (`tuning.reconnect_backoff_min` to `tuning.reconnect_backoff_max`). The reconciliation loop runs at `tuning.reconcile_interval`.
 - Failures: TLS/handshake failures count as dial failures. Bind failures warn and fall back to unbound sockets, which can risk recursive routing if the system route points to the TUN.
 
 ```mermaid
