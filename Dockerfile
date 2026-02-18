@@ -143,6 +143,10 @@ RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/out/h3llo /usr/local/bin/h3llo
 RUN mkdir -p /etc/h3llo
 WORKDIR /etc/h3llo
+# Eagerly return freed pages to the OS. Without this, mimalloc retains
+# committed segments after freeing large (>=64KB) allocations, causing
+# RSS to be ~10x the actual live heap. See docs/memory-leak-investigation.md.
+ENV MIMALLOC_PURGE_DELAY=0
 ENTRYPOINT ["/usr/local/bin/h3llo"]
 CMD ["-c", "/etc/h3llo/config.yaml"]
 
