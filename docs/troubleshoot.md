@@ -332,7 +332,7 @@ tuning:
 
 **Symptom**: All outbound QUIC handshakes time out. Logs show only `H3 dial failed ... timed out` with **no send errors visible in h3llo's default log output**. tcpdump shows zero outbound QUIC packets — the node appears completely silent on the network.
 
-**Root cause**: On Linux, h3llo calls `apply_max_capabilities()` on QUIC sockets when `tuning.udp_enable_offload` is `true` (the default), which enables `UDP_SEGMENT` (Generic Segmentation Offload). On certain aarch64 kernels (observed on Oracle Cloud Linux 6.5 aarch64), the kernel does not support `UDP_SEGMENT` on the socket path used, causing every subsequent `sendto()` to fail with `EINVAL` (errno 22). No QUIC packets are ever transmitted.
+**Root cause**: On Linux, h3llo calls `apply_max_capabilities()` on QUIC sockets when `tuning.udp_enable_offload` is `true` (disabled by default), which enables `UDP_SEGMENT` (Generic Segmentation Offload). On certain aarch64 kernels (observed on Oracle Cloud Linux 6.5 aarch64), the kernel does not support `UDP_SEGMENT` on the socket path used, causing every subsequent `sendto()` to fail with `EINVAL` (errno 22). No QUIC packets are ever transmitted.
 
 tokio-quiche logs the `EINVAL` via `foundations::telemetry::log` (slog-based), bridged to tracing.
 The error appears at `warn` level by default: `WARN tokio_quiche: error sending client Initial packets to peer, error: Invalid argument (os error 22)`.

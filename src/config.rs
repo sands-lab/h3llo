@@ -92,7 +92,7 @@ pub struct LocalTun {
     /// TUN addresses with CIDR prefixes (IPv4/IPv6, required).
     /// Example: `192.168.180.1/24`, `2001:db8::1/64`
     pub addrs: Vec<IpNet>,
-    /// TUN MTU (default: 1393).
+    /// TUN MTU (default: 1350).
     #[serde(default = "default_mtu")]
     pub mtu: u16,
 }
@@ -171,15 +171,17 @@ pub struct Tuning {
     /// Controls how many packets the kernel queues for transmission on the TUN
     /// interface. Applied on Linux only; ignored on other platforms.
     pub tun_tx_queue_len: u32,
-    /// Enable GSO/GRO offload on the TUN device (default: `true`).
+    /// Enable GSO/GRO offload on the TUN device (default: `false`).
     ///
     /// When `true` on Linux, the TUN device uses batched I/O with
     /// `virtio_net_hdr` for GSO/GRO, significantly improving throughput.
     /// When `false` or on non-Linux platforms, single-packet I/O is used.
-    /// Disable if TUN offload causes issues with specific kernel versions
-    /// or virtualization layers.
+    ///
+    /// Disabled by default due to compatibility issues with certain kernel
+    /// versions and virtualization layers. Enable for better performance
+    /// and verify with thorough testing.
     pub tun_enable_offload: bool,
-    /// Enable GSO/GRO offload for UDP transports (default: `true`).
+    /// Enable GSO/GRO offload for UDP transports (default: `false`).
     ///
     /// Controls software GSO/GRO for BareUDP via quinn-udp. When `true`,
     /// BareUDP uses `UdpSocketState` for batched sends (GSO) and receives
@@ -191,8 +193,10 @@ pub struct Tuning {
     /// `apply_max_capabilities()`. HTTP/3 **listener** sockets are managed
     /// internally by tokio-quiche and are not affected by this switch.
     ///
-    /// Disable as a software-level workaround when NIC hardware offload
-    /// produces incorrect checksums (see troubleshooting guide).
+    /// Disabled by default due to compatibility issues with certain NIC
+    /// drivers and platforms (e.g., incorrect checksums, EINVAL on
+    /// aarch64). Enable for better performance and verify with thorough
+    /// testing. See troubleshooting guide for known issues.
     pub udp_enable_offload: bool,
     /// Interval for the periodic reconciliation cycle (default: 10s).
     ///
@@ -280,17 +284,17 @@ impl Default for Tuning {
             packet_queue_depth: 256,
             socket_buffer_size: 16,
             tun_tx_queue_len: 1000,
-            tun_enable_offload: true,
-            udp_enable_offload: true,
+            tun_enable_offload: false,
+            udp_enable_offload: false,
             reconcile_interval: Duration::from_secs(10),
             reconnect_backoff_min: Duration::from_secs(3),
             reconnect_backoff_max: Duration::from_secs(60),
             metrics_push_interval: Duration::from_millis(1000),
             metrics_log_interval: Duration::from_secs(3),
             dns_query_timeout: Duration::from_secs(2),
-            dns_refresh_interval: Duration::from_secs(60),
+            dns_refresh_interval: Duration::from_secs(300),
             dns_snapshot_delay: Duration::from_millis(100),
-            dns_query_interval: Duration::from_millis(10),
+            dns_query_interval: Duration::from_millis(50),
             dns_min_ttl: 60,
             h3_handshake_timeout: Duration::from_secs(5),
             h3_max_idle_timeout: Duration::from_secs(60),
@@ -683,10 +687,11 @@ fn default_ifname() -> String {
     "h3llo0".to_string()
 }
 
-/// Default TUN MTU: safe for IPv6 outer transport on a 1500-byte WAN.
-/// 1500 (Ethernet MTU) - 48 (IPv6 + UDP) - 59 (CONNECT-IP overhead) = 1393.
+/// Default TUN MTU: capped to tokio-quiche's default maximum DATAGRAM size.
+/// tokio-quiche limits QUIC DATAGRAM payloads to 1350 bytes by default,
+/// but the limit is configurable in quiche. 1350 is a safe conservative default.
 pub fn default_mtu() -> u16 {
-    1393
+    1350
 }
 
 /// Maximum safe TUN MTU for HTTP/3 CONNECT-IP over a 1500-byte IPv4 WAN path.
@@ -944,7 +949,7 @@ mod tests {
                 tun: LocalTun {
                     ifname: "h3llo0".to_string(),
                     addrs: vec!["192.168.180.1/32".parse().unwrap()],
-                    mtu: 1393,
+                    mtu: 1350,
                 },
             },
             tuning: Tuning::default(),
@@ -1265,7 +1270,7 @@ peers:
         );
         assert_eq!(cfg.local.dns.bindif, None);
         assert_eq!(cfg.local.tun.ifname, "h3llo0");
-        assert_eq!(cfg.local.tun.mtu, 1393);
+        assert_eq!(cfg.local.tun.mtu, 1350);
         assert!(cfg.peers[0].h3.is_some());
         if let Some(h3) = cfg.peers[0].h3.as_ref() {
             assert!(h3.endpoint.is_none());
@@ -1927,9 +1932,9 @@ peers:
         );
         assert_eq!(cfg.tuning.metrics_log_interval, Duration::from_secs(3));
         assert_eq!(cfg.tuning.dns_query_timeout, Duration::from_secs(2));
-        assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(60));
+        assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(300));
         assert_eq!(cfg.tuning.dns_snapshot_delay, Duration::from_millis(100));
-        assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(10));
+        assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(50));
         assert_eq!(cfg.tuning.dns_min_ttl, 60);
         assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(5));
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
@@ -1938,8 +1943,8 @@ peers:
         assert!(!cfg.tuning.h3_enable_pacing);
         assert!(!cfg.tuning.h3_insecure_skip_verify);
         assert_eq!(cfg.tuning.tun_tx_queue_len, 1000);
-        assert!(cfg.tuning.tun_enable_offload);
-        assert!(cfg.tuning.udp_enable_offload);
+        assert!(!cfg.tuning.tun_enable_offload);
+        assert!(!cfg.tuning.udp_enable_offload);
     }
 
     #[test]
@@ -2177,10 +2182,10 @@ local:
     addrs:
       - 192.168.180.1/32
 tuning:
-  dns_query_interval: 50
+  dns_query_interval: 100
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(50));
+        assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(100));
     }
 
     #[test]
@@ -2344,7 +2349,7 @@ peers:
     }
 
     #[test]
-    fn tuning_offload_defaults_true() {
+    fn tuning_offload_defaults_false() {
         let yaml = r#"
 local:
   tun:
@@ -2352,24 +2357,24 @@ local:
       - 192.168.180.1/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert!(cfg.tuning.tun_enable_offload);
-        assert!(cfg.tuning.udp_enable_offload);
+        assert!(!cfg.tuning.tun_enable_offload);
+        assert!(!cfg.tuning.udp_enable_offload);
     }
 
     #[test]
-    fn tuning_offload_override_false() {
+    fn tuning_offload_override_true() {
         let yaml = r#"
 local:
   tun:
     addrs:
       - 192.168.180.1/32
 tuning:
-  tun_enable_offload: false
-  udp_enable_offload: false
+  tun_enable_offload: true
+  udp_enable_offload: true
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert!(!cfg.tuning.tun_enable_offload);
-        assert!(!cfg.tuning.udp_enable_offload);
+        assert!(cfg.tuning.tun_enable_offload);
+        assert!(cfg.tuning.udp_enable_offload);
     }
 
     #[test]
@@ -2380,11 +2385,11 @@ local:
     addrs:
       - 192.168.180.1/32
 tuning:
-  udp_enable_offload: false
+  udp_enable_offload: true
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert!(cfg.tuning.tun_enable_offload); // still default
-        assert!(!cfg.tuning.udp_enable_offload);
+        assert!(!cfg.tuning.tun_enable_offload); // still default
+        assert!(cfg.tuning.udp_enable_offload);
     }
 
     // ========== H3 validation warning tests ==========

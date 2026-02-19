@@ -20,23 +20,23 @@ local:
     ifname: h3llo0 # optional, default: h3llo0
     addrs: # required (CIDR notation with prefix length)
       - 192.168.180.2/24 # required; supports subnets (e.g., /24) or host addresses (/32, /128)
-    mtu: 1393 # optional, default: 1393 (see docs/protocol.md for MTU sizing)
+    mtu: 1350 # optional, default: 1350 (tokio-quiche default DATAGRAM upper limit)
 tuning: # optional, all fields have defaults
   packet_queue_depth: 256 # optional, default: 256
   socket_buffer_size: 16 # optional, default: 16 (MiB; 0 to use system default)
   tun_tx_queue_len: 1000 # optional, default: 1000 (packets; Linux only)
-  tun_enable_offload: true # optional, default: true (TUN GSO/GRO; Linux only)
-  udp_enable_offload: true # optional, default: true (UDP GSO/GRO; Linux only)
+  tun_enable_offload: false # optional, default: false (TUN GSO/GRO; Linux only)
+  udp_enable_offload: false # optional, default: false (UDP GSO/GRO; Linux only)
   reconcile_interval: 10 # optional, default: 10 (seconds)
   reconnect_backoff_min: 3 # optional, default: 3 (seconds)
   reconnect_backoff_max: 60 # optional, default: 60 (seconds)
   metrics_push_interval: 1000 # optional, default: 1000 (milliseconds)
   metrics_log_interval: 3 # optional, default: 3 (seconds)
   dns_query_timeout: 2 # optional, default: 2 (seconds)
-  dns_refresh_interval: 60 # optional, default: 60 (seconds; 0 disables)
+  dns_refresh_interval: 300 # optional, default: 300 (seconds; 0 disables)
   dns_snapshot_delay: 100 # optional, default: 100 (milliseconds)
   dns_min_ttl: 60 # optional, default: 60 (seconds)
-  dns_query_interval: 10 # optional, default: 10 (milliseconds; minimum delay between DNS query sends)
+  dns_query_interval: 50 # optional, default: 50 (milliseconds; minimum delay between DNS query sends)
   h3_handshake_timeout: 5 # optional, default: 5 (seconds)
   h3_max_idle_timeout: 60 # optional, default: 60 (seconds)
   h3_keepalive_interval: 20 # optional, default: 20 (seconds; must be < h3_max_idle_timeout)
@@ -72,23 +72,23 @@ peers: # optional, default: []
 - `local.bare.listen`: BareUDP listen address when using the plaintext fast path; required to start BareUDP and optional alongside `local.h3`.
 - `local.tun.ifname` (default `h3llo0`): Name of the TUN interface created by h3llo.
 - `local.tun.addrs` (required): IP prefixes in CIDR notation (e.g., `192.168.180.1/24`, `2001:db8::1/64`) for the TUN interface. Supports IPv4, IPv6, dual-stack, and multiple prefixes. Extra system routes come from `peers[].tun.allowed_ips` when `local.table=true`.
-- `local.tun.mtu` (default `1393`): MTU for the TUN interface; see [docs/protocol.md](protocol.md) for sizing guidance. When H3 peers are configured and MTU exceeds 1413, a warning is emitted because IPv4 CONNECT-IP payloads may exceed the QUIC DATAGRAM writable size.
+- `local.tun.mtu` (default `1350`): MTU for the TUN interface, capped to tokio-quiche's default maximum DATAGRAM size (the limit is configurable in quiche). See [docs/protocol.md](protocol.md) for sizing guidance. When H3 peers are configured and MTU exceeds 1413, a warning is emitted because IPv4 CONNECT-IP payloads may exceed the QUIC DATAGRAM writable size.
 - `tuning` (optional): All fields have defaults; omit the entire section to use defaults.
 - `tuning.packet_queue_depth` (default `256`): Bounded channel capacity for data-plane packet queues between actors. Counts batch messages, not individual packets; each batch carries one device I/O operation's worth of packets.
 - `tuning.socket_buffer_size` (default `16`): Socket buffer size in megabytes, applied to all UDP sockets via SO_RCVBUF and SO_SNDBUF. Set to `0` to skip buffer configuration and use system defaults. On Linux, the effective buffer size may be clamped by `net.core.rmem_max` / `net.core.wmem_max`; setting failures are logged as warnings without aborting.
 - `tuning.tun_tx_queue_len` (default `1000`): TUN interface transmit queue length in packets. Controls how many packets the kernel queues for transmission. Applied on Linux only; ignored on other platforms.
-- `tuning.tun_enable_offload` (default `true`): Enable GSO/GRO offload on the TUN device for batched I/O. When disabled, TUN reads and writes fall back to single-packet operations. Linux only; ignored on other platforms.
-- `tuning.udp_enable_offload` (default `true`): Enable GSO/GRO offload for BareUDP and HTTP/3 transports (both client and listener). When disabled, GSO/GRO segment counts are capped to 1, resulting in per-packet I/O. Linux only; ignored on other platforms. Disabling may help work around NIC TX checksum offload bugs (see [troubleshooting](troubleshoot.md#bareudp-checksum-errors-with-nic-tx-offload)) or GSO `EINVAL` on aarch64 (see [troubleshooting](troubleshoot.md#gso-udp_segment-sendto-einval-on-aarch64)).
+- `tuning.tun_enable_offload` (default `false`): Enable GSO/GRO offload on the TUN device for batched I/O. When disabled, TUN reads and writes fall back to single-packet operations. Linux only; ignored on other platforms. Disabled by default due to compatibility issues with certain kernel versions and virtualization layers. Enable for better performance and verify with thorough testing.
+- `tuning.udp_enable_offload` (default `false`): Enable GSO/GRO offload for BareUDP and HTTP/3 transports (both client and listener). When disabled, GSO/GRO segment counts are capped to 1, resulting in per-packet I/O. Linux only; ignored on other platforms. Disabled by default due to compatibility issues with certain NIC drivers and platforms — e.g., incorrect checksums (see [troubleshooting](troubleshoot.md#bareudp-checksum-errors-with-nic-tx-offload)) or GSO `EINVAL` on aarch64 (see [troubleshooting](troubleshoot.md#gso-udp_segment-sendto-einval-on-aarch64)). Enable for better performance and verify with thorough testing.
 - `tuning.reconcile_interval` (default `10`): Seconds between periodic reconciliation cycles (prune stale bounds + attempt reconnection). Controls how often the orchestrator scans all peers for stale bounds and uncovered IPs.
 - `tuning.reconnect_backoff_min` (default `3`): Minimum backoff duration in seconds between reconnection attempts for a specific IP. The backoff grows exponentially from this base value after each failed attempt. When H3 peers are configured, a warning is emitted if this value is not greater than `tuning.h3_handshake_timeout` (default `5`) to prevent overlapping handshake attempts.
 - `tuning.reconnect_backoff_max` (default `60`): Maximum backoff duration in seconds for reconnection attempts per IP. The exponential backoff is capped at this ceiling. Must be greater than or equal to `reconnect_backoff_min`.
 - `tuning.metrics_push_interval` (default `1000`): Milliseconds between periodic metric push emissions from actors to the orchestrator.
 - `tuning.metrics_log_interval` (default `3`): Seconds between periodic `debug!`-level logging of QUIC and transport metrics by the orchestrator. Independent of `metrics_push_interval`, which controls actor emission cadence.
 - `tuning.dns_query_timeout` (default `2`): Seconds before a DNS query is considered timed out and retried.
-- `tuning.dns_refresh_interval` (default `60`): DNS refresh timer in seconds (`0` disables). The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)).
+- `tuning.dns_refresh_interval` (default `300`): DNS refresh timer in seconds (`0` disables). The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)).
 - `tuning.dns_snapshot_delay` (default `100`): Milliseconds to wait after the first DNS state change before emitting a snapshot to the orchestrator. Coalesces bursts of DNS replies into a single event.
 - `tuning.dns_min_ttl` (default `60`): Minimum TTL floor in seconds for DNS records. Responses with shorter TTL are raised to this value to prevent excessive re-queries.
-- `tuning.dns_query_interval` (default `10`): Interval in milliseconds between consecutive outbound DNS query sends. Serializes queries to prevent public DNS resolvers (e.g., 1.1.1.1) from rate-limiting or truncating responses due to query bursts. Applies globally across all hostnames and record types.
+- `tuning.dns_query_interval` (default `50`): Interval in milliseconds between consecutive outbound DNS query sends. Serializes queries to prevent public DNS resolvers (e.g., 1.1.1.1) from rate-limiting or truncating responses due to query bursts. Applies globally across all hostnames and record types.
 - `tuning.h3_handshake_timeout` (default `5`): Seconds to wait for an HTTP/3 handshake to complete.
 - `tuning.h3_max_idle_timeout` (default `60`): QUIC idle timeout in seconds; connections idle longer than this are closed.
 - `tuning.h3_keepalive_interval` (default `20`): QUIC keepalive interval in seconds; sends PING frames to prevent idle timeout. Must be less than `h3_max_idle_timeout`.
