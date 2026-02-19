@@ -170,7 +170,7 @@ WARN h3llo::dns: dns: response truncated, will retry host=peer5.example.com
 To confirm:
 
 ```bash
-# Look for truncation warnings in logs (now includes "will retry")
+# Look for truncation warnings in logs
 docker logs <container> 2>&1 | grep -i "truncated"
 
 # Check if some peers have no resolved IPs (no "dialing H3 endpoint" log for those peers)

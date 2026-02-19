@@ -17,7 +17,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
-use tracing::warn;
+use tracing::{debug, warn};
 
 const DNS_BUFFER_SIZE: usize = 1500;
 
@@ -427,6 +427,8 @@ async fn handle_packet(
     if message.truncated() {
         if let Some(req) = pending.get(&id) {
             warn!(host = %req.host, "dns: response truncated, will retry");
+        } else {
+            debug!(id = id, "dns: truncated response for unknown transaction ID");
         }
         return;
     }
@@ -598,6 +600,19 @@ mod tests {
         for answer in answers {
             response.add_answer(answer);
         }
+        response.to_vec().unwrap()
+    }
+
+    /// Builds a truncated DNS response (TC bit set, no answers).
+    fn build_truncated_response(id: u16, query: Query) -> Vec<u8> {
+        let mut response = Message::new();
+        response.set_id(id);
+        response.set_message_type(MessageType::Response);
+        response.set_op_code(OpCode::Query);
+        response.set_response_code(ResponseCode::NoError);
+        response.set_recursion_available(true);
+        response.set_truncated(true);
+        response.add_query(query);
         response.to_vec().unwrap()
     }
 
@@ -959,19 +974,8 @@ mod tests {
             let query = request.queries().first().cloned().unwrap();
             original_ids.insert(query.query_type(), request.id());
 
-            // Reply with a truncated response (TC bit set, no answers).
-            let mut response = Message::new();
-            response.set_id(request.id());
-            response.set_message_type(MessageType::Response);
-            response.set_op_code(OpCode::Query);
-            response.set_response_code(ResponseCode::NoError);
-            response.set_recursion_available(true);
-            response.set_truncated(true);
-            response.add_query(query);
-            socket
-                .send_to(&response.to_vec().unwrap(), peer)
-                .await
-                .unwrap();
+            let data = build_truncated_response(request.id(), query);
+            socket.send_to(&data, peer).await.unwrap();
         }
 
         // Wait briefly, then collect the retry queries (driven by handle_tick).
@@ -1025,18 +1029,8 @@ mod tests {
             let request = Message::from_vec(&buf[..len]).unwrap();
             let query = request.queries().first().cloned().unwrap();
 
-            let mut response = Message::new();
-            response.set_id(request.id());
-            response.set_message_type(MessageType::Response);
-            response.set_op_code(OpCode::Query);
-            response.set_response_code(ResponseCode::NoError);
-            response.set_recursion_available(true);
-            response.set_truncated(true);
-            response.add_query(query);
-            socket
-                .send_to(&response.to_vec().unwrap(), peer)
-                .await
-                .unwrap();
+            let data = build_truncated_response(request.id(), query);
+            socket.send_to(&data, peer).await.unwrap();
         }
 
         // Wait briefly and verify no snapshot is emitted.
