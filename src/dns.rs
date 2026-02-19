@@ -428,7 +428,10 @@ async fn handle_packet(
         if let Some(req) = pending.get(&id) {
             warn!(host = %req.host, "dns: response truncated, will retry");
         } else {
-            debug!(id = id, "dns: truncated response for unknown transaction ID");
+            debug!(
+                id = id,
+                "dns: truncated response for unknown transaction ID"
+            );
         }
         return;
     }
