@@ -421,11 +421,21 @@ async fn handle_packet(
     };
 
     let id = message.id();
-    if let Some(request) = pending.remove(&id) {
-        handle_decoded_packet(message, request, state);
-    } else {
-        warn!(id = id, "dns: unknown transaction ID");
+
+    // Treat truncated responses as packet loss: leave the pending entry
+    // untouched so handle_tick retries after dns_query_timeout elapses.
+    if message.truncated() {
+        if let Some(req) = pending.get(&id) {
+            warn!(host = %req.host, "dns: response truncated, will retry");
+        }
+        return;
     }
+
+    let Some(request) = pending.remove(&id) else {
+        warn!(id = id, "dns: unknown transaction ID");
+        return;
+    };
+    handle_decoded_packet(message, request, state);
 }
 
 /// Handles a parsed DNS packet that matches a pending request.
@@ -519,10 +529,6 @@ fn log_response_warnings(message: &Message, host: &str) {
         other => {
             warn!(host = %host, code = ?other, "dns: unexpected response code");
         }
-    }
-
-    if message.truncated() {
-        warn!(host = %host, "dns: response truncated");
     }
 
     if !message.recursion_available() {
