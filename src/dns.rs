@@ -993,14 +993,20 @@ mod tests {
         }
 
         // Retry must use new transaction IDs.
-        assert_ne!(
-            original_ids.get(&RecordType::A),
-            retry_ids.get(&RecordType::A),
-        );
-        assert_ne!(
-            original_ids.get(&RecordType::AAAA),
-            retry_ids.get(&RecordType::AAAA),
-        );
+        let orig_a = *original_ids
+            .get(&RecordType::A)
+            .expect("missing original A query");
+        let orig_aaaa = *original_ids
+            .get(&RecordType::AAAA)
+            .expect("missing original AAAA query");
+        let retry_a = *retry_ids
+            .get(&RecordType::A)
+            .expect("missing retry A query");
+        let retry_aaaa = *retry_ids
+            .get(&RecordType::AAAA)
+            .expect("missing retry AAAA query");
+        assert_ne!(orig_a, retry_a);
+        assert_ne!(orig_aaaa, retry_aaaa);
 
         handle.abort();
     }
@@ -1038,8 +1044,9 @@ mod tests {
 
         // Wait briefly and verify no snapshot is emitted.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            events_rx.try_recv().is_err(),
+        assert_eq!(
+            events_rx.try_recv().unwrap_err(),
+            tokio::sync::mpsc::error::TryRecvError::Empty,
             "truncated response should not trigger a snapshot"
         );
 
