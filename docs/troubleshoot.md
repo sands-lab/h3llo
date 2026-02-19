@@ -148,9 +148,9 @@ The drop location tells you where the bottleneck is:
 
 ### DNS Resolution Failure Due to Query Burst Rate Limiting
 
-**Symptom**: Some or all peer endpoints fail to resolve on startup. Logs show `dns: response truncated` warnings and/or `dns: query timed out, retrying` for multiple hostnames. Affected peers never establish QUIC connections. The issue is intermittent — restarting may resolve a different subset of hostnames each time.
+**Symptom**: Some or all peer endpoints fail to resolve on startup. Logs show `dns: response truncated, will retry` warnings and/or `dns: query timed out, retrying` for multiple hostnames. Affected peers never establish QUIC connections. The issue is intermittent — restarting may resolve a different subset of hostnames each time.
 
-**Root cause**: On startup, h3llo issues A and AAAA queries for every peer endpoint hostname simultaneously. With many peers (e.g., 20+ peers = 40+ concurrent queries), the burst of UDP packets sent to a remote public DNS resolver (e.g., `1.1.1.1`, `8.8.8.8`) can trigger server-side rate limiting. The resolver responds with truncated (`TC=1`) or empty responses for the excess queries. h3llo logs the truncation warning but does not retry via TCP or re-query with EDNS0 — the affected hostnames remain unresolved until the next refresh cycle.
+**Root cause**: On startup, h3llo issues A and AAAA queries for every peer endpoint hostname simultaneously. With many peers (e.g., 20+ peers = 40+ concurrent queries), the burst of UDP packets sent to a remote public DNS resolver (e.g., `1.1.1.1`, `8.8.8.8`) can trigger server-side rate limiting. The resolver responds with truncated (`TC=1`) or empty responses for the excess queries. h3llo treats truncated responses as packet loss and retries after `dns_query_timeout` (default 2s), but if the server persistently truncates under load, retries will also be truncated.
 
 The severity depends on the number of peers and the DNS server's rate-limiting policy. A mesh with 5 peers may work fine; a mesh with 20+ peers will likely hit the limit on remote resolvers.
 
@@ -159,11 +159,11 @@ The severity depends on the number of peers and the DNS server's rate-limiting p
 With 20+ peers and `dns.server: udp://1.1.1.1:53`, startup logs will show a burst of truncation warnings within the same millisecond:
 
 ```
-WARN h3llo::dns: dns: response truncated host=peer1.example.com
-WARN h3llo::dns: dns: response truncated host=peer2.example.com
-WARN h3llo::dns: dns: response truncated host=peer3.example.com
-WARN h3llo::dns: dns: response truncated host=peer4.example.com
-WARN h3llo::dns: dns: response truncated host=peer5.example.com
+WARN h3llo::dns: dns: response truncated, will retry host=peer1.example.com
+WARN h3llo::dns: dns: response truncated, will retry host=peer2.example.com
+WARN h3llo::dns: dns: response truncated, will retry host=peer3.example.com
+WARN h3llo::dns: dns: response truncated, will retry host=peer4.example.com
+WARN h3llo::dns: dns: response truncated, will retry host=peer5.example.com
 ...  (28 warnings in <3ms)
 ```
 
@@ -188,7 +188,7 @@ local:
 
 The local resolver (e.g., systemd-resolved at `127.0.0.53`) absorbs the query burst locally, deduplicates identical queries, and handles upstream TCP fallback transparently. This eliminates both the rate-limiting and truncation issues.
 
-> **Note**: h3llo's DNS implementation uses plain UDP without EDNS0 and does not fall back to TCP on truncation. The `dns: response truncated` warning (logged in `dns.rs`) is informational only — no recovery action is taken. Hostnames affected by truncation will eventually resolve on the next `dns_refresh_interval` cycle, but initial connectivity is delayed.
+> **Note**: h3llo's DNS implementation uses plain UDP without EDNS0 and does not fall back to TCP on truncation. Truncated responses are treated as packet loss — the pending query is preserved and retried after `dns_query_timeout` (default 2s) with a new transaction ID. However, if the server persistently truncates (e.g., due to rate limiting under burst), retries will also be truncated until the burst subsides. Using a local caching resolver (as recommended above) remains the most effective mitigation.
 
 ### Silent H3/QUIC Connection Failure on Multi-NIC Hosts
 

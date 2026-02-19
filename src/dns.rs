@@ -17,7 +17,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
-use tracing::warn;
+use tracing::{debug, warn};
 
 const DNS_BUFFER_SIZE: usize = 1500;
 
@@ -421,11 +421,26 @@ async fn handle_packet(
     };
 
     let id = message.id();
-    if let Some(request) = pending.remove(&id) {
-        handle_decoded_packet(message, request, state);
-    } else {
-        warn!(id = id, "dns: unknown transaction ID");
+
+    // Treat truncated responses as packet loss: leave the pending entry
+    // untouched so handle_tick retries after dns_query_timeout elapses.
+    if message.truncated() {
+        if let Some(req) = pending.get(&id) {
+            warn!(host = %req.host, "dns: response truncated, will retry");
+        } else {
+            debug!(
+                id = id,
+                "dns: truncated response for unknown transaction ID"
+            );
+        }
+        return;
     }
+
+    let Some(request) = pending.remove(&id) else {
+        warn!(id = id, "dns: unknown transaction ID");
+        return;
+    };
+    handle_decoded_packet(message, request, state);
 }
 
 /// Handles a parsed DNS packet that matches a pending request.
@@ -521,10 +536,6 @@ fn log_response_warnings(message: &Message, host: &str) {
         }
     }
 
-    if message.truncated() {
-        warn!(host = %host, "dns: response truncated");
-    }
-
     if !message.recursion_available() {
         warn!(host = %host, "dns: recursion unavailable");
     }
@@ -592,6 +603,19 @@ mod tests {
         for answer in answers {
             response.add_answer(answer);
         }
+        response.to_vec().unwrap()
+    }
+
+    /// Builds a truncated DNS response (TC bit set, no answers).
+    fn build_truncated_response(id: u16, query: Query) -> Vec<u8> {
+        let mut response = Message::new();
+        response.set_id(id);
+        response.set_message_type(MessageType::Response);
+        response.set_op_code(OpCode::Query);
+        response.set_response_code(ResponseCode::NoError);
+        response.set_recursion_available(true);
+        response.set_truncated(true);
+        response.add_query(query);
         response.to_vec().unwrap()
     }
 
@@ -930,6 +954,103 @@ mod tests {
             "actor should shut down cleanly after sender dropped, got {:?}",
             result
         );
+    }
+
+    // ========== Truncation Tests ==========
+
+    #[tokio::test]
+    async fn retries_on_truncated_response() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, _events_rx, handle) = start_resolver(server_addr, None).await;
+
+        let mut hosts = HashSet::new();
+        hosts.insert("truncated.example".to_string());
+        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+
+        // Collect the two initial queries (A + AAAA).
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+        let mut original_ids: HashMap<RecordType, u16> = HashMap::new();
+        for _ in 0..2 {
+            let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+            let request = Message::from_vec(&buf[..len]).unwrap();
+            let query = request.queries().first().cloned().unwrap();
+            original_ids.insert(query.query_type(), request.id());
+
+            let data = build_truncated_response(request.id(), query);
+            socket.send_to(&data, peer).await.unwrap();
+        }
+
+        // Wait briefly, then collect the retry queries (driven by handle_tick).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut retry_ids: HashMap<RecordType, u16> = HashMap::new();
+        for _ in 0..2 {
+            let (len, _peer) = socket.recv_from(&mut buf).await.unwrap();
+            let message = Message::from_vec(&buf[..len]).unwrap();
+            let query = message.queries().first().cloned().unwrap();
+            retry_ids.insert(query.query_type(), message.id());
+        }
+
+        // Retry must use new transaction IDs.
+        let orig_a = *original_ids
+            .get(&RecordType::A)
+            .expect("missing original A query");
+        let orig_aaaa = *original_ids
+            .get(&RecordType::AAAA)
+            .expect("missing original AAAA query");
+        let retry_a = *retry_ids
+            .get(&RecordType::A)
+            .expect("missing retry A query");
+        let retry_aaaa = *retry_ids
+            .get(&RecordType::AAAA)
+            .expect("missing retry AAAA query");
+        assert_ne!(orig_a, retry_a);
+        assert_ne!(orig_aaaa, retry_aaaa);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn truncated_response_does_not_emit_snapshot() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+
+        let mut hosts = HashSet::new();
+        hosts.insert("truncated.example".to_string());
+        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+
+        // Consume the initial empty snapshot from SetHostnames.
+        let snapshot = next_dns_snapshot(&mut events_rx).await;
+        assert!(
+            snapshot
+                .get("truncated.example")
+                .map_or(true, |ips| ips.is_empty()),
+            "initial snapshot should have no IPs"
+        );
+
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+
+        // Receive and reply with truncated for both A and AAAA.
+        for _ in 0..2 {
+            let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+            let request = Message::from_vec(&buf[..len]).unwrap();
+            let query = request.queries().first().cloned().unwrap();
+
+            let data = build_truncated_response(request.id(), query);
+            socket.send_to(&data, peer).await.unwrap();
+        }
+
+        // Wait briefly and verify no snapshot is emitted.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            events_rx.try_recv().unwrap_err(),
+            tokio::sync::mpsc::error::TryRecvError::Empty,
+            "truncated response should not trigger a snapshot"
+        );
+
+        handle.abort();
     }
 
     // ========== Timeout Retry Tests ==========
