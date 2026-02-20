@@ -13,6 +13,7 @@ mod helpers;
 mod metrics;
 pub mod orch;
 pub mod route;
+pub mod router;
 pub mod tun;
 
 /// Test utilities module exposed via the `test-utils` feature.

@@ -208,6 +208,8 @@ pub enum DropReason {
     NoPeerChannel,
     /// PooledBuf lacked headroom for datagram prefix insertion.
     NoHeadroom,
+    /// Packet's TTL/hop limit reached zero (forwarded to TUN for ICMP generation).
+    TtlExpired,
 }
 
 /// Tracks cumulative wait events caused by backpressure or I/O congestion.

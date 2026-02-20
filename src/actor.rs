@@ -101,6 +101,13 @@ pub enum ActorError {
         /// Failure reason.
         reason: String,
     },
+
+    /// Router actor exited unexpectedly.
+    #[error("router: fatal error: {reason}")]
+    RouterFailed {
+        /// Failure reason.
+        reason: String,
+    },
 }
 
 impl ActorError {
@@ -113,6 +120,7 @@ impl ActorError {
             ActorError::BareRxRecv { .. } => ActorKind::Critical,
             ActorError::DnsRecv { .. } => ActorKind::Critical,
             ActorError::ApiServer { .. } => ActorKind::Critical,
+            ActorError::RouterFailed { .. } => ActorKind::Critical,
             // Restartable actors - could be reconnected (future work)
             ActorError::BareTxSend { .. } => ActorKind::Restartable,
             ActorError::H3RxRecv { .. } => ActorKind::Restartable,

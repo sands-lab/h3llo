@@ -3,9 +3,9 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::{LocalTun, Peer};
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
-use crate::helpers::extract_dst_ip;
 use crate::helpers::retry_on_transient;
 use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
+use crate::router::{BatchSource, RouterMsg};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use ipnet_trie::IpnetTrie;
 use std::collections::HashMap;
@@ -639,16 +639,6 @@ impl RoutingTable {
     }
 }
 
-/// Commands accepted by the TUN receive loop.
-#[derive(Debug, Clone)]
-pub enum TunRxCommand {
-    /// Replace the routing table atomically.
-    UpdateRouting {
-        /// New routing table (includes embedded TX channels).
-        routing: RoutingTable,
-    },
-}
-
 /// Routing table construction or lookup error.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RoutingError {
@@ -680,32 +670,27 @@ fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
 
 /// Spawns the TUN read loop.
 ///
-/// Creates an unbounded command channel internally (actor owns the receiver).
-/// Returns the command sender and join handle.
+/// TUN Rx is a pure packet producer. Reads batches from the TUN device
+/// and forwards them to the router actor. No routing logic.
 ///
 /// # Arguments
 ///
 /// * `tun` - TUN device reader.
-/// * `routing` - Initial routing table for destination lookups.
+/// * `router_tx` - Bounded sender to the router actor's inbound queue.
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
 #[allow(dead_code)]
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
-    mut routing: RoutingTable,
+    router_tx: mpsc::Sender<RouterMsg>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
-) -> (
-    mpsc::UnboundedSender<TunRxCommand>,
-    JoinHandle<ActorExitResult>,
-) {
-    // Actor creates and owns its command channel receiver
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+) -> JoinHandle<ActorExitResult> {
     let tun_name = tun.name().to_string();
     let batch_size = tun.batch_size();
     let scratch_buf_size = tun.scratch_buf_size();
 
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
         let mut ticker = time::interval(interval);
         let mtu = tun.mtu();
@@ -720,47 +705,31 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                     match result {
                         Ok(count) => {
                             let count = count.min(batch_size);
-                            // First-packet routing: GSO guarantees all packets in
-                            // a batch belong to the same flow (same 5-tuple).
-                            let first_idx = (0..count).find(|&i| sizes[i] > 0);
-                            let Some(first_idx) = first_idx else {
-                                continue;
-                            };
-
-                            let first_packet = std::mem::replace(&mut bufs[first_idx], TunBuf::alloc_uninit(mtu))
-                                .into_pooled(sizes[first_idx]);
-                            let total_bytes: u64 = sizes[..count].iter().map(|&s| s as u64).sum();
-                            let Some(dest) = extract_dst_ip(&first_packet) else {
-                                counters.record_drop(DropReason::InvalidIpVersion, count as u64, total_bytes);
-                                continue;
-                            };
-
-                            let Some(route) = routing.lookup(dest) else {
-                                counters.record_drop(DropReason::NoRoute, count as u64, total_bytes);
-                                continue;
-                            };
-
                             let mut batch = Vec::with_capacity(count);
-                            batch.push(first_packet);
                             for i in 0..count {
-                                if i != first_idx && sizes[i] > 0 {
+                                if sizes[i] > 0 {
                                     batch.push(
                                         std::mem::replace(&mut bufs[i], TunBuf::alloc_uninit(mtu))
                                             .into_pooled(sizes[i]),
                                     );
                                 }
                             }
-
-                            if send_with_backpressure(route.tx, batch, |event| match event {
+                            if batch.is_empty() {
+                                continue;
+                            }
+                            let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
+                            let pkt_count = batch.len() as u64;
+                            let msg = RouterMsg { source: BatchSource::Tun, packets: batch };
+                            if send_with_backpressure(&router_tx, msg, |event| match event {
                                 SendEvent::Waited(waited) => counters.record_queue_full(waited),
                                 SendEvent::Fast | SendEvent::Full => {}
                             })
                             .await
                             .is_err()
                             {
-                                counters.record_drop(DropReason::ChannelClosed, count as u64, total_bytes);
+                                counters.record_drop(DropReason::ChannelClosed, pkt_count, total_bytes);
                             } else {
-                                counters.record_success(count as u64, total_bytes);
+                                counters.record_success(pkt_count, total_bytes);
                             }
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -769,14 +738,6 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                         }
                     }
                 }
-                cmd = cmd_rx.recv() => {
-                    let Some(command) = cmd else {
-                        return Ok(()); // Channel closed, exit gracefully
-                    };
-                    // Single-variant enum: destructure directly
-                    let TunRxCommand::UpdateRouting { routing: new_routing } = command;
-                    routing = new_routing;
-                }
                 _ = ticker.tick() => {
                     if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
                         return Ok(()); // Events channel closed during shutdown
@@ -784,9 +745,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                 }
             }
         }
-    });
-
-    (cmd_tx, handle)
+    })
 }
 
 /// Spawns the TUN write loop, dropping oversize packets with counting and emitting TX metrics.
@@ -1035,37 +994,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tun_rx_pushes_packets_and_counts() {
+    async fn tun_rx_forwards_batch_to_router() {
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem0", 64);
-        let (peer_tx, mut peer_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
+        let (router_tx, mut router_rx) = mpsc::channel::<RouterMsg>(4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
-        // Setup routing: 192.0.2.0/24 -> peer1
-        let peer_config = Peer {
-            id: "peer1".to_string(),
-
-            h3: None,
-            bare: None,
-            tun: PeerTun {
-                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
-            },
-        };
-        let mut peer_txs = HashMap::new();
-        peer_txs.insert("peer1".to_string(), peer_tx);
-        let routing = RoutingTable::from_peers(&[peer_config], &peer_txs).unwrap();
-
-        let (_cmd_tx, tun_rx_task) =
-            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_millis(10));
+        let tun_rx_task = spawn_tun_rx(rx_tun, router_tx, events_tx, Duration::from_millis(10));
 
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
-        let batch = peer_rx
+        let msg = router_rx
             .recv()
             .await
-            .expect("batch should be routed to peer");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &ipv4_packet[..]);
+            .expect("router should receive message");
+        assert_eq!(msg.source, BatchSource::Tun);
+        assert_eq!(msg.packets.len(), 1);
+        assert_eq!(&msg.packets[0][..], &ipv4_packet[..]);
 
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
@@ -1085,8 +1030,6 @@ mod tests {
         let metrics = snapshot.expect("rx metrics should arrive");
         assert_eq!(metrics.labels.kind, TransportKind::Tun);
         assert_eq!(metrics.labels.direction, Direction::Rx);
-        assert_eq!(metrics.labels.peer_id, None);
-        assert_eq!(metrics.labels.remote_addr, None);
         assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 20);
@@ -1271,114 +1214,7 @@ mod tests {
         assert_eq!(result.peer_id, "peer-a");
     }
 
-    #[tokio::test]
-    async fn tun_rx_updates_routing_via_command() {
-        let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem-cmd", 64);
-        let (peer1_tx, mut peer1_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
-        let (peer2_tx, mut peer2_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-
-        let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
-
-        // Initial routing: 192.0.2.0/24 -> peer1
-        let peer1_config = Peer {
-            id: "peer1".to_string(),
-
-            h3: None,
-            bare: None,
-            tun: PeerTun {
-                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
-            },
-        };
-        let mut peer_txs = HashMap::new();
-        peer_txs.insert("peer1".to_string(), peer1_tx);
-        let routing = RoutingTable::from_peers(&[peer1_config], &peer_txs).unwrap();
-
-        let (cmd_tx, tun_rx_task) =
-            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_secs(60));
-
-        // Send packet - should go to peer1
-        inject_tx.send(ipv4_packet.clone()).await.unwrap();
-        let batch = peer1_rx.recv().await.expect("packet should route to peer1");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &ipv4_packet[..]);
-
-        // Update routing: 192.0.2.0/24 -> peer2
-        let peer2_config = Peer {
-            id: "peer2".to_string(),
-
-            h3: None,
-            bare: None,
-            tun: PeerTun {
-                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
-            },
-        };
-        let mut new_peer_txs = HashMap::new();
-        new_peer_txs.insert("peer2".to_string(), peer2_tx);
-        let new_routing = RoutingTable::from_peers(&[peer2_config], &new_peer_txs).unwrap();
-
-        cmd_tx
-            .send(TunRxCommand::UpdateRouting {
-                routing: new_routing,
-            })
-            .unwrap();
-
-        // Allow command to be processed
-        tokio::task::yield_now().await;
-
-        // Send another packet - should now go to peer2
-        inject_tx.send(ipv4_packet.clone()).await.unwrap();
-        let batch = peer2_rx.recv().await.expect("packet should route to peer2");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &ipv4_packet[..]);
-
-        // Verify peer1 did not receive the second packet
-        assert!(peer1_rx.try_recv().is_err());
-
-        tun_rx_task.abort();
-    }
-
     // ========== Actor Lifecycle Tests ==========
-
-    #[tokio::test]
-    async fn spawn_tun_rx_returns_working_cmd_tx() {
-        let (rx_tun, _tx_tun, _inject_tx, _output_rx) = memory_tun("mem-lifecycle", 64);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let routing = RoutingTable::new();
-
-        let (cmd_tx, handle) = spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_secs(60));
-
-        // Verify cmd_tx is functional by sending a routing update
-        let new_routing = RoutingTable::new();
-        assert!(cmd_tx
-            .send(TunRxCommand::UpdateRouting {
-                routing: new_routing
-            })
-            .is_ok());
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn tun_rx_actor_exits_when_sender_dropped() {
-        let (rx_tun, _tx_tun, _inject_tx, _output_rx) = memory_tun("mem-shutdown", 64);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let routing = RoutingTable::new();
-
-        let (cmd_tx, join_handle) =
-            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_secs(60));
-
-        // Drop sender to signal shutdown
-        drop(cmd_tx);
-
-        // Actor should exit gracefully (check both timeout and join result)
-        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
-        assert!(
-            matches!(result, Ok(Ok(Ok(())))),
-            "tun_rx actor should shut down cleanly after sender dropped, got {:?}",
-            result
-        );
-    }
 
     #[tokio::test]
     async fn spawn_tun_tx_returns_working_packet_tx() {
@@ -1431,34 +1267,21 @@ mod tests {
         // Verifies that the batch-aware spawn_tun_rx loop works
         // correctly when recv_batch falls back to single-packet recv.
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem-batch-fb", 64);
-        let (peer_tx, mut peer_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
+        let (router_tx, mut router_rx) = mpsc::channel::<RouterMsg>(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
-        let peer_config = Peer {
-            id: "peer1".to_string(),
-
-            h3: None,
-            bare: None,
-            tun: PeerTun {
-                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
-            },
-        };
-        let mut peer_txs = HashMap::new();
-        peer_txs.insert("peer1".to_string(), peer_tx);
-        let routing = RoutingTable::from_peers(&[peer_config], &peer_txs).unwrap();
-
-        let (_cmd_tx, tun_rx_task) =
-            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_millis(10));
+        let tun_rx_task = spawn_tun_rx(rx_tun, router_tx, events_tx, Duration::from_millis(10));
 
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
-        let batch = peer_rx
+        let msg = router_rx
             .recv()
             .await
-            .expect("packet should be routed via batch fallback");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &ipv4_packet[..]);
+            .expect("packet should be forwarded to router");
+        assert_eq!(msg.source, BatchSource::Tun);
+        assert_eq!(msg.packets.len(), 1);
+        assert_eq!(&msg.packets[0][..], &ipv4_packet[..]);
 
         tun_rx_task.abort();
     }

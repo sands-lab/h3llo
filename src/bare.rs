@@ -6,6 +6,7 @@ use crate::config::Tuning;
 use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
 use crate::helpers::retry_on_transient;
 use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
+use crate::router::{BatchSource, RouterMsg};
 use crate::tun::alloc_packet_buf;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::collections::HashSet;
@@ -133,13 +134,13 @@ pub async fn make_bare_tx<P: RouteProbe>(
 /// # Arguments
 /// - `rx`: Receive-only socket and MTU.
 /// - `accepted_sources`: Initial accepted source IP set.
-/// - `packet_tx`: Bounded channel to push accepted packets into (data plane).
+/// - `router_tx`: Bounded channel to push accepted packets to the router actor.
 /// - `events_tx`: Unbounded channel for emitting receive metrics.
 /// - `interval`: Metrics emission interval.
 pub fn spawn_udp_rx(
     rx: BareUdpRx,
     mut accepted_sources: HashSet<IpAddr>,
-    packet_tx: mpsc::Sender<Vec<PooledBuf>>,
+    router_tx: mpsc::Sender<RouterMsg>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> (
@@ -209,7 +210,8 @@ pub fn spawn_udp_rx(
 
                             let count = batch.len() as u64;
                             let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
-                            if send_with_backpressure(&packet_tx, batch, |event| match event {
+                            let msg = RouterMsg { source: BatchSource::Transport, packets: batch };
+                            if send_with_backpressure(&router_tx, msg, |event| match event {
                                 SendEvent::Waited(waited) => counters.record_queue_full(waited),
                                 SendEvent::Fast | SendEvent::Full => {}
                             })
@@ -436,14 +438,14 @@ mod tests {
             (sock, addr)
         };
 
-        let (packet_tx, mut packet_rx) = mpsc::channel(4);
+        let (router_tx, mut router_rx) = mpsc::channel(4);
         let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))]);
         let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
         let context = test_bare_rx(socket, 64);
         let (_cmd_tx, handle) = spawn_udp_rx(
             context,
             accepted,
-            packet_tx,
+            router_tx,
             events_tx,
             Duration::from_millis(200),
         );
@@ -455,7 +457,7 @@ mod tests {
             .expect("send should succeed");
 
         // Packet should be dropped because source IP is not allowed.
-        let result = tokio::time::timeout(Duration::from_millis(50), packet_rx.recv()).await;
+        let result = tokio::time::timeout(Duration::from_millis(50), router_rx.recv()).await;
         assert!(result.is_err(), "no packet should be delivered");
 
         handle.abort();
@@ -469,13 +471,13 @@ mod tests {
             (sock, addr)
         };
 
-        let (packet_tx, mut packet_rx) = mpsc::channel(4);
+        let (router_tx, mut router_rx) = mpsc::channel(4);
         let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
         let context = test_bare_rx(socket, 64);
         let (cmd_tx, handle) = spawn_udp_rx(
             context,
             HashSet::new(),
-            packet_tx,
+            router_tx,
             events_tx,
             Duration::from_millis(200),
         );
@@ -487,7 +489,7 @@ mod tests {
             .expect("initial send should succeed");
 
         // First packet should be dropped.
-        let first = tokio::time::timeout(Duration::from_millis(50), packet_rx.recv()).await;
+        let first = tokio::time::timeout(Duration::from_millis(50), router_rx.recv()).await;
         assert!(
             first.is_err(),
             "no packet should be delivered before update"
@@ -504,12 +506,13 @@ mod tests {
             .await
             .expect("second send should succeed");
 
-        let batch = tokio::time::timeout(Duration::from_millis(100), packet_rx.recv())
+        let msg = tokio::time::timeout(Duration::from_millis(100), router_rx.recv())
             .await
             .expect("packet should arrive after update")
-            .expect("channel should carry packet");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &[7, 8, 9]);
+            .expect("channel should carry message");
+        assert_eq!(msg.source, BatchSource::Transport);
+        assert_eq!(msg.packets.len(), 1);
+        assert_eq!(&msg.packets[0][..], &[7, 8, 9]);
 
         handle.abort();
     }
@@ -553,13 +556,13 @@ mod tests {
             (sock, addr)
         };
 
-        let (packet_tx, mut packet_rx) = mpsc::channel(4);
+        let (router_tx, mut router_rx) = mpsc::channel(4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let context = test_bare_rx(socket, 128);
         let (_cmd_tx, handle) = spawn_udp_rx(
             context,
             HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]),
-            packet_tx,
+            router_tx,
             events_tx,
             Duration::from_millis(10),
         );
@@ -570,10 +573,10 @@ mod tests {
             .await
             .expect("send should succeed");
 
-        // Drain the forwarded packet to avoid channel backpressure.
-        let batch = packet_rx.recv().await.expect("packet should be forwarded");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &[1, 2, 3, 4]);
+        // Drain the forwarded message to avoid channel backpressure.
+        let msg = router_rx.recv().await.expect("message should be forwarded");
+        assert_eq!(msg.packets.len(), 1);
+        assert_eq!(&msg.packets[0][..], &[1, 2, 3, 4]);
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
@@ -659,14 +662,14 @@ mod tests {
     #[tokio::test]
     async fn spawn_udp_rx_returns_working_cmd_tx() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (packet_tx, _packet_rx) = mpsc::channel(4);
+        let (router_tx, _router_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let context = test_bare_rx(socket, 64);
 
         let (cmd_tx, handle) = spawn_udp_rx(
             context,
             HashSet::new(),
-            packet_tx,
+            router_tx,
             events_tx,
             Duration::from_secs(60),
         );
@@ -684,14 +687,14 @@ mod tests {
     #[tokio::test]
     async fn udp_rx_actor_exits_when_sender_dropped() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (packet_tx, _packet_rx) = mpsc::channel(4);
+        let (router_tx, _router_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let context = test_bare_rx(socket, 64);
 
         let (cmd_tx, join_handle) = spawn_udp_rx(
             context,
             HashSet::new(),
-            packet_tx,
+            router_tx,
             events_tx,
             Duration::from_secs(60),
         );
@@ -763,51 +766,39 @@ mod tests {
         );
     }
 
-    /// Verifies RX output can be wired directly to TX input for packet forwarding.
+    /// Verifies RX sends RouterMsg with BatchSource::Transport.
     #[tokio::test]
-    async fn udp_loopback_rx_to_tx_round_trip() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let dest = receiver.local_addr().unwrap();
+    async fn udp_rx_sends_transport_source() {
+        let (socket, addr) = {
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            (sock, addr)
+        };
 
-        let rx_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let rx_addr = rx_socket.local_addr().unwrap();
-
-        let tx_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-
-        // Spawn TX first to get its packet_tx channel
-        let (packet_tx, tx_handle) = spawn_udp_tx(
-            test_bare_tx(tx_socket, dest),
-            "test-peer".to_string(),
-            events_tx.clone(),
-            &test_tuning(Duration::from_secs(60)),
-        );
-
-        // Spawn RX with TX's packet channel as output (direct wiring, no forwarder)
+        let (router_tx, mut router_rx) = mpsc::channel(4);
         let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
-        let (_cmd_tx, rx_handle) = spawn_udp_rx(
-            test_bare_rx(rx_socket, 64),
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let context = test_bare_rx(socket, 64);
+        let (_cmd_tx, handle) = spawn_udp_rx(
+            context,
             accepted,
-            packet_tx,
+            router_tx,
             events_tx,
             Duration::from_secs(60),
         );
 
-        // Send packet to RX, expect it at external receiver via TX
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender.send_to(&[1, 2, 3], rx_addr).await.unwrap();
+        sender.send_to(&[1, 2, 3], addr).await.unwrap();
 
-        let mut buf = [0u8; 64];
-        let (len, _) =
-            tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
-                .await
-                .expect("timeout")
-                .expect("recv");
-        assert_eq!(&buf[..len], &[1, 2, 3]);
+        let msg = tokio::time::timeout(Duration::from_millis(200), router_rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel should carry message");
+        assert_eq!(msg.source, BatchSource::Transport);
+        assert_eq!(msg.packets.len(), 1);
+        assert_eq!(&msg.packets[0][..], &[1, 2, 3]);
 
-        rx_handle.abort();
-        tx_handle.abort();
+        handle.abort();
     }
 
     /// Verifies that a multi-packet batch is delivered correctly via GSO

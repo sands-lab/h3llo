@@ -15,7 +15,8 @@ use crate::h3::{
 };
 use crate::metrics::{log_quic_metrics, log_transport_metrics};
 use crate::route::{make_route, spawn_route, RouteCommand};
-use crate::tun::{self, RoutingTable, TunRxCommand};
+use crate::router::{spawn_router, RouterCommand, RouterMsg};
+use crate::tun::{self, RoutingTable};
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -378,12 +379,11 @@ pub struct Orchestrator {
     tuning: Tuning,
     /// Unified peer state: config + active bound.
     peers: HashMap<String, PeerEntry>,
-    tun_cmd_tx: mpsc::UnboundedSender<TunRxCommand>,
+    router_cmd_tx: mpsc::UnboundedSender<RouterCommand>,
+    router_tx: mpsc::Sender<RouterMsg>,
     bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
     /// H3 listener command sender (if listening).
     h3_listener_cmd_tx: Option<mpsc::UnboundedSender<H3ListenerCommand>>,
-    /// Packet sender to TUN TX (for H3 RX actors).
-    tun_packet_tx: mpsc::Sender<Vec<PooledBuf>>,
 
     /// DNS resolver command sender for SetHostnames.
     dns_cmd_tx: mpsc::UnboundedSender<DnsCommand>,
@@ -464,8 +464,8 @@ impl Orchestrator {
             .collect();
         if let Ok(routing) = RoutingTable::from_peers(&peer_configs, &peer_txs) {
             if let Err(e) = self
-                .tun_cmd_tx
-                .send(TunRxCommand::UpdateRouting { routing })
+                .router_cmd_tx
+                .send(RouterCommand::UpdateRouting { routing })
             {
                 warn!(error = %e, "failed to send routing update command");
             }
@@ -522,13 +522,6 @@ impl Orchestrator {
         // Start with empty routing table; routes populated as DNS answers arrive
         let routing = RoutingTable::new();
 
-        // Spawn TUN actors - actors create their own command channels
-        let (tun_cmd_tx, tun_rx_handle) = tun::spawn_tun_rx(
-            tun_reader,
-            routing,
-            events_tx.clone(),
-            tuning.metrics_push_interval,
-        );
         // TUN-Tx actor creates its own packet channel; returns sender for transports to use
         let (tun_packet_tx, tun_tx_handle) = tun::spawn_tun_tx(
             tun_writer,
@@ -537,8 +530,26 @@ impl Orchestrator {
             tuning.packet_queue_depth,
         );
 
-        join_set.spawn(tun_rx_handle);
+        // Spawn router actor between RX actors and TUN TX
+        let (router_tx, router_cmd_tx, router_handle) = spawn_router(
+            routing,
+            tun_packet_tx,
+            events_tx.clone(),
+            tuning.metrics_push_interval,
+            tuning.packet_queue_depth,
+        );
+
+        // Spawn TUN RX — pure packet producer forwarding to router
+        let tun_rx_handle = tun::spawn_tun_rx(
+            tun_reader,
+            router_tx.clone(),
+            events_tx.clone(),
+            tuning.metrics_push_interval,
+        );
+
         join_set.spawn(tun_tx_handle);
+        join_set.spawn(router_handle);
+        join_set.spawn(tun_rx_handle);
 
         // Initialize BareUDP listener if configured
         let bare_rx_cmd_tx = if let Some(ref local_bare) = config.local.bare {
@@ -556,7 +567,7 @@ impl Orchestrator {
             let (cmd_tx, bare_rx_handle) = spawn_udp_rx(
                 bare_rx,
                 std::collections::HashSet::new(),
-                tun_packet_tx.clone(),
+                router_tx.clone(),
                 events_tx.clone(),
                 tuning.metrics_push_interval,
             );
@@ -662,10 +673,10 @@ impl Orchestrator {
             mtu,
             tuning: config.tuning,
             peers,
-            tun_cmd_tx,
+            router_cmd_tx,
+            router_tx,
             bare_rx_cmd_tx,
             h3_listener_cmd_tx,
-            tun_packet_tx,
             dns_cmd_tx,
             route_cmd_tx,
             tun_addrs,
@@ -1075,7 +1086,7 @@ impl Orchestrator {
         // Spawn RX actor
         let rx_handle = spawn_h3_rx(
             rx_state,
-            self.tun_packet_tx.clone(),
+            self.router_tx.clone(),
             self.events_tx.clone(),
             self.tuning.metrics_push_interval,
         );
@@ -1185,7 +1196,7 @@ mod test_support {
     #[allow(dead_code)]
     pub struct TestHandles {
         pub events_tx: mpsc::UnboundedSender<Event>,
-        pub tun_cmd_rx: mpsc::UnboundedReceiver<TunRxCommand>,
+        pub router_cmd_rx: mpsc::UnboundedReceiver<RouterCommand>,
         pub bare_rx_cmd_rx: mpsc::UnboundedReceiver<BareUdpRxCommand>,
         pub dns_cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
         pub route_cmd_rx: mpsc::UnboundedReceiver<RouteCommand>,
@@ -1233,10 +1244,10 @@ mod test_support {
         /// commands sent to child actors.
         pub fn build(self) -> (Orchestrator, TestHandles) {
             let (events_tx, events_rx) = mpsc::unbounded_channel();
-            let (tun_cmd_tx, tun_cmd_rx) = mpsc::unbounded_channel();
+            let (router_cmd_tx, router_cmd_rx) = mpsc::unbounded_channel();
             let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel();
             let (dns_cmd_tx, dns_cmd_rx) = mpsc::unbounded_channel();
-            let (tun_packet_tx, _tun_packet_rx) = mpsc::channel(1);
+            let (router_tx, _router_rx) = mpsc::channel(1);
             let (route_cmd_tx, route_cmd_rx) = mpsc::unbounded_channel();
             let (h3_listener_cmd_tx, h3_listener_cmd_rx) = mpsc::unbounded_channel();
 
@@ -1264,10 +1275,10 @@ mod test_support {
                 mtu: self.mtu,
                 tuning: Tuning::default(),
                 peers: self.peers,
-                tun_cmd_tx,
+                router_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
                 h3_listener_cmd_tx: Some(h3_listener_cmd_tx),
-                tun_packet_tx,
+                router_tx,
                 dns_cmd_tx,
                 route_cmd_tx: Some(route_cmd_tx),
                 tun_addrs: self.tun_addrs,
@@ -1279,7 +1290,7 @@ mod test_support {
                 orch,
                 TestHandles {
                     events_tx,
-                    tun_cmd_rx,
+                    router_cmd_rx,
                     bare_rx_cmd_rx,
                     dns_cmd_rx,
                     route_cmd_rx,
@@ -1496,7 +1507,7 @@ mod tests {
         assert!(!orch.peers.get("peer1").unwrap().bounds.is_empty());
 
         // No commands sent to child actors
-        assert!(handles.tun_cmd_rx.try_recv().is_err());
+        assert!(handles.router_cmd_rx.try_recv().is_err());
         assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
     }
 
@@ -1731,7 +1742,7 @@ mod tests {
         assert_eq!(cmd, BareUdpRxCommand::UpdateAcceptedSources(HashSet::new()));
         // Routing always updated unconditionally
         handles
-            .tun_cmd_rx
+            .router_cmd_rx
             .try_recv()
             .expect("routing update always sent");
     }
@@ -1782,7 +1793,7 @@ mod tests {
         assert_eq!(cmd, BareUdpRxCommand::UpdateAcceptedSources(HashSet::new()));
         // Routing always updated unconditionally
         handles
-            .tun_cmd_rx
+            .router_cmd_rx
             .try_recv()
             .expect("routing update always sent");
     }
@@ -2015,7 +2026,7 @@ mod tests {
         assert!(ips.contains(&ip));
 
         // Routing command should NOT be sent
-        assert!(handles.tun_cmd_rx.try_recv().is_err());
+        assert!(handles.router_cmd_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2031,7 +2042,7 @@ mod tests {
         orch.update_routing();
 
         // Routing command SHOULD be sent
-        assert!(handles.tun_cmd_rx.try_recv().is_ok());
+        assert!(handles.router_cmd_rx.try_recv().is_ok());
 
         // Accepted sources command should NOT be sent
         assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
@@ -2068,7 +2079,7 @@ mod tests {
 
         // Routing always updated unconditionally
         handles
-            .tun_cmd_rx
+            .router_cmd_rx
             .try_recv()
             .expect("routing update always sent");
     }
@@ -2207,7 +2218,7 @@ mod tests {
         );
 
         // Routing should be updated (TUN command sent)
-        assert!(handles.tun_cmd_rx.try_recv().is_ok());
+        assert!(handles.router_cmd_rx.try_recv().is_ok());
     }
 
     // ========== PeerEntry prune/try_connect tests ==========

@@ -19,6 +19,7 @@ use crate::events::{
     ConnectionDirection, Direction, Event, H3ConnectedEvent, TransportEvent, TransportKind,
 };
 use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
+use crate::router::{BatchSource, RouterMsg};
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -712,7 +713,7 @@ pub struct H3Rx {
 /// Spawns the HTTP/3 receive loop for a single connection.
 ///
 /// Receives datagrams from the inbound channel and forwards IP packets
-/// (after stripping Context ID 0) to the TUN-Tx queue.  Uses a
+/// (after stripping Context ID 0) to the router actor. Uses a
 /// `recv()` + `try_recv()` drain pattern to batch all immediately-ready
 /// frames into a single `Vec<PooledBuf>`, mirroring tokio-quiche's
 /// synchronous `gather_data_from_quiche_conn` loop.
@@ -720,12 +721,12 @@ pub struct H3Rx {
 /// # Arguments
 ///
 /// * `rx` - H3 receive state (peer_id and datagram_rx).
-/// * `packet_tx` - Bounded channel to push received packets into (data plane).
+/// * `router_tx` - Bounded channel to push received packets to the router actor.
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
 pub fn spawn_h3_rx(
     rx: H3Rx,
-    packet_tx: mpsc::Sender<Vec<PooledBuf>>,
+    router_tx: mpsc::Sender<RouterMsg>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<ActorExitResult> {
@@ -768,7 +769,8 @@ pub fn spawn_h3_rx(
                         );
                     }
 
-                    if send_with_backpressure(&packet_tx, batch, |event| match event {
+                    let msg = RouterMsg { source: BatchSource::Transport, packets: batch };
+                    if send_with_backpressure(&router_tx, msg, |event| match event {
                         SendEvent::Waited(waited) => counters.record_queue_full(waited),
                         SendEvent::Fast | SendEvent::Full => {}
                     })
@@ -1984,9 +1986,9 @@ mod tests {
         let (server_rx, _server_tx) = server_event.connection.into_actors();
 
         // Server RX actor
-        let (server_packet_tx, mut server_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (server_router_tx, mut server_router_rx) = mpsc::channel::<RouterMsg>(16);
         let _server_rx_handle =
-            spawn_h3_rx(server_rx, server_packet_tx, events_tx, metrics_interval);
+            spawn_h3_rx(server_rx, server_router_tx, events_tx, metrics_interval);
 
         // Send test packet (allocate with headroom for H3 TX encoding)
         use crate::tun::alloc_packet_buf;
@@ -1995,13 +1997,14 @@ mod tests {
         client_packet_tx.send(vec![pkt]).await.expect("send failed");
 
         // Verify receipt
-        let batch = tokio::time::timeout(Duration::from_secs(5), server_packet_rx.recv())
+        let msg = tokio::time::timeout(Duration::from_secs(5), server_router_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
 
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &test_packet[..]);
+        assert_eq!(msg.source, BatchSource::Transport);
+        assert_eq!(msg.packets.len(), 1);
+        assert_eq!(&msg.packets[0][..], &test_packet[..]);
 
         drop(cmd_tx);
     }
@@ -2076,10 +2079,10 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (server_to_client_tx, mut client_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (s2c_router_tx, mut s2c_router_rx) = mpsc::channel::<RouterMsg>(16);
         let _client_rx_handle = spawn_h3_rx(
             client_rx,
-            server_to_client_tx,
+            s2c_router_tx,
             events_tx.clone(),
             metrics_interval,
         );
@@ -2096,9 +2099,8 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (client_to_server_tx, mut server_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
-        let _server_rx_handle =
-            spawn_h3_rx(server_rx, client_to_server_tx, events_tx, metrics_interval);
+        let (c2s_router_tx, mut c2s_router_rx) = mpsc::channel::<RouterMsg>(16);
+        let _server_rx_handle = spawn_h3_rx(server_rx, c2s_router_tx, events_tx, metrics_interval);
 
         // Test client -> server
         let packet_c2s = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
@@ -2107,12 +2109,12 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_c2s = tokio::time::timeout(Duration::from_secs(5), server_packet_rx.recv())
+        let msg_c2s = tokio::time::timeout(Duration::from_secs(5), c2s_router_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
-        assert_eq!(batch_c2s.len(), 1);
-        assert_eq!(&batch_c2s[0][..], &packet_c2s[..]);
+        assert_eq!(msg_c2s.packets.len(), 1);
+        assert_eq!(&msg_c2s.packets[0][..], &packet_c2s[..]);
 
         // Test server -> client
         let packet_s2c = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
@@ -2121,12 +2123,12 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_s2c = tokio::time::timeout(Duration::from_secs(5), client_packet_rx.recv())
+        let msg_s2c = tokio::time::timeout(Duration::from_secs(5), s2c_router_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
-        assert_eq!(batch_s2c.len(), 1);
-        assert_eq!(&batch_s2c[0][..], &packet_s2c[..]);
+        assert_eq!(msg_s2c.packets.len(), 1);
+        assert_eq!(&msg_s2c.packets[0][..], &packet_s2c[..]);
 
         drop(cmd_tx);
     }
