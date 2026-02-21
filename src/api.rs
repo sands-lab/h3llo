@@ -55,9 +55,7 @@ struct SnapshotCollector(HashMap<Labels, Metrics>);
 /// Combines application-level transport metrics (via `prometheus-client`) with
 /// QUIC-level metrics (via `foundations::telemetry::metrics`) into a single
 /// Prometheus-compatible text response.
-pub(crate) fn encode_metrics_snapshot(
-    snapshot: HashMap<Labels, Metrics>,
-) -> String {
+pub(crate) fn encode_metrics_snapshot(snapshot: HashMap<Labels, Metrics>) -> String {
     let mut registry = Registry::default();
     registry.register_collector(Box::new(SnapshotCollector(snapshot)));
     let mut text = String::new();

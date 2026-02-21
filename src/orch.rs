@@ -247,24 +247,20 @@ impl PeerEntry {
                                 events_tx.clone(),
                                 &tuning,
                             );
-                            let _ = events_tx.send(Event::BareConnected(
-                                BareConnectedEvent {
-                                    peer_id,
-                                    endpoint,
-                                    dest: destination,
-                                    tx: packet_tx,
-                                    tx_handle,
-                                },
-                            ));
+                            let _ = events_tx.send(Event::BareConnected(BareConnectedEvent {
+                                peer_id,
+                                endpoint,
+                                dest: destination,
+                                tx: packet_tx,
+                                tx_handle,
+                            }));
                         }
                         Err(err) => {
                             warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
-                            let _ = events_tx.send(Event::DialFailed(
-                                DialFailedEvent {
-                                    peer_id,
-                                    ip: dial_ip,
-                                },
-                            ));
+                            let _ = events_tx.send(Event::DialFailed(DialFailedEvent {
+                                peer_id,
+                                ip: dial_ip,
+                            }));
                         }
                     }
                 });
@@ -292,21 +288,17 @@ impl PeerEntry {
                     {
                         Ok(conn) => {
                             debug!(peer = %peer_id, addr = %destination, "H3 connection established");
-                            let _ = events_tx.send(Event::H3Connected(
-                                H3ConnectedEvent {
-                                    connection: conn,
-                                    direction: ConnectionDirection::Outbound,
-                                },
-                            ));
+                            let _ = events_tx.send(Event::H3Connected(H3ConnectedEvent {
+                                connection: conn,
+                                direction: ConnectionDirection::Outbound,
+                            }));
                         }
                         Err(e) => {
                             warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
-                            let _ = events_tx.send(Event::DialFailed(
-                                DialFailedEvent {
-                                    peer_id,
-                                    ip: dial_ip,
-                                },
-                            ));
+                            let _ = events_tx.send(Event::DialFailed(DialFailedEvent {
+                                peer_id,
+                                ip: dial_ip,
+                            }));
                         }
                     }
                 });

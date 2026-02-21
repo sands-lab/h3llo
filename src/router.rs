@@ -417,11 +417,7 @@ pub fn spawn_router(
 }
 
 /// Handles a batch from TUN Rx: first-packet routing, no TTL mutation.
-async fn handle_tun_batch(
-    batch: Vec<PooledBuf>,
-    routing: &RoutingTable,
-    counters: &mut Counters,
-) {
+async fn handle_tun_batch(batch: Vec<PooledBuf>, routing: &RoutingTable, counters: &mut Counters) {
     let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
     let pkt_count = batch.len() as u64;
 
@@ -694,8 +690,8 @@ mod tests {
             addrs: vec!["10.0.0.1/24".parse().unwrap()],
             mtu: 1350,
         };
-        let table = RoutingTable::make(&peers, &peer_txs, &local_tun, &tun_tx)
-            .expect("table should build");
+        let table =
+            RoutingTable::make(&peers, &peer_txs, &local_tun, &tun_tx).expect("table should build");
 
         // Local host route (/32) wins over peer subnet (/24) for the local address
         let local = table
