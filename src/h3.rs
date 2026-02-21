@@ -16,10 +16,10 @@ use crate::auth::{generate_bearer_auth, validate_connect_auth};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::{
-    ConnectionDirection, Direction, Event, H3ConnectedEvent, TransportEvent, TransportKind,
+    ConnectionDirection, Direction, Event, H3ConnectedEvent, Source, TransportEvent,
 };
-use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
-use crate::router::{BatchSource, RouterMsg};
+use crate::metrics::{send_with_backpressure, Counters, SendEvent};
+use crate::router::RouterMsg;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -738,7 +738,7 @@ pub fn spawn_h3_rx(
     let peer = peer_id.clone();
 
     tokio::spawn(async move {
-        let mut counters = TransportCounters::new(TransportKind::Http3, Direction::Rx);
+        let mut counters = Counters::new(Source::Http3, Direction::Rx);
         let mut ticker = time::interval(interval);
         loop {
             tokio::select! {
@@ -769,7 +769,7 @@ pub fn spawn_h3_rx(
                         );
                     }
 
-                    let msg = RouterMsg { source: BatchSource::Transport, packets: batch };
+                    let msg = RouterMsg { source: Source::Http3, packets: batch };
                     if send_with_backpressure(&router_tx, msg, |event| match event {
                         SendEvent::Waited(waited) => counters.record_queue_full(waited),
                         SendEvent::Fast | SendEvent::Full => {}
@@ -787,7 +787,7 @@ pub fn spawn_h3_rx(
                 }
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), Some(remote_addr));
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(metrics))).is_err() {
+                    if events_tx.send(Event::Metrics(metrics)).is_err() {
                         return Ok(());
                     }
                 }
@@ -805,7 +805,7 @@ fn handle_inbound_frame(
     batch: &mut Vec<PooledBuf>,
     ok_pkts: &mut u64,
     ok_bytes: &mut u64,
-    counters: &mut TransportCounters,
+    counters: &mut Counters,
 ) {
     match inbound_frame {
         InboundFrame::Datagram(mut dgram) => {
@@ -908,7 +908,7 @@ pub fn spawn_h3_tx(
     let peer = peer_id.clone();
 
     let handle = tokio::spawn(async move {
-        let mut counters = TransportCounters::new(TransportKind::Http3, Direction::Tx);
+        let mut counters = Counters::new(Source::Http3, Direction::Tx);
         let mut ticker = time::interval(interval);
         let mut keepalive_ticker = time::interval(keepalive_interval);
         keepalive_ticker.tick().await; // Skip first immediate tick
@@ -992,7 +992,7 @@ pub fn spawn_h3_tx(
                 }
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), Some(remote_addr));
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(metrics))).is_err() {
+                    if events_tx.send(Event::Metrics(metrics)).is_err() {
                         return Ok(());
                     }
                 }
@@ -2002,7 +2002,7 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
 
-        assert_eq!(msg.source, BatchSource::Transport);
+        assert_eq!(msg.source, Source::Http3);
         assert_eq!(msg.packets.len(), 1);
         assert_eq!(&msg.packets[0][..], &test_packet[..]);
 
@@ -2212,7 +2212,7 @@ mod tests {
     /// a batch of packets that all succeed via try_send -> 1 batch count.
     #[tokio::test]
     async fn h3_tx_batch_counting_try_send() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
         use crate::tun::alloc_packet_buf;
         use tokio_util::sync::PollSender;
 
@@ -2250,7 +2250,7 @@ mod tests {
         // Wait for a metrics tick.
         let metrics = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(Event::Transport(TransportEvent::Metrics(m))) = events_rx.recv().await {
+                if let Some(Event::Metrics(m)) = events_rx.recv().await {
                     if m.stats.succeeded.packets > 0 {
                         return m;
                     }
@@ -2276,7 +2276,7 @@ mod tests {
     /// 2. Splits the batch into multiple segments (batch count > 1)
     #[tokio::test]
     async fn h3_tx_backpressure_splits_batch() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
         use crate::tun::alloc_packet_buf;
         use tokio_util::sync::PollSender;
 
@@ -2321,7 +2321,7 @@ mod tests {
         // Wait for metrics.
         let metrics = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(Event::Transport(TransportEvent::Metrics(m))) = events_rx.recv().await {
+                if let Some(Event::Metrics(m)) = events_rx.recv().await {
                     if m.stats.succeeded.packets >= 3 {
                         return m;
                     }

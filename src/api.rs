@@ -11,8 +11,8 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::{Config, Peer};
 use crate::events::{
-    ApiEvent, CongestionStats, Direction, DropReason, Event, PktCounters, TransportKind,
-    TransportLabels, TransportMetrics,
+    ApiEvent, CongestionStats, Direction, DropReason, Event, PktCounters, Source, Labels,
+    Metrics,
 };
 use crate::metrics::collect_quic_metrics;
 use bytes::Bytes;
@@ -48,7 +48,7 @@ const OPENMETRICS_EOF: &str = "# EOF\n";
 /// Created per scrape from the snapshot received via `ApiEvent::GetMetricsSnapshot`.
 /// No `Arc`, no `Mutex` — the collector owns the `HashMap` directly.
 #[derive(Debug)]
-struct SnapshotCollector(HashMap<TransportLabels, TransportMetrics>);
+struct SnapshotCollector(HashMap<Labels, Metrics>);
 
 /// Encodes a metrics snapshot into OpenMetrics text format.
 ///
@@ -56,7 +56,7 @@ struct SnapshotCollector(HashMap<TransportLabels, TransportMetrics>);
 /// QUIC-level metrics (via `foundations::telemetry::metrics`) into a single
 /// Prometheus-compatible text response.
 pub(crate) fn encode_metrics_snapshot(
-    snapshot: HashMap<TransportLabels, TransportMetrics>,
+    snapshot: HashMap<Labels, Metrics>,
 ) -> String {
     let mut registry = Registry::default();
     registry.register_collector(Box::new(SnapshotCollector(snapshot)));
@@ -149,7 +149,7 @@ fn encode_drop_counter_family(
     encoder: &mut DescriptorEncoder,
     name: &str,
     help: &str,
-    store: &HashMap<TransportLabels, TransportMetrics>,
+    store: &HashMap<Labels, Metrics>,
     field: fn(&PktCounters) -> u64,
 ) -> Result<(), fmt::Error> {
     let counter = ConstCounter::new(0u64);
@@ -170,7 +170,7 @@ fn encode_congestion_family<N, F>(
     encoder: &mut DescriptorEncoder,
     name: &str,
     help: &str,
-    store: &HashMap<TransportLabels, TransportMetrics>,
+    store: &HashMap<Labels, Metrics>,
     extractor: F,
 ) -> Result<(), fmt::Error>
 where
@@ -194,8 +194,8 @@ fn encode_counter_family(
     encoder: &mut DescriptorEncoder,
     name: &str,
     help: &str,
-    store: &HashMap<TransportLabels, TransportMetrics>,
-    extractor: fn(&TransportMetrics) -> (u64, u64),
+    store: &HashMap<Labels, Metrics>,
+    extractor: fn(&Metrics) -> (u64, u64),
 ) -> Result<(), fmt::Error> {
     let counter = ConstCounter::new(0u64);
     let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
@@ -212,7 +212,7 @@ fn encode_counter_family(
 /// Label set for packet/byte counter families.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct PacketLabelSet {
-    kind: TransportKindLabel,
+    source: SourceLabel,
     direction: DirectionLabel,
     peer_id: String,
     remote_addr: String,
@@ -220,9 +220,9 @@ struct PacketLabelSet {
 }
 
 impl PacketLabelSet {
-    fn from_metrics(m: &TransportMetrics, outcome: &str) -> Self {
+    fn from_metrics(m: &Metrics, outcome: &str) -> Self {
         Self {
-            kind: TransportKindLabel(m.labels.kind),
+            source: SourceLabel(m.labels.source),
             direction: DirectionLabel(m.labels.direction),
             peer_id: m.labels.peer_id.clone().unwrap_or_default(),
             remote_addr: m
@@ -238,7 +238,7 @@ impl PacketLabelSet {
 /// Label set for drop-reason counter families.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct DropLabelSet {
-    kind: TransportKindLabel,
+    source: SourceLabel,
     direction: DirectionLabel,
     peer_id: String,
     remote_addr: String,
@@ -246,9 +246,9 @@ struct DropLabelSet {
 }
 
 impl DropLabelSet {
-    fn from_metrics(m: &TransportMetrics, reason: DropReason) -> Self {
+    fn from_metrics(m: &Metrics, reason: DropReason) -> Self {
         Self {
-            kind: TransportKindLabel(m.labels.kind),
+            source: SourceLabel(m.labels.source),
             direction: DirectionLabel(m.labels.direction),
             peer_id: m.labels.peer_id.clone().unwrap_or_default(),
             remote_addr: m
@@ -261,19 +261,20 @@ impl DropLabelSet {
     }
 }
 
-/// Prometheus label value for transport kind.
+/// Prometheus label value for packet source.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct TransportKindLabel(TransportKind);
+struct SourceLabel(Source);
 
-impl EncodeLabelValue for TransportKindLabel {
+impl EncodeLabelValue for SourceLabel {
     fn encode(
         &self,
         encoder: &mut prometheus_client::encoding::LabelValueEncoder,
     ) -> Result<(), fmt::Error> {
         let s = match self.0 {
-            TransportKind::Tun => "tun",
-            TransportKind::BareUdp => "bare_udp",
-            TransportKind::Http3 => "http3",
+            Source::Tun => "tun",
+            Source::BareUdp => "bare_udp",
+            Source::Http3 => "http3",
+            Source::Router => "router",
         };
         EncodeLabelValue::encode(&s, encoder)
     }
@@ -299,7 +300,7 @@ impl EncodeLabelValue for DirectionLabel {
 /// Label set for congestion counter families with `event` dimension.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct CongestionLabelSet {
-    kind: TransportKindLabel,
+    source: SourceLabel,
     direction: DirectionLabel,
     peer_id: String,
     remote_addr: String,
@@ -307,9 +308,9 @@ struct CongestionLabelSet {
 }
 
 impl CongestionLabelSet {
-    fn from_metrics(m: &TransportMetrics, event: &str) -> Self {
+    fn from_metrics(m: &Metrics, event: &str) -> Self {
         Self {
-            kind: TransportKindLabel(m.labels.kind),
+            source: SourceLabel(m.labels.source),
             direction: DirectionLabel(m.labels.direction),
             peer_id: m.labels.peer_id.clone().unwrap_or_default(),
             remote_addr: m
@@ -597,7 +598,7 @@ async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Respons
 mod tests {
     use super::*;
     use crate::config::{Local, LocalDns, LocalTun, Tuning};
-    use crate::events::{ApiEvent, PktCounters, TransportStats};
+    use crate::events::{ApiEvent, PktCounters, Stats};
     use hyper::client::conn::http1;
     use tokio::net::TcpStream;
 
@@ -610,14 +611,14 @@ mod tests {
     #[test]
     fn encode_snapshot_includes_succeeded_and_dropped() {
         let mut snapshot = HashMap::new();
-        let metrics = TransportMetrics {
-            labels: TransportLabels {
-                kind: TransportKind::Tun,
+        let metrics = Metrics {
+            labels: Labels {
+                source: Source::Tun,
                 direction: Direction::Rx,
                 peer_id: None,
                 remote_addr: None,
             },
-            stats: TransportStats {
+            stats: Stats {
                 succeeded: PktCounters {
                     packets: 100,
                     bytes: 50000,
@@ -662,14 +663,14 @@ mod tests {
             },
         );
         let mut snapshot = HashMap::new();
-        let metrics = TransportMetrics {
-            labels: TransportLabels {
-                kind: TransportKind::BareUdp,
+        let metrics = Metrics {
+            labels: Labels {
+                source: Source::BareUdp,
                 direction: Direction::Tx,
                 peer_id: Some("peer-1".to_string()),
                 remote_addr: None,
             },
-            stats: TransportStats {
+            stats: Stats {
                 succeeded: PktCounters {
                     packets: 50,
                     bytes: 25000,
@@ -703,14 +704,14 @@ mod tests {
     #[test]
     fn encode_snapshot_is_openmetrics_format() {
         let mut snapshot = HashMap::new();
-        let metrics = TransportMetrics {
-            labels: TransportLabels {
-                kind: TransportKind::Tun,
+        let metrics = Metrics {
+            labels: Labels {
+                source: Source::Tun,
                 direction: Direction::Rx,
                 peer_id: None,
                 remote_addr: None,
             },
-            stats: TransportStats::default(),
+            stats: Stats::default(),
         };
         snapshot.insert(metrics.labels.clone(), metrics);
         let text = encode_metrics_snapshot(snapshot);
@@ -725,14 +726,14 @@ mod tests {
     fn encode_snapshot_includes_remote_addr_label() {
         let mut snapshot = HashMap::new();
         let addr: std::net::SocketAddr = "1.2.3.4:5353".parse().unwrap();
-        let metrics = TransportMetrics {
-            labels: TransportLabels {
-                kind: TransportKind::BareUdp,
+        let metrics = Metrics {
+            labels: Labels {
+                source: Source::BareUdp,
                 direction: Direction::Tx,
                 peer_id: Some("peer-x".to_string()),
                 remote_addr: Some(addr),
             },
-            stats: TransportStats {
+            stats: Stats {
                 succeeded: PktCounters {
                     packets: 10,
                     bytes: 1000,
@@ -817,18 +818,18 @@ mod tests {
         use std::time::Duration;
 
         let mut snapshot = HashMap::new();
-        let mut stats = TransportStats::default();
+        let mut stats = Stats::default();
         stats.congestion.record_queue_full(Duration::from_millis(5));
         stats
             .congestion
             .record_would_block(Duration::from_micros(200));
-        let labels = TransportLabels {
-            kind: TransportKind::Tun,
+        let labels = Labels {
+            source: Source::Tun,
             direction: Direction::Rx,
             peer_id: None,
             remote_addr: None,
         };
-        let metrics = TransportMetrics {
+        let metrics = Metrics {
             labels: labels.clone(),
             stats,
         };
@@ -1095,14 +1096,14 @@ mod tests {
             let event = recv_event(&mut events_rx).await;
             if let Event::Api(ApiEvent::GetMetricsSnapshot { reply_tx }) = event {
                 let mut snapshot = HashMap::new();
-                let metrics = TransportMetrics {
-                    labels: TransportLabels {
-                        kind: TransportKind::BareUdp,
+                let metrics = Metrics {
+                    labels: Labels {
+                        source: Source::BareUdp,
                         direction: Direction::Rx,
                         peer_id: Some("test-peer".to_string()),
                         remote_addr: None,
                     },
-                    stats: TransportStats {
+                    stats: Stats {
                         succeeded: PktCounters {
                             packets: 42,
                             bytes: 12345,

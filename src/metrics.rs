@@ -3,26 +3,24 @@
 //! Also provides formatting helpers for periodic metrics logging
 //! and QUIC-level metrics collection via `foundations`.
 
-use crate::events::{
-    Direction, DropReason, TransportKind, TransportLabels, TransportMetrics, TransportStats,
-};
+use crate::events::{Direction, DropReason, Source, Stats, Labels, Metrics};
 use std::net::SocketAddr;
 use tracing::debug;
 
-/// Tracks counters for a transport direction.
-pub(crate) struct TransportCounters {
-    kind: TransportKind,
+/// Tracks counters for a source direction.
+pub(crate) struct Counters {
+    source: Source,
     direction: Direction,
-    stats: TransportStats,
+    stats: Stats,
 }
 
-impl TransportCounters {
-    /// Builds counters for the given transport kind and direction.
-    pub(crate) fn new(transport: TransportKind, direction: Direction) -> Self {
+impl Counters {
+    /// Builds counters for the given source and direction.
+    pub(crate) fn new(source: Source, direction: Direction) -> Self {
         Self {
-            kind: transport,
+            source,
             direction,
-            stats: TransportStats::default(),
+            stats: Stats::default(),
         }
     }
 
@@ -60,10 +58,10 @@ impl TransportCounters {
         &self,
         peer_id: Option<&str>,
         remote_addr: Option<SocketAddr>,
-    ) -> TransportMetrics {
-        TransportMetrics {
-            labels: TransportLabels {
-                kind: self.kind,
+    ) -> Metrics {
+        Metrics {
+            labels: Labels {
+                source: self.source,
                 direction: self.direction,
                 peer_id: peer_id.map(str::to_string),
                 remote_addr,
@@ -124,7 +122,7 @@ where
 ///
 /// Prints succeeded/dropped batch/packet/byte totals and per-reason
 /// drop breakdowns when any drops are present.
-pub(crate) fn log_transport_metrics(metrics: &TransportMetrics) {
+pub(crate) fn log_transport_metrics(metrics: &Metrics) {
     let labels = &metrics.labels;
     let stats = &metrics.stats;
     let remote = labels
@@ -134,7 +132,7 @@ pub(crate) fn log_transport_metrics(metrics: &TransportMetrics) {
     debug!(
         "{:?} {:?} {} {}: {} batches/{} pkts/{} bytes ok, \
          {} batches/{} pkts/{} bytes dropped",
-        labels.kind,
+        labels.source,
         labels.direction,
         labels.peer_id.as_deref().unwrap_or("local"),
         remote,
@@ -195,14 +193,14 @@ mod tests {
 
     #[test]
     fn log_transport_metrics_zero_stats() {
-        let metrics = TransportMetrics {
-            labels: TransportLabels {
-                kind: TransportKind::Tun,
+        let metrics = Metrics {
+            labels: Labels {
+                source: Source::Tun,
                 direction: Direction::Rx,
                 peer_id: None,
                 remote_addr: None,
             },
-            stats: TransportStats::default(),
+            stats: Stats::default(),
         };
         // Should not panic; exercises the zero-drops fast path (skips drop_reasons).
         log_transport_metrics(&metrics);
@@ -210,7 +208,7 @@ mod tests {
 
     #[test]
     fn log_transport_metrics_with_drops() {
-        let mut stats = TransportStats::default();
+        let mut stats = Stats::default();
         stats.succeeded.record(10, 5000);
         stats.dropped.record(2, 300);
         stats
@@ -219,9 +217,9 @@ mod tests {
             .or_default()
             .record(2, 300);
 
-        let metrics = TransportMetrics {
-            labels: TransportLabels {
-                kind: TransportKind::BareUdp,
+        let metrics = Metrics {
+            labels: Labels {
+                source: Source::BareUdp,
                 direction: Direction::Tx,
                 peer_id: Some("peer1".to_string()),
                 remote_addr: None,

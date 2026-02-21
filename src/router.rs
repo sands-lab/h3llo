@@ -2,9 +2,9 @@
 //! and batch splitting for userspace L3 forwarding.
 
 use crate::actor::ActorExitResult;
-use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
+use crate::events::{Direction, DropReason, Event, Source};
 use crate::helpers::{decrement_ttl, extract_dst_ip};
-use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
+use crate::metrics::{send_with_backpressure, Counters, SendEvent};
 use crate::tun::RoutingTable;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -12,22 +12,11 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
 
-/// Identifies the origin of a batch for routing policy selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchSource {
-    /// Batch from the TUN device (local OS). No TTL mutation needed.
-    /// GSO guarantees all packets share the same flow (first-packet routing).
-    Tun,
-    /// Batch from a transport peer (BareUDP or H3). Requires per-packet
-    /// dst-IP inspection, batch splitting, and TTL decrement for non-TUN routes.
-    Transport,
-}
-
 /// Message sent from RX actors to the router.
 #[derive(Debug)]
 pub struct RouterMsg {
-    /// Origin of the batch.
-    pub source: BatchSource,
+    /// Origin of the batch (determines routing policy).
+    pub source: Source,
     /// Packet batch.
     pub packets: Vec<PooledBuf>,
 }
@@ -69,7 +58,7 @@ pub fn spawn_router(
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
     let handle = tokio::spawn(async move {
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
+        let mut counters = Counters::new(Source::Router, Direction::Rx);
         let mut ticker = time::interval(interval);
 
         loop {
@@ -79,10 +68,10 @@ pub fn spawn_router(
                         return Ok(());
                     };
                     match source {
-                        BatchSource::Tun => {
+                        Source::Tun => {
                             handle_tun_batch(packets, &routing, &mut counters).await;
                         }
-                        BatchSource::Transport => {
+                        Source::BareUdp | Source::Http3 | Source::Router => {
                             handle_transport_batch(
                                 packets, &routing, &tun_tx, &mut counters,
                             ).await;
@@ -97,8 +86,8 @@ pub fn spawn_router(
                     routing = new_routing;
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(
-                        TransportEvent::Metrics(counters.snapshot(None, None))
+                    if events_tx.send(Event::Metrics(
+                        counters.snapshot(None, None)
                     )).is_err() {
                         return Ok(());
                     }
@@ -114,7 +103,7 @@ pub fn spawn_router(
 async fn handle_tun_batch(
     batch: Vec<PooledBuf>,
     routing: &RoutingTable,
-    counters: &mut TransportCounters,
+    counters: &mut Counters,
 ) {
     let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
     let pkt_count = batch.len() as u64;
@@ -153,7 +142,7 @@ async fn handle_transport_batch(
     mut batch: Vec<PooledBuf>,
     routing: &RoutingTable,
     tun_tx: &mpsc::Sender<Vec<PooledBuf>>,
-    counters: &mut TransportCounters,
+    counters: &mut Counters,
 ) {
     // Process batch by draining consecutive groups from the front.
     // After each drain, indices shift — but we always drain from index 0
@@ -279,7 +268,7 @@ mod tests {
     async fn tun_batch_routes_via_first_packet() {
         let (peer_tx, mut peer_rx) = mpsc::channel(4);
         let routing = make_test_routing("peer1", "10.0.0.0/8".parse().unwrap(), peer_tx);
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
+        let mut counters = Counters::new(Source::Router, Direction::Rx);
 
         let pkt_data = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
         let batch = vec![alloc_packet_buf(&pkt_data)];
@@ -294,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn tun_batch_no_route_drops() {
         let routing = RoutingTable::new();
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
+        let mut counters = Counters::new(Source::Router, Direction::Rx);
 
         let pkt_data = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
         let batch = vec![alloc_packet_buf(&pkt_data)];
@@ -331,7 +320,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
+        let mut counters = Counters::new(Source::Router, Direction::Rx);
 
         // Build batch: 2 packets to 10.x, then 1 packet to 192.168.x
         let mut batch = Vec::new();
@@ -357,7 +346,7 @@ mod tests {
         let (tun_tx, mut tun_rx) = mpsc::channel(4);
 
         let routing = make_test_routing("peer1", "10.0.0.0/8".parse().unwrap(), peer_tx);
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
+        let mut counters = Counters::new(Source::Router, Direction::Rx);
 
         // TTL=1 packet → should expire and go to tun_tx
         let pkt_data = make_ipv4_with_ttl(Ipv4Addr::new(10, 0, 0, 1), 1);
@@ -386,7 +375,7 @@ mod tests {
         let (tun_tx, mut tun_rx) = mpsc::channel(4);
 
         let routing = make_test_routing("local", "10.0.0.0/8".parse().unwrap(), tun_tx.clone());
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
+        let mut counters = Counters::new(Source::Router, Direction::Rx);
 
         let pkt_data = make_ipv4_with_ttl(Ipv4Addr::new(10, 0, 0, 1), 5);
         let batch = vec![alloc_packet_buf(&pkt_data)];
@@ -405,7 +394,7 @@ mod tests {
         let (tun_tx, _tun_rx) = mpsc::channel(4);
 
         let routing = make_test_routing("peer1", "10.0.0.0/8".parse().unwrap(), peer_tx);
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
+        let mut counters = Counters::new(Source::Router, Direction::Rx);
 
         let pkt_data = make_ipv4_with_ttl(Ipv4Addr::new(10, 0, 0, 1), 64);
         let batch = vec![alloc_packet_buf(&pkt_data)];
@@ -424,7 +413,7 @@ mod tests {
         let (tun_tx, _tun_rx) = mpsc::channel(4);
 
         let routing = make_test_routing("peer1", "2001:db8::/32".parse().unwrap(), peer_tx);
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
+        let mut counters = Counters::new(Source::Router, Direction::Rx);
 
         let mut pkt_data = make_ipv6_packet("2001:db8::1".parse::<Ipv6Addr>().unwrap());
         pkt_data[7] = 128; // hop limit
@@ -464,7 +453,7 @@ mod tests {
         let pkt_data = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
         router_tx
             .send(RouterMsg {
-                source: BatchSource::Tun,
+                source: Source::Tun,
                 packets: vec![alloc_packet_buf(&pkt_data)],
             })
             .await

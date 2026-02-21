@@ -8,7 +8,7 @@ use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::ApiEvent;
 use crate::events::{
     BareConnectedEvent, ConnectionDirection, DialFailedEvent, Direction, DnsEvent, Endpoint, Event,
-    H3ConnectedEvent, TransportEvent, TransportLabels, TransportMetrics,
+    H3ConnectedEvent, TransportEvent, Labels, Metrics,
 };
 use crate::h3::{
     dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
@@ -42,9 +42,9 @@ struct BoundState {
     /// TX channel for sending packet batches.
     tx: mpsc::Sender<Vec<PooledBuf>>,
     /// Latest cumulative RX metrics for this connection.
-    rx_metrics: Option<TransportMetrics>,
+    rx_metrics: Option<Metrics>,
     /// Latest cumulative TX metrics for this connection.
-    tx_metrics: Option<TransportMetrics>,
+    tx_metrics: Option<Metrics>,
 }
 
 /// Per-IP dial state for tracking in-flight connections and exponential backoff.
@@ -398,7 +398,7 @@ pub struct Orchestrator {
     /// Metrics from non-peer-scoped actors (TUN RX/TX, BareUDP RX).
     ///
     /// At most 3 entries. Peer-scoped metrics live in `BoundState`.
-    non_peer_metrics: HashMap<TransportLabels, TransportMetrics>,
+    non_peer_metrics: HashMap<Labels, Metrics>,
 }
 
 impl Orchestrator {
@@ -794,7 +794,7 @@ impl Orchestrator {
     ///
     /// Called on Prometheus scrape (`GetMetricsSnapshot`) and periodic metrics logging.
     /// Only includes metrics from currently live connections — pruned bounds are absent.
-    fn collect_metrics_snapshot(&self) -> HashMap<TransportLabels, TransportMetrics> {
+    fn collect_metrics_snapshot(&self) -> HashMap<Labels, Metrics> {
         let mut snapshot = self.non_peer_metrics.clone();
         for entry in self.peers.values() {
             for bound in &entry.bounds {
@@ -894,12 +894,12 @@ impl Orchestrator {
             Event::Api(api_event) => {
                 self.handle_api_event(api_event);
             }
-            Event::Transport(TransportEvent::Metrics(metrics)) => {
+            Event::Metrics(metrics) => {
                 let labels = &metrics.labels;
 
                 let (Some(pid), Some(addr)) = (labels.peer_id.as_deref(), labels.remote_addr)
                 else {
-                    // Non-peer-scoped (TUN, BareUDP RX)
+                    // Non-peer-scoped (TUN, Router, BareUDP RX)
                     self.non_peer_metrics.insert(labels.clone(), metrics);
                     return;
                 };
@@ -1307,8 +1307,7 @@ mod tests {
     use super::*;
     use crate::config::{PeerBare, PeerTun};
     use crate::events::{
-        Direction, DnsEvent, TransportEvent, TransportKind, TransportLabels, TransportMetrics,
-        TransportStats,
+        Direction, DnsEvent, Labels, Metrics, Source, Stats,
     };
 
     // ========== PeerEntry unit tests ==========
@@ -1354,15 +1353,15 @@ mod tests {
     }
 
     fn make_metrics_event() -> Event {
-        Event::Transport(TransportEvent::Metrics(TransportMetrics {
-            labels: TransportLabels {
-                kind: TransportKind::Tun,
+        Event::Metrics(Metrics {
+            labels: Labels {
+                source: Source::Tun,
                 direction: Direction::Rx,
                 peer_id: None,
                 remote_addr: None,
             },
-            stats: TransportStats::default(),
-        }))
+            stats: Stats::default(),
+        })
     }
 
     #[test]
@@ -1526,21 +1525,21 @@ mod tests {
         assert_eq!(orch.non_peer_metrics.len(), 1);
 
         // Push again with different values but same labels
-        let event = Event::Transport(TransportEvent::Metrics(TransportMetrics {
-            labels: TransportLabels {
-                kind: TransportKind::Tun,
+        let event = Event::Metrics(Metrics {
+            labels: Labels {
+                source: Source::Tun,
                 direction: Direction::Rx,
                 peer_id: None,
                 remote_addr: None,
             },
-            stats: TransportStats {
+            stats: Stats {
                 succeeded: crate::events::PktCounters {
                     packets: 42,
                     ..Default::default()
                 },
                 ..Default::default()
             },
-        }));
+        });
         orch.handle_event(event).await;
         assert_eq!(orch.non_peer_metrics.len(), 1);
         let stored = orch.non_peer_metrics.values().next().unwrap();
@@ -1554,21 +1553,21 @@ mod tests {
         direction: Direction,
         packets: u64,
     ) -> Event {
-        Event::Transport(TransportEvent::Metrics(TransportMetrics {
-            labels: TransportLabels {
-                kind: TransportKind::BareUdp,
+        Event::Metrics(Metrics {
+            labels: Labels {
+                source: Source::BareUdp,
                 direction,
                 peer_id: Some(peer_id.to_string()),
                 remote_addr: Some(remote_addr),
             },
-            stats: TransportStats {
+            stats: Stats {
                 succeeded: crate::events::PktCounters {
                     packets,
                     ..Default::default()
                 },
                 ..Default::default()
             },
-        }))
+        })
     }
 
     #[tokio::test]

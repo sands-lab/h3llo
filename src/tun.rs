@@ -2,10 +2,10 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::{LocalTun, Peer};
-use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
+use crate::events::{Direction, DropReason, Event, Source};
 use crate::helpers::retry_on_transient;
-use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
-use crate::router::{BatchSource, RouterMsg};
+use crate::metrics::{send_with_backpressure, Counters, SendEvent};
+use crate::router::RouterMsg;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use ipnet_trie::IpnetTrie;
 use std::collections::HashMap;
@@ -691,7 +691,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
     let scratch_buf_size = tun.scratch_buf_size();
 
     tokio::spawn(async move {
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
+        let mut counters = Counters::new(Source::Tun, Direction::Rx);
         let mut ticker = time::interval(interval);
         let mtu = tun.mtu();
 
@@ -719,7 +719,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             }
                             let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
                             let pkt_count = batch.len() as u64;
-                            let msg = RouterMsg { source: BatchSource::Tun, packets: batch };
+                            let msg = RouterMsg { source: Source::Tun, packets: batch };
                             if send_with_backpressure(&router_tx, msg, |event| match event {
                                 SendEvent::Waited(waited) => counters.record_queue_full(waited),
                                 SendEvent::Fast | SendEvent::Full => {}
@@ -739,7 +739,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
+                    if events_tx.send(Event::Metrics(counters.snapshot(None, None))).is_err() {
                         return Ok(()); // Events channel closed during shutdown
                     }
                 }
@@ -765,7 +765,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
 
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Tx);
+        let mut counters = Counters::new(Source::Tun, Direction::Tx);
         let mut ticker = time::interval(interval);
 
         loop {
@@ -803,7 +803,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
+                    if events_tx.send(Event::Metrics(counters.snapshot(None, None))).is_err() {
                         return Ok(()); // Events channel closed during shutdown
                     }
                 }
@@ -1008,14 +1008,14 @@ mod tests {
             .recv()
             .await
             .expect("router should receive message");
-        assert_eq!(msg.source, BatchSource::Tun);
+        assert_eq!(msg.source, Source::Tun);
         assert_eq!(msg.packets.len(), 1);
         assert_eq!(&msg.packets[0][..], &ipv4_packet[..]);
 
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                if let Event::Metrics(m) = event {
                     if m.labels.direction == Direction::Rx && m.stats.succeeded.packets >= 1 {
                         snapshot = Some(m);
                         break;
@@ -1028,7 +1028,7 @@ mod tests {
         tun_rx_task.abort();
 
         let metrics = snapshot.expect("rx metrics should arrive");
-        assert_eq!(metrics.labels.kind, TransportKind::Tun);
+        assert_eq!(metrics.labels.source, Source::Tun);
         assert_eq!(metrics.labels.direction, Direction::Rx);
         assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
@@ -1058,7 +1058,7 @@ mod tests {
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                if let Event::Metrics(m) = event {
                     if m.labels.direction == Direction::Tx
                         && m.stats.succeeded.packets >= 1
                         && m.stats.dropped.packets >= 1
@@ -1074,7 +1074,7 @@ mod tests {
         tun_tx_task.abort();
 
         let metrics = snapshot.expect("tx metrics should arrive");
-        assert_eq!(metrics.labels.kind, TransportKind::Tun);
+        assert_eq!(metrics.labels.source, Source::Tun);
         assert_eq!(metrics.labels.direction, Direction::Tx);
         assert_eq!(metrics.labels.peer_id, None);
         assert_eq!(metrics.labels.remote_addr, None);
@@ -1112,7 +1112,7 @@ mod tests {
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                if let Event::Metrics(m) = event {
                     if m.labels.direction == Direction::Tx && m.stats.succeeded.packets >= 1 {
                         return Some(m);
                     }
@@ -1126,7 +1126,7 @@ mod tests {
 
         tun_tx_task.abort();
 
-        assert_eq!(metrics.labels.kind, TransportKind::Tun);
+        assert_eq!(metrics.labels.source, Source::Tun);
         assert_eq!(metrics.labels.direction, Direction::Tx);
         assert_eq!(metrics.labels.peer_id, None);
         assert_eq!(metrics.labels.remote_addr, None);
@@ -1279,7 +1279,7 @@ mod tests {
             .recv()
             .await
             .expect("packet should be forwarded to router");
-        assert_eq!(msg.source, BatchSource::Tun);
+        assert_eq!(msg.source, Source::Tun);
         assert_eq!(msg.packets.len(), 1);
         assert_eq!(&msg.packets[0][..], &ipv4_packet[..]);
 

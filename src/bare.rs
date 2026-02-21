@@ -3,10 +3,10 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
 use crate::config::Tuning;
-use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
+use crate::events::{Direction, DropReason, Event, Source};
 use crate::helpers::retry_on_transient;
-use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
-use crate::router::{BatchSource, RouterMsg};
+use crate::metrics::{send_with_backpressure, Counters, SendEvent};
+use crate::router::RouterMsg;
 use crate::tun::alloc_packet_buf;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::collections::HashSet;
@@ -168,7 +168,7 @@ pub fn spawn_udp_rx(
             1
         };
         let mut buf = vec![0u8; mtu * gro_segments];
-        let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Rx);
+        let mut counters = Counters::new(Source::BareUdp, Direction::Rx);
         let mut ticker = time::interval(interval);
         let mut meta = RecvMeta::default();
 
@@ -210,7 +210,7 @@ pub fn spawn_udp_rx(
 
                             let count = batch.len() as u64;
                             let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
-                            let msg = RouterMsg { source: BatchSource::Transport, packets: batch };
+                            let msg = RouterMsg { source: Source::BareUdp, packets: batch };
                             if send_with_backpressure(&router_tx, msg, |event| match event {
                                 SendEvent::Waited(waited) => counters.record_queue_full(waited),
                                 SendEvent::Fast | SendEvent::Full => {}
@@ -239,7 +239,7 @@ pub fn spawn_udp_rx(
                     accepted_sources = update;
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
+                    if events_tx.send(Event::Metrics(counters.snapshot(None, None))).is_err() {
                         return Ok(()); // Events channel closed during shutdown
                     }
                 }
@@ -282,7 +282,7 @@ pub fn spawn_udp_tx(
 
     let metrics_interval = tuning.metrics_push_interval;
     let handle = tokio::spawn(async move {
-        let mut counters = TransportCounters::new(TransportKind::BareUdp, Direction::Tx);
+        let mut counters = Counters::new(Source::BareUdp, Direction::Tx);
         let mut ticker = time::interval(metrics_interval);
         let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
         let max_segs = if enable_offload {
@@ -355,7 +355,7 @@ pub fn spawn_udp_tx(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(Some(&peer_id), Some(dest_addr))))).is_err() {
+                    if events_tx.send(Event::Metrics(counters.snapshot(Some(&peer_id), Some(dest_addr)))).is_err() {
                         return Ok(()); // Events channel closed during shutdown
                     }
                 }
@@ -510,7 +510,7 @@ mod tests {
             .await
             .expect("packet should arrive after update")
             .expect("channel should carry message");
-        assert_eq!(msg.source, BatchSource::Transport);
+        assert_eq!(msg.source, Source::BareUdp);
         assert_eq!(msg.packets.len(), 1);
         assert_eq!(&msg.packets[0][..], &[7, 8, 9]);
 
@@ -580,7 +580,7 @@ mod tests {
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                if let Event::Metrics(m) = event {
                     if m.labels.direction == Direction::Rx && m.stats.succeeded.packets >= 1 {
                         return Some(m);
                     }
@@ -592,7 +592,7 @@ mod tests {
         .expect("rx metrics should arrive")
         .expect("rx metrics should not be None");
 
-        assert_eq!(metrics.labels.kind, TransportKind::BareUdp);
+        assert_eq!(metrics.labels.source, Source::BareUdp);
         assert_eq!(metrics.labels.direction, Direction::Rx);
         assert_eq!(metrics.labels.peer_id, None);
         assert_eq!(metrics.labels.remote_addr, None);
@@ -632,7 +632,7 @@ mod tests {
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                if let Event::Metrics(m) = event {
                     if m.labels.direction == Direction::Tx && m.stats.succeeded.packets >= 1 {
                         return Some(m);
                     }
@@ -644,7 +644,7 @@ mod tests {
         .expect("tx metrics should arrive")
         .expect("tx metrics should not be None");
 
-        assert_eq!(metrics.labels.kind, TransportKind::BareUdp);
+        assert_eq!(metrics.labels.source, Source::BareUdp);
         assert_eq!(metrics.labels.direction, Direction::Tx);
         assert_eq!(metrics.labels.peer_id, Some("test-peer".to_string()));
         assert_eq!(metrics.labels.remote_addr, Some(dest));
@@ -766,7 +766,7 @@ mod tests {
         );
     }
 
-    /// Verifies RX sends RouterMsg with BatchSource::Transport.
+    /// Verifies RX sends `RouterMsg` with `Source::BareUdp`.
     #[tokio::test]
     async fn udp_rx_sends_transport_source() {
         let (socket, addr) = {
@@ -794,7 +794,7 @@ mod tests {
             .await
             .expect("timeout")
             .expect("channel should carry message");
-        assert_eq!(msg.source, BatchSource::Transport);
+        assert_eq!(msg.source, Source::BareUdp);
         assert_eq!(msg.packets.len(), 1);
         assert_eq!(&msg.packets[0][..], &[1, 2, 3]);
 
@@ -922,7 +922,7 @@ mod tests {
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                if let Event::Metrics(m) = event {
                     if m.labels.direction == Direction::Tx && m.stats.succeeded.packets >= 2 {
                         return Some(m);
                     }

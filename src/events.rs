@@ -37,7 +37,9 @@ pub enum ConnectionDirection {
 /// Carries high-level events emitted by modules to the orchestrator.
 #[derive(Debug)]
 pub enum Event {
-    /// Events originating from transports (TUN, BareUDP, HTTP/3).
+    /// Cumulative metrics snapshot from any source.
+    Metrics(Metrics),
+    /// Events originating from transports (BareUDP, HTTP/3).
     Transport(TransportEvent),
     /// Events originating from DNS resolution.
     Dns(DnsEvent),
@@ -69,7 +71,7 @@ pub enum ApiEvent {
     /// GET /metrics — orchestrator replies with raw metrics snapshot for API-side rendering.
     GetMetricsSnapshot {
         /// Reply channel carrying cloned metrics data. Rendering happens in the API actor.
-        reply_tx: oneshot::Sender<HashMap<TransportLabels, TransportMetrics>>,
+        reply_tx: oneshot::Sender<HashMap<Labels, Metrics>>,
     },
 }
 
@@ -104,10 +106,8 @@ pub struct DialFailedEvent {
     pub ip: IpAddr,
 }
 
-/// Describes transport-level events.
+/// Describes transport-level events (connection lifecycle).
 pub enum TransportEvent {
-    /// Latest cumulative metrics for a transport direction.
-    Metrics(TransportMetrics),
     /// HTTP/3 connection established, ready for actor spawning.
     H3Connected(H3ConnectedEvent),
     /// BareUDP TX connection established, ready for bound registration.
@@ -119,7 +119,6 @@ pub enum TransportEvent {
 impl std::fmt::Debug for TransportEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Metrics(m) => f.debug_tuple("Metrics").field(m).finish(),
             Self::H3Connected(e) => f.debug_tuple("H3Connected").field(e).finish(),
             Self::BareConnected(e) => f.debug_tuple("BareConnected").field(e).finish(),
             Self::DialFailed(e) => f.debug_tuple("DialFailed").field(e).finish(),
@@ -167,15 +166,17 @@ pub struct H3ConnectedEvent {
     pub direction: ConnectionDirection,
 }
 
-/// Indicates which transport produced the metrics.
+/// Identifies the origin of packets for metrics and routing policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TransportKind {
+pub enum Source {
     /// TUN interface.
     Tun,
     /// BareUDP socket.
     BareUdp,
     /// HTTP/3 transport.
     Http3,
+    /// Router actor (forwarding path).
+    Router,
 }
 
 /// Indicates whether metrics were collected on the receive or transmit path.
@@ -351,9 +352,9 @@ mod tests {
     }
 }
 
-/// Collects per-transport statistics including drop breakdowns.
+/// Collects per-source statistics including drop breakdowns.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TransportStats {
+pub struct Stats {
     /// Successful packet counters.
     pub succeeded: PktCounters,
     /// Dropped packet counters.
@@ -366,9 +367,9 @@ pub struct TransportStats {
 
 /// Labels attached to transport metrics for grouping.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TransportLabels {
-    /// Transport kind (TUN, BareUDP, HTTP/3).
-    pub kind: TransportKind,
+pub struct Labels {
+    /// Packet source (TUN, BareUDP, HTTP/3, Router).
+    pub source: Source,
     /// Direction (receive or transmit) of the collected metrics.
     pub direction: Direction,
     /// Optional peer identifier when the transport is peer-scoped.
@@ -379,11 +380,11 @@ pub struct TransportLabels {
 
 /// Carries cumulative counters collected from a transport loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransportMetrics {
+pub struct Metrics {
     /// Labels describing the metric dimensions.
-    pub labels: TransportLabels,
+    pub labels: Labels,
     /// Aggregated statistics with drop breakdown.
-    pub stats: TransportStats,
+    pub stats: Stats,
 }
 
 /// DNS resolution state change notification.
