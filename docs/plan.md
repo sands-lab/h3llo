@@ -26,6 +26,7 @@ Primary build order with the minimum test coverage for each module.
 - [x] Step 9: Implement HTTP/3 transport: listen/dial with DATAGRAM, Context ID 0, reconnection and smooth handover; add loopback/component tests for send/receive and reconnect.
 - [x] Step 10: Implement control plane (GET/POST/DELETE): snapshot export, peer replace/delete, trigger routing/transport refresh; add handler tests for auth, payload validation, and metrics exposition.
 - [x] Step 11: Implement runtime orchestration (Hybrid): mix H3 and BareUDP; add integration tests for clean startup/shutdown and restartability with both transports.
+- [ ] Step 12: Implement router actor: centralized userspace L3 forwarding in `src/router.rs` with LPM routing, TTL decrement (RFC 1624), batch splitting by destination; strip routing from `spawn_tun_rx`; rewire orchestrator so all RX actors send to router.
 
 ## BareUDP VPN Delivery
 

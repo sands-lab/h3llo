@@ -15,10 +15,8 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_bearer_auth, validate_connect_auth};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
-use crate::events::{
-    ConnectionDirection, Direction, Event, H3ConnectedEvent, TransportEvent, TransportKind,
-};
-use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
+use crate::events::{ConnectionDirection, Event, H3ConnectedEvent};
+use crate::metrics::{send_with_backpressure, Counters, Direction, SendEvent, Source};
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -335,10 +333,10 @@ async fn handle_h3_connection(
                     flow_id,
                     quic_cmd_send,
                 };
-                let event = Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
+                let event = Event::H3Connected(H3ConnectedEvent {
                     connection: conn,
                     direction: ConnectionDirection::Inbound,
-                }));
+                });
                 if events_tx.send(event).is_err() {
                     debug!(%remote_addr, "events channel closed");
                     close_quic_connection(&quic_cmd_tx);
@@ -712,7 +710,7 @@ pub struct H3Rx {
 /// Spawns the HTTP/3 receive loop for a single connection.
 ///
 /// Receives datagrams from the inbound channel and forwards IP packets
-/// (after stripping Context ID 0) to the TUN-Tx queue.  Uses a
+/// (after stripping Context ID 0) to the router actor. Uses a
 /// `recv()` + `try_recv()` drain pattern to batch all immediately-ready
 /// frames into a single `Vec<PooledBuf>`, mirroring tokio-quiche's
 /// synchronous `gather_data_from_quiche_conn` loop.
@@ -720,12 +718,12 @@ pub struct H3Rx {
 /// # Arguments
 ///
 /// * `rx` - H3 receive state (peer_id and datagram_rx).
-/// * `packet_tx` - Bounded channel to push received packets into (data plane).
+/// * `ingress_tx` - Bounded channel to push received packets to the router actor.
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
 pub fn spawn_h3_rx(
     rx: H3Rx,
-    packet_tx: mpsc::Sender<Vec<PooledBuf>>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<ActorExitResult> {
@@ -737,7 +735,7 @@ pub fn spawn_h3_rx(
     let peer = peer_id.clone();
 
     tokio::spawn(async move {
-        let mut counters = TransportCounters::new(TransportKind::Http3, Direction::Rx);
+        let mut counters = Counters::new(Source::Http3, Direction::Rx);
         let mut ticker = time::interval(interval);
         loop {
             tokio::select! {
@@ -768,7 +766,7 @@ pub fn spawn_h3_rx(
                         );
                     }
 
-                    if send_with_backpressure(&packet_tx, batch, |event| match event {
+                    if send_with_backpressure(&ingress_tx, batch, |event| match event {
                         SendEvent::Waited(waited) => counters.record_queue_full(waited),
                         SendEvent::Fast | SendEvent::Full => {}
                     })
@@ -776,7 +774,7 @@ pub fn spawn_h3_rx(
                     .is_err()
                     {
                         counters.record_drop(
-                            crate::events::DropReason::ChannelClosed,
+                            crate::metrics::DropReason::ChannelClosed,
                             ok_pkts, ok_bytes,
                         );
                         return Ok(());
@@ -785,7 +783,7 @@ pub fn spawn_h3_rx(
                 }
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), Some(remote_addr));
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(metrics))).is_err() {
+                    if events_tx.send(Event::Metrics(metrics)).is_err() {
                         return Ok(());
                     }
                 }
@@ -803,13 +801,13 @@ fn handle_inbound_frame(
     batch: &mut Vec<PooledBuf>,
     ok_pkts: &mut u64,
     ok_bytes: &mut u64,
-    counters: &mut TransportCounters,
+    counters: &mut Counters,
 ) {
     match inbound_frame {
         InboundFrame::Datagram(mut dgram) => {
             if dgram.is_empty() || dgram[0] != CONTEXT_ID_IP {
                 counters.record_drop(
-                    crate::events::DropReason::InvalidFraming,
+                    crate::metrics::DropReason::InvalidFraming,
                     1,
                     dgram.len() as u64,
                 );
@@ -828,7 +826,7 @@ fn handle_inbound_frame(
                 "received unexpected Body frame on CONNECT-IP stream"
             );
             counters.record_drop(
-                crate::events::DropReason::InvalidFraming,
+                crate::metrics::DropReason::InvalidFraming,
                 1,
                 pooled_buf.len() as u64,
             );
@@ -894,7 +892,7 @@ pub fn spawn_h3_tx(
     packet_queue_depth: usize,
     keepalive_interval: Duration,
 ) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
+    let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
 
     let H3Tx {
         peer_id,
@@ -906,7 +904,7 @@ pub fn spawn_h3_tx(
     let peer = peer_id.clone();
 
     let handle = tokio::spawn(async move {
-        let mut counters = TransportCounters::new(TransportKind::Http3, Direction::Tx);
+        let mut counters = Counters::new(Source::Http3, Direction::Tx);
         let mut ticker = time::interval(interval);
         let mut keepalive_ticker = time::interval(keepalive_interval);
         keepalive_ticker.tick().await; // Skip first immediate tick
@@ -924,7 +922,7 @@ pub fn spawn_h3_tx(
 
         loop {
             tokio::select! {
-                maybe_batch = packet_rx.recv() => {
+                maybe_batch = egress_rx.recv() => {
                     let Some(packets) = maybe_batch else {
                         let _ = quic_cmd_send(QuicCommand::ConnectionClose(
                             ConnectionShutdownBehaviour {
@@ -946,7 +944,7 @@ pub fn spawn_h3_tx(
                         let len = packet.len();
                         // Zero-copy: prepend Context ID using reserved headroom.
                         if !packet.add_prefix(&[CONTEXT_ID_IP]) {
-                            counters.record_drop(crate::events::DropReason::NoHeadroom, 1, len as u64);
+                            counters.record_drop(crate::metrics::DropReason::NoHeadroom, 1, len as u64);
                             continue;
                         }
                         let frame = OutboundFrame::Datagram(packet, flow_id);
@@ -974,7 +972,7 @@ pub fn spawn_h3_tx(
                         .await
                         .map_err(|_| {
                             counters.record_drop(
-                                crate::events::DropReason::SendError, 1, len as u64,
+                                crate::metrics::DropReason::SendError, 1, len as u64,
                             );
                             ActorError::H3TxSend {
                                 peer_id: peer.clone(),
@@ -990,7 +988,7 @@ pub fn spawn_h3_tx(
                 }
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), Some(remote_addr));
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(metrics))).is_err() {
+                    if events_tx.send(Event::Metrics(metrics)).is_err() {
                         return Ok(());
                     }
                 }
@@ -1006,7 +1004,7 @@ pub fn spawn_h3_tx(
         }
     });
 
-    (packet_tx, handle)
+    (egress_tx, handle)
 }
 
 // ========== Listener ==========
@@ -1300,8 +1298,10 @@ mod tests {
 
     #[test]
     fn make_quic_settings_applies_handshake_timeout() {
-        let mut tuning = Tuning::default();
-        tuning.h3_handshake_timeout = Duration::from_secs(7);
+        let tuning = Tuning {
+            h3_handshake_timeout: Duration::from_secs(7),
+            ..Tuning::default()
+        };
 
         let settings = make_quic_settings(&tuning, crate::config::default_mtu());
 
@@ -1615,7 +1615,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_success() {
-        use crate::events::{ConnectionDirection, Event, TransportEvent};
+        use crate::events::{ConnectionDirection, Event};
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1663,7 +1663,7 @@ mod tests {
         // Server should emit an H3Connected event
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
@@ -1681,7 +1681,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_success_with_sni_override() {
-        use crate::events::{ConnectionDirection, Event, TransportEvent};
+        use crate::events::{ConnectionDirection, Event};
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1731,7 +1731,7 @@ mod tests {
         // Server should emit an H3Connected event
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
@@ -1750,7 +1750,7 @@ mod tests {
 
     #[tokio::test]
     async fn h3_connection_into_actors_preserves_peer_id() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1789,7 +1789,7 @@ mod tests {
 
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
@@ -1810,7 +1810,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_rejects_wrong_secret() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1854,7 +1854,7 @@ mod tests {
         // Server should NOT have emitted an H3Connected event
         let server_recv = tokio::time::timeout(Duration::from_millis(500), async {
             while let Some(event) = events_rx.recv().await {
-                if matches!(event, Event::Transport(TransportEvent::H3Connected(_))) {
+                if matches!(event, Event::H3Connected(_)) {
                     return Some(());
                 }
             }
@@ -1914,7 +1914,7 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_roundtrip() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
 
@@ -1955,7 +1955,7 @@ mod tests {
 
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = listener_events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
@@ -1972,7 +1972,7 @@ mod tests {
         let (_client_rx, client_tx) = client_conn.into_actors();
 
         // Client TX actor
-        let (client_packet_tx, _client_tx_handle) = spawn_h3_tx(
+        let (client_egress_tx, _client_tx_handle) = spawn_h3_tx(
             client_tx,
             events_tx.clone(),
             metrics_interval,
@@ -1984,18 +1984,18 @@ mod tests {
         let (server_rx, _server_tx) = server_event.connection.into_actors();
 
         // Server RX actor
-        let (server_packet_tx, mut server_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (server_router_tx, mut server_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _server_rx_handle =
-            spawn_h3_rx(server_rx, server_packet_tx, events_tx, metrics_interval);
+            spawn_h3_rx(server_rx, server_router_tx, events_tx, metrics_interval);
 
         // Send test packet (allocate with headroom for H3 TX encoding)
         use crate::tun::alloc_packet_buf;
         let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
         let pkt = alloc_packet_buf(&test_packet);
-        client_packet_tx.send(vec![pkt]).await.expect("send failed");
+        client_egress_tx.send(vec![pkt]).await.expect("send failed");
 
         // Verify receipt
-        let batch = tokio::time::timeout(Duration::from_secs(5), server_packet_rx.recv())
+        let batch = tokio::time::timeout(Duration::from_secs(5), server_router_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
@@ -2008,7 +2008,7 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_bidirectional() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
 
@@ -2049,7 +2049,7 @@ mod tests {
 
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = listener_events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
@@ -2076,10 +2076,10 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (server_to_client_tx, mut client_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (s2c_router_tx, mut s2c_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _client_rx_handle = spawn_h3_rx(
             client_rx,
-            server_to_client_tx,
+            s2c_router_tx,
             events_tx.clone(),
             metrics_interval,
         );
@@ -2096,9 +2096,8 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (client_to_server_tx, mut server_packet_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
-        let _server_rx_handle =
-            spawn_h3_rx(server_rx, client_to_server_tx, events_tx, metrics_interval);
+        let (c2s_router_tx, mut c2s_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let _server_rx_handle = spawn_h3_rx(server_rx, c2s_router_tx, events_tx, metrics_interval);
 
         // Test client -> server
         let packet_c2s = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
@@ -2107,7 +2106,7 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_c2s = tokio::time::timeout(Duration::from_secs(5), server_packet_rx.recv())
+        let batch_c2s = tokio::time::timeout(Duration::from_secs(5), c2s_router_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
@@ -2121,7 +2120,7 @@ mod tests {
             .await
             .unwrap();
 
-        let batch_s2c = tokio::time::timeout(Duration::from_secs(5), client_packet_rx.recv())
+        let batch_s2c = tokio::time::timeout(Duration::from_secs(5), s2c_router_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
@@ -2133,7 +2132,7 @@ mod tests {
 
     #[tokio::test]
     async fn connection_graceful_shutdown() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -2172,7 +2171,7 @@ mod tests {
 
         let _server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
@@ -2210,7 +2209,7 @@ mod tests {
     /// a batch of packets that all succeed via try_send -> 1 batch count.
     #[tokio::test]
     async fn h3_tx_batch_counting_try_send() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
         use crate::tun::alloc_packet_buf;
         use tokio_util::sync::PollSender;
 
@@ -2229,7 +2228,7 @@ mod tests {
             quic_cmd_send,
         };
 
-        let (packet_tx, tx_handle) = spawn_h3_tx(
+        let (egress_tx, tx_handle) = spawn_h3_tx(
             tx,
             events_tx,
             Duration::from_millis(50), // short interval for metrics emission
@@ -2243,12 +2242,12 @@ mod tests {
         // Send a batch of 5 packets — capacity=64 so all try_send succeed.
         let payload = vec![0u8; 100];
         let batch: Vec<PooledBuf> = (0..5).map(|_| alloc_packet_buf(&payload)).collect();
-        packet_tx.send(batch).await.unwrap();
+        egress_tx.send(batch).await.unwrap();
 
         // Wait for a metrics tick.
         let metrics = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(Event::Transport(TransportEvent::Metrics(m))) = events_rx.recv().await {
+                if let Some(Event::Metrics(m)) = events_rx.recv().await {
                     if m.stats.succeeded.packets > 0 {
                         return m;
                     }
@@ -2264,7 +2263,7 @@ mod tests {
         // No queue-full events.
         assert_eq!(metrics.stats.congestion.queue_full_count, 0);
 
-        drop(packet_tx);
+        drop(egress_tx);
         let _ = tx_handle.await;
         drain.abort();
     }
@@ -2274,7 +2273,7 @@ mod tests {
     /// 2. Splits the batch into multiple segments (batch count > 1)
     #[tokio::test]
     async fn h3_tx_backpressure_splits_batch() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
         use crate::tun::alloc_packet_buf;
         use tokio_util::sync::PollSender;
 
@@ -2293,7 +2292,7 @@ mod tests {
             quic_cmd_send,
         };
 
-        let (packet_tx, tx_handle) = spawn_h3_tx(
+        let (egress_tx, tx_handle) = spawn_h3_tx(
             tx,
             events_tx,
             Duration::from_millis(50),
@@ -2314,12 +2313,12 @@ mod tests {
         // Send batch of 3 packets with capacity=1 -> at least 2 backpressure events.
         let payload = vec![0u8; 100];
         let batch: Vec<PooledBuf> = (0..3).map(|_| alloc_packet_buf(&payload)).collect();
-        packet_tx.send(batch).await.unwrap();
+        egress_tx.send(batch).await.unwrap();
 
         // Wait for metrics.
         let metrics = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(Event::Transport(TransportEvent::Metrics(m))) = events_rx.recv().await {
+                if let Some(Event::Metrics(m)) = events_rx.recv().await {
                     if m.stats.succeeded.packets >= 3 {
                         return m;
                     }
@@ -2343,7 +2342,7 @@ mod tests {
         );
         assert!(metrics.stats.congestion.queue_full_duration > Duration::ZERO);
 
-        drop(packet_tx);
+        drop(egress_tx);
         let _ = tx_handle.await;
         drain.abort();
     }

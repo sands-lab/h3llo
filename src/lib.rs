@@ -10,9 +10,10 @@ pub mod dns;
 pub mod events;
 pub mod h3;
 mod helpers;
-mod metrics;
+pub mod metrics;
 pub mod orch;
 pub mod route;
+pub mod router;
 pub mod tun;
 
 /// Test utilities module exposed via the `test-utils` feature.

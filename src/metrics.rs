@@ -1,28 +1,176 @@
-//! Shared counters for transport receive/transmit loops.
+//! Metrics data model and shared counters for transport receive/transmit loops.
 //!
-//! Also provides formatting helpers for periodic metrics logging
-//! and QUIC-level metrics collection via `foundations`.
+//! Owns the metrics type hierarchy (`Source`, `Direction`, `DropReason`,
+//! `PktCounters`, `CongestionStats`, `Stats`, `Labels`, `Metrics`) and
+//! provides formatting helpers for periodic metrics logging and QUIC-level
+//! metrics collection via `foundations`.
 
-use crate::events::{
-    Direction, DropReason, TransportKind, TransportLabels, TransportMetrics, TransportStats,
-};
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tracing::debug;
 
-/// Tracks counters for a transport direction.
-pub(crate) struct TransportCounters {
-    kind: TransportKind,
-    direction: Direction,
-    stats: TransportStats,
+// ---------------------------------------------------------------------------
+// Metrics data model
+// ---------------------------------------------------------------------------
+
+/// Identifies the origin of packets for metrics and routing policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Source {
+    /// TUN interface.
+    Tun,
+    /// BareUDP socket.
+    BareUdp,
+    /// HTTP/3 transport.
+    Http3,
+    /// Router actor (forwarding path).
+    Router,
 }
 
-impl TransportCounters {
-    /// Builds counters for the given transport kind and direction.
-    pub(crate) fn new(transport: TransportKind, direction: Direction) -> Self {
+/// Indicates whether metrics were collected on the receive or transmit path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Direction {
+    /// Metrics from the receive side.
+    Rx,
+    /// Metrics from the transmit side.
+    Tx,
+}
+
+/// Enumerates reasons for packet drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DropReason {
+    /// Packet exceeded the MTU.
+    Oversize,
+    /// Packet failed allowlist checks (e.g., source IP).
+    DisallowedSource,
+    /// Sending the packet failed.
+    SendError,
+    /// Packet could not be forwarded because the channel closed.
+    ChannelClosed,
+    /// Packet has unknown or invalid IP version.
+    InvalidIpVersion,
+    /// DATAGRAM framing error (e.g., invalid Context ID).
+    InvalidFraming,
+    /// No route found for destination IP.
+    NoRoute,
+    /// No peer channel available for the route.
+    NoPeerChannel,
+    /// PooledBuf lacked headroom for datagram prefix insertion.
+    NoHeadroom,
+    /// Packet's TTL/hop limit reached zero (forwarded to TUN for ICMP generation).
+    TtlExpired,
+}
+
+/// Tracks cumulative wait events caused by backpressure or I/O congestion.
+///
+/// Each field pair captures an event count and the total time spent waiting.
+/// These metrics are separate from drop accounting because the affected packets
+/// are ultimately delivered — they are merely delayed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CongestionStats {
+    /// Number of times a bounded mpsc `try_send` found the queue full.
+    pub queue_full_count: u64,
+    /// Cumulative wall-clock time spent waiting for queue capacity
+    /// (from `try_send` failure to `send().await` completion).
+    pub queue_full_duration: Duration,
+    /// Number of times a socket I/O operation returned `WouldBlock`.
+    pub would_block_count: u64,
+    /// Cumulative wall-clock time spent retrying after `WouldBlock`
+    /// (from first `WouldBlock` to eventual I/O success).
+    pub would_block_duration: Duration,
+}
+
+impl CongestionStats {
+    /// Records a queue-full wait event with its duration, saturating on overflow.
+    pub fn record_queue_full(&mut self, wait: Duration) {
+        self.queue_full_count = self.queue_full_count.saturating_add(1);
+        self.queue_full_duration = self.queue_full_duration.saturating_add(wait);
+    }
+
+    /// Records a WouldBlock wait event with its duration, saturating on overflow.
+    pub fn record_would_block(&mut self, wait: Duration) {
+        self.would_block_count = self.would_block_count.saturating_add(1);
+        self.would_block_duration = self.would_block_duration.saturating_add(wait);
+    }
+}
+
+/// Aggregates packet counters by outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PktCounters {
+    /// Number of batch operations (`record()` invocations).
+    pub batches: u64,
+    /// Number of packets observed.
+    pub packets: u64,
+    /// Total bytes observed.
+    pub bytes: u64,
+}
+
+impl PktCounters {
+    /// Records a batch of packets, saturating on overflow.
+    ///
+    /// For single-packet recording, pass `count = 1`.
+    /// Each call increments `batches` by 1, representing one `record()`
+    /// invocation for GSO/GRO effectiveness tracking.
+    pub fn record(&mut self, count: u64, total_bytes: u64) {
+        self.batches = self.batches.saturating_add(1);
+        self.packets = self.packets.saturating_add(count);
+        self.bytes = self.bytes.saturating_add(total_bytes);
+    }
+}
+
+/// Collects per-source statistics including drop breakdowns.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Stats {
+    /// Successful packet counters.
+    pub succeeded: PktCounters,
+    /// Dropped packet counters.
+    pub dropped: PktCounters,
+    /// Drop counters keyed by reason.
+    pub drop_reasons: HashMap<DropReason, PktCounters>,
+    /// Backpressure and I/O congestion wait counters.
+    pub congestion: CongestionStats,
+}
+
+/// Labels attached to transport metrics for grouping.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Labels {
+    /// Packet source (TUN, BareUDP, HTTP/3, Router).
+    pub source: Source,
+    /// Direction (receive or transmit) of the collected metrics.
+    pub direction: Direction,
+    /// Optional peer identifier when the transport is peer-scoped.
+    pub peer_id: Option<String>,
+    /// Optional remote socket address for per-connection disambiguation.
+    pub remote_addr: Option<SocketAddr>,
+}
+
+/// Carries cumulative counters collected from a transport loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Metrics {
+    /// Labels describing the metric dimensions.
+    pub labels: Labels,
+    /// Aggregated statistics with drop breakdown.
+    pub stats: Stats,
+}
+
+// ---------------------------------------------------------------------------
+// Counters (operational layer)
+// ---------------------------------------------------------------------------
+
+/// Tracks counters for a source direction.
+pub(crate) struct Counters {
+    source: Source,
+    direction: Direction,
+    stats: Stats,
+}
+
+impl Counters {
+    /// Builds counters for the given source and direction.
+    pub(crate) fn new(source: Source, direction: Direction) -> Self {
         Self {
-            kind: transport,
+            source,
             direction,
-            stats: TransportStats::default(),
+            stats: Stats::default(),
         }
     }
 
@@ -60,10 +208,10 @@ impl TransportCounters {
         &self,
         peer_id: Option<&str>,
         remote_addr: Option<SocketAddr>,
-    ) -> TransportMetrics {
-        TransportMetrics {
-            labels: TransportLabels {
-                kind: self.kind,
+    ) -> Metrics {
+        Metrics {
+            labels: Labels {
+                source: self.source,
                 direction: self.direction,
                 peer_id: peer_id.map(str::to_string),
                 remote_addr,
@@ -72,6 +220,10 @@ impl TransportCounters {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Channel backpressure helper
+// ---------------------------------------------------------------------------
 
 /// Event stream emitted by `send_with_backpressure`.
 pub(crate) enum SendEvent {
@@ -120,11 +272,15 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// Logging helpers
+// ---------------------------------------------------------------------------
+
 /// Logs a transport metrics snapshot at `debug!` level.
 ///
 /// Prints succeeded/dropped batch/packet/byte totals and per-reason
 /// drop breakdowns when any drops are present.
-pub(crate) fn log_transport_metrics(metrics: &TransportMetrics) {
+pub(crate) fn log_transport_metrics(metrics: &Metrics) {
     let labels = &metrics.labels;
     let stats = &metrics.stats;
     let remote = labels
@@ -134,7 +290,7 @@ pub(crate) fn log_transport_metrics(metrics: &TransportMetrics) {
     debug!(
         "{:?} {:?} {} {}: {} batches/{} pkts/{} bytes ok, \
          {} batches/{} pkts/{} bytes dropped",
-        labels.kind,
+        labels.source,
         labels.direction,
         labels.peer_id.as_deref().unwrap_or("local"),
         remote,
@@ -193,16 +349,99 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
+    // -- PktCounters tests --
+
+    #[test]
+    fn pkt_counters_record_batch() {
+        let mut c = PktCounters::default();
+        c.record(3, 150);
+        assert_eq!(c.batches, 1);
+        assert_eq!(c.packets, 3);
+        assert_eq!(c.bytes, 150);
+    }
+
+    #[test]
+    fn pkt_counters_record_single() {
+        let mut c = PktCounters::default();
+        c.record(1, 64);
+        assert_eq!(c.batches, 1);
+        assert_eq!(c.packets, 1);
+        assert_eq!(c.bytes, 64);
+    }
+
+    #[test]
+    fn pkt_counters_saturates() {
+        let mut c = PktCounters {
+            batches: u64::MAX - 1,
+            packets: u64::MAX - 1,
+            bytes: u64::MAX - 1,
+        };
+        c.record(5, 100);
+        assert_eq!(c.batches, u64::MAX);
+        assert_eq!(c.packets, u64::MAX);
+        assert_eq!(c.bytes, u64::MAX);
+    }
+
+    #[test]
+    fn pkt_counters_multiple_batches() {
+        let mut c = PktCounters::default();
+        c.record(10, 1000);
+        c.record(5, 500);
+        c.record(1, 100);
+        assert_eq!(c.batches, 3);
+        assert_eq!(c.packets, 16);
+        assert_eq!(c.bytes, 1600);
+    }
+
+    // -- CongestionStats tests --
+
+    #[test]
+    fn congestion_stats_record_queue_full() {
+        let mut c = CongestionStats::default();
+        c.record_queue_full(Duration::from_millis(5));
+        c.record_queue_full(Duration::from_millis(10));
+        assert_eq!(c.queue_full_count, 2);
+        assert_eq!(c.queue_full_duration, Duration::from_millis(15));
+        assert_eq!(c.would_block_count, 0);
+    }
+
+    #[test]
+    fn congestion_stats_record_would_block() {
+        let mut c = CongestionStats::default();
+        c.record_would_block(Duration::from_micros(100));
+        assert_eq!(c.would_block_count, 1);
+        assert_eq!(c.would_block_duration, Duration::from_micros(100));
+        assert_eq!(c.queue_full_count, 0);
+    }
+
+    #[test]
+    fn congestion_stats_saturates() {
+        let mut c = CongestionStats {
+            queue_full_count: u64::MAX - 1,
+            queue_full_duration: Duration::MAX,
+            would_block_count: u64::MAX - 1,
+            would_block_duration: Duration::MAX,
+        };
+        c.record_queue_full(Duration::from_secs(1));
+        assert_eq!(c.queue_full_count, u64::MAX);
+        assert_eq!(c.queue_full_duration, Duration::MAX);
+        c.record_would_block(Duration::from_secs(1));
+        assert_eq!(c.would_block_count, u64::MAX);
+        assert_eq!(c.would_block_duration, Duration::MAX);
+    }
+
+    // -- log_transport_metrics tests --
+
     #[test]
     fn log_transport_metrics_zero_stats() {
-        let metrics = TransportMetrics {
-            labels: TransportLabels {
-                kind: TransportKind::Tun,
+        let metrics = Metrics {
+            labels: Labels {
+                source: Source::Tun,
                 direction: Direction::Rx,
                 peer_id: None,
                 remote_addr: None,
             },
-            stats: TransportStats::default(),
+            stats: Stats::default(),
         };
         // Should not panic; exercises the zero-drops fast path (skips drop_reasons).
         log_transport_metrics(&metrics);
@@ -210,7 +449,7 @@ mod tests {
 
     #[test]
     fn log_transport_metrics_with_drops() {
-        let mut stats = TransportStats::default();
+        let mut stats = Stats::default();
         stats.succeeded.record(10, 5000);
         stats.dropped.record(2, 300);
         stats
@@ -219,9 +458,9 @@ mod tests {
             .or_default()
             .record(2, 300);
 
-        let metrics = TransportMetrics {
-            labels: TransportLabels {
-                kind: TransportKind::BareUdp,
+        let metrics = Metrics {
+            labels: Labels {
+                source: Source::BareUdp,
                 direction: Direction::Tx,
                 peer_id: Some("peer1".to_string()),
                 remote_addr: None,
@@ -231,6 +470,8 @@ mod tests {
         // Should not panic; exercises the drop-reason iteration branch.
         log_transport_metrics(&metrics);
     }
+
+    // -- send_with_backpressure tests --
 
     #[tokio::test]
     async fn send_with_backpressure_fast_path() {

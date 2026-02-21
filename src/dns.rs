@@ -1026,7 +1026,7 @@ mod tests {
         assert!(
             snapshot
                 .get("truncated.example")
-                .map_or(true, |ips| ips.is_empty()),
+                .is_none_or(|ips| ips.is_empty()),
             "initial snapshot should have no IPs"
         );
 

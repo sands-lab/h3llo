@@ -101,6 +101,13 @@ pub enum ActorError {
         /// Failure reason.
         reason: String,
     },
+
+    /// Router actor exited unexpectedly.
+    #[error("router: fatal error: {reason}")]
+    RouterFailed {
+        /// Failure reason.
+        reason: String,
+    },
 }
 
 impl ActorError {
@@ -113,6 +120,7 @@ impl ActorError {
             ActorError::BareRxRecv { .. } => ActorKind::Critical,
             ActorError::DnsRecv { .. } => ActorKind::Critical,
             ActorError::ApiServer { .. } => ActorKind::Critical,
+            ActorError::RouterFailed { .. } => ActorKind::Critical,
             // Restartable actors - could be reconnected (future work)
             ActorError::BareTxSend { .. } => ActorKind::Restartable,
             ActorError::H3RxRecv { .. } => ActorKind::Restartable,
@@ -130,19 +138,19 @@ mod tests {
         let errors = vec![
             ActorError::TunRxRecv {
                 name: "tun0".into(),
-                source: io::Error::new(io::ErrorKind::Other, "test"),
+                source: io::Error::other("test"),
             },
             ActorError::TunTxSend {
                 name: "tun0".into(),
-                source: io::Error::new(io::ErrorKind::Other, "test"),
+                source: io::Error::other("test"),
             },
             ActorError::BareRxRecv {
                 addr: "0.0.0.0:5353".into(),
-                source: io::Error::new(io::ErrorKind::Other, "test"),
+                source: io::Error::other("test"),
             },
             ActorError::DnsRecv {
                 server: "8.8.8.8:53".into(),
-                source: io::Error::new(io::ErrorKind::Other, "test"),
+                source: io::Error::other("test"),
             },
             ActorError::ApiServer {
                 addr: "127.0.0.1:9090".into(),
@@ -164,7 +172,7 @@ mod tests {
         let errors = vec![
             ActorError::BareTxSend {
                 dest: "1.2.3.4:5353".into(),
-                source: io::Error::new(io::ErrorKind::Other, "test"),
+                source: io::Error::other("test"),
             },
             ActorError::H3RxRecv {
                 peer_id: "peer-1".into(),
@@ -189,7 +197,7 @@ mod tests {
     fn actor_error_display_includes_context() {
         let err = ActorError::TunRxRecv {
             name: "tun0".to_string(),
-            source: io::Error::new(io::ErrorKind::Other, "test"),
+            source: io::Error::other("test"),
         };
         let msg = err.to_string();
         assert!(msg.contains("tun_rx"));
@@ -201,7 +209,7 @@ mod tests {
     fn actor_error_bare_tx_includes_dest() {
         let err = ActorError::BareTxSend {
             dest: "192.168.1.1:5353".to_string(),
-            source: io::Error::new(io::ErrorKind::Other, "test"),
+            source: io::Error::other("test"),
         };
         let msg = err.to_string();
         assert!(msg.contains("bare_tx"));

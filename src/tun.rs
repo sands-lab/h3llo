@@ -1,16 +1,13 @@
 //! TUN management: device creation, read/write loops with backpressure, and metrics reporting.
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::config::{LocalTun, Peer};
-use crate::events::{Direction, DropReason, Event, TransportEvent, TransportKind};
-use crate::helpers::extract_dst_ip;
+use crate::config::LocalTun;
+use crate::events::Event;
 use crate::helpers::retry_on_transient;
-use crate::metrics::{send_with_backpressure, SendEvent, TransportCounters};
+use crate::metrics::{send_with_backpressure, Counters, Direction, DropReason, SendEvent, Source};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use ipnet_trie::IpnetTrie;
-use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -18,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
-use tracing::{info, warn};
+use tracing::info;
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -478,193 +475,6 @@ pub enum TunError {
     DeviceBuild(String),
 }
 
-// ============================================================================
-// Routing table (migrated from routing.rs)
-// ============================================================================
-
-fn log_duplicate_allowed(peer_id: &str, cidr: &str) {
-    warn!(
-        "duplicate allowed_ips '{}' for peer '{}'; keeping the first entry",
-        cidr, peer_id
-    );
-}
-
-/// Stores routing metadata for a prefix, including the channel to forward packets.
-#[derive(Clone)]
-pub struct RouteEntry {
-    /// Identifier of the peer owning the prefix.
-    pub peer_id: String,
-    /// Channel to send packet batches to this peer.
-    pub tx: mpsc::Sender<Vec<PooledBuf>>,
-}
-
-impl std::fmt::Debug for RouteEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RouteEntry")
-            .field("peer_id", &self.peer_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for RouteEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.peer_id == other.peer_id
-    }
-}
-
-impl Eq for RouteEntry {}
-
-/// Represents the result of a longest-prefix lookup.
-#[derive(Debug, Clone)]
-pub struct RouteMatch<'a> {
-    /// Matched prefix.
-    pub prefix: IpNet,
-    /// Identifier of the peer selected by the lookup.
-    pub peer_id: &'a str,
-    /// Channel to send packet batches to this peer.
-    pub tx: &'a mpsc::Sender<Vec<PooledBuf>>,
-}
-
-/// In-memory routing table supporting IPv4 and IPv6 longest-prefix matches.
-#[derive(Clone)]
-pub struct RoutingTable {
-    trie: IpnetTrie<RouteEntry>,
-}
-
-impl std::fmt::Debug for RoutingTable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RoutingTable")
-            .field("len", &self.trie.len())
-            .finish()
-    }
-}
-
-impl Default for RoutingTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RoutingTable {
-    /// Creates an empty routing table.
-    pub fn new() -> Self {
-        Self {
-            trie: IpnetTrie::new(),
-        }
-    }
-
-    /// Builds a routing table from peers with their TX channels.
-    ///
-    /// # Arguments
-    ///
-    /// * `peers` - Peer configurations.
-    /// * `peer_txs` - Map of peer ID to TX channel. Peers without a channel are skipped.
-    ///
-    /// # Errors
-    ///
-    /// Returns `RoutingError::ConflictingPrefix` when a prefix conflicts with an existing peer.
-    pub fn from_peers(
-        peers: &[Peer],
-        peer_txs: &HashMap<String, mpsc::Sender<Vec<PooledBuf>>>,
-    ) -> Result<Self, RoutingError> {
-        let mut table = RoutingTable::new();
-
-        for peer in peers {
-            let Some(tx) = peer_txs.get(&peer.id) else {
-                warn!(
-                    "peer '{}' has no TX channel; skipping route registration",
-                    peer.id
-                );
-                continue;
-            };
-
-            // allowed_ips is pre-parsed as Vec<IpNet> during config deserialization
-            for net in &peer.tun.allowed_ips {
-                table.insert(
-                    *net,
-                    RouteEntry {
-                        peer_id: peer.id.clone(),
-                        tx: tx.clone(),
-                    },
-                )?;
-            }
-        }
-
-        Ok(table)
-    }
-
-    /// Inserts a prefix and associated peer into the table, rejecting conflicting owners.
-    ///
-    /// # Errors
-    ///
-    /// Returns `RoutingError::ConflictingPrefix` when the prefix already belongs to another peer.
-    pub fn insert(&mut self, prefix: IpNet, entry: RouteEntry) -> Result<(), RoutingError> {
-        if let Some(existing) = self.trie.exact_match(prefix) {
-            if existing.peer_id == entry.peer_id {
-                log_duplicate_allowed(&entry.peer_id, &prefix.to_string());
-                return Ok(());
-            }
-
-            return Err(RoutingError::ConflictingPrefix {
-                prefix,
-                existing_peer_id: existing.peer_id.clone(),
-                new_peer_id: entry.peer_id,
-            });
-        }
-
-        self.trie.insert(prefix, entry);
-        Ok(())
-    }
-
-    /// Performs a longest-prefix match for the provided address.
-    pub fn lookup(&self, addr: IpAddr) -> Option<RouteMatch<'_>> {
-        let net = IpNet::from(addr);
-        self.trie
-            .longest_match(&net)
-            .map(|(prefix, entry)| RouteMatch {
-                prefix,
-                peer_id: entry.peer_id.as_str(),
-                tx: &entry.tx,
-            })
-    }
-
-    /// Returns the number of IPv4 and IPv6 prefixes stored.
-    pub fn len(&self) -> (usize, usize) {
-        self.trie.len()
-    }
-
-    /// Returns true when no prefixes are present.
-    pub fn is_empty(&self) -> bool {
-        self.trie.is_empty()
-    }
-}
-
-/// Commands accepted by the TUN receive loop.
-#[derive(Debug, Clone)]
-pub enum TunRxCommand {
-    /// Replace the routing table atomically.
-    UpdateRouting {
-        /// New routing table (includes embedded TX channels).
-        routing: RoutingTable,
-    },
-}
-
-/// Routing table construction or lookup error.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum RoutingError {
-    // Note: InvalidAllowedIp variant removed - parsing now happens during config deserialization.
-    /// Two peers claim the same prefix.
-    #[error("prefix {prefix} already assigned to peer '{existing_peer_id}', cannot assign to '{new_peer_id}'")]
-    ConflictingPrefix {
-        /// Prefix that was duplicated.
-        prefix: IpNet,
-        /// Existing owner of the prefix.
-        existing_peer_id: String,
-        /// New peer that attempted to claim the prefix.
-        new_peer_id: String,
-    },
-}
-
 /// Groups pre-parsed CIDR networks by IP version.
 fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
     let mut v4 = Vec::new();
@@ -680,33 +490,27 @@ fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
 
 /// Spawns the TUN read loop.
 ///
-/// Creates an unbounded command channel internally (actor owns the receiver).
-/// Returns the command sender and join handle.
+/// TUN Rx is a pure packet producer. Reads batches from the TUN device
+/// and forwards them to the router actor. No routing logic.
 ///
 /// # Arguments
 ///
 /// * `tun` - TUN device reader.
-/// * `routing` - Initial routing table for destination lookups.
+/// * `output_tx` - Bounded sender to the router actor's outbound channel.
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
-#[allow(dead_code)]
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
-    mut routing: RoutingTable,
+    output_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
-) -> (
-    mpsc::UnboundedSender<TunRxCommand>,
-    JoinHandle<ActorExitResult>,
-) {
-    // Actor creates and owns its command channel receiver
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+) -> JoinHandle<ActorExitResult> {
     let tun_name = tun.name().to_string();
     let batch_size = tun.batch_size();
     let scratch_buf_size = tun.scratch_buf_size();
 
-    let handle = tokio::spawn(async move {
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Rx);
+    tokio::spawn(async move {
+        let mut counters = Counters::new(Source::Tun, Direction::Rx);
         let mut ticker = time::interval(interval);
         let mtu = tun.mtu();
 
@@ -720,47 +524,30 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                     match result {
                         Ok(count) => {
                             let count = count.min(batch_size);
-                            // First-packet routing: GSO guarantees all packets in
-                            // a batch belong to the same flow (same 5-tuple).
-                            let first_idx = (0..count).find(|&i| sizes[i] > 0);
-                            let Some(first_idx) = first_idx else {
-                                continue;
-                            };
-
-                            let first_packet = std::mem::replace(&mut bufs[first_idx], TunBuf::alloc_uninit(mtu))
-                                .into_pooled(sizes[first_idx]);
-                            let total_bytes: u64 = sizes[..count].iter().map(|&s| s as u64).sum();
-                            let Some(dest) = extract_dst_ip(&first_packet) else {
-                                counters.record_drop(DropReason::InvalidIpVersion, count as u64, total_bytes);
-                                continue;
-                            };
-
-                            let Some(route) = routing.lookup(dest) else {
-                                counters.record_drop(DropReason::NoRoute, count as u64, total_bytes);
-                                continue;
-                            };
-
                             let mut batch = Vec::with_capacity(count);
-                            batch.push(first_packet);
                             for i in 0..count {
-                                if i != first_idx && sizes[i] > 0 {
+                                if sizes[i] > 0 {
                                     batch.push(
                                         std::mem::replace(&mut bufs[i], TunBuf::alloc_uninit(mtu))
                                             .into_pooled(sizes[i]),
                                     );
                                 }
                             }
-
-                            if send_with_backpressure(route.tx, batch, |event| match event {
+                            if batch.is_empty() {
+                                continue;
+                            }
+                            let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
+                            let pkt_count = batch.len() as u64;
+                            if send_with_backpressure(&output_tx, batch, |event| match event {
                                 SendEvent::Waited(waited) => counters.record_queue_full(waited),
                                 SendEvent::Fast | SendEvent::Full => {}
                             })
                             .await
                             .is_err()
                             {
-                                counters.record_drop(DropReason::ChannelClosed, count as u64, total_bytes);
+                                counters.record_drop(DropReason::ChannelClosed, pkt_count, total_bytes);
                             } else {
-                                counters.record_success(count as u64, total_bytes);
+                                counters.record_success(pkt_count, total_bytes);
                             }
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -769,31 +556,20 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                         }
                     }
                 }
-                cmd = cmd_rx.recv() => {
-                    let Some(command) = cmd else {
-                        return Ok(()); // Channel closed, exit gracefully
-                    };
-                    // Single-variant enum: destructure directly
-                    let TunRxCommand::UpdateRouting { routing: new_routing } = command;
-                    routing = new_routing;
-                }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
+                    if events_tx.send(Event::Metrics(counters.snapshot(None, None))).is_err() {
                         return Ok(()); // Events channel closed during shutdown
                     }
                 }
             }
         }
-    });
-
-    (cmd_tx, handle)
+    })
 }
 
 /// Spawns the TUN write loop, dropping oversize packets with counting and emitting TX metrics.
 ///
 /// Creates a bounded packet channel internally (actor owns the receiver).
 /// Returns the packet sender and join handle.
-#[allow(dead_code)]
 pub(crate) fn spawn_tun_tx<T: TunTx>(
     mut tun: T,
     events_tx: mpsc::UnboundedSender<Event>,
@@ -801,17 +577,17 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     packet_queue_depth: usize,
 ) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
+    let (input_tx, mut input_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
     let tun_name = tun.name().to_string();
 
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
-        let mut counters = TransportCounters::new(TransportKind::Tun, Direction::Tx);
+        let mut counters = Counters::new(Source::Tun, Direction::Tx);
         let mut ticker = time::interval(interval);
 
         loop {
             tokio::select! {
-                maybe_batch = packet_rx.recv() => {
+                maybe_batch = input_rx.recv() => {
                     let Some(packets) = maybe_batch else {
                         return Ok(()); // Channel closed, exit gracefully
                     };
@@ -844,7 +620,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Transport(TransportEvent::Metrics(counters.snapshot(None, None)))).is_err() {
+                    if events_tx.send(Event::Metrics(counters.snapshot(None, None))).is_err() {
                         return Ok(()); // Events channel closed during shutdown
                     }
                 }
@@ -852,7 +628,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
         }
     });
 
-    (packet_tx, handle)
+    (input_tx, handle)
 }
 
 // ============================================================================
@@ -1035,42 +811,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tun_rx_pushes_packets_and_counts() {
+    async fn tun_rx_forwards_batch_to_router() {
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem0", 64);
-        let (peer_tx, mut peer_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
+        let (output_tx, mut output_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
-        // Setup routing: 192.0.2.0/24 -> peer1
-        let peer_config = Peer {
-            id: "peer1".to_string(),
-
-            h3: None,
-            bare: None,
-            tun: PeerTun {
-                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
-            },
-        };
-        let mut peer_txs = HashMap::new();
-        peer_txs.insert("peer1".to_string(), peer_tx);
-        let routing = RoutingTable::from_peers(&[peer_config], &peer_txs).unwrap();
-
-        let (_cmd_tx, tun_rx_task) =
-            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_millis(10));
+        let tun_rx_task = spawn_tun_rx(rx_tun, output_tx, events_tx, Duration::from_millis(10));
 
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
-        let batch = peer_rx
+        let batch = output_rx
             .recv()
             .await
-            .expect("batch should be routed to peer");
+            .expect("router should receive message");
         assert_eq!(batch.len(), 1);
         assert_eq!(&batch[0][..], &ipv4_packet[..]);
 
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                if let Event::Metrics(m) = event {
                     if m.labels.direction == Direction::Rx && m.stats.succeeded.packets >= 1 {
                         snapshot = Some(m);
                         break;
@@ -1083,10 +844,8 @@ mod tests {
         tun_rx_task.abort();
 
         let metrics = snapshot.expect("rx metrics should arrive");
-        assert_eq!(metrics.labels.kind, TransportKind::Tun);
+        assert_eq!(metrics.labels.source, Source::Tun);
         assert_eq!(metrics.labels.direction, Direction::Rx);
-        assert_eq!(metrics.labels.peer_id, None);
-        assert_eq!(metrics.labels.remote_addr, None);
         assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 20);
@@ -1096,14 +855,14 @@ mod tests {
     async fn tun_tx_drops_oversize_and_reports_metrics() {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) = memory_tun("mem1", 4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (packet_tx, tun_tx_task) =
+        let (input_tx, tun_tx_task) =
             spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(10), 256);
 
-        packet_tx
+        input_tx
             .send(vec![BufFactory::buf_from_slice(&[0, 1, 2, 3, 4, 5])])
             .await
             .unwrap();
-        packet_tx
+        input_tx
             .send(vec![BufFactory::buf_from_slice(&[9, 9, 9])])
             .await
             .unwrap();
@@ -1115,7 +874,7 @@ mod tests {
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                if let Event::Metrics(m) = event {
                     if m.labels.direction == Direction::Tx
                         && m.stats.succeeded.packets >= 1
                         && m.stats.dropped.packets >= 1
@@ -1131,7 +890,7 @@ mod tests {
         tun_tx_task.abort();
 
         let metrics = snapshot.expect("tx metrics should arrive");
-        assert_eq!(metrics.labels.kind, TransportKind::Tun);
+        assert_eq!(metrics.labels.source, Source::Tun);
         assert_eq!(metrics.labels.direction, Direction::Tx);
         assert_eq!(metrics.labels.peer_id, None);
         assert_eq!(metrics.labels.remote_addr, None);
@@ -1156,10 +915,10 @@ mod tests {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) =
             memory_tun_with_errors("mem-interrupt", 16, vec![std::io::ErrorKind::Interrupted]);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (packet_tx, tun_tx_task) =
+        let (input_tx, tun_tx_task) =
             spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(5), 256);
 
-        packet_tx
+        input_tx
             .send(vec![BufFactory::buf_from_slice(&[1, 2, 3])])
             .await
             .unwrap();
@@ -1169,7 +928,7 @@ mod tests {
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::Metrics(m)) = event {
+                if let Event::Metrics(m) = event {
                     if m.labels.direction == Direction::Tx && m.stats.succeeded.packets >= 1 {
                         return Some(m);
                     }
@@ -1183,7 +942,7 @@ mod tests {
 
         tun_tx_task.abort();
 
-        assert_eq!(metrics.labels.kind, TransportKind::Tun);
+        assert_eq!(metrics.labels.source, Source::Tun);
         assert_eq!(metrics.labels.direction, Direction::Tx);
         assert_eq!(metrics.labels.peer_id, None);
         assert_eq!(metrics.labels.remote_addr, None);
@@ -1192,203 +951,17 @@ mod tests {
         assert_eq!(metrics.stats.dropped.packets, 0);
     }
 
-    // ========================================================================
-    // Routing table tests (migrated from routing.rs)
-    // ========================================================================
-
-    use crate::config::{PeerBare, PeerTun, UdpEndpoint};
-
-    fn bare_peer(id: &str, allowed: &[&str]) -> Peer {
-        Peer {
-            id: id.to_string(),
-            h3: None,
-            bare: Some(PeerBare {
-                endpoint: UdpEndpoint {
-                    host: "127.0.0.1".to_string(),
-                    port: 5353,
-                },
-                bindif: None,
-            }),
-            tun: PeerTun {
-                allowed_ips: allowed.iter().map(|s| s.parse().unwrap()).collect(),
-            },
-        }
-    }
-
-    /// Creates dummy peer TX channels for routing table tests.
-    fn dummy_peer_txs(peer_ids: &[&str]) -> HashMap<String, mpsc::Sender<Vec<PooledBuf>>> {
-        peer_ids
-            .iter()
-            .map(|id| {
-                let (tx, _rx) = mpsc::channel(1);
-                (id.to_string(), tx)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn chooses_longest_prefix() {
-        let peers = vec![
-            bare_peer("peer-a", &["10.0.0.0/16"]),
-            bare_peer("peer-b", &["10.0.0.0/24"]),
-        ];
-        let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
-        let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
-        let result = table
-            .lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42)))
-            .expect("lookup should succeed");
-        assert_eq!(result.peer_id, "peer-b");
-        assert_eq!(result.prefix, "10.0.0.0/24".parse::<IpNet>().unwrap());
-    }
-
-    #[test]
-    fn errors_on_conflicting_prefix_ownership() {
-        let peers = vec![
-            bare_peer("peer-a", &["10.0.0.0/24"]),
-            bare_peer("peer-b", &["10.0.0.0/24"]),
-        ];
-        let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
-        let err = RoutingTable::from_peers(&peers, &peer_txs).unwrap_err();
-        assert!(matches!(
-            err,
-            RoutingError::ConflictingPrefix {
-                existing_peer_id,
-                new_peer_id,
-                ..
-            } if existing_peer_id == "peer-a" && new_peer_id == "peer-b"
-        ));
-    }
-
-    #[test]
-    fn skips_duplicate_prefixes_within_peer() {
-        let peers = vec![bare_peer("peer-a", &["10.0.0.0/24", "10.0.0.0/24"])];
-        let peer_txs = dummy_peer_txs(&["peer-a"]);
-        let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
-        assert_eq!(table.len(), (1, 0));
-        let result = table
-            .lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
-            .expect("lookup should succeed");
-        assert_eq!(result.peer_id, "peer-a");
-    }
-
-    #[tokio::test]
-    async fn tun_rx_updates_routing_via_command() {
-        let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem-cmd", 64);
-        let (peer1_tx, mut peer1_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
-        let (peer2_tx, mut peer2_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-
-        let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
-
-        // Initial routing: 192.0.2.0/24 -> peer1
-        let peer1_config = Peer {
-            id: "peer1".to_string(),
-
-            h3: None,
-            bare: None,
-            tun: PeerTun {
-                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
-            },
-        };
-        let mut peer_txs = HashMap::new();
-        peer_txs.insert("peer1".to_string(), peer1_tx);
-        let routing = RoutingTable::from_peers(&[peer1_config], &peer_txs).unwrap();
-
-        let (cmd_tx, tun_rx_task) =
-            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_secs(60));
-
-        // Send packet - should go to peer1
-        inject_tx.send(ipv4_packet.clone()).await.unwrap();
-        let batch = peer1_rx.recv().await.expect("packet should route to peer1");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &ipv4_packet[..]);
-
-        // Update routing: 192.0.2.0/24 -> peer2
-        let peer2_config = Peer {
-            id: "peer2".to_string(),
-
-            h3: None,
-            bare: None,
-            tun: PeerTun {
-                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
-            },
-        };
-        let mut new_peer_txs = HashMap::new();
-        new_peer_txs.insert("peer2".to_string(), peer2_tx);
-        let new_routing = RoutingTable::from_peers(&[peer2_config], &new_peer_txs).unwrap();
-
-        cmd_tx
-            .send(TunRxCommand::UpdateRouting {
-                routing: new_routing,
-            })
-            .unwrap();
-
-        // Allow command to be processed
-        tokio::task::yield_now().await;
-
-        // Send another packet - should now go to peer2
-        inject_tx.send(ipv4_packet.clone()).await.unwrap();
-        let batch = peer2_rx.recv().await.expect("packet should route to peer2");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &ipv4_packet[..]);
-
-        // Verify peer1 did not receive the second packet
-        assert!(peer1_rx.try_recv().is_err());
-
-        tun_rx_task.abort();
-    }
-
     // ========== Actor Lifecycle Tests ==========
 
     #[tokio::test]
-    async fn spawn_tun_rx_returns_working_cmd_tx() {
-        let (rx_tun, _tx_tun, _inject_tx, _output_rx) = memory_tun("mem-lifecycle", 64);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let routing = RoutingTable::new();
-
-        let (cmd_tx, handle) = spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_secs(60));
-
-        // Verify cmd_tx is functional by sending a routing update
-        let new_routing = RoutingTable::new();
-        assert!(cmd_tx
-            .send(TunRxCommand::UpdateRouting {
-                routing: new_routing
-            })
-            .is_ok());
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn tun_rx_actor_exits_when_sender_dropped() {
-        let (rx_tun, _tx_tun, _inject_tx, _output_rx) = memory_tun("mem-shutdown", 64);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let routing = RoutingTable::new();
-
-        let (cmd_tx, join_handle) =
-            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_secs(60));
-
-        // Drop sender to signal shutdown
-        drop(cmd_tx);
-
-        // Actor should exit gracefully (check both timeout and join result)
-        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
-        assert!(
-            matches!(result, Ok(Ok(Ok(())))),
-            "tun_rx actor should shut down cleanly after sender dropped, got {:?}",
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn spawn_tun_tx_returns_working_packet_tx() {
+    async fn spawn_tun_tx_returns_working_input_tx() {
         let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-lifecycle", 64);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (packet_tx, handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
+        let (input_tx, handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
 
-        // Verify packet_tx is functional by sending a batch
-        assert!(packet_tx
+        // Verify input_tx is functional by sending a batch
+        assert!(input_tx
             .send(vec![BufFactory::buf_from_slice(&[1, 2, 3])])
             .await
             .is_ok());
@@ -1401,11 +974,10 @@ mod tests {
         let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-shutdown", 64);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (packet_tx, join_handle) =
-            spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
+        let (input_tx, join_handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
 
         // Drop sender to signal shutdown
-        drop(packet_tx);
+        drop(input_tx);
 
         // Actor should exit gracefully (check both timeout and join result)
         let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
@@ -1431,32 +1003,18 @@ mod tests {
         // Verifies that the batch-aware spawn_tun_rx loop works
         // correctly when recv_batch falls back to single-packet recv.
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem-batch-fb", 64);
-        let (peer_tx, mut peer_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
+        let (output_tx, mut output_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
-        let peer_config = Peer {
-            id: "peer1".to_string(),
-
-            h3: None,
-            bare: None,
-            tun: PeerTun {
-                allowed_ips: vec!["192.0.2.0/24".parse().unwrap()],
-            },
-        };
-        let mut peer_txs = HashMap::new();
-        peer_txs.insert("peer1".to_string(), peer_tx);
-        let routing = RoutingTable::from_peers(&[peer_config], &peer_txs).unwrap();
-
-        let (_cmd_tx, tun_rx_task) =
-            spawn_tun_rx(rx_tun, routing, events_tx, Duration::from_millis(10));
+        let tun_rx_task = spawn_tun_rx(rx_tun, output_tx, events_tx, Duration::from_millis(10));
 
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
-        let batch = peer_rx
+        let batch = output_rx
             .recv()
             .await
-            .expect("packet should be routed via batch fallback");
+            .expect("packet should be forwarded to router");
         assert_eq!(batch.len(), 1);
         assert_eq!(&batch[0][..], &ipv4_packet[..]);
 
