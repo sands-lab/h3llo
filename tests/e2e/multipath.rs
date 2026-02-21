@@ -19,7 +19,7 @@ use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-use super::common::{TestContext, TEST_IMAGE, TEST_TAG};
+use super::common::{assert_ping, TestContext, TEST_IMAGE, TEST_TAG};
 use super::h3::generate_test_certs;
 
 /// Multipath node config: dual transport (BareUDP + H3) with different subnets.
@@ -34,6 +34,7 @@ use super::h3::generate_test_certs;
 /// * `peer_h3_fqdn` - Peer's H3 FQDN for DNS resolution
 /// * `cert_path` - Container path to TLS certificate
 /// * `key_path` - Container path to TLS private key
+#[allow(clippy::too_many_arguments)]
 fn multipath_config(
     bare_addr: &str,
     h3_addr: &str,
@@ -186,87 +187,11 @@ async fn test_multipath_dual_subnet_mixed_transport() {
     // Need extra time for both BareUDP and H3 to establish
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // Test 1: Ping via BareUDP path (10.0.0.x subnet)
-    let mut ping_bare_ab = node_a
-        .exec(testcontainers::core::ExecCommand::new([
-            "ping", "-c", "3", "-W", "2", "10.0.0.2",
-        ]))
-        .await
-        .expect("exec ping bareudp a->b");
+    assert_ping(&node_a, "10.0.0.2", "bareudp a->b").await;
+    assert_ping(&node_a, "10.0.1.2", "h3 a->b").await;
+    assert_ping(&node_b, "10.0.0.1", "bareudp b->a").await;
+    assert_ping(&node_b, "10.0.1.1", "h3 b->a").await;
 
-    let ping_bare_ab_out = ping_bare_ab.stdout_to_vec().await.unwrap();
-    let ping_bare_ab_exit = ping_bare_ab.exit_code().await.unwrap();
-    println!(
-        "Ping node-a -> node-b (10.0.0.2 via BareUDP):\n{}",
-        String::from_utf8_lossy(&ping_bare_ab_out)
-    );
-    assert_eq!(
-        ping_bare_ab_exit,
-        Some(0),
-        "BareUDP ping a->b failed (exit={ping_bare_ab_exit:?})"
-    );
-
-    // Test 2: Ping via H3 path (10.0.1.x subnet)
-    let mut ping_h3_ab = node_a
-        .exec(testcontainers::core::ExecCommand::new([
-            "ping", "-c", "3", "-W", "2", "10.0.1.2",
-        ]))
-        .await
-        .expect("exec ping h3 a->b");
-
-    let ping_h3_ab_out = ping_h3_ab.stdout_to_vec().await.unwrap();
-    let ping_h3_ab_exit = ping_h3_ab.exit_code().await.unwrap();
-    println!(
-        "Ping node-a -> node-b (10.0.1.2 via H3):\n{}",
-        String::from_utf8_lossy(&ping_h3_ab_out)
-    );
-    assert_eq!(
-        ping_h3_ab_exit,
-        Some(0),
-        "H3 ping a->b failed (exit={ping_h3_ab_exit:?})"
-    );
-
-    // Test 3: Reverse direction - BareUDP path
-    let mut ping_bare_ba = node_b
-        .exec(testcontainers::core::ExecCommand::new([
-            "ping", "-c", "3", "-W", "2", "10.0.0.1",
-        ]))
-        .await
-        .expect("exec ping bareudp b->a");
-
-    let ping_bare_ba_out = ping_bare_ba.stdout_to_vec().await.unwrap();
-    let ping_bare_ba_exit = ping_bare_ba.exit_code().await.unwrap();
-    println!(
-        "Ping node-b -> node-a (10.0.0.1 via BareUDP):\n{}",
-        String::from_utf8_lossy(&ping_bare_ba_out)
-    );
-    assert_eq!(
-        ping_bare_ba_exit,
-        Some(0),
-        "BareUDP ping b->a failed (exit={ping_bare_ba_exit:?})"
-    );
-
-    // Test 4: Reverse direction - H3 path
-    let mut ping_h3_ba = node_b
-        .exec(testcontainers::core::ExecCommand::new([
-            "ping", "-c", "3", "-W", "2", "10.0.1.1",
-        ]))
-        .await
-        .expect("exec ping h3 b->a");
-
-    let ping_h3_ba_out = ping_h3_ba.stdout_to_vec().await.unwrap();
-    let ping_h3_ba_exit = ping_h3_ba.exit_code().await.unwrap();
-    println!(
-        "Ping node-b -> node-a (10.0.1.1 via H3):\n{}",
-        String::from_utf8_lossy(&ping_h3_ba_out)
-    );
-    assert_eq!(
-        ping_h3_ba_exit,
-        Some(0),
-        "H3 ping b->a failed (exit={ping_h3_ba_exit:?})"
-    );
-
-    // Cleanup
     drop(node_b);
     drop(node_a);
     drop(temp_dir);

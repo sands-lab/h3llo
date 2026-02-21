@@ -10,7 +10,8 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 use super::common::{
-    bareudp_config, format_throughput, parse_iperf3_bps, TestContext, TEST_IMAGE, TEST_TAG,
+    bareudp_config, format_throughput, parse_iperf3_bps, start_bareudp_node, BareUdpPeer,
+    TestContext, TEST_IMAGE, TEST_TAG,
 };
 use super::h3::{generate_test_certs, h3_node_config};
 
@@ -90,52 +91,28 @@ async fn test_bareudp_tcp_throughput() {
 
     let name_a = ctx.container_name("node-a-tp");
     let name_b = ctx.container_name("node-b-tp");
+    let fqdn_a = ctx.fqdn("node-a-tp");
+    let fqdn_b = ctx.fqdn("node-b-tp");
 
-    let node_a_cfg = bareudp_config(
+    let cfg_a = bareudp_config(
         "10.0.0.1/32",
-        &name_b,
-        &ctx.fqdn("node-b-tp"),
-        "10.0.0.2/32",
+        &[BareUdpPeer {
+            id: &name_b,
+            fqdn: &fqdn_b,
+            allowed_ips: &["10.0.0.2/32"],
+        }],
     );
-    let node_b_cfg = bareudp_config(
+    let cfg_b = bareudp_config(
         "10.0.0.2/32",
-        &name_a,
-        &ctx.fqdn("node-a-tp"),
-        "10.0.0.1/32",
+        &[BareUdpPeer {
+            id: &name_a,
+            fqdn: &fqdn_a,
+            allowed_ips: &["10.0.0.1/32"],
+        }],
     );
 
-    let node_a_config_path = temp_dir.path().join("node-a-tp.yaml");
-    let node_b_config_path = temp_dir.path().join("node-b-tp.yaml");
-    std::fs::write(&node_a_config_path, &node_a_cfg).expect("write node-a config");
-    std::fs::write(&node_b_config_path, &node_b_cfg).expect("write node-b config");
-
-    let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
-        .with_exposed_port(ContainerPort::Udp(5353))
-        .with_wait_for(WaitFor::seconds(2))
-        .with_container_name(&name_a)
-        .with_network(ctx.network())
-        .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_a_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .start()
-        .await
-        .expect("start node-a-tp");
-
-    let node_b = GenericImage::new(TEST_IMAGE, TEST_TAG)
-        .with_exposed_port(ContainerPort::Udp(5353))
-        .with_wait_for(WaitFor::seconds(2))
-        .with_container_name(&name_b)
-        .with_network(ctx.network())
-        .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_b_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .start()
-        .await
-        .expect("start node-b-tp");
+    let node_a = start_bareudp_node(&ctx, temp_dir.path(), "node-a-tp", &cfg_a).await;
+    let node_b = start_bareudp_node(&ctx, temp_dir.path(), "node-b-tp", &cfg_b).await;
 
     // Wait for DNS refresh and tunnel establishment
     tokio::time::sleep(Duration::from_secs(5)).await;

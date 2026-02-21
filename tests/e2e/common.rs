@@ -1,9 +1,13 @@
 //! Shared utilities for E2E integration tests.
 //!
 //! Provides common constants, Docker helpers, per-test isolation context,
-//! and iperf3 output parsing shared across all E2E test modules.
+//! config generation, container lifecycle, ping assertions, and iperf3
+//! output parsing shared across all E2E test modules.
 
 use std::process::Command;
+use testcontainers::core::{ContainerPort, Mount, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 /// Default test image name.
 pub const TEST_IMAGE: &str = "h3llo";
@@ -104,20 +108,35 @@ fn ensure_image_exists() -> bool {
     }
 }
 
-/// Generates a BareUDP node config with dynamic peer endpoint FQDN.
+/// BareUDP peer specification for config generation.
+pub struct BareUdpPeer<'a> {
+    /// Peer's container name (used as peer ID in config).
+    pub id: &'a str,
+    /// Peer's FQDN for DNS resolution in Docker network.
+    pub fqdn: &'a str,
+    /// CIDR prefixes routed via this peer.
+    pub allowed_ips: &'a [&'a str],
+}
+
+/// Generates a BareUDP node config with one or more peers.
 ///
 /// # Arguments
 ///
 /// * `tun_addr` - Local TUN IP address (e.g., "10.0.0.1/32")
-/// * `peer_id` - Peer's container name (used as peer ID)
-/// * `peer_fqdn` - Peer's FQDN for DNS resolution in Docker network
-/// * `peer_allowed_ip` - CIDR for peer traffic
-pub fn bareudp_config(
-    tun_addr: &str,
-    peer_id: &str,
-    peer_fqdn: &str,
-    peer_allowed_ip: &str,
-) -> String {
+/// * `peers` - One or more peer specifications
+pub fn bareudp_config(tun_addr: &str, peers: &[BareUdpPeer<'_>]) -> String {
+    use std::fmt::Write;
+    let mut peers_yaml = String::new();
+    for peer in peers {
+        writeln!(peers_yaml, "  - id: {}", peer.id).unwrap();
+        writeln!(peers_yaml, "    bare:").unwrap();
+        writeln!(peers_yaml, "      endpoint: \"udp://{}:5353\"", peer.fqdn).unwrap();
+        writeln!(peers_yaml, "    tun:").unwrap();
+        writeln!(peers_yaml, "      allowed_ips:").unwrap();
+        for ip in peer.allowed_ips {
+            writeln!(peers_yaml, "        - {ip}").unwrap();
+        }
+    }
     format!(
         r#"
 local:
@@ -130,16 +149,70 @@ local:
   bare:
     listen: "udp://0.0.0.0:5353"
 peers:
-  - id: {peer_id}
-    bare:
-      endpoint: "udp://{peer_fqdn}:5353"
-    tun:
-      allowed_ips:
-        - {peer_allowed_ip}
-tuning:
+{peers_yaml}tuning:
   dns_refresh_interval: 1
 "#
     )
+}
+
+/// Starts a BareUDP h3llo node in a Docker container.
+///
+/// Writes config to `temp_dir`, creates a privileged container with the config
+/// bind-mounted, and returns the running container handle.
+///
+/// # Arguments
+///
+/// * `ctx` - Test context for unique naming and network
+/// * `temp_dir` - Directory for config file (must outlive returned container)
+/// * `role` - Logical role name; used for container name and config filename
+/// * `config` - YAML config string
+pub async fn start_bareudp_node(
+    ctx: &TestContext,
+    temp_dir: &std::path::Path,
+    role: &str,
+    config: &str,
+) -> ContainerAsync<GenericImage> {
+    let config_path = temp_dir.join(format!("{role}.yaml"));
+    std::fs::write(&config_path, config).unwrap_or_else(|e| panic!("write {role} config: {e}"));
+
+    GenericImage::new(TEST_IMAGE, TEST_TAG)
+        .with_exposed_port(ContainerPort::Udp(5353))
+        .with_wait_for(WaitFor::seconds(2))
+        .with_container_name(ctx.container_name(role))
+        .with_network(ctx.network())
+        .with_privileged(true)
+        .with_mount(Mount::bind_mount(
+            config_path.to_str().unwrap(),
+            "/etc/h3llo/config.yaml",
+        ))
+        .start()
+        .await
+        .unwrap_or_else(|e| panic!("start {role}: {e}"))
+}
+
+/// Asserts that a ping from `container` to `target_ip` succeeds.
+///
+/// Captures both stdout and stderr per `docs/test.md` logging requirement
+/// and includes them in the assertion failure message.
+pub async fn assert_ping(container: &ContainerAsync<GenericImage>, target_ip: &str, label: &str) {
+    let mut result = container
+        .exec(testcontainers::core::ExecCommand::new([
+            "ping", "-c", "3", "-W", "2", target_ip,
+        ]))
+        .await
+        .unwrap_or_else(|e| panic!("exec ping {label}: {e}"));
+
+    let stdout = result.stdout_to_vec().await.unwrap();
+    let stderr = result.stderr_to_vec().await.unwrap();
+    let exit = result.exit_code().await.unwrap();
+    let stdout_str = String::from_utf8_lossy(&stdout);
+    let stderr_str = String::from_utf8_lossy(&stderr);
+    println!("Ping {label} ({target_ip}):\n{stdout_str}");
+    assert_eq!(
+        exit,
+        Some(0),
+        "ping {label} failed (exit={exit:?})\nstdout: {stdout_str}\nstderr: {stderr_str}"
+    );
 }
 
 /// Parses iperf3 JSON output to extract received throughput in bits/second.

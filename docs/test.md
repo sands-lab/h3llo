@@ -173,6 +173,10 @@ cargo test --test e2e -- --ignored --nocapture throughput
 
 1. **Dual-subnet mixed transport**: Verifies two nodes routing 10.0.0.0/24 through BareUDP and 10.0.1.0/24 through HTTP/3 concurrently, with bidirectional ping validation.
 
+### E2E Test Scenarios (`tests/e2e/forwarding.rs`)
+
+1. **Three-node BareUDP forwarding**: Verifies userspace L3 forwarding through a relay node. Node A (10.0.0.1) pings Node C (10.0.0.3) via relay Node B (10.0.0.2), exercising the router actor's `handle_transport_batch` forwarding path with LPM routing and TTL decrement. Bidirectional forwarding (A→C, C→A) and direct peer connectivity verified as preconditions.
+
 ### Integration Test Scenarios (`tests/integration/native/dns.rs`)
 
 DNS resolver validation against a containerized CoreDNS server with deterministic zone data.
@@ -299,6 +303,7 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Docker E2E: `tests/e2e/h3.rs` multi-node HTTP/3 connectivity via testcontainers-rs.
 - Docker E2E: `tests/e2e/multipath.rs` dual-subnet mixed transport (BareUDP + HTTP/3) via testcontainers-rs.
 - Docker E2E: `tests/e2e/throughput.rs` iperf3 TCP throughput tests for BareUDP and HTTP/3 tunnels.
+- Docker E2E: `tests/e2e/forwarding.rs` three-node BareUDP userspace forwarding via relay node.
 - Docker Integration: `tests/integration/native/dns.rs` DNS resolver integration tests against CoreDNS container.
 - Docker Integration: `tests/integration/native/tun.rs` TUN device creation and addressing via Container Test Pattern.
 - Docker Integration: `tests/integration/native/route.rs` Route sync with real netlink API via Container Test Pattern.
