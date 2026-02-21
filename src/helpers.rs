@@ -1,4 +1,6 @@
-//! Helpers for retrying transient I/O errors.
+//! Helpers for retrying transient I/O errors and channel backpressure.
+
+use std::time::{Duration, Instant};
 
 /// Retries an async I/O expression on transient errors (`Interrupted`, `WouldBlock`).
 ///
@@ -43,6 +45,57 @@ macro_rules! retry_on_transient {
 
 pub(crate) use retry_on_transient;
 
+// ---------------------------------------------------------------------------
+// Channel backpressure helper
+// ---------------------------------------------------------------------------
+
+/// Event emitted by [`send_with_backpressure`] to report channel state.
+pub(crate) enum SendEvent {
+    /// `try_send` succeeded on the fast path (no contention).
+    Fast,
+    /// `try_send` returned `Full`; an awaited send will follow.
+    Full,
+    /// Awaited send completed after a wait of the given duration.
+    Waited(Duration),
+}
+
+/// Sends a value through a bounded channel and exposes backpressure events.
+///
+/// Event order:
+/// - Fast path: `Fast`
+/// - Full then success: `Full` → `Waited(duration)`
+pub(crate) async fn send_with_backpressure<T, F>(
+    tx: &tokio::sync::mpsc::Sender<T>,
+    value: T,
+    mut on_event: F,
+) -> Result<(), tokio::sync::mpsc::error::SendError<T>>
+where
+    F: FnMut(SendEvent),
+{
+    match tx.try_send(value) {
+        Ok(()) => {
+            on_event(SendEvent::Fast);
+            Ok(())
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(val)) => {
+            on_event(SendEvent::Full);
+            let start = Instant::now();
+            match tx.send(val).await {
+                Ok(()) => {
+                    on_event(SendEvent::Waited(start.elapsed()));
+                    Ok(())
+                }
+                Err(tokio::sync::mpsc::error::SendError(val)) => {
+                    Err(tokio::sync::mpsc::error::SendError(val))
+                }
+            }
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(val)) => {
+            Err(tokio::sync::mpsc::error::SendError(val))
+        }
+    }
+}
+
 /// Test utilities for constructing IP packets.
 #[cfg(test)]
 pub(crate) mod test_packets {
@@ -82,13 +135,15 @@ pub(crate) mod test_packets {
 
 #[cfg(test)]
 mod tests {
-    use super::test_packets;
+    use super::*;
     use std::io;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+    use std::time::Duration;
+    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn retries_on_interrupted_errors() {
@@ -237,5 +292,80 @@ mod tests {
         let after = interloper_ran.load(Ordering::SeqCst);
         interloper.abort();
         assert_eq!(before, after, "Interrupted should not yield to other tasks");
+    }
+
+    // -- send_with_backpressure tests --
+
+    #[tokio::test]
+    async fn send_with_backpressure_fast_path() {
+        let (tx, mut rx) = mpsc::channel::<u32>(4);
+        let mut saw_fast = false;
+        let mut saw_full = false;
+        let mut waited = Duration::ZERO;
+
+        send_with_backpressure(&tx, 7, |event| match event {
+            SendEvent::Fast => saw_fast = true,
+            SendEvent::Full => saw_full = true,
+            SendEvent::Waited(d) => waited = d,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(rx.recv().await, Some(7));
+        assert!(saw_fast);
+        assert!(!saw_full);
+        assert_eq!(waited, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn send_with_backpressure_waited_path() {
+        let (tx, mut rx) = mpsc::channel::<u32>(1);
+        tx.send(1).await.unwrap();
+
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            rx.recv().await;
+            rx
+        });
+
+        let mut saw_fast = false;
+        let mut saw_full = false;
+        let mut waited = Duration::ZERO;
+
+        send_with_backpressure(&tx, 2, |event| match event {
+            SendEvent::Fast => saw_fast = true,
+            SendEvent::Full => saw_full = true,
+            SendEvent::Waited(d) => waited = d,
+        })
+        .await
+        .unwrap();
+
+        assert!(!saw_fast);
+        assert!(saw_full);
+        assert!(waited > Duration::ZERO);
+        let _rx = drain.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_with_backpressure_closed_path() {
+        let (tx, rx) = mpsc::channel::<u32>(1);
+        drop(rx);
+
+        let mut saw_fast = false;
+        let mut saw_full = false;
+        let mut waited = Duration::ZERO;
+
+        let err = send_with_backpressure(&tx, 9, |event| match event {
+            SendEvent::Fast => saw_fast = true,
+            SendEvent::Full => saw_full = true,
+            SendEvent::Waited(d) => waited = d,
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, 9);
+        assert!(!saw_fast);
+        assert!(!saw_full);
+        assert_eq!(waited, Duration::ZERO);
     }
 }

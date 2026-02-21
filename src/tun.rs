@@ -4,7 +4,7 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::config::LocalTun;
 use crate::events::Event;
 use crate::helpers::retry_on_transient;
-use crate::metrics::{send_with_backpressure, Counters, Direction, DropReason, SendEvent, Source};
+use crate::metrics::{Counters, Direction, DropReason, Source};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::io;
 use std::net::Ipv6Addr;
@@ -538,17 +538,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             }
                             let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
                             let pkt_count = batch.len() as u64;
-                            if send_with_backpressure(&output_tx, batch, |event| match event {
-                                SendEvent::Waited(waited) => counters.record_queue_full(waited),
-                                SendEvent::Fast | SendEvent::Full => {}
-                            })
-                            .await
-                            .is_err()
-                            {
-                                counters.record_drop(DropReason::ChannelClosed, pkt_count, total_bytes);
-                            } else {
-                                counters.record_success(pkt_count, total_bytes);
-                            }
+                            counters.send_and_record(&output_tx, batch, pkt_count, total_bytes).await;
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(err) => {

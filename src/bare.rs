@@ -5,7 +5,7 @@ use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, U
 use crate::config::Tuning;
 use crate::events::Event;
 use crate::helpers::retry_on_transient;
-use crate::metrics::{send_with_backpressure, Counters, Direction, DropReason, SendEvent, Source};
+use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::tun::alloc_packet_buf;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::collections::HashSet;
@@ -209,17 +209,9 @@ pub fn spawn_udp_rx(
 
                             let count = batch.len() as u64;
                             let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
-                            if send_with_backpressure(&ingress_tx, batch, |event| match event {
-                                SendEvent::Waited(waited) => counters.record_queue_full(waited),
-                                SendEvent::Fast | SendEvent::Full => {}
-                            })
-                            .await
-                            .is_err()
-                            {
-                                counters.record_drop(DropReason::ChannelClosed, count, total_bytes);
+                            if !counters.send_and_record(&ingress_tx, batch, count, total_bytes).await {
                                 return Ok(());
                             }
-                            counters.record_success(count, total_bytes);
                         }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,

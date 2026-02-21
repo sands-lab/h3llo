@@ -7,7 +7,8 @@
 use crate::actor::ActorExitResult;
 use crate::config::{LocalTun, Peer};
 use crate::events::Event;
-use crate::metrics::{send_with_backpressure, Counters, Direction, DropReason, SendEvent, Source};
+use crate::helpers::{send_with_backpressure, SendEvent};
+use crate::metrics::{Counters, Direction, DropReason, Source};
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
 use std::collections::HashMap;
@@ -432,17 +433,9 @@ async fn handle_output_batch(
         counters.record_drop(DropReason::NoRoute, pkt_count, total_bytes);
         return;
     };
-    if send_with_backpressure(route.tx, batch, |event| match event {
-        SendEvent::Waited(waited) => counters.record_queue_full(waited),
-        SendEvent::Fast | SendEvent::Full => {}
-    })
-    .await
-    .is_err()
-    {
-        counters.record_drop(DropReason::ChannelClosed, pkt_count, total_bytes);
-    } else {
-        counters.record_success(pkt_count, total_bytes);
-    }
+    counters
+        .send_and_record(route.tx, batch, pkt_count, total_bytes)
+        .await;
 }
 
 /// Handles an ingress batch (from transport peers): per-packet dst-IP scanning,
@@ -498,17 +491,9 @@ async fn handle_ingress_batch(
 
         if is_tun_dest {
             // TUN destination: no TTL decrement, forward directly.
-            if send_with_backpressure(route.tx, group, |event| match event {
-                SendEvent::Waited(waited) => counters.record_queue_full(waited),
-                SendEvent::Fast | SendEvent::Full => {}
-            })
-            .await
-            .is_err()
-            {
-                counters.record_drop(DropReason::ChannelClosed, group_count, group_bytes);
-            } else {
-                counters.record_success(group_count, group_bytes);
-            }
+            counters
+                .send_and_record(route.tx, group, group_count, group_bytes)
+                .await;
         } else {
             // Single-pass: decrement TTL, partition expired vs forward.
             let mut forward = Vec::with_capacity(group.len());
@@ -531,17 +516,9 @@ async fn handle_ingress_batch(
             if !forward.is_empty() {
                 let fwd_count = forward.len() as u64;
                 let fwd_bytes: u64 = forward.iter().map(|p| p.len() as u64).sum();
-                if send_with_backpressure(route.tx, forward, |event| match event {
-                    SendEvent::Waited(waited) => counters.record_queue_full(waited),
-                    SendEvent::Fast | SendEvent::Full => {}
-                })
-                .await
-                .is_err()
-                {
-                    counters.record_drop(DropReason::ChannelClosed, fwd_count, fwd_bytes);
-                } else {
-                    counters.record_success(fwd_count, fwd_bytes);
-                }
+                counters
+                    .send_and_record(route.tx, forward, fwd_count, fwd_bytes)
+                    .await;
             }
 
             if !expired.is_empty() {
