@@ -35,16 +35,32 @@ pub enum ConnectionDirection {
 }
 
 /// Carries high-level events emitted by modules to the orchestrator.
-#[derive(Debug)]
 pub enum Event {
     /// Cumulative metrics snapshot from any source.
     Metrics(Metrics),
-    /// Events originating from transports (BareUDP, HTTP/3).
-    Transport(TransportEvent),
+    /// HTTP/3 connection established, ready for actor spawning.
+    H3Connected(H3ConnectedEvent),
+    /// BareUDP TX connection established, ready for bound registration.
+    BareConnected(BareConnectedEvent),
+    /// A dial attempt failed; orchestrator should clear in-flight state and update backoff.
+    DialFailed(DialFailedEvent),
     /// Events originating from DNS resolution.
     Dns(DnsEvent),
     /// Events originating from the management API.
     Api(ApiEvent),
+}
+
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Metrics(m) => f.debug_tuple("Metrics").field(m).finish(),
+            Self::H3Connected(e) => f.debug_tuple("H3Connected").field(e).finish(),
+            Self::BareConnected(e) => f.debug_tuple("BareConnected").field(e).finish(),
+            Self::DialFailed(e) => f.debug_tuple("DialFailed").field(e).finish(),
+            Self::Dns(e) => f.debug_tuple("Dns").field(e).finish(),
+            Self::Api(e) => f.debug_tuple("Api").field(e).finish(),
+        }
+    }
 }
 
 /// Events emitted by the management API actor.
@@ -104,26 +120,6 @@ pub struct DialFailedEvent {
     pub peer_id: String,
     /// The IP address that failed to connect.
     pub ip: IpAddr,
-}
-
-/// Describes transport-level events (connection lifecycle).
-pub enum TransportEvent {
-    /// HTTP/3 connection established, ready for actor spawning.
-    H3Connected(H3ConnectedEvent),
-    /// BareUDP TX connection established, ready for bound registration.
-    BareConnected(BareConnectedEvent),
-    /// A dial attempt failed; orchestrator should clear in-flight state and update backoff.
-    DialFailed(DialFailedEvent),
-}
-
-impl std::fmt::Debug for TransportEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::H3Connected(e) => f.debug_tuple("H3Connected").field(e).finish(),
-            Self::BareConnected(e) => f.debug_tuple("BareConnected").field(e).finish(),
-            Self::DialFailed(e) => f.debug_tuple("DialFailed").field(e).finish(),
-        }
-    }
 }
 
 /// BareUDP TX connection established event.

@@ -7,7 +7,7 @@ use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
     ApiEvent, BareConnectedEvent, ConnectionDirection, DialFailedEvent, DnsEvent, Endpoint, Event,
-    H3ConnectedEvent, TransportEvent,
+    H3ConnectedEvent,
 };
 use crate::h3::{
     dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
@@ -247,24 +247,24 @@ impl PeerEntry {
                                 events_tx.clone(),
                                 &tuning,
                             );
-                            let _ = events_tx.send(Event::Transport(
-                                TransportEvent::BareConnected(BareConnectedEvent {
+                            let _ = events_tx.send(Event::BareConnected(
+                                BareConnectedEvent {
                                     peer_id,
                                     endpoint,
                                     dest: destination,
                                     tx: packet_tx,
                                     tx_handle,
-                                }),
+                                },
                             ));
                         }
                         Err(err) => {
                             warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
-                            let _ = events_tx.send(Event::Transport(TransportEvent::DialFailed(
+                            let _ = events_tx.send(Event::DialFailed(
                                 DialFailedEvent {
                                     peer_id,
                                     ip: dial_ip,
                                 },
-                            )));
+                            ));
                         }
                     }
                 });
@@ -292,21 +292,21 @@ impl PeerEntry {
                     {
                         Ok(conn) => {
                             debug!(peer = %peer_id, addr = %destination, "H3 connection established");
-                            let _ = events_tx.send(Event::Transport(TransportEvent::H3Connected(
+                            let _ = events_tx.send(Event::H3Connected(
                                 H3ConnectedEvent {
                                     connection: conn,
                                     direction: ConnectionDirection::Outbound,
                                 },
-                            )));
+                            ));
                         }
                         Err(e) => {
                             warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
-                            let _ = events_tx.send(Event::Transport(TransportEvent::DialFailed(
+                            let _ = events_tx.send(Event::DialFailed(
                                 DialFailedEvent {
                                     peer_id,
                                     ip: dial_ip,
                                 },
-                            )));
+                            ));
                         }
                     }
                 });
@@ -924,13 +924,13 @@ impl Orchestrator {
                     Direction::Tx => bound.tx_metrics = Some(metrics),
                 }
             }
-            Event::Transport(TransportEvent::H3Connected(event)) => {
+            Event::H3Connected(event) => {
                 self.handle_h3_connection(event).await;
             }
-            Event::Transport(TransportEvent::BareConnected(event)) => {
+            Event::BareConnected(event) => {
                 self.handle_bare_connection(event);
             }
-            Event::Transport(TransportEvent::DialFailed(event)) => {
+            Event::DialFailed(event) => {
                 self.handle_dial_failed(event);
             }
         }

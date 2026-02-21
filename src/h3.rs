@@ -15,7 +15,7 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_bearer_auth, validate_connect_auth};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
-use crate::events::{ConnectionDirection, Event, H3ConnectedEvent, TransportEvent};
+use crate::events::{ConnectionDirection, Event, H3ConnectedEvent};
 use crate::metrics::{send_with_backpressure, Counters, Direction, SendEvent, Source};
 use crate::router::RouterMsg;
 use futures_util::sink::SinkExt;
@@ -334,10 +334,10 @@ async fn handle_h3_connection(
                     flow_id,
                     quic_cmd_send,
                 };
-                let event = Event::Transport(TransportEvent::H3Connected(H3ConnectedEvent {
+                let event = Event::H3Connected(H3ConnectedEvent {
                     connection: conn,
                     direction: ConnectionDirection::Inbound,
-                }));
+                });
                 if events_tx.send(event).is_err() {
                     debug!(%remote_addr, "events channel closed");
                     close_quic_connection(&quic_cmd_tx);
@@ -1615,7 +1615,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_success() {
-        use crate::events::{ConnectionDirection, Event, TransportEvent};
+        use crate::events::{ConnectionDirection, Event};
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1663,7 +1663,7 @@ mod tests {
         // Server should emit an H3Connected event
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
@@ -1681,7 +1681,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_success_with_sni_override() {
-        use crate::events::{ConnectionDirection, Event, TransportEvent};
+        use crate::events::{ConnectionDirection, Event};
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1731,7 +1731,7 @@ mod tests {
         // Server should emit an H3Connected event
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
@@ -1750,7 +1750,7 @@ mod tests {
 
     #[tokio::test]
     async fn h3_connection_into_actors_preserves_peer_id() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1789,7 +1789,7 @@ mod tests {
 
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
@@ -1810,7 +1810,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_rejects_wrong_secret() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1854,7 +1854,7 @@ mod tests {
         // Server should NOT have emitted an H3Connected event
         let server_recv = tokio::time::timeout(Duration::from_millis(500), async {
             while let Some(event) = events_rx.recv().await {
-                if matches!(event, Event::Transport(TransportEvent::H3Connected(_))) {
+                if matches!(event, Event::H3Connected(_)) {
                     return Some(());
                 }
             }
@@ -1914,7 +1914,7 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_roundtrip() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
 
@@ -1955,7 +1955,7 @@ mod tests {
 
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = listener_events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
@@ -2009,7 +2009,7 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_bidirectional() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
 
@@ -2050,7 +2050,7 @@ mod tests {
 
         let server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = listener_events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
@@ -2133,7 +2133,7 @@ mod tests {
 
     #[tokio::test]
     async fn connection_graceful_shutdown() {
-        use crate::events::{Event, TransportEvent};
+        use crate::events::Event;
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -2172,7 +2172,7 @@ mod tests {
 
         let _server_event = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::Transport(TransportEvent::H3Connected(connected)) = event {
+                if let Event::H3Connected(connected) = event {
                     return Some(connected);
                 }
             }
