@@ -5,7 +5,7 @@
 //! `RouteMatch`, `RoutingError`) used for longest-prefix-match lookups.
 
 use crate::actor::ActorExitResult;
-use crate::config::Peer;
+use crate::config::{LocalTun, Peer};
 use crate::events::Event;
 use crate::metrics::{send_with_backpressure, Counters, Direction, DropReason, SendEvent, Source};
 use ipnet::IpNet;
@@ -127,6 +127,9 @@ fn extract_dst_ip(packet: &[u8]) -> Option<IpAddr> {
 // Routing table
 // ---------------------------------------------------------------------------
 
+/// Sentinel peer ID used for local TUN route entries.
+pub const LOCAL_PEER_ID: &str = "__local__";
+
 fn log_duplicate_allowed(peer_id: &str, cidr: &str) {
     warn!(
         "duplicate allowed_ips '{}' for peer '{}'; keeping the first entry",
@@ -198,19 +201,27 @@ impl RoutingTable {
         }
     }
 
-    /// Builds a routing table from peers with their TX channels.
+    /// Builds a complete routing table from peer and local TUN configuration.
+    ///
+    /// Inserts peer `allowed_ips` prefixes first, then local TUN host routes
+    /// (`/32` or `/128`) so that locally-destined traffic is delivered to the
+    /// TUN device without TTL decrement.
     ///
     /// # Arguments
     ///
     /// * `peers` - Peer configurations.
     /// * `peer_txs` - Map of peer ID to TX channel. Peers without a channel are skipped.
+    /// * `local_tun` - Local TUN configuration (uses `addrs` for host routes).
+    /// * `tun_tx` - TUN TX channel for local delivery.
     ///
     /// # Errors
     ///
-    /// Returns `RoutingError::ConflictingPrefix` when a prefix conflicts with an existing peer.
-    pub fn from_peers(
+    /// Returns `RoutingError::ConflictingPrefix` when a peer prefix conflicts with another peer.
+    pub fn make(
         peers: &[Peer],
         peer_txs: &HashMap<String, mpsc::Sender<Vec<PooledBuf>>>,
+        local_tun: &LocalTun,
+        tun_tx: &mpsc::Sender<Vec<PooledBuf>>,
     ) -> Result<Self, RoutingError> {
         let mut table = RoutingTable::new();
 
@@ -232,6 +243,21 @@ impl RoutingTable {
                         tx: tx.clone(),
                     },
                 )?;
+            }
+        }
+
+        // Insert local host routes so peers can reach this node's TUN addresses.
+        // Uses host prefix (/32 or /128) — only the address itself is local.
+        for addr in &local_tun.addrs {
+            let host_route = IpNet::from(addr.addr());
+            if let Err(e) = table.insert(
+                host_route,
+                RouteEntry {
+                    peer_id: LOCAL_PEER_ID.to_string(),
+                    tx: tun_tx.clone(),
+                },
+            ) {
+                warn!(error = %e, "failed to insert local TUN route");
             }
         }
 
@@ -455,7 +481,12 @@ async fn handle_transport_batch(
         }
 
         // Drain the group out of the batch.
-        let group: Vec<PooledBuf> = batch.drain(..group_end).collect();
+        // When the entire batch shares the same dst, take the whole Vec in O(1).
+        let group: Vec<PooledBuf> = if group_end == batch.len() {
+            std::mem::take(&mut batch)
+        } else {
+            batch.drain(..group_end).collect()
+        };
         let group_count = group.len() as u64;
         let group_bytes: u64 = group.iter().map(|p| p.len() as u64).sum();
 
@@ -592,6 +623,15 @@ mod tests {
             .collect()
     }
 
+    /// Empty LocalTun for tests that don't need local routes.
+    fn empty_local_tun() -> LocalTun {
+        LocalTun {
+            ifname: "test0".to_string(),
+            addrs: vec![],
+            mtu: 1350,
+        }
+    }
+
     // -- Routing table tests --
 
     #[test]
@@ -601,7 +641,9 @@ mod tests {
             bare_peer("peer-b", &["10.0.0.0/24"]),
         ];
         let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
-        let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
+        let (tun_tx, _) = mpsc::channel(1);
+        let table = RoutingTable::make(&peers, &peer_txs, &empty_local_tun(), &tun_tx)
+            .expect("table should build");
         let result = table
             .lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42)))
             .expect("lookup should succeed");
@@ -616,7 +658,8 @@ mod tests {
             bare_peer("peer-b", &["10.0.0.0/24"]),
         ];
         let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
-        let err = RoutingTable::from_peers(&peers, &peer_txs).unwrap_err();
+        let (tun_tx, _) = mpsc::channel(1);
+        let err = RoutingTable::make(&peers, &peer_txs, &empty_local_tun(), &tun_tx).unwrap_err();
         assert!(matches!(
             err,
             RoutingError::ConflictingPrefix {
@@ -631,12 +674,41 @@ mod tests {
     fn skips_duplicate_prefixes_within_peer() {
         let peers = vec![bare_peer("peer-a", &["10.0.0.0/24", "10.0.0.0/24"])];
         let peer_txs = dummy_peer_txs(&["peer-a"]);
-        let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
+        let (tun_tx, _) = mpsc::channel(1);
+        let table = RoutingTable::make(&peers, &peer_txs, &empty_local_tun(), &tun_tx)
+            .expect("table should build");
         assert_eq!(table.len(), (1, 0));
         let result = table
             .lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
             .expect("lookup should succeed");
         assert_eq!(result.peer_id, "peer-a");
+    }
+
+    #[test]
+    fn make_inserts_local_tun_host_routes() {
+        let peers = vec![bare_peer("peer-a", &["10.0.0.0/24"])];
+        let peer_txs = dummy_peer_txs(&["peer-a"]);
+        let (tun_tx, _) = mpsc::channel(1);
+        let local_tun = LocalTun {
+            ifname: "test0".to_string(),
+            addrs: vec!["10.0.0.1/24".parse().unwrap()],
+            mtu: 1350,
+        };
+        let table = RoutingTable::make(&peers, &peer_txs, &local_tun, &tun_tx)
+            .expect("table should build");
+
+        // Local host route (/32) wins over peer subnet (/24) for the local address
+        let local = table
+            .lookup("10.0.0.1".parse().unwrap())
+            .expect("local addr should match");
+        assert_eq!(local.peer_id, LOCAL_PEER_ID);
+        assert_eq!(local.prefix, "10.0.0.1/32".parse::<IpNet>().unwrap());
+
+        // Other addresses in the subnet still route to the peer
+        let peer = table
+            .lookup("10.0.0.2".parse().unwrap())
+            .expect("peer addr should match");
+        assert_eq!(peer.peer_id, "peer-a");
     }
 
     // -- Router actor tests --

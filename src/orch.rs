@@ -389,9 +389,9 @@ pub struct Orchestrator {
 
     /// Route sync actor command sender (None when `local.table` is false or init failed).
     route_cmd_tx: Option<mpsc::UnboundedSender<RouteCommand>>,
-    /// TUN interface addresses for route sync commands.
-    tun_addrs: Vec<IpNet>,
-    /// Stored local config for GET /config snapshot reconstruction.
+    /// TUN TX channel for local host routes in the routing table.
+    tun_tx: mpsc::Sender<Vec<PooledBuf>>,
+    /// Stored local config (TUN addrs, routing, GET /config snapshot).
     local: Local,
 
     /// Metrics from non-peer-scoped actors (TUN RX/TX, BareUDP RX).
@@ -461,7 +461,9 @@ impl Orchestrator {
             .iter()
             .filter_map(|(id, e)| e.preferred_tx().map(|tx| (id.clone(), tx.clone())))
             .collect();
-        if let Ok(routing) = RoutingTable::from_peers(&peer_configs, &peer_txs) {
+        if let Ok(routing) =
+            RoutingTable::make(&peer_configs, &peer_txs, &self.local.tun, &self.tun_tx)
+        {
             if let Err(e) = self
                 .router_cmd_tx
                 .send(RouterCommand::UpdateRouting { routing })
@@ -473,7 +475,7 @@ impl Orchestrator {
         if let Some(route_cmd_tx) = &self.route_cmd_tx {
             let allowed = collect_allowed_ips(&peer_configs);
             if let Err(e) = route_cmd_tx.send(RouteCommand::SyncRoutes {
-                tun_addrs: self.tun_addrs.clone(),
+                tun_addrs: self.local.tun.addrs.clone(),
                 allowed,
             }) {
                 warn!(error = %e, "failed to send route sync command");
@@ -500,7 +502,6 @@ impl Orchestrator {
         let tun_if = config.local.tun.ifname.clone();
         let mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
-        let tun_addrs = config.local.tun.addrs.clone();
 
         // Note: NoTransportConfigured validation moved to Config::validate()
 
@@ -532,7 +533,7 @@ impl Orchestrator {
         // Spawn router actor between RX actors and TUN TX
         let (router_tx, router_cmd_tx, router_handle) = spawn_router(
             routing,
-            tun_packet_tx,
+            tun_packet_tx.clone(),
             events_tx.clone(),
             tuning.metrics_push_interval,
             tuning.packet_queue_depth,
@@ -678,7 +679,7 @@ impl Orchestrator {
             h3_listener_cmd_tx,
             dns_cmd_tx,
             route_cmd_tx,
-            tun_addrs,
+            tun_tx: tun_packet_tx,
             local: config.local,
             non_peer_metrics: HashMap::new(),
         };
@@ -1175,7 +1176,6 @@ mod test_support {
         tun_if: String,
         mtu: usize,
         peers: HashMap<String, PeerEntry>,
-        tun_addrs: Vec<IpNet>,
         local: Option<crate::config::Local>,
     }
 
@@ -1185,7 +1185,6 @@ mod test_support {
                 tun_if: "test0".to_string(),
                 mtu: crate::config::default_mtu() as usize,
                 peers: HashMap::new(),
-                tun_addrs: Vec::new(),
                 local: None,
             }
         }
@@ -1230,6 +1229,12 @@ mod test_support {
             self
         }
 
+        pub fn with_tun_addrs(mut self, addrs: Vec<IpNet>) -> Self {
+            let local = self.local.get_or_insert_with(Self::default_local);
+            local.tun.addrs = addrs;
+            self
+        }
+
         pub fn with_resolved_ips(mut self, peer_id: &str, ips: HashSet<IpAddr>) -> Self {
             if let Some(entry) = self.peers.get_mut(peer_id) {
                 entry.resolved_ips = ips;
@@ -1237,20 +1242,8 @@ mod test_support {
             self
         }
 
-        /// Builds a testable orchestrator with dummy channels.
-        ///
-        /// Returns the orchestrator and test handles that allow verifying
-        /// commands sent to child actors.
-        pub fn build(self) -> (Orchestrator, TestHandles) {
-            let (events_tx, events_rx) = mpsc::unbounded_channel();
-            let (router_cmd_tx, router_cmd_rx) = mpsc::unbounded_channel();
-            let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel();
-            let (dns_cmd_tx, dns_cmd_rx) = mpsc::unbounded_channel();
-            let (router_tx, _router_rx) = mpsc::channel(1);
-            let (route_cmd_tx, route_cmd_rx) = mpsc::unbounded_channel();
-            let (h3_listener_cmd_tx, h3_listener_cmd_rx) = mpsc::unbounded_channel();
-
-            let local = self.local.unwrap_or_else(|| crate::config::Local {
+        fn default_local() -> crate::config::Local {
+            crate::config::Local {
                 table: false,
                 dns: crate::config::LocalDns {
                     server: "1.1.1.1:53".parse().unwrap(),
@@ -1264,7 +1257,24 @@ mod test_support {
                     addrs: vec!["192.168.180.1/32".parse().unwrap()],
                     mtu: 1393,
                 },
-            });
+            }
+        }
+
+        /// Builds a testable orchestrator with dummy channels.
+        ///
+        /// Returns the orchestrator and test handles that allow verifying
+        /// commands sent to child actors.
+        pub fn build(self) -> (Orchestrator, TestHandles) {
+            let (events_tx, events_rx) = mpsc::unbounded_channel();
+            let (router_cmd_tx, router_cmd_rx) = mpsc::unbounded_channel();
+            let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel();
+            let (dns_cmd_tx, dns_cmd_rx) = mpsc::unbounded_channel();
+            let (router_tx, _router_rx) = mpsc::channel(1);
+            let (tun_tx, _tun_rx) = mpsc::channel(1);
+            let (route_cmd_tx, route_cmd_rx) = mpsc::unbounded_channel();
+            let (h3_listener_cmd_tx, h3_listener_cmd_rx) = mpsc::unbounded_channel();
+
+            let local = self.local.unwrap_or_else(Self::default_local);
 
             let orch = Orchestrator {
                 events_rx,
@@ -1280,7 +1290,7 @@ mod test_support {
                 router_tx,
                 dns_cmd_tx,
                 route_cmd_tx: Some(route_cmd_tx),
-                tun_addrs: self.tun_addrs,
+                tun_tx,
                 local,
                 non_peer_metrics: HashMap::new(),
             };
@@ -2043,6 +2053,43 @@ mod tests {
 
         // Accepted sources command should NOT be sent
         assert!(handles.bare_rx_cmd_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn update_routing_includes_local_tun_routes() {
+        use crate::router::LOCAL_PEER_ID;
+
+        let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (orch, mut handles) = TestableOrchestratorBuilder::default()
+            .with_peers(vec![peer])
+            .with_peer_tx("peer1", "1.2.3.4:5353".parse().unwrap(), tx)
+            .with_tun_addrs(vec!["10.0.0.1/24".parse().unwrap()])
+            .build();
+
+        orch.update_routing();
+
+        let RouterCommand::UpdateRouting { routing } = handles
+            .router_cmd_rx
+            .try_recv()
+            .expect("routing update expected");
+
+        // Local host route should be present as /32
+        let local_route = routing
+            .lookup("10.0.0.1".parse().unwrap())
+            .expect("local TUN address should be routable");
+        assert_eq!(local_route.peer_id, LOCAL_PEER_ID);
+        assert_eq!(
+            local_route.prefix,
+            "10.0.0.1/32".parse::<ipnet::IpNet>().unwrap()
+        );
+
+        // Other addresses in the subnet should route to the peer, not local
+        let peer_route = routing
+            .lookup("10.0.0.2".parse().unwrap())
+            .expect("peer subnet should be routable");
+        assert_eq!(peer_route.peer_id, "peer1");
     }
 
     #[tokio::test]
