@@ -10,6 +10,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::debug;
 
+use crate::helpers::{send_with_backpressure, SendEvent};
+
 // ---------------------------------------------------------------------------
 // Metrics data model
 // ---------------------------------------------------------------------------
@@ -203,6 +205,32 @@ impl Counters {
         self.stats.congestion.record_queue_full(dur);
     }
 
+    /// Sends `value` via `tx` with backpressure, recording queue-full,
+    /// success, or [`DropReason::ChannelClosed`] drop automatically.
+    ///
+    /// Returns `true` on success, `false` on channel close (drop recorded).
+    pub(crate) async fn send_and_record<T>(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<T>,
+        value: T,
+        count: u64,
+        bytes: u64,
+    ) -> bool {
+        if send_with_backpressure(tx, value, |event| match event {
+            SendEvent::Waited(waited) => self.record_queue_full(waited),
+            SendEvent::Fast | SendEvent::Full => {}
+        })
+        .await
+        .is_err()
+        {
+            self.record_drop(DropReason::ChannelClosed, count, bytes);
+            false
+        } else {
+            self.record_success(count, bytes);
+            true
+        }
+    }
+
     /// Generates a metrics snapshot with optional peer and remote address labels.
     pub(crate) fn snapshot(
         &self,
@@ -217,57 +245,6 @@ impl Counters {
                 remote_addr,
             },
             stats: self.stats.clone(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Channel backpressure helper
-// ---------------------------------------------------------------------------
-
-/// Event stream emitted by `send_with_backpressure`.
-pub(crate) enum SendEvent {
-    /// Emitted when `try_send` succeeds on the fast path.
-    Fast,
-    /// Emitted when `try_send` returns `Full`.
-    Full,
-    /// Emitted after a successful awaited send with the wait duration.
-    Waited(std::time::Duration),
-}
-
-/// Sends a value through a bounded channel and exposes backpressure events.
-///
-/// Event order:
-/// - Fast path: `Fast`
-/// - Full then success: `Full` -> `Waited(duration)`
-pub(crate) async fn send_with_backpressure<T, F>(
-    tx: &tokio::sync::mpsc::Sender<T>,
-    value: T,
-    mut on_event: F,
-) -> Result<(), tokio::sync::mpsc::error::SendError<T>>
-where
-    F: FnMut(SendEvent),
-{
-    match tx.try_send(value) {
-        Ok(()) => {
-            on_event(SendEvent::Fast);
-            Ok(())
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Full(val)) => {
-            on_event(SendEvent::Full);
-            let start = std::time::Instant::now();
-            match tx.send(val).await {
-                Ok(()) => {
-                    on_event(SendEvent::Waited(start.elapsed()));
-                    Ok(())
-                }
-                Err(tokio::sync::mpsc::error::SendError(val)) => {
-                    Err(tokio::sync::mpsc::error::SendError(val))
-                }
-            }
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(val)) => {
-            Err(tokio::sync::mpsc::error::SendError(val))
         }
     }
 }
@@ -471,33 +448,49 @@ mod tests {
         log_transport_metrics(&metrics);
     }
 
-    // -- send_with_backpressure tests --
+    // -- send_and_record tests --
 
     #[tokio::test]
-    async fn send_with_backpressure_fast_path() {
+    async fn send_and_record_success() {
         let (tx, mut rx) = mpsc::channel::<u32>(4);
-        let mut saw_fast = false;
-        let mut saw_full = false;
-        let mut waited = Duration::ZERO;
+        let mut counters = Counters::new(Source::Tun, Direction::Tx);
 
-        send_with_backpressure(&tx, 7, |event| match event {
-            SendEvent::Fast => saw_fast = true,
-            SendEvent::Full => saw_full = true,
-            SendEvent::Waited(d) => waited = d,
-        })
-        .await
-        .unwrap();
+        let ok = counters.send_and_record(&tx, 42, 1, 100).await;
+        assert!(ok);
+        assert_eq!(rx.recv().await, Some(42));
 
-        assert_eq!(rx.recv().await, Some(7));
-        assert!(saw_fast);
-        assert!(!saw_full);
-        assert_eq!(waited, Duration::ZERO);
+        let snap = counters.snapshot(None, None);
+        assert_eq!(snap.stats.succeeded.packets, 1);
+        assert_eq!(snap.stats.succeeded.bytes, 100);
+        assert_eq!(snap.stats.dropped.packets, 0);
     }
 
     #[tokio::test]
-    async fn send_with_backpressure_waited_path() {
+    async fn send_and_record_channel_closed() {
+        let (tx, rx) = mpsc::channel::<u32>(4);
+        drop(rx);
+        let mut counters = Counters::new(Source::Tun, Direction::Tx);
+
+        let ok = counters.send_and_record(&tx, 42, 3, 300).await;
+        assert!(!ok);
+
+        let snap = counters.snapshot(None, None);
+        assert_eq!(snap.stats.succeeded.packets, 0);
+        assert_eq!(snap.stats.dropped.packets, 3);
+        assert_eq!(snap.stats.dropped.bytes, 300);
+        assert_eq!(
+            snap.stats
+                .drop_reasons
+                .get(&DropReason::ChannelClosed)
+                .map(|c| (c.packets, c.bytes)),
+            Some((3, 300))
+        );
+    }
+
+    #[tokio::test]
+    async fn send_and_record_queue_full_records_congestion() {
         let (tx, mut rx) = mpsc::channel::<u32>(1);
-        tx.send(1).await.unwrap();
+        tx.send(1).await.unwrap(); // fill the channel
 
         let drain = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -505,44 +498,14 @@ mod tests {
             rx
         });
 
-        let mut saw_fast = false;
-        let mut saw_full = false;
-        let mut waited = Duration::ZERO;
+        let mut counters = Counters::new(Source::Tun, Direction::Tx);
+        let ok = counters.send_and_record(&tx, 2, 1, 64).await;
+        assert!(ok);
 
-        send_with_backpressure(&tx, 2, |event| match event {
-            SendEvent::Fast => saw_fast = true,
-            SendEvent::Full => saw_full = true,
-            SendEvent::Waited(d) => waited = d,
-        })
-        .await
-        .unwrap();
-
-        assert!(!saw_fast);
-        assert!(saw_full);
-        assert!(waited > Duration::ZERO);
+        let snap = counters.snapshot(None, None);
+        assert_eq!(snap.stats.succeeded.packets, 1);
+        assert!(snap.stats.congestion.queue_full_count > 0);
+        assert!(snap.stats.congestion.queue_full_duration > Duration::ZERO);
         let _rx = drain.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn send_with_backpressure_closed_path() {
-        let (tx, rx) = mpsc::channel::<u32>(1);
-        drop(rx);
-
-        let mut saw_fast = false;
-        let mut saw_full = false;
-        let mut waited = Duration::ZERO;
-
-        let err = send_with_backpressure(&tx, 9, |event| match event {
-            SendEvent::Fast => saw_fast = true,
-            SendEvent::Full => saw_full = true,
-            SendEvent::Waited(d) => waited = d,
-        })
-        .await
-        .unwrap_err();
-
-        assert_eq!(err.0, 9);
-        assert!(!saw_fast);
-        assert!(!saw_full);
-        assert_eq!(waited, Duration::ZERO);
     }
 }

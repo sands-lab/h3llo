@@ -16,7 +16,8 @@ use crate::auth::{generate_bearer_auth, validate_connect_auth};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::{ConnectionDirection, Event, H3ConnectedEvent};
-use crate::metrics::{send_with_backpressure, Counters, Direction, SendEvent, Source};
+use crate::helpers::{send_with_backpressure, SendEvent};
+use crate::metrics::{Counters, Direction, Source};
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -766,20 +767,9 @@ pub fn spawn_h3_rx(
                         );
                     }
 
-                    if send_with_backpressure(&ingress_tx, batch, |event| match event {
-                        SendEvent::Waited(waited) => counters.record_queue_full(waited),
-                        SendEvent::Fast | SendEvent::Full => {}
-                    })
-                    .await
-                    .is_err()
-                    {
-                        counters.record_drop(
-                            crate::metrics::DropReason::ChannelClosed,
-                            ok_pkts, ok_bytes,
-                        );
+                    if !counters.send_and_record(&ingress_tx, batch, ok_pkts, ok_bytes).await {
                         return Ok(());
                     }
-                    counters.record_success(ok_pkts, ok_bytes);
                 }
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), Some(remote_addr));
