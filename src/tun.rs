@@ -499,7 +499,6 @@ fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
 /// * `output_tx` - Bounded sender to the router actor's outbound channel.
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
-#[allow(dead_code)]
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
     output_tx: mpsc::Sender<Vec<PooledBuf>>,
@@ -571,7 +570,6 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
 ///
 /// Creates a bounded packet channel internally (actor owns the receiver).
 /// Returns the packet sender and join handle.
-#[allow(dead_code)]
 pub(crate) fn spawn_tun_tx<T: TunTx>(
     mut tun: T,
     events_tx: mpsc::UnboundedSender<Event>,

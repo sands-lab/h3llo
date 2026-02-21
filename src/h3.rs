@@ -1298,8 +1298,10 @@ mod tests {
 
     #[test]
     fn make_quic_settings_applies_handshake_timeout() {
-        let mut tuning = Tuning::default();
-        tuning.h3_handshake_timeout = Duration::from_secs(7);
+        let tuning = Tuning {
+            h3_handshake_timeout: Duration::from_secs(7),
+            ..Tuning::default()
+        };
 
         let settings = make_quic_settings(&tuning, crate::config::default_mtu());
 

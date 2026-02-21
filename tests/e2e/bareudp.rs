@@ -270,7 +270,7 @@ async fn test_mtu_boundary_drop() {
 
     // Compute ping payload sizes from default MTU.
     // Max payload = MTU - 20 (IP hdr) - 8 (ICMP hdr).
-    let mtu = h3llo::config::default_mtu() as u16;
+    let mtu = h3llo::config::default_mtu();
     let ok_payload = (mtu - 20 - 8).to_string();
     let exceed_payload = mtu.to_string();
 

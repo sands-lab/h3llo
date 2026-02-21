@@ -1372,7 +1372,7 @@ mod tests {
 
         let actor_err = ActorError::TunRxRecv {
             name: "tun0".to_string(),
-            source: io::Error::new(io::ErrorKind::Other, "test error"),
+            source: io::Error::other("test error"),
         };
         let error = OrchestratorError::ActorError(actor_err);
         let error_msg = error.to_string();
@@ -1901,7 +1901,7 @@ mod tests {
 
     #[test]
     fn collect_hostnames_deduplicates() {
-        let peers = vec![
+        let peers = [
             bare_peer_at_host("peer1", "shared.example.com", 5353, &["10.0.0.0/24"]),
             bare_peer_at_host("peer2", "shared.example.com", 5354, &["172.16.0.0/16"]),
         ];

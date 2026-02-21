@@ -221,7 +221,7 @@ mod tests {
         tokio::task::yield_now().await;
         let before = interloper_ran.load(Ordering::SeqCst);
 
-        let _result = retry_on_transient!(
+        retry_on_transient!(
             {
                 let count = attempts_clone.fetch_add(1, Ordering::SeqCst);
                 if count < 3 {

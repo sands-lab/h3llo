@@ -811,7 +811,7 @@ mod tests {
             .stats
             .drop_reasons
             .get(&DropReason::TtlExpired)
-            .map_or(false, |c| c.packets == 1));
+            .is_some_and(|c| c.packets == 1));
     }
 
     #[tokio::test]
@@ -879,7 +879,7 @@ mod tests {
             .stats
             .drop_reasons
             .get(&DropReason::TtlExpired)
-            .map_or(false, |c| c.packets == 1));
+            .is_some_and(|c| c.packets == 1));
     }
 
     #[tokio::test]
