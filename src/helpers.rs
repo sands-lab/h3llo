@@ -1,80 +1,4 @@
-//! Helpers for retrying I/O operations and IP packet utilities.
-
-use std::net::IpAddr;
-
-/// IPv4 header field offsets.
-const IPV4_TTL_OFFSET: usize = 8;
-const IPV4_CHECKSUM_OFFSET: usize = 10;
-/// IPv6 hop limit offset.
-const IPV6_HOP_LIMIT_OFFSET: usize = 7;
-/// Minimum IPv4 header length.
-const IPV4_MIN_LEN: usize = 20;
-/// Minimum IPv6 header length.
-const IPV6_MIN_LEN: usize = 40;
-
-/// Decrements the TTL (IPv4) or hop limit (IPv6) by 1 in-place.
-///
-/// For IPv4, also performs an RFC 1624 incremental checksum update.
-/// Returns the **original** TTL/hop-limit value before decrement, or `None`
-/// if the packet is malformed (too short, unrecognized version, or TTL already 0).
-///
-/// # IPv4 incremental checksum ([RFC 1624])
-///
-/// TTL occupies byte 8, the high byte of the 16-bit word `[TTL, Protocol]`.
-/// Decrementing TTL by 1 subtracts `0x0100` from that word. The one's-complement
-/// checksum update adds `0x0100` with carry folding.
-///
-/// # IPv6
-///
-/// IPv6 has no header checksum. Only the hop limit (byte 7) is decremented.
-///
-/// [RFC 1624]: https://www.rfc-editor.org/rfc/rfc1624
-pub(crate) fn decrement_ttl(packet: &mut [u8]) -> Option<u8> {
-    let version = packet.first().map(|b| b >> 4)?;
-    match version {
-        4 => {
-            if packet.len() < IPV4_MIN_LEN {
-                return None;
-            }
-            let old_ttl = packet[IPV4_TTL_OFFSET];
-            if old_ttl == 0 {
-                return None;
-            }
-            packet[IPV4_TTL_OFFSET] = old_ttl - 1;
-
-            // RFC 1624 incremental checksum update.
-            let old_check = u16::from_be_bytes([
-                packet[IPV4_CHECKSUM_OFFSET],
-                packet[IPV4_CHECKSUM_OFFSET + 1],
-            ]);
-            let mut sum = old_check as u32 + 0x0100;
-            sum = (sum & 0xFFFF) + (sum >> 16);
-            sum = (sum & 0xFFFF) + (sum >> 16);
-            // Handle -0 edge case (RFC 1624 Section 4).
-            let new_check = if sum as u16 == 0xFFFF {
-                0u16
-            } else {
-                sum as u16
-            };
-            packet[IPV4_CHECKSUM_OFFSET..IPV4_CHECKSUM_OFFSET + 2]
-                .copy_from_slice(&new_check.to_be_bytes());
-
-            Some(old_ttl)
-        }
-        6 => {
-            if packet.len() < IPV6_MIN_LEN {
-                return None;
-            }
-            let old_hl = packet[IPV6_HOP_LIMIT_OFFSET];
-            if old_hl == 0 {
-                return None;
-            }
-            packet[IPV6_HOP_LIMIT_OFFSET] = old_hl - 1;
-            Some(old_hl)
-        }
-        _ => None,
-    }
-}
+//! Helpers for retrying transient I/O errors.
 
 /// Retries an async I/O expression on transient errors (`Interrupted`, `WouldBlock`).
 ///
@@ -119,31 +43,6 @@ macro_rules! retry_on_transient {
 
 pub(crate) use retry_on_transient;
 
-/// Extracts the destination IP address from an IP packet.
-///
-/// Returns `None` if the packet is too short or has an unrecognized IP version.
-pub(crate) fn extract_dst_ip(packet: &[u8]) -> Option<IpAddr> {
-    let first = *packet.first()?;
-    match first >> 4 {
-        4 => {
-            if packet.len() < 20 {
-                return None;
-            }
-            let dst = [packet[16], packet[17], packet[18], packet[19]];
-            Some(IpAddr::from(dst))
-        }
-        6 => {
-            if packet.len() < 40 {
-                return None;
-            }
-            let mut dst = [0u8; 16];
-            dst.copy_from_slice(&packet[24..40]);
-            Some(IpAddr::from(dst))
-        }
-        _ => None,
-    }
-}
-
 /// Test utilities for constructing IP packets.
 #[cfg(test)]
 pub(crate) mod test_packets {
@@ -183,10 +82,9 @@ pub(crate) mod test_packets {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::{extract_dst_ip, test_packets};
+    use super::test_packets;
     use std::io;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -247,7 +145,7 @@ mod tests {
         let dst = Ipv4Addr::new(192, 0, 2, 1);
         let packet = test_packets::make_ipv4_packet(dst);
         assert_eq!(packet.len(), 20);
-        assert_eq!(packet[0], 0x45); // Version 4, IHL 5
+        assert_eq!(packet[0], 0x45);
         assert_eq!(&packet[16..20], &[192, 0, 2, 1]);
     }
 
@@ -256,34 +154,8 @@ mod tests {
         let dst: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let packet = test_packets::make_ipv6_packet(dst);
         assert_eq!(packet.len(), 40);
-        assert_eq!(packet[0] >> 4, 6); // Version 6
+        assert_eq!(packet[0] >> 4, 6);
         assert_eq!(&packet[24..40], &dst.octets());
-    }
-
-    #[test]
-    fn extract_dst_ip_parses_ipv4() {
-        let dst = Ipv4Addr::new(10, 20, 30, 40);
-        let packet = test_packets::make_ipv4_packet(dst);
-        assert_eq!(extract_dst_ip(&packet), Some(IpAddr::V4(dst)));
-    }
-
-    #[test]
-    fn extract_dst_ip_parses_ipv6() {
-        let dst: Ipv6Addr = "fe80::1".parse().unwrap();
-        let packet = test_packets::make_ipv6_packet(dst);
-        assert_eq!(extract_dst_ip(&packet), Some(IpAddr::V6(dst)));
-    }
-
-    #[test]
-    fn extract_dst_ip_returns_none_for_invalid_packets() {
-        // Empty packet
-        assert_eq!(extract_dst_ip(&[]), None);
-        // Truncated IPv4 (less than 20 bytes)
-        assert_eq!(extract_dst_ip(&[0x45; 10]), None);
-        // Truncated IPv6 (less than 40 bytes)
-        assert_eq!(extract_dst_ip(&[0x60; 30]), None);
-        // Unknown version
-        assert_eq!(extract_dst_ip(&[0x30; 20]), None);
     }
 
     #[tokio::test]
@@ -365,87 +237,5 @@ mod tests {
         let after = interloper_ran.load(Ordering::SeqCst);
         interloper.abort();
         assert_eq!(before, after, "Interrupted should not yield to other tasks");
-    }
-
-    // ========== decrement_ttl tests ==========
-
-    /// Compute IPv4 header checksum from scratch for test verification.
-    fn compute_ipv4_checksum(header: &[u8]) -> u16 {
-        let mut sum: u32 = 0;
-        for i in (0..20).step_by(2) {
-            sum += u16::from_be_bytes([header[i], header[i + 1]]) as u32;
-        }
-        while sum >> 16 != 0 {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-        !(sum as u16)
-    }
-
-    #[test]
-    fn decrement_ttl_ipv4_updates_checksum() {
-        let mut pkt = vec![0u8; 20];
-        pkt[0] = 0x45;
-        pkt[8] = 64;
-        // Compute initial checksum from scratch.
-        pkt[10] = 0;
-        pkt[11] = 0;
-        let initial = compute_ipv4_checksum(&pkt);
-        pkt[10..12].copy_from_slice(&initial.to_be_bytes());
-
-        let old_ttl = decrement_ttl(&mut pkt);
-        assert_eq!(old_ttl, Some(64));
-        assert_eq!(pkt[8], 63);
-
-        // Verify incremental matches from-scratch.
-        let stored = u16::from_be_bytes([pkt[10], pkt[11]]);
-        pkt[10] = 0;
-        pkt[11] = 0;
-        let recomputed = compute_ipv4_checksum(&pkt);
-        assert_eq!(stored, recomputed);
-    }
-
-    #[test]
-    fn decrement_ttl_ipv4_ttl_one_becomes_zero() {
-        let mut pkt = vec![0u8; 20];
-        pkt[0] = 0x45;
-        pkt[8] = 1;
-        assert_eq!(decrement_ttl(&mut pkt), Some(1));
-        assert_eq!(pkt[8], 0);
-    }
-
-    #[test]
-    fn decrement_ttl_ipv4_checksum_carry_folds() {
-        let mut pkt = vec![0u8; 20];
-        pkt[0] = 0x45;
-        pkt[8] = 10;
-        pkt[10] = 0xFF;
-        pkt[11] = 0x00;
-        let old = decrement_ttl(&mut pkt).unwrap();
-        assert_eq!(old, 10);
-        assert_eq!(u16::from_be_bytes([pkt[10], pkt[11]]), 0x0001);
-    }
-
-    #[test]
-    fn decrement_ttl_ipv6_decrements_hop_limit() {
-        let mut pkt = vec![0u8; 40];
-        pkt[0] = 0x60;
-        pkt[7] = 128;
-        assert_eq!(decrement_ttl(&mut pkt), Some(128));
-        assert_eq!(pkt[7], 127);
-    }
-
-    #[test]
-    fn decrement_ttl_returns_none_for_malformed() {
-        assert!(decrement_ttl(&mut [0x45; 10]).is_none()); // IPv4 too short
-        assert!(decrement_ttl(&mut [0x60; 20]).is_none()); // IPv6 too short
-        assert!(decrement_ttl(&mut [0x30; 20]).is_none()); // Unknown version
-    }
-
-    #[test]
-    fn decrement_ttl_zero_ttl_returns_none() {
-        let mut pkt = vec![0u8; 20];
-        pkt[0] = 0x45;
-        pkt[8] = 0;
-        assert_eq!(decrement_ttl(&mut pkt), None);
     }
 }
