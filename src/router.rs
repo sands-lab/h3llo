@@ -212,7 +212,7 @@ impl RoutingTable {
     /// * `peers` - Peer configurations.
     /// * `peer_txs` - Map of peer ID to TX channel. Peers without a channel are skipped.
     /// * `local_tun` - Local TUN configuration (uses `addrs` for host routes).
-    /// * `tun_tx` - TUN TX channel for local delivery.
+    /// * `input_tx` - Input channel for local delivery (TUN TX).
     ///
     /// # Errors
     ///
@@ -221,7 +221,7 @@ impl RoutingTable {
         peers: &[Peer],
         peer_txs: &HashMap<String, mpsc::Sender<Vec<PooledBuf>>>,
         local_tun: &LocalTun,
-        tun_tx: &mpsc::Sender<Vec<PooledBuf>>,
+        input_tx: &mpsc::Sender<Vec<PooledBuf>>,
     ) -> Result<Self, RoutingError> {
         let mut table = RoutingTable::new();
 
@@ -254,7 +254,7 @@ impl RoutingTable {
                 host_route,
                 RouteEntry {
                     peer_id: LOCAL_PEER_ID.to_string(),
-                    tx: tun_tx.clone(),
+                    tx: input_tx.clone(),
                 },
             ) {
                 warn!(error = %e, "failed to insert local TUN route");
@@ -329,15 +329,6 @@ pub enum RoutingError {
 // Router actor
 // ---------------------------------------------------------------------------
 
-/// Message sent from RX actors to the router.
-#[derive(Debug)]
-pub struct RouterMsg {
-    /// Origin of the batch (determines routing policy).
-    pub source: Source,
-    /// Packet batch.
-    pub packets: Vec<PooledBuf>,
-}
-
 /// Commands accepted by the router actor's control-plane channel.
 #[derive(Debug)]
 pub enum RouterCommand {
@@ -348,30 +339,36 @@ pub enum RouterCommand {
     },
 }
 
+/// Handles returned by [`spawn_router`].
+pub type RouterHandles = (
+    mpsc::Sender<Vec<PooledBuf>>,
+    mpsc::Sender<Vec<PooledBuf>>,
+    mpsc::UnboundedSender<RouterCommand>,
+    JoinHandle<ActorExitResult>,
+);
+
 /// Spawns the router actor.
 ///
-/// Creates a bounded data-plane inbound channel and an unbounded command
-/// channel internally (actor owns both receivers). Returns senders and handle.
+/// Creates two bounded data-plane channels (output from TUN, ingress from
+/// transport peers) and an unbounded command channel internally. Returns
+/// senders and handle.
 ///
 /// # Arguments
 ///
 /// * `routing` - Initial routing table.
-/// * `tun_tx` - Sender to TUN Tx for TTL-expired and locally-destined packets.
+/// * `input_tx` - Sender for locally-destined and TTL-expired packets (TUN TX).
 /// * `events_tx` - Unbounded channel for emitting router metrics.
 /// * `interval` - Metrics emission interval.
-/// * `packet_queue_depth` - Bounded capacity for the inbound data-plane channel.
+/// * `packet_queue_depth` - Bounded capacity for each data-plane channel.
 pub fn spawn_router(
     mut routing: RoutingTable,
-    tun_tx: mpsc::Sender<Vec<PooledBuf>>,
+    input_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
     packet_queue_depth: usize,
-) -> (
-    mpsc::Sender<RouterMsg>,
-    mpsc::UnboundedSender<RouterCommand>,
-    JoinHandle<ActorExitResult>,
-) {
-    let (router_tx, mut router_rx) = mpsc::channel::<RouterMsg>(packet_queue_depth);
+) -> RouterHandles {
+    let (output_tx, mut output_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
+    let (ingress_tx, mut ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
     let handle = tokio::spawn(async move {
@@ -380,20 +377,19 @@ pub fn spawn_router(
 
         loop {
             tokio::select! {
-                msg = router_rx.recv() => {
-                    let Some(RouterMsg { source, packets }) = msg else {
+                batch = output_rx.recv() => {
+                    let Some(packets) = batch else {
                         return Ok(());
                     };
-                    match source {
-                        Source::Tun => {
-                            handle_tun_batch(packets, &routing, &mut counters).await;
-                        }
-                        Source::BareUdp | Source::Http3 | Source::Router => {
-                            handle_transport_batch(
-                                packets, &routing, &tun_tx, &mut counters,
-                            ).await;
-                        }
-                    }
+                    handle_output_batch(packets, &routing, &mut counters).await;
+                }
+                batch = ingress_rx.recv() => {
+                    let Some(packets) = batch else {
+                        return Ok(());
+                    };
+                    handle_ingress_batch(
+                        packets, &routing, &input_tx, &mut counters,
+                    ).await;
                 }
                 cmd = cmd_rx.recv() => {
                     let Some(command) = cmd else {
@@ -413,11 +409,15 @@ pub fn spawn_router(
         }
     });
 
-    (router_tx, cmd_tx, handle)
+    (output_tx, ingress_tx, cmd_tx, handle)
 }
 
-/// Handles a batch from TUN Rx: first-packet routing, no TTL mutation.
-async fn handle_tun_batch(batch: Vec<PooledBuf>, routing: &RoutingTable, counters: &mut Counters) {
+/// Handles an output batch (from TUN Rx): first-packet routing, no TTL mutation.
+async fn handle_output_batch(
+    batch: Vec<PooledBuf>,
+    routing: &RoutingTable,
+    counters: &mut Counters,
+) {
     let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
     let pkt_count = batch.len() as u64;
 
@@ -445,16 +445,16 @@ async fn handle_tun_batch(batch: Vec<PooledBuf>, routing: &RoutingTable, counter
     }
 }
 
-/// Handles a batch from a transport peer: per-packet dst-IP scanning,
+/// Handles an ingress batch (from transport peers): per-packet dst-IP scanning,
 /// consecutive-group splitting, LPM lookup, TTL decrement + checksum.
 ///
 /// Uses `drain`-based group extraction (always draining from index 0),
 /// `same_channel()` for TUN detection, and old-TTL return semantics
 /// (`Some(1)` signals expired).
-async fn handle_transport_batch(
+async fn handle_ingress_batch(
     mut batch: Vec<PooledBuf>,
     routing: &RoutingTable,
-    tun_tx: &mpsc::Sender<Vec<PooledBuf>>,
+    input_tx: &mpsc::Sender<Vec<PooledBuf>>,
     counters: &mut Counters,
 ) {
     // Process batch by draining consecutive groups from the front.
@@ -492,9 +492,9 @@ async fn handle_transport_batch(
         };
 
         // TUN detection via channel pointer comparison. If the route's TX
-        // channel is the same as the dedicated tun_tx, this is a locally-
+        // channel is the same as the dedicated input_tx, this is a locally-
         // destined group — no TTL decrement needed.
-        let is_tun_dest = route.tx.same_channel(tun_tx);
+        let is_tun_dest = route.tx.same_channel(input_tx);
 
         if is_tun_dest {
             // TUN destination: no TTL decrement, forward directly.
@@ -548,7 +548,7 @@ async fn handle_transport_batch(
                 let exp_count = expired.len() as u64;
                 let exp_bytes: u64 = expired.iter().map(|p| p.len() as u64).sum();
                 counters.record_drop(DropReason::TtlExpired, exp_count, exp_bytes);
-                if send_with_backpressure(tun_tx, expired, |event| match event {
+                if send_with_backpressure(input_tx, expired, |event| match event {
                     SendEvent::Waited(waited) => counters.record_queue_full(waited),
                     SendEvent::Fast | SendEvent::Full => {}
                 })
@@ -637,8 +637,8 @@ mod tests {
             bare_peer("peer-b", &["10.0.0.0/24"]),
         ];
         let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
-        let (tun_tx, _) = mpsc::channel(1);
-        let table = RoutingTable::make(&peers, &peer_txs, &empty_local_tun(), &tun_tx)
+        let (input_tx, _) = mpsc::channel(1);
+        let table = RoutingTable::make(&peers, &peer_txs, &empty_local_tun(), &input_tx)
             .expect("table should build");
         let result = table
             .lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42)))
@@ -654,8 +654,8 @@ mod tests {
             bare_peer("peer-b", &["10.0.0.0/24"]),
         ];
         let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
-        let (tun_tx, _) = mpsc::channel(1);
-        let err = RoutingTable::make(&peers, &peer_txs, &empty_local_tun(), &tun_tx).unwrap_err();
+        let (input_tx, _) = mpsc::channel(1);
+        let err = RoutingTable::make(&peers, &peer_txs, &empty_local_tun(), &input_tx).unwrap_err();
         assert!(matches!(
             err,
             RoutingError::ConflictingPrefix {
@@ -670,8 +670,8 @@ mod tests {
     fn skips_duplicate_prefixes_within_peer() {
         let peers = vec![bare_peer("peer-a", &["10.0.0.0/24", "10.0.0.0/24"])];
         let peer_txs = dummy_peer_txs(&["peer-a"]);
-        let (tun_tx, _) = mpsc::channel(1);
-        let table = RoutingTable::make(&peers, &peer_txs, &empty_local_tun(), &tun_tx)
+        let (input_tx, _) = mpsc::channel(1);
+        let table = RoutingTable::make(&peers, &peer_txs, &empty_local_tun(), &input_tx)
             .expect("table should build");
         assert_eq!(table.len(), (1, 0));
         let result = table
@@ -684,14 +684,14 @@ mod tests {
     fn make_inserts_local_tun_host_routes() {
         let peers = vec![bare_peer("peer-a", &["10.0.0.0/24"])];
         let peer_txs = dummy_peer_txs(&["peer-a"]);
-        let (tun_tx, _) = mpsc::channel(1);
+        let (input_tx, _) = mpsc::channel(1);
         let local_tun = LocalTun {
             ifname: "test0".to_string(),
             addrs: vec!["10.0.0.1/24".parse().unwrap()],
             mtu: 1350,
         };
-        let table =
-            RoutingTable::make(&peers, &peer_txs, &local_tun, &tun_tx).expect("table should build");
+        let table = RoutingTable::make(&peers, &peer_txs, &local_tun, &input_tx)
+            .expect("table should build");
 
         // Local host route (/32) wins over peer subnet (/24) for the local address
         let local = table
@@ -718,7 +718,7 @@ mod tests {
         let pkt_data = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
         let batch = vec![alloc_packet_buf(&pkt_data)];
 
-        handle_tun_batch(batch, &routing, &mut counters).await;
+        handle_output_batch(batch, &routing, &mut counters).await;
 
         let received = peer_rx.recv().await.expect("batch should arrive");
         assert_eq!(received.len(), 1);
@@ -733,7 +733,7 @@ mod tests {
         let pkt_data = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
         let batch = vec![alloc_packet_buf(&pkt_data)];
 
-        handle_tun_batch(batch, &routing, &mut counters).await;
+        handle_output_batch(batch, &routing, &mut counters).await;
 
         let snap = counters.snapshot(None, None);
         assert_eq!(snap.stats.dropped.packets, 1);
@@ -743,7 +743,7 @@ mod tests {
     async fn transport_batch_splits_by_dst_ip() {
         let (peer1_tx, mut peer1_rx) = mpsc::channel(4);
         let (peer2_tx, mut peer2_rx) = mpsc::channel(4);
-        let (tun_tx, _tun_rx) = mpsc::channel(4);
+        let (input_tx, _input_rx) = mpsc::channel(4);
 
         let mut routing = RoutingTable::new();
         routing
@@ -776,7 +776,7 @@ mod tests {
         batch.push(alloc_packet_buf(&pkt2));
         batch.push(alloc_packet_buf(&pkt3));
 
-        handle_transport_batch(batch, &routing, &tun_tx, &mut counters).await;
+        handle_ingress_batch(batch, &routing, &input_tx, &mut counters).await;
 
         let peer1_batch = peer1_rx.recv().await.expect("peer1 should receive");
         assert_eq!(peer1_batch.len(), 2);
@@ -788,22 +788,22 @@ mod tests {
     #[tokio::test]
     async fn transport_batch_ttl_expired_forwarded_to_tun() {
         let (peer_tx, mut peer_rx) = mpsc::channel(4);
-        let (tun_tx, mut tun_rx) = mpsc::channel(4);
+        let (input_tx, mut input_rx) = mpsc::channel(4);
 
         let routing = make_test_routing("peer1", "10.0.0.0/8".parse().unwrap(), peer_tx);
         let mut counters = Counters::new(Source::Router, Direction::Rx);
 
-        // TTL=1 packet → should expire and go to tun_tx
+        // TTL=1 packet → should expire and go to input_tx
         let pkt_data = make_ipv4_with_ttl(Ipv4Addr::new(10, 0, 0, 1), 1);
         let batch = vec![alloc_packet_buf(&pkt_data)];
 
-        handle_transport_batch(batch, &routing, &tun_tx, &mut counters).await;
+        handle_ingress_batch(batch, &routing, &input_tx, &mut counters).await;
 
         // Peer should NOT receive it
         assert!(peer_rx.try_recv().is_err());
 
         // TUN should receive the expired packet
-        let expired_batch = tun_rx.recv().await.expect("tun should get expired");
+        let expired_batch = input_rx.recv().await.expect("tun should get expired");
         assert_eq!(expired_batch.len(), 1);
 
         let snap = counters.snapshot(None, None);
@@ -816,18 +816,18 @@ mod tests {
 
     #[tokio::test]
     async fn transport_batch_tun_dest_no_ttl_decrement() {
-        // Route points to tun_tx → should forward without TTL decrement
-        let (tun_tx, mut tun_rx) = mpsc::channel(4);
+        // Route points to input_tx → should forward without TTL decrement
+        let (input_tx, mut input_rx) = mpsc::channel(4);
 
-        let routing = make_test_routing("local", "10.0.0.0/8".parse().unwrap(), tun_tx.clone());
+        let routing = make_test_routing("local", "10.0.0.0/8".parse().unwrap(), input_tx.clone());
         let mut counters = Counters::new(Source::Router, Direction::Rx);
 
         let pkt_data = make_ipv4_with_ttl(Ipv4Addr::new(10, 0, 0, 1), 5);
         let batch = vec![alloc_packet_buf(&pkt_data)];
 
-        handle_transport_batch(batch, &routing, &tun_tx, &mut counters).await;
+        handle_ingress_batch(batch, &routing, &input_tx, &mut counters).await;
 
-        let received = tun_rx.recv().await.expect("tun should receive");
+        let received = input_rx.recv().await.expect("tun should receive");
         assert_eq!(received.len(), 1);
         // TTL should be unchanged (5, not decremented to 4)
         assert_eq!(received[0][8], 5);
@@ -836,7 +836,7 @@ mod tests {
     #[tokio::test]
     async fn transport_batch_decrements_ttl_for_non_tun() {
         let (peer_tx, mut peer_rx) = mpsc::channel(4);
-        let (tun_tx, _tun_rx) = mpsc::channel(4);
+        let (input_tx, _input_rx) = mpsc::channel(4);
 
         let routing = make_test_routing("peer1", "10.0.0.0/8".parse().unwrap(), peer_tx);
         let mut counters = Counters::new(Source::Router, Direction::Rx);
@@ -844,7 +844,7 @@ mod tests {
         let pkt_data = make_ipv4_with_ttl(Ipv4Addr::new(10, 0, 0, 1), 64);
         let batch = vec![alloc_packet_buf(&pkt_data)];
 
-        handle_transport_batch(batch, &routing, &tun_tx, &mut counters).await;
+        handle_ingress_batch(batch, &routing, &input_tx, &mut counters).await;
 
         let received = peer_rx.recv().await.expect("peer should receive");
         assert_eq!(received.len(), 1);
@@ -855,23 +855,23 @@ mod tests {
     #[tokio::test]
     async fn transport_batch_ipv6_hop_limit_expired_forwarded_to_tun() {
         let (peer_tx, mut peer_rx) = mpsc::channel(4);
-        let (tun_tx, mut tun_rx) = mpsc::channel(4);
+        let (input_tx, mut input_rx) = mpsc::channel(4);
 
         let routing = make_test_routing("peer1", "2001:db8::/32".parse().unwrap(), peer_tx);
         let mut counters = Counters::new(Source::Router, Direction::Rx);
 
-        // Hop limit = 1 → should expire and go to tun_tx
+        // Hop limit = 1 → should expire and go to input_tx
         let mut pkt_data = make_ipv6_packet("2001:db8::1".parse::<Ipv6Addr>().unwrap());
         pkt_data[7] = 1; // hop limit
         let batch = vec![alloc_packet_buf(&pkt_data)];
 
-        handle_transport_batch(batch, &routing, &tun_tx, &mut counters).await;
+        handle_ingress_batch(batch, &routing, &input_tx, &mut counters).await;
 
         // Peer should NOT receive it
         assert!(peer_rx.try_recv().is_err());
 
         // TUN should receive the expired packet
-        let expired_batch = tun_rx.recv().await.expect("tun should get expired");
+        let expired_batch = input_rx.recv().await.expect("tun should get expired");
         assert_eq!(expired_batch.len(), 1);
 
         let snap = counters.snapshot(None, None);
@@ -885,7 +885,7 @@ mod tests {
     #[tokio::test]
     async fn transport_batch_ipv6_decrements_hop_limit() {
         let (peer_tx, mut peer_rx) = mpsc::channel(4);
-        let (tun_tx, _tun_rx) = mpsc::channel(4);
+        let (input_tx, _input_rx) = mpsc::channel(4);
 
         let routing = make_test_routing("peer1", "2001:db8::/32".parse().unwrap(), peer_tx);
         let mut counters = Counters::new(Source::Router, Direction::Rx);
@@ -894,7 +894,7 @@ mod tests {
         pkt_data[7] = 128; // hop limit
         let batch = vec![alloc_packet_buf(&pkt_data)];
 
-        handle_transport_batch(batch, &routing, &tun_tx, &mut counters).await;
+        handle_ingress_batch(batch, &routing, &input_tx, &mut counters).await;
 
         let received = peer_rx.recv().await.expect("peer should receive");
         assert_eq!(received.len(), 1);
@@ -905,13 +905,13 @@ mod tests {
     async fn routing_update_replaces_table() {
         let (peer1_tx, _peer1_rx) = mpsc::channel(4);
         let (peer2_tx, mut peer2_rx) = mpsc::channel(4);
-        let (tun_tx, _tun_rx) = mpsc::channel(4);
+        let (input_tx, _input_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let routing = make_test_routing("peer1", "10.0.0.0/8".parse().unwrap(), peer1_tx);
 
-        let (router_tx, cmd_tx, handle) =
-            spawn_router(routing, tun_tx, events_tx, Duration::from_secs(60), 16);
+        let (output_tx, _ingress_tx, cmd_tx, handle) =
+            spawn_router(routing, input_tx, events_tx, Duration::from_secs(60), 16);
 
         // Update routing to point to peer2
         let new_routing = make_test_routing("peer2", "10.0.0.0/8".parse().unwrap(), peer2_tx);
@@ -924,13 +924,10 @@ mod tests {
         // Allow the command to be processed
         tokio::task::yield_now().await;
 
-        // Send a TUN batch
+        // Send an output (TUN) batch
         let pkt_data = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
-        router_tx
-            .send(RouterMsg {
-                source: Source::Tun,
-                packets: vec![alloc_packet_buf(&pkt_data)],
-            })
+        output_tx
+            .send(vec![alloc_packet_buf(&pkt_data)])
             .await
             .unwrap();
 
@@ -942,14 +939,15 @@ mod tests {
 
     #[tokio::test]
     async fn router_exits_when_senders_dropped() {
-        let (tun_tx, _tun_rx) = mpsc::channel(4);
+        let (input_tx, _input_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let routing = RoutingTable::new();
 
-        let (router_tx, cmd_tx, handle) =
-            spawn_router(routing, tun_tx, events_tx, Duration::from_secs(60), 16);
+        let (output_tx, ingress_tx, cmd_tx, handle) =
+            spawn_router(routing, input_tx, events_tx, Duration::from_secs(60), 16);
 
-        drop(router_tx);
+        drop(output_tx);
+        drop(ingress_tx);
         drop(cmd_tx);
 
         let result = tokio::time::timeout(Duration::from_millis(200), handle).await;

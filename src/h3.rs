@@ -17,7 +17,6 @@ use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::{ConnectionDirection, Event, H3ConnectedEvent};
 use crate::metrics::{send_with_backpressure, Counters, Direction, SendEvent, Source};
-use crate::router::RouterMsg;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -719,12 +718,12 @@ pub struct H3Rx {
 /// # Arguments
 ///
 /// * `rx` - H3 receive state (peer_id and datagram_rx).
-/// * `router_tx` - Bounded channel to push received packets to the router actor.
+/// * `ingress_tx` - Bounded channel to push received packets to the router actor.
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
 pub fn spawn_h3_rx(
     rx: H3Rx,
-    router_tx: mpsc::Sender<RouterMsg>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<ActorExitResult> {
@@ -767,8 +766,7 @@ pub fn spawn_h3_rx(
                         );
                     }
 
-                    let msg = RouterMsg { source: Source::Http3, packets: batch };
-                    if send_with_backpressure(&router_tx, msg, |event| match event {
+                    if send_with_backpressure(&ingress_tx, batch, |event| match event {
                         SendEvent::Waited(waited) => counters.record_queue_full(waited),
                         SendEvent::Fast | SendEvent::Full => {}
                     })
@@ -894,7 +892,7 @@ pub fn spawn_h3_tx(
     packet_queue_depth: usize,
     keepalive_interval: Duration,
 ) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
+    let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
 
     let H3Tx {
         peer_id,
@@ -924,7 +922,7 @@ pub fn spawn_h3_tx(
 
         loop {
             tokio::select! {
-                maybe_batch = packet_rx.recv() => {
+                maybe_batch = egress_rx.recv() => {
                     let Some(packets) = maybe_batch else {
                         let _ = quic_cmd_send(QuicCommand::ConnectionClose(
                             ConnectionShutdownBehaviour {
@@ -1006,7 +1004,7 @@ pub fn spawn_h3_tx(
         }
     });
 
-    (packet_tx, handle)
+    (egress_tx, handle)
 }
 
 // ========== Listener ==========
@@ -1972,7 +1970,7 @@ mod tests {
         let (_client_rx, client_tx) = client_conn.into_actors();
 
         // Client TX actor
-        let (client_packet_tx, _client_tx_handle) = spawn_h3_tx(
+        let (client_egress_tx, _client_tx_handle) = spawn_h3_tx(
             client_tx,
             events_tx.clone(),
             metrics_interval,
@@ -1984,7 +1982,7 @@ mod tests {
         let (server_rx, _server_tx) = server_event.connection.into_actors();
 
         // Server RX actor
-        let (server_router_tx, mut server_router_rx) = mpsc::channel::<RouterMsg>(16);
+        let (server_router_tx, mut server_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _server_rx_handle =
             spawn_h3_rx(server_rx, server_router_tx, events_tx, metrics_interval);
 
@@ -1992,17 +1990,16 @@ mod tests {
         use crate::tun::alloc_packet_buf;
         let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
         let pkt = alloc_packet_buf(&test_packet);
-        client_packet_tx.send(vec![pkt]).await.expect("send failed");
+        client_egress_tx.send(vec![pkt]).await.expect("send failed");
 
         // Verify receipt
-        let msg = tokio::time::timeout(Duration::from_secs(5), server_router_rx.recv())
+        let batch = tokio::time::timeout(Duration::from_secs(5), server_router_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
 
-        assert_eq!(msg.source, Source::Http3);
-        assert_eq!(msg.packets.len(), 1);
-        assert_eq!(&msg.packets[0][..], &test_packet[..]);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], &test_packet[..]);
 
         drop(cmd_tx);
     }
@@ -2077,7 +2074,7 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (s2c_router_tx, mut s2c_router_rx) = mpsc::channel::<RouterMsg>(16);
+        let (s2c_router_tx, mut s2c_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _client_rx_handle = spawn_h3_rx(
             client_rx,
             s2c_router_tx,
@@ -2097,7 +2094,7 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (c2s_router_tx, mut c2s_router_rx) = mpsc::channel::<RouterMsg>(16);
+        let (c2s_router_tx, mut c2s_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _server_rx_handle = spawn_h3_rx(server_rx, c2s_router_tx, events_tx, metrics_interval);
 
         // Test client -> server
@@ -2107,12 +2104,12 @@ mod tests {
             .await
             .unwrap();
 
-        let msg_c2s = tokio::time::timeout(Duration::from_secs(5), c2s_router_rx.recv())
+        let batch_c2s = tokio::time::timeout(Duration::from_secs(5), c2s_router_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
-        assert_eq!(msg_c2s.packets.len(), 1);
-        assert_eq!(&msg_c2s.packets[0][..], &packet_c2s[..]);
+        assert_eq!(batch_c2s.len(), 1);
+        assert_eq!(&batch_c2s[0][..], &packet_c2s[..]);
 
         // Test server -> client
         let packet_s2c = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
@@ -2121,12 +2118,12 @@ mod tests {
             .await
             .unwrap();
 
-        let msg_s2c = tokio::time::timeout(Duration::from_secs(5), s2c_router_rx.recv())
+        let batch_s2c = tokio::time::timeout(Duration::from_secs(5), s2c_router_rx.recv())
             .await
             .expect("timeout")
             .expect("channel closed");
-        assert_eq!(msg_s2c.packets.len(), 1);
-        assert_eq!(&msg_s2c.packets[0][..], &packet_s2c[..]);
+        assert_eq!(batch_s2c.len(), 1);
+        assert_eq!(&batch_s2c[0][..], &packet_s2c[..]);
 
         drop(cmd_tx);
     }
@@ -2229,7 +2226,7 @@ mod tests {
             quic_cmd_send,
         };
 
-        let (packet_tx, tx_handle) = spawn_h3_tx(
+        let (egress_tx, tx_handle) = spawn_h3_tx(
             tx,
             events_tx,
             Duration::from_millis(50), // short interval for metrics emission
@@ -2243,7 +2240,7 @@ mod tests {
         // Send a batch of 5 packets — capacity=64 so all try_send succeed.
         let payload = vec![0u8; 100];
         let batch: Vec<PooledBuf> = (0..5).map(|_| alloc_packet_buf(&payload)).collect();
-        packet_tx.send(batch).await.unwrap();
+        egress_tx.send(batch).await.unwrap();
 
         // Wait for a metrics tick.
         let metrics = tokio::time::timeout(Duration::from_secs(2), async {
@@ -2264,7 +2261,7 @@ mod tests {
         // No queue-full events.
         assert_eq!(metrics.stats.congestion.queue_full_count, 0);
 
-        drop(packet_tx);
+        drop(egress_tx);
         let _ = tx_handle.await;
         drain.abort();
     }
@@ -2293,7 +2290,7 @@ mod tests {
             quic_cmd_send,
         };
 
-        let (packet_tx, tx_handle) = spawn_h3_tx(
+        let (egress_tx, tx_handle) = spawn_h3_tx(
             tx,
             events_tx,
             Duration::from_millis(50),
@@ -2314,7 +2311,7 @@ mod tests {
         // Send batch of 3 packets with capacity=1 -> at least 2 backpressure events.
         let payload = vec![0u8; 100];
         let batch: Vec<PooledBuf> = (0..3).map(|_| alloc_packet_buf(&payload)).collect();
-        packet_tx.send(batch).await.unwrap();
+        egress_tx.send(batch).await.unwrap();
 
         // Wait for metrics.
         let metrics = tokio::time::timeout(Duration::from_secs(2), async {
@@ -2343,7 +2340,7 @@ mod tests {
         );
         assert!(metrics.stats.congestion.queue_full_duration > Duration::ZERO);
 
-        drop(packet_tx);
+        drop(egress_tx);
         let _ = tx_handle.await;
         drain.abort();
     }

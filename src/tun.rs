@@ -5,7 +5,6 @@ use crate::config::LocalTun;
 use crate::events::Event;
 use crate::helpers::retry_on_transient;
 use crate::metrics::{send_with_backpressure, Counters, Direction, DropReason, SendEvent, Source};
-use crate::router::RouterMsg;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::io;
 use std::net::Ipv6Addr;
@@ -497,13 +496,13 @@ fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
 /// # Arguments
 ///
 /// * `tun` - TUN device reader.
-/// * `router_tx` - Bounded sender to the router actor's inbound queue.
+/// * `output_tx` - Bounded sender to the router actor's outbound channel.
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
 #[allow(dead_code)]
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
-    router_tx: mpsc::Sender<RouterMsg>,
+    output_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<ActorExitResult> {
@@ -540,8 +539,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             }
                             let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
                             let pkt_count = batch.len() as u64;
-                            let msg = RouterMsg { source: Source::Tun, packets: batch };
-                            if send_with_backpressure(&router_tx, msg, |event| match event {
+                            if send_with_backpressure(&output_tx, batch, |event| match event {
                                 SendEvent::Waited(waited) => counters.record_queue_full(waited),
                                 SendEvent::Fast | SendEvent::Full => {}
                             })
@@ -581,7 +579,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     packet_queue_depth: usize,
 ) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
-    let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
+    let (input_tx, mut input_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
     let tun_name = tun.name().to_string();
 
     let handle = tokio::spawn(async move {
@@ -591,7 +589,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
 
         loop {
             tokio::select! {
-                maybe_batch = packet_rx.recv() => {
+                maybe_batch = input_rx.recv() => {
                     let Some(packets) = maybe_batch else {
                         return Ok(()); // Channel closed, exit gracefully
                     };
@@ -632,7 +630,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
         }
     });
 
-    (packet_tx, handle)
+    (input_tx, handle)
 }
 
 // ============================================================================
@@ -817,21 +815,20 @@ mod tests {
     #[tokio::test]
     async fn tun_rx_forwards_batch_to_router() {
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem0", 64);
-        let (router_tx, mut router_rx) = mpsc::channel::<RouterMsg>(4);
+        let (output_tx, mut output_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
-        let tun_rx_task = spawn_tun_rx(rx_tun, router_tx, events_tx, Duration::from_millis(10));
+        let tun_rx_task = spawn_tun_rx(rx_tun, output_tx, events_tx, Duration::from_millis(10));
 
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
-        let msg = router_rx
+        let batch = output_rx
             .recv()
             .await
             .expect("router should receive message");
-        assert_eq!(msg.source, Source::Tun);
-        assert_eq!(msg.packets.len(), 1);
-        assert_eq!(&msg.packets[0][..], &ipv4_packet[..]);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], &ipv4_packet[..]);
 
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
@@ -860,14 +857,14 @@ mod tests {
     async fn tun_tx_drops_oversize_and_reports_metrics() {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) = memory_tun("mem1", 4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (packet_tx, tun_tx_task) =
+        let (input_tx, tun_tx_task) =
             spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(10), 256);
 
-        packet_tx
+        input_tx
             .send(vec![BufFactory::buf_from_slice(&[0, 1, 2, 3, 4, 5])])
             .await
             .unwrap();
-        packet_tx
+        input_tx
             .send(vec![BufFactory::buf_from_slice(&[9, 9, 9])])
             .await
             .unwrap();
@@ -920,10 +917,10 @@ mod tests {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) =
             memory_tun_with_errors("mem-interrupt", 16, vec![std::io::ErrorKind::Interrupted]);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (packet_tx, tun_tx_task) =
+        let (input_tx, tun_tx_task) =
             spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(5), 256);
 
-        packet_tx
+        input_tx
             .send(vec![BufFactory::buf_from_slice(&[1, 2, 3])])
             .await
             .unwrap();
@@ -959,14 +956,14 @@ mod tests {
     // ========== Actor Lifecycle Tests ==========
 
     #[tokio::test]
-    async fn spawn_tun_tx_returns_working_packet_tx() {
+    async fn spawn_tun_tx_returns_working_input_tx() {
         let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-lifecycle", 64);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (packet_tx, handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
+        let (input_tx, handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
 
-        // Verify packet_tx is functional by sending a batch
-        assert!(packet_tx
+        // Verify input_tx is functional by sending a batch
+        assert!(input_tx
             .send(vec![BufFactory::buf_from_slice(&[1, 2, 3])])
             .await
             .is_ok());
@@ -979,11 +976,10 @@ mod tests {
         let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-shutdown", 64);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (packet_tx, join_handle) =
-            spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
+        let (input_tx, join_handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
 
         // Drop sender to signal shutdown
-        drop(packet_tx);
+        drop(input_tx);
 
         // Actor should exit gracefully (check both timeout and join result)
         let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
@@ -1009,21 +1005,20 @@ mod tests {
         // Verifies that the batch-aware spawn_tun_rx loop works
         // correctly when recv_batch falls back to single-packet recv.
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem-batch-fb", 64);
-        let (router_tx, mut router_rx) = mpsc::channel::<RouterMsg>(4);
+        let (output_tx, mut output_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
-        let tun_rx_task = spawn_tun_rx(rx_tun, router_tx, events_tx, Duration::from_millis(10));
+        let tun_rx_task = spawn_tun_rx(rx_tun, output_tx, events_tx, Duration::from_millis(10));
 
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
-        let msg = router_rx
+        let batch = output_rx
             .recv()
             .await
             .expect("packet should be forwarded to router");
-        assert_eq!(msg.source, Source::Tun);
-        assert_eq!(msg.packets.len(), 1);
-        assert_eq!(&msg.packets[0][..], &ipv4_packet[..]);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], &ipv4_packet[..]);
 
         tun_rx_task.abort();
     }

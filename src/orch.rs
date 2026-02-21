@@ -14,7 +14,7 @@ use crate::h3::{
 };
 use crate::metrics::{log_quic_metrics, log_transport_metrics, Direction, Labels, Metrics};
 use crate::route::{make_route, spawn_route, RouteCommand};
-use crate::router::{spawn_router, RouterCommand, RouterMsg, RoutingTable};
+use crate::router::{spawn_router, RouterCommand, RoutingTable};
 use crate::tun;
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -241,7 +241,7 @@ impl PeerEntry {
                     .await
                     {
                         Ok(tx_socket) => {
-                            let (packet_tx, tx_handle) = spawn_udp_tx(
+                            let (egress_tx, tx_handle) = spawn_udp_tx(
                                 tx_socket,
                                 peer_id.clone(),
                                 events_tx.clone(),
@@ -251,7 +251,7 @@ impl PeerEntry {
                                 peer_id,
                                 endpoint,
                                 dest: destination,
-                                tx: packet_tx,
+                                tx: egress_tx,
                                 tx_handle,
                             }));
                         }
@@ -371,7 +371,7 @@ pub struct Orchestrator {
     /// Unified peer state: config + active bound.
     peers: HashMap<String, PeerEntry>,
     router_cmd_tx: mpsc::UnboundedSender<RouterCommand>,
-    router_tx: mpsc::Sender<RouterMsg>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
     /// H3 listener command sender (if listening).
     h3_listener_cmd_tx: Option<mpsc::UnboundedSender<H3ListenerCommand>>,
@@ -381,8 +381,8 @@ pub struct Orchestrator {
 
     /// Route sync actor command sender (None when `local.table` is false or init failed).
     route_cmd_tx: Option<mpsc::UnboundedSender<RouteCommand>>,
-    /// TUN TX channel for local host routes in the routing table.
-    tun_tx: mpsc::Sender<Vec<PooledBuf>>,
+    /// Input channel (TUN TX) for local host routes in the routing table.
+    input_tx: mpsc::Sender<Vec<PooledBuf>>,
     /// Stored local config (TUN addrs, routing, GET /config snapshot).
     local: Local,
 
@@ -454,7 +454,7 @@ impl Orchestrator {
             .filter_map(|(id, e)| e.preferred_tx().map(|tx| (id.clone(), tx.clone())))
             .collect();
         if let Ok(routing) =
-            RoutingTable::make(&peer_configs, &peer_txs, &self.local.tun, &self.tun_tx)
+            RoutingTable::make(&peer_configs, &peer_txs, &self.local.tun, &self.input_tx)
         {
             if let Err(e) = self
                 .router_cmd_tx
@@ -515,7 +515,7 @@ impl Orchestrator {
         let routing = RoutingTable::new();
 
         // TUN-Tx actor creates its own packet channel; returns sender for transports to use
-        let (tun_packet_tx, tun_tx_handle) = tun::spawn_tun_tx(
+        let (input_tx, tun_tx_handle) = tun::spawn_tun_tx(
             tun_writer,
             events_tx.clone(),
             tuning.metrics_push_interval,
@@ -523,9 +523,9 @@ impl Orchestrator {
         );
 
         // Spawn router actor between RX actors and TUN TX
-        let (router_tx, router_cmd_tx, router_handle) = spawn_router(
+        let (output_tx, ingress_tx, router_cmd_tx, router_handle) = spawn_router(
             routing,
-            tun_packet_tx.clone(),
+            input_tx.clone(),
             events_tx.clone(),
             tuning.metrics_push_interval,
             tuning.packet_queue_depth,
@@ -534,7 +534,7 @@ impl Orchestrator {
         // Spawn TUN RX — pure packet producer forwarding to router
         let tun_rx_handle = tun::spawn_tun_rx(
             tun_reader,
-            router_tx.clone(),
+            output_tx,
             events_tx.clone(),
             tuning.metrics_push_interval,
         );
@@ -559,7 +559,7 @@ impl Orchestrator {
             let (cmd_tx, bare_rx_handle) = spawn_udp_rx(
                 bare_rx,
                 std::collections::HashSet::new(),
-                router_tx.clone(),
+                ingress_tx.clone(),
                 events_tx.clone(),
                 tuning.metrics_push_interval,
             );
@@ -666,12 +666,12 @@ impl Orchestrator {
             tuning: config.tuning,
             peers,
             router_cmd_tx,
-            router_tx,
+            ingress_tx,
             bare_rx_cmd_tx,
             h3_listener_cmd_tx,
             dns_cmd_tx,
             route_cmd_tx,
-            tun_tx: tun_packet_tx,
+            input_tx,
             local: config.local,
             non_peer_metrics: HashMap::new(),
         };
@@ -1078,13 +1078,13 @@ impl Orchestrator {
         // Spawn RX actor
         let rx_handle = spawn_h3_rx(
             rx_state,
-            self.router_tx.clone(),
+            self.ingress_tx.clone(),
             self.events_tx.clone(),
             self.tuning.metrics_push_interval,
         );
 
         // Spawn TX actor
-        let (packet_tx, tx_handle) = spawn_h3_tx(
+        let (egress_tx, tx_handle) = spawn_h3_tx(
             tx_state,
             self.events_tx.clone(),
             self.tuning.metrics_push_interval,
@@ -1094,7 +1094,7 @@ impl Orchestrator {
 
         self.join_set.spawn(rx_handle);
         self.join_set.spawn(tx_handle);
-        self.update_bound(&peer_id, endpoint, remote_addr, packet_tx);
+        self.update_bound(&peer_id, endpoint, remote_addr, egress_tx);
     }
 }
 
@@ -1261,8 +1261,8 @@ mod test_support {
             let (router_cmd_tx, router_cmd_rx) = mpsc::unbounded_channel();
             let (bare_rx_cmd_tx, bare_rx_cmd_rx) = mpsc::unbounded_channel();
             let (dns_cmd_tx, dns_cmd_rx) = mpsc::unbounded_channel();
-            let (router_tx, _router_rx) = mpsc::channel(1);
-            let (tun_tx, _tun_rx) = mpsc::channel(1);
+            let (ingress_tx, _ingress_rx) = mpsc::channel(1);
+            let (input_tx, _input_rx) = mpsc::channel(1);
             let (route_cmd_tx, route_cmd_rx) = mpsc::unbounded_channel();
             let (h3_listener_cmd_tx, h3_listener_cmd_rx) = mpsc::unbounded_channel();
 
@@ -1279,10 +1279,10 @@ mod test_support {
                 router_cmd_tx,
                 bare_rx_cmd_tx: Some(bare_rx_cmd_tx),
                 h3_listener_cmd_tx: Some(h3_listener_cmd_tx),
-                router_tx,
+                ingress_tx,
                 dns_cmd_tx,
                 route_cmd_tx: Some(route_cmd_tx),
-                tun_tx,
+                input_tx,
                 local,
                 non_peer_metrics: HashMap::new(),
             };
