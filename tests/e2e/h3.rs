@@ -11,7 +11,7 @@ use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
-use super::common::{TestContext, TEST_IMAGE, TEST_TAG};
+use super::common::{assert_ping, TestContext, TEST_IMAGE, TEST_TAG};
 
 /// Generates self-signed certificates for testing.
 ///
@@ -201,45 +201,8 @@ async fn test_two_node_h3_tunnel() {
     // Wait for DNS refresh cycles and H3 handshake
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    // Test ping from node A to node B via VPN tunnel
-    let mut ping_ab = node_a
-        .exec(testcontainers::core::ExecCommand::new([
-            "ping", "-c", "3", "-W", "2", "10.0.0.2",
-        ]))
-        .await
-        .expect("exec ping a->b");
-
-    let ping_ab_out = ping_ab.stdout_to_vec().await.unwrap();
-    let ping_ab_exit = ping_ab.exit_code().await.unwrap();
-    println!(
-        "Ping node-a -> node-b (10.0.0.2):\n{}",
-        String::from_utf8_lossy(&ping_ab_out)
-    );
-    assert_eq!(
-        ping_ab_exit,
-        Some(0),
-        "ping a->b failed (exit={ping_ab_exit:?})"
-    );
-
-    // Test ping from node B to node A via VPN tunnel
-    let mut ping_ba = node_b
-        .exec(testcontainers::core::ExecCommand::new([
-            "ping", "-c", "3", "-W", "2", "10.0.0.1",
-        ]))
-        .await
-        .expect("exec ping b->a");
-
-    let ping_ba_out = ping_ba.stdout_to_vec().await.unwrap();
-    let ping_ba_exit = ping_ba.exit_code().await.unwrap();
-    println!(
-        "Ping node-b -> node-a (10.0.0.1):\n{}",
-        String::from_utf8_lossy(&ping_ba_out)
-    );
-    assert_eq!(
-        ping_ba_exit,
-        Some(0),
-        "ping b->a failed (exit={ping_ba_exit:?})"
-    );
+    assert_ping(&node_a, "10.0.0.2", "h3 a->b").await;
+    assert_ping(&node_b, "10.0.0.1", "h3 b->a").await;
 
     drop(node_b);
     drop(node_a);
