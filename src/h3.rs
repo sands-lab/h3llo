@@ -15,10 +15,8 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_bearer_auth, validate_connect_auth};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
-use crate::events::{
-    ConnectionDirection, Direction, Event, H3ConnectedEvent, Source, TransportEvent,
-};
-use crate::metrics::{send_with_backpressure, Counters, SendEvent};
+use crate::events::{ConnectionDirection, Event, H3ConnectedEvent, TransportEvent};
+use crate::metrics::{send_with_backpressure, Counters, Direction, SendEvent, Source};
 use crate::router::RouterMsg;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
@@ -778,7 +776,7 @@ pub fn spawn_h3_rx(
                     .is_err()
                     {
                         counters.record_drop(
-                            crate::events::DropReason::ChannelClosed,
+                            crate::metrics::DropReason::ChannelClosed,
                             ok_pkts, ok_bytes,
                         );
                         return Ok(());
@@ -811,7 +809,7 @@ fn handle_inbound_frame(
         InboundFrame::Datagram(mut dgram) => {
             if dgram.is_empty() || dgram[0] != CONTEXT_ID_IP {
                 counters.record_drop(
-                    crate::events::DropReason::InvalidFraming,
+                    crate::metrics::DropReason::InvalidFraming,
                     1,
                     dgram.len() as u64,
                 );
@@ -830,7 +828,7 @@ fn handle_inbound_frame(
                 "received unexpected Body frame on CONNECT-IP stream"
             );
             counters.record_drop(
-                crate::events::DropReason::InvalidFraming,
+                crate::metrics::DropReason::InvalidFraming,
                 1,
                 pooled_buf.len() as u64,
             );
@@ -948,7 +946,7 @@ pub fn spawn_h3_tx(
                         let len = packet.len();
                         // Zero-copy: prepend Context ID using reserved headroom.
                         if !packet.add_prefix(&[CONTEXT_ID_IP]) {
-                            counters.record_drop(crate::events::DropReason::NoHeadroom, 1, len as u64);
+                            counters.record_drop(crate::metrics::DropReason::NoHeadroom, 1, len as u64);
                             continue;
                         }
                         let frame = OutboundFrame::Datagram(packet, flow_id);
@@ -976,7 +974,7 @@ pub fn spawn_h3_tx(
                         .await
                         .map_err(|_| {
                             counters.record_drop(
-                                crate::events::DropReason::SendError, 1, len as u64,
+                                crate::metrics::DropReason::SendError, 1, len as u64,
                             );
                             ActorError::H3TxSend {
                                 peer_id: peer.clone(),

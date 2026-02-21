@@ -1,16 +1,14 @@
 //! TUN management: device creation, read/write loops with backpressure, and metrics reporting.
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::config::{LocalTun, Peer};
-use crate::events::{Direction, DropReason, Event, Source};
+use crate::config::LocalTun;
+use crate::events::Event;
 use crate::helpers::retry_on_transient;
-use crate::metrics::{send_with_backpressure, Counters, SendEvent};
+use crate::metrics::{send_with_backpressure, Counters, Direction, DropReason, SendEvent, Source};
 use crate::router::RouterMsg;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use ipnet_trie::IpnetTrie;
-use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -18,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
-use tracing::{info, warn};
+use tracing::info;
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -476,183 +474,6 @@ pub enum TunError {
     /// Device creation or address assignment failed.
     #[error("failed to build TUN device: {0}")]
     DeviceBuild(String),
-}
-
-// ============================================================================
-// Routing table (migrated from routing.rs)
-// ============================================================================
-
-fn log_duplicate_allowed(peer_id: &str, cidr: &str) {
-    warn!(
-        "duplicate allowed_ips '{}' for peer '{}'; keeping the first entry",
-        cidr, peer_id
-    );
-}
-
-/// Stores routing metadata for a prefix, including the channel to forward packets.
-#[derive(Clone)]
-pub struct RouteEntry {
-    /// Identifier of the peer owning the prefix.
-    pub peer_id: String,
-    /// Channel to send packet batches to this peer.
-    pub tx: mpsc::Sender<Vec<PooledBuf>>,
-}
-
-impl std::fmt::Debug for RouteEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RouteEntry")
-            .field("peer_id", &self.peer_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for RouteEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.peer_id == other.peer_id
-    }
-}
-
-impl Eq for RouteEntry {}
-
-/// Represents the result of a longest-prefix lookup.
-#[derive(Debug, Clone)]
-pub struct RouteMatch<'a> {
-    /// Matched prefix.
-    pub prefix: IpNet,
-    /// Identifier of the peer selected by the lookup.
-    pub peer_id: &'a str,
-    /// Channel to send packet batches to this peer.
-    pub tx: &'a mpsc::Sender<Vec<PooledBuf>>,
-}
-
-/// In-memory routing table supporting IPv4 and IPv6 longest-prefix matches.
-#[derive(Clone)]
-pub struct RoutingTable {
-    trie: IpnetTrie<RouteEntry>,
-}
-
-impl std::fmt::Debug for RoutingTable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RoutingTable")
-            .field("len", &self.trie.len())
-            .finish()
-    }
-}
-
-impl Default for RoutingTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RoutingTable {
-    /// Creates an empty routing table.
-    pub fn new() -> Self {
-        Self {
-            trie: IpnetTrie::new(),
-        }
-    }
-
-    /// Builds a routing table from peers with their TX channels.
-    ///
-    /// # Arguments
-    ///
-    /// * `peers` - Peer configurations.
-    /// * `peer_txs` - Map of peer ID to TX channel. Peers without a channel are skipped.
-    ///
-    /// # Errors
-    ///
-    /// Returns `RoutingError::ConflictingPrefix` when a prefix conflicts with an existing peer.
-    pub fn from_peers(
-        peers: &[Peer],
-        peer_txs: &HashMap<String, mpsc::Sender<Vec<PooledBuf>>>,
-    ) -> Result<Self, RoutingError> {
-        let mut table = RoutingTable::new();
-
-        for peer in peers {
-            let Some(tx) = peer_txs.get(&peer.id) else {
-                warn!(
-                    "peer '{}' has no TX channel; skipping route registration",
-                    peer.id
-                );
-                continue;
-            };
-
-            // allowed_ips is pre-parsed as Vec<IpNet> during config deserialization
-            for net in &peer.tun.allowed_ips {
-                table.insert(
-                    *net,
-                    RouteEntry {
-                        peer_id: peer.id.clone(),
-                        tx: tx.clone(),
-                    },
-                )?;
-            }
-        }
-
-        Ok(table)
-    }
-
-    /// Inserts a prefix and associated peer into the table, rejecting conflicting owners.
-    ///
-    /// # Errors
-    ///
-    /// Returns `RoutingError::ConflictingPrefix` when the prefix already belongs to another peer.
-    pub fn insert(&mut self, prefix: IpNet, entry: RouteEntry) -> Result<(), RoutingError> {
-        if let Some(existing) = self.trie.exact_match(prefix) {
-            if existing.peer_id == entry.peer_id {
-                log_duplicate_allowed(&entry.peer_id, &prefix.to_string());
-                return Ok(());
-            }
-
-            return Err(RoutingError::ConflictingPrefix {
-                prefix,
-                existing_peer_id: existing.peer_id.clone(),
-                new_peer_id: entry.peer_id,
-            });
-        }
-
-        self.trie.insert(prefix, entry);
-        Ok(())
-    }
-
-    /// Performs a longest-prefix match for the provided address.
-    pub fn lookup(&self, addr: IpAddr) -> Option<RouteMatch<'_>> {
-        let net = IpNet::from(addr);
-        self.trie
-            .longest_match(&net)
-            .map(|(prefix, entry)| RouteMatch {
-                prefix,
-                peer_id: entry.peer_id.as_str(),
-                tx: &entry.tx,
-            })
-    }
-
-    /// Returns the number of IPv4 and IPv6 prefixes stored.
-    pub fn len(&self) -> (usize, usize) {
-        self.trie.len()
-    }
-
-    /// Returns true when no prefixes are present.
-    pub fn is_empty(&self) -> bool {
-        self.trie.is_empty()
-    }
-}
-
-/// Routing table construction or lookup error.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum RoutingError {
-    // Note: InvalidAllowedIp variant removed - parsing now happens during config deserialization.
-    /// Two peers claim the same prefix.
-    #[error("prefix {prefix} already assigned to peer '{existing_peer_id}', cannot assign to '{new_peer_id}'")]
-    ConflictingPrefix {
-        /// Prefix that was duplicated.
-        prefix: IpNet,
-        /// Existing owner of the prefix.
-        existing_peer_id: String,
-        /// New peer that attempted to claim the prefix.
-        new_peer_id: String,
-    },
 }
 
 /// Groups pre-parsed CIDR networks by IP version.
@@ -1133,85 +954,6 @@ mod tests {
         assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.dropped.packets, 0);
-    }
-
-    // ========================================================================
-    // Routing table tests (migrated from routing.rs)
-    // ========================================================================
-
-    use crate::config::{PeerBare, PeerTun, UdpEndpoint};
-
-    fn bare_peer(id: &str, allowed: &[&str]) -> Peer {
-        Peer {
-            id: id.to_string(),
-            h3: None,
-            bare: Some(PeerBare {
-                endpoint: UdpEndpoint {
-                    host: "127.0.0.1".to_string(),
-                    port: 5353,
-                },
-                bindif: None,
-            }),
-            tun: PeerTun {
-                allowed_ips: allowed.iter().map(|s| s.parse().unwrap()).collect(),
-            },
-        }
-    }
-
-    /// Creates dummy peer TX channels for routing table tests.
-    fn dummy_peer_txs(peer_ids: &[&str]) -> HashMap<String, mpsc::Sender<Vec<PooledBuf>>> {
-        peer_ids
-            .iter()
-            .map(|id| {
-                let (tx, _rx) = mpsc::channel(1);
-                (id.to_string(), tx)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn chooses_longest_prefix() {
-        let peers = vec![
-            bare_peer("peer-a", &["10.0.0.0/16"]),
-            bare_peer("peer-b", &["10.0.0.0/24"]),
-        ];
-        let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
-        let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
-        let result = table
-            .lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42)))
-            .expect("lookup should succeed");
-        assert_eq!(result.peer_id, "peer-b");
-        assert_eq!(result.prefix, "10.0.0.0/24".parse::<IpNet>().unwrap());
-    }
-
-    #[test]
-    fn errors_on_conflicting_prefix_ownership() {
-        let peers = vec![
-            bare_peer("peer-a", &["10.0.0.0/24"]),
-            bare_peer("peer-b", &["10.0.0.0/24"]),
-        ];
-        let peer_txs = dummy_peer_txs(&["peer-a", "peer-b"]);
-        let err = RoutingTable::from_peers(&peers, &peer_txs).unwrap_err();
-        assert!(matches!(
-            err,
-            RoutingError::ConflictingPrefix {
-                existing_peer_id,
-                new_peer_id,
-                ..
-            } if existing_peer_id == "peer-a" && new_peer_id == "peer-b"
-        ));
-    }
-
-    #[test]
-    fn skips_duplicate_prefixes_within_peer() {
-        let peers = vec![bare_peer("peer-a", &["10.0.0.0/24", "10.0.0.0/24"])];
-        let peer_txs = dummy_peer_txs(&["peer-a"]);
-        let table = RoutingTable::from_peers(&peers, &peer_txs).expect("table should build");
-        assert_eq!(table.len(), (1, 0));
-        let result = table
-            .lookup(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
-            .expect("lookup should succeed");
-        assert_eq!(result.peer_id, "peer-a");
     }
 
     // ========== Actor Lifecycle Tests ==========

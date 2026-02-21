@@ -10,11 +10,11 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::{Config, Peer};
-use crate::events::{
-    ApiEvent, CongestionStats, Direction, DropReason, Event, PktCounters, Source, Labels,
-    Metrics,
+use crate::events::{ApiEvent, Event};
+use crate::metrics::{
+    collect_quic_metrics, CongestionStats, Direction, DropReason, Labels, Metrics, PktCounters,
+    Source,
 };
-use crate::metrics::collect_quic_metrics;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
@@ -598,7 +598,8 @@ async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Respons
 mod tests {
     use super::*;
     use crate::config::{Local, LocalDns, LocalTun, Tuning};
-    use crate::events::{ApiEvent, PktCounters, Stats};
+    use crate::events::ApiEvent;
+    use crate::metrics::{PktCounters, Stats};
     use hyper::client::conn::http1;
     use tokio::net::TcpStream;
 

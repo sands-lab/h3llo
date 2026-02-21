@@ -5,18 +5,17 @@ use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUd
 use crate::bind::DefaultRouteProbe;
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
-use crate::events::ApiEvent;
 use crate::events::{
-    BareConnectedEvent, ConnectionDirection, DialFailedEvent, Direction, DnsEvent, Endpoint, Event,
-    H3ConnectedEvent, TransportEvent, Labels, Metrics,
+    ApiEvent, BareConnectedEvent, ConnectionDirection, DialFailedEvent, DnsEvent, Endpoint, Event,
+    H3ConnectedEvent, TransportEvent,
 };
 use crate::h3::{
     dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
 };
-use crate::metrics::{log_quic_metrics, log_transport_metrics};
+use crate::metrics::{log_quic_metrics, log_transport_metrics, Direction, Labels, Metrics};
 use crate::route::{make_route, spawn_route, RouteCommand};
-use crate::router::{spawn_router, RouterCommand, RouterMsg};
-use crate::tun::{self, RoutingTable};
+use crate::router::{spawn_router, RouterCommand, RouterMsg, RoutingTable};
+use crate::tun;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1306,9 +1305,8 @@ mod tests {
     use super::test_support::TestableOrchestratorBuilder;
     use super::*;
     use crate::config::{PeerBare, PeerTun};
-    use crate::events::{
-        Direction, DnsEvent, Labels, Metrics, Source, Stats,
-    };
+    use crate::events::DnsEvent;
+    use crate::metrics::{Direction, Labels, Metrics, Source, Stats};
 
     // ========== PeerEntry unit tests ==========
 
@@ -1533,7 +1531,7 @@ mod tests {
                 remote_addr: None,
             },
             stats: Stats {
-                succeeded: crate::events::PktCounters {
+                succeeded: crate::metrics::PktCounters {
                     packets: 42,
                     ..Default::default()
                 },
@@ -1561,7 +1559,7 @@ mod tests {
                 remote_addr: Some(remote_addr),
             },
             stats: Stats {
-                succeeded: crate::events::PktCounters {
+                succeeded: crate::metrics::PktCounters {
                     packets,
                     ..Default::default()
                 },

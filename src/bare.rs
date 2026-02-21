@@ -3,9 +3,9 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
 use crate::config::Tuning;
-use crate::events::{Direction, DropReason, Event, Source};
+use crate::events::Event;
 use crate::helpers::retry_on_transient;
-use crate::metrics::{send_with_backpressure, Counters, SendEvent};
+use crate::metrics::{send_with_backpressure, Counters, Direction, DropReason, SendEvent, Source};
 use crate::router::RouterMsg;
 use crate::tun::alloc_packet_buf;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
