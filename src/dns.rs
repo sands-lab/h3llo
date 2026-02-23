@@ -17,7 +17,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const DNS_BUFFER_SIZE: usize = 1500;
 
@@ -61,11 +61,20 @@ impl DnsState {
     fn set_hostnames(&mut self, hosts: &HashSet<String>) -> bool {
         let mut changed = false;
 
-        changed |= self.entries.extract_if(|h, _| !hosts.contains(h)).count() > 0;
+        let removed: Vec<String> = self
+            .entries
+            .extract_if(|h, _| !hosts.contains(h))
+            .map(|(h, _)| h)
+            .collect();
+        if !removed.is_empty() {
+            changed = true;
+            info!(hostnames = ?removed, "dns: hostnames unregistered");
+        }
 
         for h in hosts {
             if !self.entries.contains_key(h) {
                 changed = true;
+                info!(hostname = %h, "dns: hostname registered");
                 self.entries.insert(h.clone(), HashMap::new());
             }
         }
@@ -79,9 +88,13 @@ impl DnsState {
             return false;
         };
 
-        let expires_at = Instant::now() + Duration::from_secs(ttl.max(self.min_ttl_secs) as u64);
+        let effective_ttl = ttl.max(self.min_ttl_secs);
+        let expires_at = Instant::now() + Duration::from_secs(effective_ttl as u64);
 
         let is_new = ips.insert(ip, expires_at).is_none();
+        if is_new {
+            info!(host = %host, ip = %ip, ttl = effective_ttl, "dns: new IP resolved");
+        }
         self.touch(is_new)
     }
 
@@ -90,8 +103,15 @@ impl DnsState {
         let now = Instant::now();
         let mut removed = false;
 
-        for ips in self.entries.values_mut() {
-            removed |= ips.extract_if(|_, exp| *exp <= now).count() > 0;
+        for (host, ips) in self.entries.iter_mut() {
+            let expired: Vec<IpAddr> = ips
+                .extract_if(|_, exp| *exp <= now)
+                .map(|(ip, _)| ip)
+                .collect();
+            if !expired.is_empty() {
+                removed = true;
+                info!(host = %host, ips = ?expired, "dns: IPs expired");
+            }
         }
 
         self.touch(removed)
@@ -220,6 +240,13 @@ pub fn spawn_dns(
     } = actor;
 
     let server_str = server.to_string();
+
+    info!(
+        server = %server,
+        refresh_interval = ?refresh_interval,
+        min_ttl = min_ttl_secs,
+        "dns: resolver started"
+    );
 
     let handle = tokio::spawn(async move {
         let mut pending: HashMap<u16, PendingRequest> = HashMap::new();
@@ -392,7 +419,10 @@ async fn send_query(
     .await;
 
     if let Err(err) = result {
-        warn!(host = %host, record_type = ?record_type, error = %err, "dns: query send failed");
+        let server = socket
+            .peer_addr()
+            .map_or("unknown".into(), |a| a.to_string());
+        warn!(host = %host, record_type = ?record_type, server = %server, error = %err, "dns: query send failed");
     }
 }
 

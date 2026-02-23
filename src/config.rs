@@ -228,7 +228,7 @@ pub struct Tuning {
     /// DNS query timeout (default: 2s).
     #[serde(with = "serde_duration_secs")]
     pub dns_query_timeout: Duration,
-    /// DNS refresh interval; 0 disables (default: 60s).
+    /// DNS refresh interval; 0 disables (default: 300s).
     #[serde(with = "serde_duration_secs")]
     pub dns_refresh_interval: Duration,
     /// Delay before emitting a DNS snapshot after the first state change (default: 100ms).
