@@ -130,7 +130,12 @@ pub fn spawn_route<H: RouteHandle, R: IfIndexResolver>(
                     if let Err(err) =
                         sync_tun_routes(&tun_if, &tun_addrs, &allowed, &mut handle, &resolver).await
                     {
-                        warn!(error = %err, "route sync failed");
+                        warn!(
+                            tun = %tun_if,
+                            allowed_count = allowed.len(),
+                            error = %err,
+                            "route sync failed"
+                        );
                     }
                 }
             }

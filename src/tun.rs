@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
-use tracing::info;
+use tracing::{info, warn};
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -284,7 +284,10 @@ pub async fn make_tun(
     }
 
     #[cfg(not(target_os = "linux"))]
-    let _ = (tx_queue_len, enable_offload);
+    {
+        warn!("TUN: offload and tx_queue_len are not supported on this platform");
+        let _ = (tx_queue_len, enable_offload);
+    }
 
     if let Some(first_v4) = v4_addrs.first() {
         builder = builder.ipv4(first_v4.addr(), first_v4.prefix_len(), None);
@@ -309,11 +312,17 @@ pub async fn make_tun(
             .map_err(|e| TunError::DeviceBuild(e.to_string()))?;
     }
 
-    let name = device.name().unwrap_or_else(|_| local_tun.ifname.clone());
+    let name = device.name().unwrap_or_else(|e| {
+        warn!(error = %e, configured = %local_tun.ifname, "TUN: could not read device name, using config value");
+        local_tun.ifname.clone()
+    });
     let mtu = device
         .mtu()
         .map(|m| m as usize)
-        .unwrap_or(local_tun.mtu as usize);
+        .unwrap_or_else(|e| {
+            warn!(error = %e, configured = local_tun.mtu, "TUN: could not read device MTU, using config value");
+            local_tun.mtu as usize
+        });
 
     #[cfg(target_os = "linux")]
     info!(
