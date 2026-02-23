@@ -135,10 +135,11 @@ impl PeerEntry {
         let old_first_tx = self.bounds.first().map(|b| b.tx.clone());
         let config_ep = self.config_endpoint();
 
+        let peer_id = &self.config.id;
         self.bounds.retain(|bound| {
             // TX channel closed -> remove
             if bound.tx.is_closed() {
-                debug!(dest = %bound.dest, "pruned: tx channel closed");
+                warn!(peer = %peer_id, dest = %bound.dest, "pruned: tx channel closed");
                 return false;
             }
             // Inbound connections (endpoint: None) are never pruned by DNS/endpoint checks
@@ -147,12 +148,12 @@ impl PeerEntry {
             };
             // Endpoint changed (dynamic reconfig)
             if config_ep.as_ref() != Some(bound_ep) {
-                debug!(dest = %bound.dest, "pruned: endpoint changed");
+                warn!(peer = %peer_id, dest = %bound.dest, "pruned: endpoint changed");
                 return false;
             }
             // Dest IP no longer in resolved_ips (DNS changed)
             if !self.resolved_ips.contains(&bound.dest.ip()) {
-                debug!(dest = %bound.dest, "pruned: IP no longer in DNS");
+                warn!(peer = %peer_id, dest = %bound.dest, "pruned: IP no longer in DNS");
                 return false;
             }
             true
@@ -212,10 +213,12 @@ impl PeerEntry {
 
         for ip in &uncovered {
             // Mark in-flight (preserving attempt count from prior failures)
+            let attempt = self.dials.get(ip).map_or(0, |s| s.attempt);
             self.dials
                 .entry(*ip)
                 .and_modify(|s| s.in_flight = true)
                 .or_insert_with(DialState::new_in_flight);
+            info!(peer = %self.config.id, ip = %ip, attempt, "dialing peer");
 
             // Common bindings for the spawned task (only one branch runs).
             let events_tx = events_tx.clone();
@@ -256,7 +259,7 @@ impl PeerEntry {
                             }));
                         }
                         Err(err) => {
-                            warn!(peer = %peer_id, error = %err, "bare tx socket setup failed");
+                            warn!(peer = %peer_id, addr = %destination, error = %err, "bare tx socket setup failed");
                             let _ = events_tx.send(Event::DialFailed(DialFailedEvent {
                                 peer_id,
                                 ip: dial_ip,
@@ -287,7 +290,7 @@ impl PeerEntry {
                     .await
                     {
                         Ok(conn) => {
-                            debug!(peer = %peer_id, addr = %destination, "H3 connection established");
+                            info!(peer = %peer_id, addr = %destination, "H3 connection established");
                             let _ = events_tx.send(Event::H3Connected(H3ConnectedEvent {
                                 connection: conn,
                                 direction: ConnectionDirection::Outbound,
@@ -406,7 +409,7 @@ impl Orchestrator {
                 .flat_map(|e| e.resolved_ips.iter().copied())
                 .collect();
             if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAcceptedSources(accepted_ips)) {
-                warn!(error = %e, "failed to send accepted sources update command");
+                warn!(error = %e, "failed to send accepted sources update to bare_rx actor");
             }
         }
     }
@@ -429,7 +432,7 @@ impl Orchestrator {
                 .collect::<HashMap<_, _>>();
 
             if let Err(e) = cmd_tx.send(H3ListenerCommand::UpdatePeerTokens(tokens)) {
-                warn!(error = %e, "failed to send peer tokens update to H3 listener");
+                warn!(error = %e, "failed to send peer tokens update to h3_listener actor");
             }
         }
 
@@ -453,14 +456,17 @@ impl Orchestrator {
             .iter()
             .filter_map(|(id, e)| e.preferred_tx().map(|tx| (id.clone(), tx.clone())))
             .collect();
-        if let Ok(routing) =
-            RoutingTable::make(&peer_configs, &peer_txs, &self.local.tun, &self.input_tx)
-        {
-            if let Err(e) = self
-                .router_cmd_tx
-                .send(RouterCommand::UpdateRouting { routing })
-            {
-                warn!(error = %e, "failed to send routing update command");
+        match RoutingTable::make(&peer_configs, &peer_txs, &self.local.tun, &self.input_tx) {
+            Ok(routing) => {
+                if let Err(e) = self
+                    .router_cmd_tx
+                    .send(RouterCommand::UpdateRouting { routing })
+                {
+                    warn!(error = %e, "failed to send routing update to router actor; routing may be stale");
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "routing table build failed; routing NOT updated");
             }
         }
 
@@ -470,7 +476,7 @@ impl Orchestrator {
                 tun_addrs: self.local.tun.addrs.clone(),
                 allowed,
             }) {
-                warn!(error = %e, "failed to send route sync command");
+                warn!(error = %e, "failed to send route sync command to route actor");
             }
         }
     }
@@ -639,7 +645,7 @@ impl Orchestrator {
         };
 
         if peers.is_empty() {
-            warn!("no active peers; traffic will be dropped");
+            warn!(configured = config.peers.len(), "no active peers; traffic will be dropped");
         }
 
         // Initialize management API if configured
@@ -753,7 +759,7 @@ impl Orchestrator {
 
         match actor_result {
             Ok(()) => {
-                debug!("an actor exited gracefully");
+                info!("an actor exited gracefully; reconciling peer state");
                 self.reconcile();
             }
             Err(actor_error) => match actor_error.kind() {
@@ -762,7 +768,7 @@ impl Orchestrator {
                     return ControlFlow::Break(Err(OrchestratorError::ActorError(actor_error)));
                 }
                 ActorKind::Restartable => {
-                    warn!("peer actor failed: {}", actor_error);
+                    warn!("peer actor failed: {}; reconciling", actor_error);
                     self.reconcile();
                 }
             },
@@ -869,7 +875,7 @@ impl Orchestrator {
         for id in peer_ids {
             if self.peers.remove(id).is_some() {
                 changed = true;
-                debug!(peer = %id, "API: peer removed");
+                info!(peer = %id, "API: peer removed");
             }
         }
         if changed {
@@ -969,9 +975,8 @@ impl Orchestrator {
         };
         // Clear dial state on successful outbound connection.
         // Inbound connections (endpoint: None) do not have dial state.
-        if endpoint.is_some() {
-            entry.dials.remove(&dest.ip());
-        }
+        let retries = endpoint.as_ref().and_then(|_| entry.dials.remove(&dest.ip())).map_or(0, |s| s.attempt);
+        info!(peer = %peer_id, addr = %dest, retries, inbound = endpoint.is_none(), "connected");
         let was_empty = entry.bounds.is_empty();
         entry.bounds.push(BoundState {
             endpoint,
@@ -1017,7 +1022,7 @@ impl Orchestrator {
                 self.tuning.reconnect_backoff_min,
                 self.tuning.reconnect_backoff_max,
             );
-            debug!(
+            warn!(
                 peer = %event.peer_id, ip = %event.ip,
                 attempt = state.attempt,
                 next_allowed_at = ?state.next_allowed_at,
@@ -1064,13 +1069,6 @@ impl Orchestrator {
                 .map(|ep| Endpoint::H3(ep.clone())),
             ConnectionDirection::Inbound => None,
         };
-
-        debug!(
-            peer = %peer_id,
-            addr = %remote_addr,
-            direction = ?direction,
-            "H3 connection accepted"
-        );
 
         // Split connection into actor states
         let (rx_state, tx_state) = conn.into_actors();

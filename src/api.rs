@@ -34,7 +34,7 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// OpenMetrics text format EOF marker.
 const OPENMETRICS_EOF: &str = "# EOF\n";
@@ -406,6 +406,7 @@ pub fn spawn_api(
             .parse()
             .expect("infallible: constant literal parse")
     });
+    info!(%addr, "API listener started");
     tokio::spawn(async move {
         loop {
             let (stream, remote) = listener.accept().await.map_err(|e| ActorError::ApiServer {

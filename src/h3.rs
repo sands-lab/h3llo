@@ -43,7 +43,7 @@ use tokio_quiche::settings::{
     CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
 };
 use tokio_quiche::socket::QuicListener;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Builds common `QuicSettings` from `Tuning` and TUN MTU.
 ///
@@ -288,7 +288,8 @@ async fn handle_h3_connection(
                 }
                 ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => return,
                 ServerH3Event::Core(H3Event::ConnectionError(e)) => {
-                    warn!(%remote_addr, error = ?e, "H3 connection error");
+                    let peer = pending_auth.as_deref().unwrap_or("unknown");
+                    warn!(%remote_addr, peer, error = ?e, "H3 connection error during handshake");
                     return;
                 }
                 other => {
@@ -322,7 +323,7 @@ async fn handle_h3_connection(
                     close_quic_connection(&quic_cmd_tx);
                     return;
                 }
-                debug!(%peer_id, %remote_addr, "H3 connection established");
+                info!(%peer_id, %remote_addr, "H3 inbound connection established");
 
                 let quic_cmd_send = make_quic_command_sender(quic_cmd_tx.clone());
 
@@ -348,7 +349,7 @@ async fn handle_h3_connection(
 
         // Event stream closed before handshake completed
         if pending_auth.is_some() || pending_flow.is_some() {
-            debug!(%remote_addr, "H3 handshake incomplete: connection closed");
+            warn!(%remote_addr, "H3 handshake incomplete: connection closed before completion");
             close_quic_connection(&quic_cmd_tx);
         }
     };
@@ -614,7 +615,7 @@ pub async fn dial_h3<P: RouteProbe>(
                         ));
                     }
 
-                    debug!(%remote_addr, "CONNECT-IP accepted");
+                    info!(%remote_addr, "CONNECT-IP accepted");
                     status_validated = true;
                     // If NewFlow already arrived, we can exit
                     if datagram_tx.is_some() {
@@ -1065,7 +1066,7 @@ pub fn make_h3_listener(
         .ok_or_else(|| ListenerError::Tls("invalid key path encoding".to_string()))?
         .to_string();
 
-    debug!(%listen_addr, %bound_addr, "H3 listener state created");
+    info!(%listen_addr, %bound_addr, "H3 listener created");
 
     Ok(H3Listener {
         socket,
@@ -1106,7 +1107,7 @@ pub fn spawn_h3_listener(
         key_path,
     } = listener;
 
-    debug!(%bound_addr, "spawning H3 listener actor");
+    info!(%bound_addr, "H3 listener started");
 
     // Configure TLS with certificate paths
     let tls_config = TlsCertificatePaths {
