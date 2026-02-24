@@ -228,7 +228,11 @@ pub struct Tuning {
     /// DNS query timeout (default: 2s).
     #[serde(with = "serde_duration_secs")]
     pub dns_query_timeout: Duration,
-    /// DNS refresh interval; 0 disables (default: 300s).
+    /// DNS refresh interval; 0 disables (default: 120s).
+    ///
+    /// **Warning:** `dns_min_ttl` should be at least `2 × dns_refresh_interval`.
+    /// Otherwise, cached IPs may expire before the next refresh re-queries them,
+    /// causing connections to be pruned and re-established in a loop.
     #[serde(with = "serde_duration_secs")]
     pub dns_refresh_interval: Duration,
     /// Delay before emitting a DNS snapshot after the first state change (default: 100ms).
@@ -245,10 +249,17 @@ pub struct Tuning {
     /// is inserted before each outbound query send.
     #[serde(with = "serde_duration_millis")]
     pub dns_query_interval: Duration,
-    /// Minimum TTL floor in seconds for DNS records (default: 60).
+    /// Minimum TTL floor in seconds for DNS records (default: 300).
     ///
     /// DNS responses with TTL below this value are raised to this floor
-    /// to prevent excessive re-queries.
+    /// to prevent excessive re-queries. Recursive DNS servers return the
+    /// *remaining* cache TTL, which can be arbitrarily low (even 0) when
+    /// the upstream record is about to expire. Without a sufficient floor
+    /// the IP expires in the local cache before the next refresh cycle
+    /// re-queries it, triggering connection pruning and reconnection.
+    ///
+    /// **Warning:** Should be at least `2 × dns_refresh_interval` to
+    /// guarantee that every refresh cycle renews the TTL before expiry.
     pub dns_min_ttl: u32,
     /// HTTP/3 handshake timeout (default: 5s).
     #[serde(with = "serde_duration_secs")]
@@ -292,10 +303,10 @@ impl Default for Tuning {
             metrics_push_interval: Duration::from_millis(1000),
             metrics_log_interval: Duration::from_secs(3),
             dns_query_timeout: Duration::from_secs(2),
-            dns_refresh_interval: Duration::from_secs(300),
+            dns_refresh_interval: Duration::from_secs(120),
             dns_snapshot_delay: Duration::from_millis(100),
             dns_query_interval: Duration::from_millis(50),
-            dns_min_ttl: 60,
+            dns_min_ttl: 300,
             h3_handshake_timeout: Duration::from_secs(5),
             h3_max_idle_timeout: Duration::from_secs(60),
             h3_keepalive_interval: Duration::from_secs(20),
@@ -542,6 +553,22 @@ impl Config {
                     h3_handshake_timeout = ?self.tuning.h3_handshake_timeout,
                     "tuning.reconnect_backoff_min should be greater than \
                      tuning.h3_handshake_timeout to prevent overlapping handshake attempts"
+                );
+            }
+        }
+
+        // DNS TTL floor vs refresh interval: if min_ttl < 2× refresh, IPs can
+        // expire between refresh cycles, causing repeated connection churn.
+        if !self.tuning.dns_refresh_interval.is_zero() {
+            let min_safe_ttl = self.tuning.dns_refresh_interval.as_secs().saturating_mul(2);
+            if (self.tuning.dns_min_ttl as u64) < min_safe_ttl {
+                tracing::warn!(
+                    dns_min_ttl = self.tuning.dns_min_ttl,
+                    dns_refresh_interval = self.tuning.dns_refresh_interval.as_secs(),
+                    recommended_min_ttl = min_safe_ttl,
+                    "tuning.dns_min_ttl should be at least 2× tuning.dns_refresh_interval; \
+                     otherwise cached IPs may expire before the next refresh, \
+                     causing repeated connection pruning and reconnection"
                 );
             }
         }
@@ -1932,10 +1959,10 @@ peers:
         );
         assert_eq!(cfg.tuning.metrics_log_interval, Duration::from_secs(3));
         assert_eq!(cfg.tuning.dns_query_timeout, Duration::from_secs(2));
-        assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(300));
+        assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(120));
         assert_eq!(cfg.tuning.dns_snapshot_delay, Duration::from_millis(100));
         assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(50));
-        assert_eq!(cfg.tuning.dns_min_ttl, 60);
+        assert_eq!(cfg.tuning.dns_min_ttl, 300);
         assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(5));
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
         assert_eq!(cfg.tuning.h3_keepalive_interval, Duration::from_secs(20));
