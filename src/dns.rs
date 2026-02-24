@@ -290,13 +290,12 @@ pub fn spawn_dns(
                 maybe_cmd = cmd_rx.recv() => {
                     match maybe_cmd {
                         Some(DnsCommand::SetHostnames { hosts }) => {
-                            handle_set_hostnames(hosts, &mut state, &mut pending, &socket, query_interval).await;
+                            handle_set_hostnames(hosts, &mut state, &mut pending, &socket, query_interval, &events_tx).await;
                         }
                         None => {
                             cmd_rx_closed = true;
                         }
                     }
-                    state.emit_snapshot(&events_tx);
                 }
                 result = socket.recv(&mut buf) => {
                     match result {
@@ -353,6 +352,7 @@ async fn handle_set_hostnames(
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
     query_interval: Duration,
+    events_tx: &mpsc::UnboundedSender<Event>,
 ) {
     state.set_hostnames(&new_hosts);
 
@@ -362,6 +362,12 @@ async fn handle_set_hostnames(
             state.record_ip(host, ip, u32::MAX);
         }
     }
+
+    // Always emit a snapshot so the orchestrator rebuilds routing after config
+    // changes. Without this, config updates that only change allowed_ips (same
+    // hostnames, same resolved IPs) would never trigger a routing table rebuild.
+    state.dirty = true;
+    state.emit_snapshot(events_tx);
 
     trigger_refresh(state, pending, socket, query_interval).await;
 }
@@ -715,7 +721,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_emit_duplicate_snapshot_on_refresh() {
+    async fn emits_snapshot_on_repeated_set_hostnames() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
         let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
@@ -755,29 +761,22 @@ mod tests {
         );
         socket.send_to(&response2, peer2).await.unwrap();
 
-        // Drain any pending debounce snapshot before the duplicate check
+        // Drain any pending debounce snapshot before the re-register check
         tokio::time::sleep(Duration::from_millis(200)).await;
         while events_rx.try_recv().is_ok() {}
 
-        // Re-register same hosts (simulating refresh via new SetHostnames with same content)
-        // This should not re-query since hosts haven't changed
+        // Re-register same hosts (simulating config push with changed allowed_ips)
+        // SetHostnames always marks dirty so the orchestrator can rebuild routing.
         let mut hosts2 = HashSet::new();
         hosts2.insert("example.com".to_string());
         cmd_tx
             .send(DnsCommand::SetHostnames { hosts: hosts2 })
             .unwrap();
 
-        // Should not receive another snapshot (no new hostnames added, no state change)
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                // Expected - no event
-            }
-            event = events_rx.recv() => {
-                if let Some(Event::Dns(_)) = event {
-                    panic!("should not emit duplicate snapshot when state unchanged");
-                }
-            }
-        }
+        // Should receive a snapshot (SetHostnames unconditionally marks dirty)
+        let snapshot = next_dns_snapshot(&mut events_rx).await;
+        let ips = snapshot.get("example.com").expect("missing example.com");
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
 
         handle.abort();
     }
