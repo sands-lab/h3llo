@@ -290,7 +290,7 @@ pub fn spawn_dns(
                 maybe_cmd = cmd_rx.recv() => {
                     match maybe_cmd {
                         Some(DnsCommand::SetHostnames { hosts }) => {
-                            handle_set_hostnames(hosts, &mut state, &mut pending, &socket, query_interval).await;
+                            handle_set_hostnames(hosts, &mut state, &mut pending, &socket, query_interval, &events_tx).await;
                         }
                         None => {
                             cmd_rx_closed = true;
@@ -353,6 +353,7 @@ async fn handle_set_hostnames(
     pending: &mut HashMap<u16, PendingRequest>,
     socket: &UdpSocket,
     query_interval: Duration,
+    events_tx: &mpsc::UnboundedSender<Event>,
 ) {
     state.set_hostnames(&new_hosts);
 
@@ -363,10 +364,11 @@ async fn handle_set_hostnames(
         }
     }
 
-    // Always mark dirty so the orchestrator rebuilds routing after config changes.
-    // Without this, config updates that only change allowed_ips (same hostnames,
-    // same resolved IPs) would never trigger a routing table rebuild.
+    // Always emit a snapshot so the orchestrator rebuilds routing after config
+    // changes. Without this, config updates that only change allowed_ips (same
+    // hostnames, same resolved IPs) would never trigger a routing table rebuild.
     state.dirty = true;
+    state.emit_snapshot(events_tx);
 
     trigger_refresh(state, pending, socket, query_interval).await;
 }
