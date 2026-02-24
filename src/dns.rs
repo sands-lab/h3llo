@@ -296,7 +296,6 @@ pub fn spawn_dns(
                             cmd_rx_closed = true;
                         }
                     }
-                    state.emit_snapshot(&events_tx);
                 }
                 result = socket.recv(&mut buf) => {
                     match result {
