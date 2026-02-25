@@ -48,60 +48,48 @@ struct DnsState {
 }
 
 impl DnsState {
-    #[inline]
-    fn touch(&mut self, changed: bool) -> bool {
-        self.dirty |= changed;
-        changed
-    }
-
     /// Updates the set of registered hostnames.
     ///
     /// Removes unregistered hostnames and their IPs; adds new hostnames with
-    /// empty IP maps. Returns true if registration changed.
-    fn set_hostnames(&mut self, hosts: &HashSet<String>) -> bool {
-        let mut changed = false;
-
+    /// empty IP maps.
+    fn set_hostnames(&mut self, hosts: &HashSet<String>) {
         let removed: Vec<String> = self
             .entries
             .extract_if(|h, _| !hosts.contains(h))
             .map(|(h, _)| h)
             .collect();
         if !removed.is_empty() {
-            changed = true;
+            self.dirty = true;
             info!(hostnames = ?removed, "dns: hostnames unregistered");
         }
 
         for h in hosts {
             if !self.entries.contains_key(h) {
-                changed = true;
+                self.dirty = true;
                 info!(hostname = %h, "dns: hostname registered");
                 self.entries.insert(h.clone(), HashMap::new());
             }
         }
-
-        self.touch(changed)
     }
 
-    /// Records a resolved IP for a hostname. Returns true if the IP is new.
-    fn record_ip(&mut self, host: &str, ip: IpAddr, ttl: u32) -> bool {
+    /// Records a resolved IP for a hostname.
+    fn record_ip(&mut self, host: &str, ip: IpAddr, ttl: u32) {
         let Some(ips) = self.entries.get_mut(host) else {
-            return false;
+            return;
         };
 
         let effective_ttl = ttl.max(self.min_ttl_secs);
         let expires_at = Instant::now() + Duration::from_secs(effective_ttl as u64);
 
-        let is_new = ips.insert(ip, expires_at).is_none();
-        if is_new {
+        if ips.insert(ip, expires_at).is_none() {
+            self.dirty = true;
             info!(host = %host, ip = %ip, ttl = effective_ttl, "dns: new IP resolved");
         }
-        self.touch(is_new)
     }
 
-    /// Removes expired IPs. Returns true if any were removed.
-    fn expire_stale(&mut self) -> bool {
+    /// Removes expired IPs.
+    fn expire_stale(&mut self) {
         let now = Instant::now();
-        let mut removed = false;
 
         for (host, ips) in self.entries.iter_mut() {
             let expired: Vec<IpAddr> = ips
@@ -109,12 +97,10 @@ impl DnsState {
                 .map(|(ip, _)| ip)
                 .collect();
             if !expired.is_empty() {
-                removed = true;
+                self.dirty = true;
                 info!(host = %host, ips = ?expired, "dns: IPs expired");
             }
         }
-
-        self.touch(removed)
     }
 
     /// Emits a snapshot to the orchestrator if dirty, clearing the dirty flag.
