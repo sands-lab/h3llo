@@ -152,13 +152,6 @@ impl DnsState {
         let _ = events_tx.send(Event::Dns(DnsEvent { state }));
     }
 
-    /// Returns true if all entries have empty IP maps and no pending queries.
-    fn is_idle(&self) -> bool {
-        self.hostnames
-            .values()
-            .all(|entry| entry.ips.is_empty() && entry.pending.is_empty())
-    }
-
     /// Validates and clears a pending query matching (hostname, record_type, txid).
     ///
     /// Returns `true` if a matching pending query was found and cleared. Performs
@@ -190,23 +183,14 @@ impl DnsState {
         true
     }
 
-    /// Allocates a unique transaction ID not used by any pending query.
+    /// Allocates a transaction ID via wrapping counter.
     ///
-    /// Uses a wrapping counter and scans all pending entries to avoid collisions.
-    /// O(n) where n = total pending queries, bounded by 2× the number of
-    /// registered hostnames.
+    /// Uniqueness is not required: response matching uses (hostname, record_type)
+    /// as the primary key, with txid as a secondary stale-response guard.
     fn allocate_id(&mut self) -> u16 {
-        loop {
-            let id = self.next_id;
-            self.next_id = self.next_id.wrapping_add(1);
-            let in_use = self
-                .hostnames
-                .values()
-                .any(|entry| entry.pending.values().any(|&(txid, _)| txid == id));
-            if !in_use {
-                return id;
-            }
-        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        id
     }
 }
 
@@ -316,7 +300,6 @@ pub fn spawn_dns(
     );
 
     let handle = tokio::spawn(async move {
-        let mut cmd_rx_closed = false;
         let mut state = DnsState {
             hostnames: HashMap::new(),
             dirty: false,
@@ -359,9 +342,7 @@ pub fn spawn_dns(
                         Some(DnsCommand::SetHostnames { hosts }) => {
                             handle_set_hostnames(hosts, &mut state, &socket, query_interval, refresh_interval, &events_tx).await;
                         }
-                        None => {
-                            cmd_rx_closed = true;
-                        }
+                        None => return Ok(()),
                     }
                 }
                 result = socket.recv(&mut buf) => {
@@ -389,10 +370,6 @@ pub fn spawn_dns(
                 _ = refresh_ticker.tick(), if !refresh_interval.is_zero() => {
                     trigger_refresh(&mut state, &socket, query_interval, refresh_interval).await;
                 }
-            }
-
-            if cmd_rx_closed && state.is_idle() {
-                return Ok(());
             }
         }
     });
@@ -459,12 +436,23 @@ async fn trigger_refresh(
 }
 
 /// Sends a DNS query packet and records it in state. Logs on error.
+///
+/// Skips sending if there is already a pending query for the same record type,
+/// avoiding redundant queries and stale txid overwrites.
 async fn send_query(
     host: String,
     record_type: RecordType,
     state: &mut DnsState,
     socket: &UdpSocket,
 ) {
+    if state
+        .hostnames
+        .get(&host)
+        .is_some_and(|e| e.pending.contains_key(&record_type))
+    {
+        return;
+    }
+
     let result: Result<(), String> = async {
         let name = Name::from_ascii(&host).map_err(|e| e.to_string())?;
 
@@ -1204,31 +1192,6 @@ mod tests {
 
         let root = Name::root();
         assert_eq!(normalize_dns_name(&root), "");
-    }
-
-    #[test]
-    fn is_idle_includes_pending() {
-        let mut state = DnsState {
-            hostnames: HashMap::new(),
-            dirty: false,
-            min_ttl_secs: 300,
-            next_id: 0,
-        };
-        assert!(state.is_idle());
-
-        // Pending query → not idle
-        let mut entry = HostnameState::default();
-        entry.pending.insert(RecordType::A, (1, Instant::now()));
-        state.hostnames.insert("example.com".into(), entry);
-        assert!(!state.is_idle());
-
-        // Clear pending, add resolved IP → still not idle
-        let entry = state.hostnames.get_mut("example.com").unwrap();
-        entry.pending.clear();
-        entry
-            .ips
-            .insert(IpAddr::V4(Ipv4Addr::LOCALHOST), Instant::now());
-        assert!(!state.is_idle());
     }
 
     #[test]
