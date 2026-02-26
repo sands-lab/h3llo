@@ -37,7 +37,7 @@ pub(super) fn generate_test_certs(
         "localhost".to_string(),
         "127.0.0.1".to_string(),
     ];
-    let CertifiedKey { cert, key_pair } =
+    let CertifiedKey { cert, signing_key } =
         generate_simple_self_signed(subject_alt_names).expect("cert generation");
 
     let cert_path = temp_dir.join(format!("{}-cert.pem", hostname));
@@ -50,7 +50,7 @@ pub(super) fn generate_test_certs(
 
     let mut key_file = std::fs::File::create(&key_path).expect("create key file");
     key_file
-        .write_all(key_pair.serialize_pem().as_bytes())
+        .write_all(signing_key.serialize_pem().as_bytes())
         .expect("write key");
 
     (cert_path, key_path)

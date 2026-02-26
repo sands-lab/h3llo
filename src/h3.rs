@@ -1407,7 +1407,7 @@ mod tests {
             use std::io::Write;
 
             let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-            let CertifiedKey { cert, key_pair } =
+            let CertifiedKey { cert, signing_key } =
                 generate_simple_self_signed(subject_alt_names).expect("cert generation");
 
             let mut cert_file = tempfile::NamedTempFile::new().expect("create cert temp file");
@@ -1417,7 +1417,7 @@ mod tests {
 
             let mut key_file = tempfile::NamedTempFile::new().expect("create key temp file");
             key_file
-                .write_all(key_pair.serialize_pem().as_bytes())
+                .write_all(signing_key.serialize_pem().as_bytes())
                 .expect("write key");
 
             Self {
