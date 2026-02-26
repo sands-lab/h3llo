@@ -40,7 +40,7 @@ pub enum DnsCommand {
 /// the hostname format used as HashMap keys throughout the DNS module.
 fn normalize_dns_name(name: &Name) -> String {
     let s = name.to_ascii();
-    s.strip_suffix('.').unwrap_or(&s).to_owned()
+    s.strip_suffix('.').unwrap_or(&s).to_ascii_lowercase()
 }
 
 /// Per-hostname DNS resolution and query tracking state.
@@ -474,9 +474,8 @@ async fn send_query(
 /// Parses a DNS response and updates state via O(1) hostname lookup.
 ///
 /// Extracts the queried hostname from the response's question section
-/// (RFC 1035 §4.1.1) for direct HashMap lookup, replacing the previous
-/// O(n) transaction-ID scan. Validates both hostname and txid before
-/// processing.
+/// (RFC 1035 §4.1.1) for direct HashMap lookup. Validates both hostname
+/// and txid before processing.
 fn handle_packet(data: &[u8], state: &mut DnsState) {
     let message = match Message::from_vec(data) {
         Ok(msg) => msg,
