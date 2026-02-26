@@ -7,6 +7,7 @@ use crate::config::{LocalDns, Tuning};
 use crate::events::{DnsEvent, Event};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
+use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -81,8 +82,6 @@ struct DnsState {
     dirty: bool,
     /// Minimum TTL floor in seconds to prevent excessive refresh.
     min_ttl_secs: u32,
-    /// Wrapping counter for transaction ID allocation.
-    next_id: u16,
 }
 
 impl DnsState {
@@ -181,16 +180,6 @@ impl DnsState {
         }
         entry.pending.remove(&record_type);
         true
-    }
-
-    /// Allocates a transaction ID via wrapping counter.
-    ///
-    /// Uniqueness is not required: response matching uses (hostname, record_type)
-    /// as the primary key, with txid as a secondary stale-response guard.
-    fn allocate_id(&mut self) -> u16 {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        id
     }
 }
 
@@ -304,7 +293,6 @@ pub fn spawn_dns(
             hostnames: HashMap::new(),
             dirty: false,
             min_ttl_secs,
-            next_id: 0,
         };
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
@@ -457,7 +445,7 @@ async fn send_query(
         let name = Name::from_ascii(&host).map_err(|e| e.to_string())?;
 
         let mut message = Message::new();
-        let id = state.allocate_id();
+        let id = rand::rng().random::<u16>();
         message.set_id(id);
         message.set_message_type(MessageType::Query);
         message.set_op_code(OpCode::Query);
@@ -1200,7 +1188,6 @@ mod tests {
             hostnames: HashMap::new(),
             dirty: false,
             min_ttl_secs: 300,
-            next_id: 0,
         };
         let mut hosts = HashSet::new();
         hosts.insert("example.com".to_string());
@@ -1223,7 +1210,6 @@ mod tests {
             hostnames: HashMap::new(),
             dirty: false,
             min_ttl_secs: 300,
-            next_id: 0,
         };
         let mut entry = HostnameState::default();
         entry.pending.insert(RecordType::A, (42, Instant::now()));
