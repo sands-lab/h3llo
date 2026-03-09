@@ -181,21 +181,20 @@ pub struct Tuning {
     /// versions and virtualization layers. Enable for better performance
     /// and verify with thorough testing.
     pub tun_enable_offload: bool,
-    /// Enable GSO offload for UDP transports (default: `false`).
+    /// Enable UDP offload for transports (default: `false`).
     ///
-    /// Controls **TX-side** GSO segment count for BareUDP via quinn-udp.
-    /// When `true`, BareUDP batches multiple packets into a single
-    /// `sendmsg` call using `UDP_SEGMENT` (GSO). When `false`, GSO segment
-    /// count is capped to 1, resulting in per-packet sends.
+    /// Effect varies by transport:
     ///
-    /// **RX-side** GRO is always active: quinn-udp's `UdpSocketState::new()`
-    /// unconditionally enables `UDP_GRO` on the socket, and the receive
-    /// buffer is always sized for the socket's actual GRO capability.
-    /// This ensures coalesced datagrams are never silently truncated.
-    ///
-    /// Also controls HTTP/3 client (dial) socket GSO via
-    /// `apply_max_capabilities()`. HTTP/3 **listener** sockets are managed
-    /// internally by tokio-quiche and are not affected by this switch.
+    /// - **BareUDP TX**: controls GSO segment count. When `true`, batches
+    ///   multiple packets into a single `sendmsg` via `UDP_SEGMENT`. When
+    ///   `false`, segment count is capped to 1 (per-packet sends).
+    /// - **BareUDP RX**: **no effect**. quinn-udp's `UdpSocketState::new()`
+    ///   unconditionally enables `UDP_GRO`; the receive buffer is always
+    ///   sized for the socket's actual GRO capability to prevent silent
+    ///   truncation of coalesced datagrams.
+    /// - **HTTP/3** (both client and listener): controls GSO **and** GRO
+    ///   via `apply_max_capabilities()`. When `false`, neither GSO nor GRO
+    ///   is enabled on the QUIC socket.
     ///
     /// Disabled by default due to compatibility issues with certain NIC
     /// drivers and platforms (e.g., incorrect checksums, EINVAL on
