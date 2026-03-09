@@ -31,12 +31,16 @@ pub enum BareUdpRxCommand {
 }
 
 /// Provides receive-only access to a BareUDP socket with quinn-udp GRO support.
+///
+/// The receive buffer is always sized for the socket's actual GRO capability.
+/// quinn-udp's `UdpSocketState::new()` unconditionally enables `UDP_GRO`, so
+/// the buffer must accommodate coalesced datagrams regardless of the
+/// `udp_enable_offload` configuration flag (which only controls TX-side GSO).
 #[derive(Debug)]
 pub struct BareUdpRx {
     socket: UdpSocket,
     state: UdpSocketState,
     mtu: usize,
-    enable_offload: bool,
 }
 
 /// Creates a BareUDP RX actor state from resolved listen address.
@@ -46,7 +50,6 @@ pub struct BareUdpRx {
 /// * `listen` - Resolved socket address to bind.
 /// * `mtu` - MTU for buffer sizing.
 /// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
-/// * `enable_offload` - Enable GRO offload; when `false`, GRO segments are capped to 1.
 ///
 /// # Errors
 ///
@@ -55,17 +58,11 @@ pub fn make_bare_rx(
     listen: SocketAddr,
     mtu: usize,
     socket_buffer_bytes: usize,
-    enable_offload: bool,
 ) -> Result<BareUdpRx, UdpError> {
     let socket = make_server_udp_socket(listen, socket_buffer_bytes)?;
     let state = UdpSocketState::new(UdpSockRef::from(&socket))
         .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
-    Ok(BareUdpRx {
-        socket,
-        state,
-        mtu,
-        enable_offload,
-    })
+    Ok(BareUdpRx { socket, state, mtu })
 }
 
 /// Provides send-only access to an unconnected BareUDP socket with quinn-udp GSO support.
@@ -149,23 +146,18 @@ pub fn spawn_udp_rx(
     // Actor creates and owns its command channel receiver
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-    let BareUdpRx {
-        socket,
-        state,
-        mtu,
-        enable_offload,
-    } = rx;
+    let BareUdpRx { socket, state, mtu } = rx;
     let local_addr = socket
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
 
     let handle = tokio::spawn(async move {
-        let gro_segments = if enable_offload {
-            state.gro_segments()
-        } else {
-            1
-        };
+        // Always size the buffer for the socket's actual GRO capability.
+        // quinn-udp's UdpSocketState::new() unconditionally enables UDP_GRO
+        // on the socket; a buffer smaller than gro_segments() would silently
+        // truncate coalesced datagrams, causing packet loss.
+        let gro_segments = state.gro_segments();
         let mut buf = vec![0u8; mtu * gro_segments];
         let mut counters = Counters::new(Source::BareUdp, Direction::Rx);
         let mut ticker = time::interval(interval);
@@ -366,12 +358,7 @@ mod tests {
     /// Creates a `BareUdpRx` directly from a socket for testing.
     fn test_bare_rx(socket: UdpSocket, mtu: usize) -> BareUdpRx {
         let state = UdpSocketState::new(UdpSockRef::from(&socket)).unwrap();
-        BareUdpRx {
-            socket,
-            state,
-            mtu,
-            enable_offload: true,
-        }
+        BareUdpRx { socket, state, mtu }
     }
 
     /// Creates a test `Tuning` with a custom metrics push interval.
@@ -398,7 +385,7 @@ mod tests {
     #[tokio::test]
     async fn make_bare_rx_creates_valid_state() {
         let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let result = make_bare_rx(listen, 1500, 0, true);
+        let result = make_bare_rx(listen, 1500, 0);
         assert!(result.is_ok());
         let rx = result.unwrap();
         assert_eq!(rx.mtu, 1500);
@@ -930,21 +917,5 @@ mod tests {
         assert_eq!(metrics.stats.succeeded.bytes, 6);
 
         handle.abort();
-    }
-
-    // ========== Offload Configuration Tests ==========
-
-    #[tokio::test]
-    async fn make_bare_rx_offload_disabled() {
-        let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let rx = make_bare_rx(listen, 1500, 0, false).unwrap();
-        assert!(!rx.enable_offload);
-    }
-
-    #[tokio::test]
-    async fn make_bare_rx_offload_enabled() {
-        let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let rx = make_bare_rx(listen, 1500, 0, true).unwrap();
-        assert!(rx.enable_offload);
     }
 }

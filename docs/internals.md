@@ -46,7 +46,7 @@ Each actor follows a consistent two-function initialization pattern:
    - Takes configuration parameters (structured config or resolved types)
    - Performs synchronous or fallible I/O (socket binding, parsing)
    - Returns `Result<ActorState, Error>`
-   - Example: `make_bare_rx(listen: SocketAddr, mtu: usize) -> Result<BareUdpRx, UdpError>`
+   - Example: `make_bare_rx(listen, mtu, socket_buffer_bytes) -> Result<BareUdpRx, UdpError>`
 
 2. **`spawn_*`** - Spawns the actor task:
    - Takes the state struct and dependencies (events_tx, etc.)
