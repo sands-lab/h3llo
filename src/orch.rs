@@ -554,13 +554,8 @@ impl Orchestrator {
             // Endpoint already parsed during config deserialization
             let listen_addr = resolve_listen_addr(&local_bare.listen.host, local_bare.listen.port)?;
 
-            let bare_rx = make_bare_rx(
-                listen_addr,
-                mtu,
-                tuning.socket_buffer_bytes(),
-                tuning.udp_enable_offload,
-            )
-            .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
+            let bare_rx = make_bare_rx(listen_addr, mtu, tuning.socket_buffer_bytes())
+                .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
 
             let (cmd_tx, bare_rx_handle) = spawn_udp_rx(
                 bare_rx,

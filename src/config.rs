@@ -181,17 +181,20 @@ pub struct Tuning {
     /// versions and virtualization layers. Enable for better performance
     /// and verify with thorough testing.
     pub tun_enable_offload: bool,
-    /// Enable GSO/GRO offload for UDP transports (default: `false`).
+    /// Enable UDP offload for transports (default: `false`).
     ///
-    /// Controls software GSO/GRO for BareUDP via quinn-udp. When `true`,
-    /// BareUDP uses `UdpSocketState` for batched sends (GSO) and receives
-    /// (GRO) on supported platforms. When `false`, GSO/GRO segment counts
-    /// are capped to 1, resulting in per-packet I/O through the same
-    /// quinn-udp code path.
+    /// Effect varies by transport:
     ///
-    /// Also controls HTTP/3 client (dial) socket GSO/GRO via
-    /// `apply_max_capabilities()`. HTTP/3 **listener** sockets are managed
-    /// internally by tokio-quiche and are not affected by this switch.
+    /// - **BareUDP TX**: controls GSO segment count. When `true`, batches
+    ///   multiple packets into a single `sendmsg` via `UDP_SEGMENT`. When
+    ///   `false`, segment count is capped to 1 (per-packet sends).
+    /// - **BareUDP RX**: **no effect**. quinn-udp's `UdpSocketState::new()`
+    ///   unconditionally enables `UDP_GRO`; the receive buffer is always
+    ///   sized for the socket's actual GRO capability to prevent silent
+    ///   truncation of coalesced datagrams.
+    /// - **HTTP/3** (both client and listener): controls GSO **and** GRO
+    ///   via `apply_max_capabilities()`. When `false`, neither GSO nor GRO
+    ///   is enabled on the QUIC socket.
     ///
     /// Disabled by default due to compatibility issues with certain NIC
     /// drivers and platforms (e.g., incorrect checksums, EINVAL on
