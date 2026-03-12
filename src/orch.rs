@@ -1,6 +1,6 @@
 //! Runtime orchestration for BareUDP and HTTP/3 transports.
 
-use crate::actor::{ActorError, ActorExitResult, ActorKind};
+use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
 use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUdpRxCommand};
 use crate::bind::DefaultRouteProbe;
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
@@ -24,6 +24,7 @@ use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_quiche::buf_factory::PooledBuf;
@@ -181,6 +182,7 @@ impl PeerEntry {
         tun_if: &str,
         mtu: usize,
         tuning: &Tuning,
+        bare_handle: &Handle,
     ) {
         if self.resolved_ips.is_empty() {
             return;
@@ -232,6 +234,9 @@ impl PeerEntry {
                 let bindif = bare.bindif.clone();
                 let endpoint = Endpoint::Udp(bare.endpoint.clone());
 
+                // Enter BareUDP runtime so tokio::spawn targets the BareUDP
+                // scheduler. Guard drops after spawn returns (sync call site).
+                let _guard = bare_handle.enter();
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
                     match make_bare_tx(
@@ -348,6 +353,12 @@ pub enum OrchestratorError {
     /// UDP socket setup failed.
     #[error("udp socket setup failed: {0}")]
     Udp(String),
+    /// Dedicated runtime creation failed.
+    #[error("dedicated runtime '{name}' failed: {source}")]
+    Runtime {
+        name: String,
+        source: std::io::Error,
+    },
     /// An actor exited with an error.
     #[error("actor error: {0}")]
     ActorError(#[from] ActorError),
@@ -393,6 +404,17 @@ pub struct Orchestrator {
     ///
     /// At most 3 entries. Peer-scoped metrics live in `BoundState`.
     non_peer_metrics: HashMap<Labels, Metrics>,
+
+    /// Dedicated runtime for TUN Tx/Rx actors (thread: `h3llo-tun`).
+    ///
+    /// Not read after init — kept alive for its `Drop` impl (RAII shutdown).
+    _tun_rt: DedicatedRuntime,
+    /// Dedicated runtime for Router actor (thread: `h3llo-router`).
+    ///
+    /// Not read after init — kept alive for its `Drop` impl (RAII shutdown).
+    _router_rt: DedicatedRuntime,
+    /// Dedicated runtime for BareUDP Tx/Rx actors (thread: `h3llo-bare`).
+    bare_rt: DedicatedRuntime,
 }
 
 impl Orchestrator {
@@ -501,16 +523,32 @@ impl Orchestrator {
         let mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
 
-        // Note: NoTransportConfigured validation moved to Config::validate()
+        // Create dedicated current_thread runtimes for data-plane actors.
+        // Each runtime runs on its own OS thread, eliminating cross-thread
+        // task migration on data-plane hot paths (thread-per-core).
+        let make_runtime = |name: &str| {
+            DedicatedRuntime::new(name).map_err(|source| OrchestratorError::Runtime {
+                name: name.to_string(),
+                source,
+            })
+        };
+        let tun_rt = make_runtime("h3llo-tun")?;
+        let router_rt = make_runtime("h3llo-router")?;
+        let bare_rt = make_runtime("h3llo-bare")?;
 
-        // Setup TUN
-        let (tun_reader, tun_writer) = tun::make_tun(
-            &config.local.tun,
-            config.tuning.tun_tx_queue_len,
-            config.tuning.tun_enable_offload,
-        )
-        .await
-        .map_err(|err| OrchestratorError::Tun(err.to_string()))?;
+        // Setup TUN — enter guard ensures AsyncFd registers with the TUN
+        // runtime's I/O reactor. make_tun is async in signature but has no
+        // internal .await points, so the guard stays effective.
+        let (tun_reader, tun_writer) = {
+            let _guard = tun_rt.handle().enter();
+            tun::make_tun(
+                &config.local.tun,
+                tuning.tun_tx_queue_len,
+                tuning.tun_enable_offload,
+            )
+            .await
+            .map_err(|err| OrchestratorError::Tun(err.to_string()))?
+        };
 
         // Control plane: unbounded to prevent deadlocks from actor cycles.
         let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -520,30 +558,45 @@ impl Orchestrator {
         // Start with empty routing table; routes populated as DNS answers arrive
         let routing = RoutingTable::new();
 
-        // TUN-Tx actor creates its own packet channel; returns sender for transports to use
-        let (input_tx, tun_tx_handle) = tun::spawn_tun_tx(
-            tun_writer,
-            events_tx.clone(),
-            tuning.metrics_push_interval,
-            tuning.packet_queue_depth,
-        );
+        // RUNTIME CONTEXT: All spawn_* calls below MUST be wrapped in a
+        // Handle::enter() guard targeting the correct dedicated runtime.
+        // The guard sets the thread-local runtime context; tokio::spawn
+        // inside the called function picks up this context. All spawn_*
+        // functions are synchronous (no .await crossing).
 
-        // Spawn router actor between RX actors and TUN TX
-        let (output_tx, ingress_tx, router_cmd_tx, router_handle) = spawn_router(
-            routing,
-            input_tx.clone(),
-            events_tx.clone(),
-            tuning.metrics_push_interval,
-            tuning.packet_queue_depth,
-        );
+        // TUN-Tx on TUN runtime (sync fn — enter guard is safe, no .await).
+        let (input_tx, tun_tx_handle) = {
+            let _guard = tun_rt.handle().enter();
+            tun::spawn_tun_tx(
+                tun_writer,
+                events_tx.clone(),
+                tuning.metrics_push_interval,
+                tuning.packet_queue_depth,
+            )
+        };
 
-        // Spawn TUN RX — pure packet producer forwarding to router
-        let tun_rx_handle = tun::spawn_tun_rx(
-            tun_reader,
-            output_tx,
-            events_tx.clone(),
-            tuning.metrics_push_interval,
-        );
+        // Router on Router runtime (sync fn — enter guard is safe, no .await).
+        let (output_tx, ingress_tx, router_cmd_tx, router_handle) = {
+            let _guard = router_rt.handle().enter();
+            spawn_router(
+                routing,
+                input_tx.clone(),
+                events_tx.clone(),
+                tuning.metrics_push_interval,
+                tuning.packet_queue_depth,
+            )
+        };
+
+        // TUN-Rx on TUN runtime (sync fn — enter guard is safe, no .await).
+        let tun_rx_handle = {
+            let _guard = tun_rt.handle().enter();
+            tun::spawn_tun_rx(
+                tun_reader,
+                output_tx,
+                events_tx.clone(),
+                tuning.metrics_push_interval,
+            )
+        };
 
         join_set.spawn(tun_tx_handle);
         join_set.spawn(router_handle);
@@ -551,19 +604,25 @@ impl Orchestrator {
 
         // Initialize BareUDP listener if configured
         let bare_rx_cmd_tx = if let Some(ref local_bare) = config.local.bare {
-            // Endpoint already parsed during config deserialization
             let listen_addr = resolve_listen_addr(&local_bare.listen.host, local_bare.listen.port)?;
 
-            let bare_rx = make_bare_rx(listen_addr, mtu, tuning.socket_buffer_bytes())
-                .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
+            // BareUDP RX on BareUDP runtime — UdpSocket registers with BareUDP reactor.
+            let bare_rx = {
+                let _guard = bare_rt.handle().enter();
+                make_bare_rx(listen_addr, mtu, tuning.socket_buffer_bytes())
+                    .map_err(|err| OrchestratorError::Udp(err.to_string()))?
+            };
 
-            let (cmd_tx, bare_rx_handle) = spawn_udp_rx(
-                bare_rx,
-                std::collections::HashSet::new(),
-                ingress_tx.clone(),
-                events_tx.clone(),
-                tuning.metrics_push_interval,
-            );
+            let (cmd_tx, bare_rx_handle) = {
+                let _guard = bare_rt.handle().enter();
+                spawn_udp_rx(
+                    bare_rx,
+                    std::collections::HashSet::new(),
+                    ingress_tx.clone(),
+                    events_tx.clone(),
+                    tuning.metrics_push_interval,
+                )
+            };
 
             join_set.spawn(bare_rx_handle);
             Some(cmd_tx)
@@ -571,7 +630,7 @@ impl Orchestrator {
             None
         };
 
-        // Initialize H3 listener if configured
+        // Initialize H3 listener if configured (H3 stays on orchestrator runtime)
         let h3_listener_cmd_tx = if let Some(ref h3_cfg) = config.local.h3 {
             let listen_addr = resolve_listen_addr(&h3_cfg.listen.host, h3_cfg.listen.port)?;
             let cert_path = Path::new(&h3_cfg.cert);
@@ -678,6 +737,9 @@ impl Orchestrator {
             input_tx,
             local: config.local,
             non_peer_metrics: HashMap::new(),
+            _tun_rt: tun_rt,
+            _router_rt: router_rt,
+            bare_rt,
         };
         orch.sync_peers_to_actors();
         Ok(orch)
@@ -776,10 +838,17 @@ impl Orchestrator {
 
     /// Periodic reconciliation: prune stale bounds and attempt reconnection.
     fn reconcile(&mut self) {
+        let bare_handle = self.bare_rt.handle().clone();
         let mut routing_changed = false;
         for entry in self.peers.values_mut() {
             routing_changed |= entry.prune();
-            entry.try_connect(&self.events_tx, &self.tun_if, self.mtu, &self.tuning);
+            entry.try_connect(
+                &self.events_tx,
+                &self.tun_if,
+                self.mtu,
+                &self.tuning,
+                &bare_handle,
+            );
         }
         if routing_changed {
             self.update_routing();
@@ -940,6 +1009,7 @@ impl Orchestrator {
     /// after DNS changes or peer mutations (add/remove via API).
     fn handle_dns_snapshot(&mut self, dns_event: DnsEvent) {
         let dns_state = dns_event.state;
+        let bare_handle = self.bare_rt.handle().clone();
 
         for entry in self.peers.values_mut() {
             let hostname = peer_dns_hostname(&entry.config);
@@ -949,7 +1019,13 @@ impl Orchestrator {
                 .unwrap_or_default();
 
             entry.prune();
-            entry.try_connect(&self.events_tx, &self.tun_if, self.mtu, &self.tuning);
+            entry.try_connect(
+                &self.events_tx,
+                &self.tun_if,
+                self.mtu,
+                &self.tuning,
+                &bare_handle,
+            );
         }
 
         self.update_accepted_sources();
@@ -1284,6 +1360,9 @@ mod test_support {
                 input_tx,
                 local,
                 non_peer_metrics: HashMap::new(),
+                _tun_rt: DedicatedRuntime::new("test-tun").expect("test runtime"),
+                _router_rt: DedicatedRuntime::new("test-router").expect("test runtime"),
+                bare_rt: DedicatedRuntime::new("test-bare").expect("test runtime"),
             };
 
             (
@@ -2425,13 +2504,25 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         // First call should mark IP as in-flight
-        entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
+        entry.try_connect(
+            &events_tx,
+            "test0",
+            1393,
+            &Tuning::default(),
+            &Handle::current(),
+        );
         assert!(entry.dials.contains_key(&ip));
         assert!(entry.dials[&ip].in_flight);
 
         // Second immediate call should skip (in-flight)
         let attempt_before = entry.dials[&ip].attempt;
-        entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
+        entry.try_connect(
+            &events_tx,
+            "test0",
+            1393,
+            &Tuning::default(),
+            &Handle::current(),
+        );
         assert_eq!(entry.dials[&ip].attempt, attempt_before);
     }
 
@@ -2452,7 +2543,13 @@ mod tests {
         );
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
+        entry.try_connect(
+            &events_tx,
+            "test0",
+            1393,
+            &Tuning::default(),
+            &Handle::current(),
+        );
 
         assert!(!entry.dials[&ip].in_flight);
         assert_eq!(entry.dials[&ip].attempt, 1);
@@ -2475,7 +2572,13 @@ mod tests {
         );
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        entry.try_connect(&events_tx, "test0", 1393, &Tuning::default());
+        entry.try_connect(
+            &events_tx,
+            "test0",
+            1393,
+            &Tuning::default(),
+            &Handle::current(),
+        );
 
         // Should have re-triggered: in_flight set, attempt preserved
         assert!(entry.dials[&ip].in_flight);

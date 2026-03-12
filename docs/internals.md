@@ -177,7 +177,7 @@ flowchart TB
     cr-orch -- emit(filter-update) --> cr-bare
 ```
 
-h3llo uses the tokio runtime to schedule actors and relies on MPSC queues instead of locks, since message passing explicitly linearizes async operations and avoids shared mutable state.
+h3llo uses a thread-per-core architecture with multiple Tokio `current_thread` runtimes. Each data-plane actor group (TUN Tx/Rx, Router, BareUDP Tx/Rx) runs on a dedicated OS thread with its own runtime, eliminating cross-thread task migrations and cache pollution on hot paths. The orchestrator and control-plane actors (DNS, Route Sync, API, H3) share the main thread's `current_thread` runtime. Cross-runtime communication uses Tokio MPSC channels, which are runtime-agnostic. `Handle::enter()` is used during initialization to register I/O resources with the correct runtime's reactor; `JoinHandle`s from foreign runtimes are monitored by the orchestrator's `JoinSet`.
 
 Orchestrator responsibilities and invariants:
 - Maintain the latest configuration snapshot and H3 connection pool; receive commands from other actors through its MPSC queue.
@@ -230,12 +230,12 @@ DNS lifecycle management:
 - Refreshing an existing IP extends its TTL without changing the snapshot (no duplicate events).
 - DNS warnings (NXDOMAIN, recursion refusal) are logged via `warn!` at the DNS module (origin) rather than propagating through events. Truncated responses are treated as packet loss and retried after `dns_query_timeout`.
 
-During packet forwarding, TUN-Rx performs inline routing dispatch: it extracts the destination IP from each packet, performs routing table lookup, and directly forwards packets to the appropriate peer's TX channel (H3 or BareUDP writer). This eliminates an intermediate dispatch actor and MPSC queue hop that would otherwise exist between TUN-Rx and peer TX channels. For inbound traffic, received IP packets are enqueued into the TUN-Tx queue to keep TUN writes thread-safe.
+During packet forwarding, TUN-Rx sends outbound packets to the Router actor via a bounded MPSC channel. The Router performs destination IP extraction, LPM lookup, TTL decrement with checksum update, and forwards packets to the appropriate peer's TX channel (H3 or BareUDP writer). For inbound traffic, transport actors (H3-Rx, BareUDP-Rx) enqueue packets to the Router's ingress channel; the Router performs LPM lookup, TTL decrement, and forwards locally-destined packets to TUN-Tx.
 
 Key flows:
 
-- TUN Reader → inline routing dispatch (dest IP extraction + route lookup) → H3/Bare datagram writer.
-- H3/Bare datagram reader → queue → TUN Writer.
+- TUN Reader → Router (LPM + TTL) → H3/Bare datagram writer.
+- H3/Bare datagram reader → Router (LPM + TTL) → TUN Writer.
 - Management API updates → internal routes → system routes.
 
 ### System Route Updates
