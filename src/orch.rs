@@ -1,6 +1,6 @@
 //! Runtime orchestration for BareUDP and HTTP/3 transports.
 
-use crate::actor::{ActorError, ActorExitResult, ActorKind};
+use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
 use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUdpRxCommand};
 use crate::bind::DefaultRouteProbe;
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
@@ -15,7 +15,6 @@ use crate::h3::{
 use crate::metrics::{log_quic_metrics, log_transport_metrics, Direction, Labels, Metrics};
 use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::router::{spawn_router, RouterCommand, RoutingTable};
-use crate::runtime::DedicatedRuntime;
 use crate::tun;
 use ipnet::IpNet;
 use std::collections::HashMap;

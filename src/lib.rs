@@ -14,7 +14,6 @@ pub mod metrics;
 pub mod orch;
 pub mod route;
 pub mod router;
-pub(crate) mod runtime;
 pub mod tun;
 
 /// Test utilities module exposed via the `test-utils` feature.
