@@ -531,8 +531,8 @@ impl Orchestrator {
             let _guard = tun_rt.handle().enter();
             tun::make_tun(
                 &config.local.tun,
-                config.tuning.tun_tx_queue_len,
-                config.tuning.tun_enable_offload,
+                tuning.tun_tx_queue_len,
+                tuning.tun_enable_offload,
             )
             .await
             .map_err(|err| OrchestratorError::Tun(err.to_string()))?
