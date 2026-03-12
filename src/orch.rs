@@ -524,20 +524,19 @@ impl Orchestrator {
         let router_rt = DedicatedRuntime::new("h3llo-router");
         let bare_rt = DedicatedRuntime::new("h3llo-bare");
 
-        // Setup TUN — spawn make_tun on the TUN runtime so the AsyncDevice's
-        // AsyncFd registers with the TUN runtime's I/O reactor.
-        let tun_config = config.local.tun.clone();
-        let tun_tx_queue_len = config.tuning.tun_tx_queue_len;
-        let tun_enable_offload = config.tuning.tun_enable_offload;
-        let (tun_reader, tun_writer) =
-            tun_rt
-                .handle()
-                .spawn(async move {
-                    tun::make_tun(&tun_config, tun_tx_queue_len, tun_enable_offload).await
-                })
-                .await
-                .expect("TUN init task panicked")
-                .map_err(|err| OrchestratorError::Tun(err.to_string()))?;
+        // Setup TUN — enter guard ensures AsyncFd registers with the TUN
+        // runtime's I/O reactor. make_tun is async in signature but has no
+        // internal .await points, so the guard stays effective.
+        let (tun_reader, tun_writer) = {
+            let _guard = tun_rt.handle().enter();
+            tun::make_tun(
+                &config.local.tun,
+                config.tuning.tun_tx_queue_len,
+                config.tuning.tun_enable_offload,
+            )
+            .await
+            .map_err(|err| OrchestratorError::Tun(err.to_string()))?
+        };
 
         // Control plane: unbounded to prevent deadlocks from actor cycles.
         let (events_tx, events_rx) = mpsc::unbounded_channel();
