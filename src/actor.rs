@@ -8,6 +8,7 @@ use std::io;
 use thiserror::Error;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot;
+use tracing::error;
 
 /// Classifies actors by their supervision policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,21 +158,18 @@ impl DedicatedRuntime {
     ///
     /// * `name` - Thread name (visible in `top`, `htop`, debuggers).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the runtime or thread cannot be created.
-    pub(crate) fn new(name: &str) -> Self {
-        let rt = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|e| panic!("failed to build runtime '{name}': {e}"));
+    /// Returns `io::Error` if the Tokio runtime or OS thread cannot be created.
+    pub(crate) fn new(name: &str) -> io::Result<Self> {
+        let rt = Builder::new_current_thread().enable_all().build()?;
 
         let handle = rt.handle().clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let thread_name = name.to_string();
 
         let thread = std::thread::Builder::new()
-            .name(thread_name.clone())
+            .name(thread_name)
             .spawn(move || {
                 // block_on drives the I/O reactor and executes spawned tasks.
                 // Returns when shutdown_rx resolves (sender dropped or sent).
@@ -179,14 +177,13 @@ impl DedicatedRuntime {
                     let _ = shutdown_rx.await;
                 });
                 // Runtime dropped here -> all remaining tasks cancelled.
-            })
-            .unwrap_or_else(|e| panic!("failed to spawn thread '{thread_name}': {e}"));
+            })?;
 
-        Self {
+        Ok(Self {
             handle,
             shutdown_tx: Some(shutdown_tx),
             thread: Some(thread),
-        }
+        })
     }
 
     /// Returns a handle for spawning tasks or entering this runtime's context.
@@ -201,7 +198,15 @@ impl Drop for DedicatedRuntime {
         drop(self.shutdown_tx.take());
         // Join the thread to ensure clean exit.
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if let Err(payload) = thread.join() {
+                // Extract a useful message from the panic payload.
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("<non-string panic>");
+                error!("dedicated runtime thread panicked: {msg}");
+            }
         }
     }
 }
@@ -331,7 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn dedicated_runtime_spawns_and_completes_tasks() {
-        let rt = DedicatedRuntime::new("test-rt");
+        let rt = DedicatedRuntime::new("test-rt").expect("test runtime");
         let result = rt
             .handle()
             .spawn(async { 42 })
@@ -342,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn cross_runtime_join_handle_await() {
-        let rt = DedicatedRuntime::new("test-cross");
+        let rt = DedicatedRuntime::new("test-cross").expect("test runtime");
         let join = rt.handle().spawn(async {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             "hello"

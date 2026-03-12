@@ -353,6 +353,12 @@ pub enum OrchestratorError {
     /// UDP socket setup failed.
     #[error("udp socket setup failed: {0}")]
     Udp(String),
+    /// Dedicated runtime creation failed.
+    #[error("dedicated runtime '{name}' failed: {source}")]
+    Runtime {
+        name: String,
+        source: std::io::Error,
+    },
     /// An actor exited with an error.
     #[error("actor error: {0}")]
     ActorError(#[from] ActorError),
@@ -520,9 +526,15 @@ impl Orchestrator {
         // Create dedicated current_thread runtimes for data-plane actors.
         // Each runtime runs on its own OS thread, eliminating cross-thread
         // task migration on data-plane hot paths (thread-per-core).
-        let tun_rt = DedicatedRuntime::new("h3llo-tun");
-        let router_rt = DedicatedRuntime::new("h3llo-router");
-        let bare_rt = DedicatedRuntime::new("h3llo-bare");
+        let make_runtime = |name: &str| {
+            DedicatedRuntime::new(name).map_err(|source| OrchestratorError::Runtime {
+                name: name.to_string(),
+                source,
+            })
+        };
+        let tun_rt = make_runtime("h3llo-tun")?;
+        let router_rt = make_runtime("h3llo-router")?;
+        let bare_rt = make_runtime("h3llo-bare")?;
 
         // Setup TUN — enter guard ensures AsyncFd registers with the TUN
         // runtime's I/O reactor. make_tun is async in signature but has no
@@ -1348,9 +1360,9 @@ mod test_support {
                 input_tx,
                 local,
                 non_peer_metrics: HashMap::new(),
-                _tun_rt: DedicatedRuntime::new("test-tun"),
-                _router_rt: DedicatedRuntime::new("test-router"),
-                bare_rt: DedicatedRuntime::new("test-bare"),
+                _tun_rt: DedicatedRuntime::new("test-tun").expect("test runtime"),
+                _router_rt: DedicatedRuntime::new("test-router").expect("test runtime"),
+                bare_rt: DedicatedRuntime::new("test-bare").expect("test runtime"),
             };
 
             (
