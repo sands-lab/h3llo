@@ -9,7 +9,7 @@ pub mod config;
 pub mod dns;
 pub mod events;
 pub mod h3;
-pub mod h3_2;
+pub mod h3v2;
 mod helpers;
 pub mod metrics;
 pub mod orch;

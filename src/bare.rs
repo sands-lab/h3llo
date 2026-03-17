@@ -45,7 +45,7 @@ pub struct BareUdpRx {
 
 /// Creates a BareUDP RX actor state from a pre-existing socket.
 ///
-/// Used by `h3_2` to reuse UDP actors with a cloned QUIC socket.
+/// Used by `h3v2` to reuse UDP actors with a cloned QUIC socket.
 ///
 /// # Errors
 ///
@@ -58,7 +58,7 @@ pub(crate) fn bare_rx_from_socket(socket: UdpSocket, mtu: usize) -> Result<BareU
 
 /// Creates a BareUDP TX actor state from a pre-existing unconnected socket.
 ///
-/// Used by `h3_2` to reuse UDP actors with a cloned QUIC socket.
+/// Used by `h3v2` to reuse UDP actors with a cloned QUIC socket.
 ///
 /// # Errors
 ///

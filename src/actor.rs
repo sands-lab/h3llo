@@ -97,9 +97,9 @@ pub enum ActorError {
         reason: String,
     },
 
-    /// Raw QUIC engine actor exited with error.
-    #[error("quic_engine[{peer_id}]: {reason}")]
-    QuicEngine {
+    /// H3 client actor exited with error.
+    #[error("h3_client[{peer_id}]: {reason}")]
+    H3Client {
         /// Peer identifier.
         peer_id: String,
         /// Failure reason.
@@ -138,7 +138,7 @@ impl ActorError {
             ActorError::BareTxSend { .. } => ActorKind::Restartable,
             ActorError::H3RxRecv { .. } => ActorKind::Restartable,
             ActorError::H3TxSend { .. } => ActorKind::Restartable,
-            ActorError::QuicEngine { .. } => ActorKind::Restartable,
+            ActorError::H3Client { .. } => ActorKind::Restartable,
         }
     }
 }

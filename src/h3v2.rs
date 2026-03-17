@@ -1,7 +1,7 @@
 //! Raw-quiche HTTP/3 CONNECT-IP transport with separated UDP I/O.
 //!
 //! Replaces tokio-quiche's internal QUIC driver with a hand-rolled quiche
-//! event loop. A single **QuicEngine** actor owns the `quiche::Connection`
+//! event loop. A single **H3 client** actor owns the `quiche::Connection`
 //! and `quiche::h3::Connection`, handles QUIC timers, encrypts/decrypts
 //! packets, and bridges DATAGRAM frames between the TUN data plane and
 //! reusable BareUDP actors.
@@ -93,19 +93,19 @@ fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
 
 // ========== Connection Handle ==========
 
-/// Established h3-2 CONNECT-IP connection.
+/// Established H3 client CONNECT-IP connection.
 ///
-/// Returned by [`dial_h3_2`]. The `tx` sender feeds IP packets into the
-/// QuicEngine for encryption and transmission. Join handles are for
+/// Returned by [`dial_h3_client`]. The `tx` sender feeds IP packets into the
+/// H3 client actor for encryption and transmission. Join handles are for
 /// orchestrator supervision.
-pub struct H32Connection {
+pub struct H3ClientConn {
     /// Authenticated peer identifier.
     pub peer_id: String,
     /// Remote socket address.
     pub remote_addr: SocketAddr,
     /// Channel for sending IP packets (TUN → encrypt → UDP).
     pub tx: mpsc::Sender<Vec<PooledBuf>>,
-    /// QuicEngine actor join handle.
+    /// H3 client actor join handle.
     pub engine_handle: JoinHandle<ActorExitResult>,
     /// BareUDP Rx actor join handle.
     pub udp_rx_handle: JoinHandle<ActorExitResult>,
@@ -113,9 +113,9 @@ pub struct H32Connection {
     pub udp_tx_handle: JoinHandle<ActorExitResult>,
 }
 
-impl std::fmt::Debug for H32Connection {
+impl std::fmt::Debug for H3ClientConn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("H32Connection")
+        f.debug_struct("H3ClientConn")
             .field("peer_id", &self.peer_id)
             .field("remote_addr", &self.remote_addr)
             .finish_non_exhaustive()
@@ -124,7 +124,7 @@ impl std::fmt::Debug for H32Connection {
 
 // ========== Dial Error ==========
 
-/// Dial error for h3-2 connection establishment.
+/// Dial error for H3 client connection establishment.
 #[derive(Debug, thiserror::Error)]
 pub enum DialError {
     /// Socket setup failed.
@@ -183,10 +183,10 @@ fn make_quiche_config(tuning: &Tuning, tun_mtu: u16) -> Result<quiche::Config, D
 
 // ========== Public Dial Function ==========
 
-/// Establishes an outbound h3-2 CONNECT-IP connection.
+/// Establishes an outbound H3 client CONNECT-IP connection.
 ///
 /// Creates a UDP socket, spawns BareUDP Rx/Tx actors on cloned socket
-/// handles, spawns the QuicEngine actor, and waits for the QUIC+H3
+/// handles, spawns the H3 client actor, and waits for the QUIC+H3
 /// handshake to complete.
 ///
 /// # Arguments
@@ -205,7 +205,7 @@ fn make_quiche_config(tuning: &Tuning, tun_mtu: u16) -> Result<quiche::Config, D
 ///
 /// Returns `DialError` on socket, handshake, or timeout failure.
 #[allow(clippy::too_many_arguments)]
-pub async fn dial_h3_2<P: RouteProbe>(
+pub async fn dial_h3_client<P: RouteProbe>(
     peer_h3: &PeerH3,
     remote_addr: SocketAddr,
     peer_id: &str,
@@ -215,7 +215,7 @@ pub async fn dial_h3_2<P: RouteProbe>(
     tuning: &Tuning,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
-) -> Result<H32Connection, DialError> {
+) -> Result<H3ClientConn, DialError> {
     let endpoint = peer_h3
         .endpoint
         .as_ref()
@@ -299,9 +299,9 @@ pub async fn dial_h3_2<P: RouteProbe>(
         quiche::h3::Header::new(b"authorization", auth_header.as_bytes()),
     ];
 
-    // Spawn QuicEngine actor.
+    // Spawn H3 client actor.
     let (established_tx, established_rx) = oneshot::channel();
-    let (egress_tx, engine_handle) = spawn_quic_engine(
+    let (egress_tx, engine_handle) = spawn_h3_client(
         conn,
         local_addr,
         remote_addr,
@@ -329,8 +329,8 @@ pub async fn dial_h3_2<P: RouteProbe>(
         Err(_) => return Err(DialError::Timeout(tuning.h3_handshake_timeout)),
     }
 
-    info!(%peer_id, %remote_addr, "h3-2 connection established");
-    Ok(H32Connection {
+    info!(%peer_id, %remote_addr, "h3 client connection established");
+    Ok(H3ClientConn {
         peer_id: peer_id.to_string(),
         remote_addr,
         tx: egress_tx,
@@ -340,20 +340,20 @@ pub async fn dial_h3_2<P: RouteProbe>(
     })
 }
 
-// ========== QuicEngine Actor ==========
+// ========== H3 Client Actor ==========
 
-/// State passed to QuicEngine for client-side handshake.
+/// State passed to the H3 client for client-side handshake.
 struct ClientHandshake {
     established_tx: oneshot::Sender<Result<(), String>>,
     connect_headers: Vec<quiche::h3::Header>,
 }
 
-/// Spawns the QuicEngine actor.
+/// Spawns the H3 client actor.
 ///
 /// Returns `(egress_tx, JoinHandle)` where `egress_tx` accepts IP packets
 /// from the TUN for encryption and transmission.
 #[allow(clippy::too_many_arguments)]
-fn spawn_quic_engine(
+fn spawn_h3_client(
     mut conn: quiche::Connection,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
@@ -397,7 +397,7 @@ fn spawn_quic_engine(
                 {
                     Ok(result) => result,
                     Err(e) => {
-                        return Err(ActorError::QuicEngine {
+                        return Err(ActorError::H3Client {
                             peer_id,
                             reason: format!("handshake: {e}"),
                         })
@@ -405,7 +405,7 @@ fn spawn_quic_engine(
                 }
             }
             None => {
-                return Err(ActorError::QuicEngine {
+                return Err(ActorError::H3Client {
                     peer_id,
                     reason: "server mode not yet implemented".into(),
                 })
@@ -457,7 +457,7 @@ fn spawn_quic_engine(
                     conn.on_timeout();
                     flush_quic_send(&mut conn, &mut send_buf, &udp_tx).await;
                     if conn.is_closed() {
-                        return Err(ActorError::QuicEngine {
+                        return Err(ActorError::H3Client {
                             peer_id,
                             reason: "connection timed out".into(),
                         });
@@ -478,7 +478,7 @@ fn spawn_quic_engine(
             }
 
             if conn.is_closed() {
-                return Err(ActorError::QuicEngine {
+                return Err(ActorError::H3Client {
                     peer_id,
                     reason: "QUIC connection closed".into(),
                 });
@@ -851,7 +851,7 @@ mod tests {
     async fn h32connection_debug_omits_handles() {
         use tokio::sync::mpsc;
         let (tx, _rx) = mpsc::channel::<Vec<PooledBuf>>(1);
-        let conn = H32Connection {
+        let conn = H3ClientConn {
             peer_id: "peer-1".into(),
             remote_addr: "1.2.3.4:443".parse().unwrap(),
             tx,
