@@ -43,6 +43,41 @@ pub struct BareUdpRx {
     mtu: usize,
 }
 
+/// Creates a BareUDP RX actor state from a pre-existing socket.
+///
+/// Used by `h3v2` to reuse UDP actors with a cloned QUIC socket.
+///
+/// # Errors
+///
+/// Returns `UdpError::Socket` if quinn-udp state init fails.
+pub(crate) fn bare_rx_from_socket(socket: UdpSocket, mtu: usize) -> Result<BareUdpRx, UdpError> {
+    let state = UdpSocketState::new(UdpSockRef::from(&socket))
+        .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
+    Ok(BareUdpRx { socket, state, mtu })
+}
+
+/// Creates a BareUDP TX actor state from a pre-existing unconnected socket.
+///
+/// Used by `h3v2` to reuse UDP actors with a cloned QUIC socket.
+///
+/// # Errors
+///
+/// Returns `UdpError::Socket` if quinn-udp state init fails.
+pub(crate) fn bare_tx_from_socket(
+    socket: UdpSocket,
+    destination: SocketAddr,
+    enable_offload: bool,
+) -> Result<BareUdpTx, UdpError> {
+    let state = UdpSocketState::new(UdpSockRef::from(&socket))
+        .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
+    Ok(BareUdpTx {
+        socket,
+        state,
+        destination,
+        enable_offload,
+    })
+}
+
 /// Creates a BareUDP RX actor state from resolved listen address.
 ///
 /// # Arguments

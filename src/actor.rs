@@ -97,6 +97,15 @@ pub enum ActorError {
         reason: String,
     },
 
+    /// H3 client actor exited with error.
+    #[error("h3_client[{peer_id}]: {reason}")]
+    H3Client {
+        /// Peer identifier.
+        peer_id: String,
+        /// Failure reason.
+        reason: String,
+    },
+
     /// Management API server exited with I/O error.
     #[error("api[{addr}]: server failed: {reason}")]
     ApiServer {
@@ -129,6 +138,7 @@ impl ActorError {
             ActorError::BareTxSend { .. } => ActorKind::Restartable,
             ActorError::H3RxRecv { .. } => ActorKind::Restartable,
             ActorError::H3TxSend { .. } => ActorKind::Restartable,
+            ActorError::H3Client { .. } => ActorKind::Restartable,
         }
     }
 }

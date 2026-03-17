@@ -64,7 +64,7 @@ fn make_quic_settings(tuning: &Tuning, tun_mtu: u16) -> QuicSettings {
 }
 
 /// Context ID for IP payloads per RFC 9484 (always 0 for CONNECT-IP).
-const CONTEXT_ID_IP: u8 = 0x00;
+pub(crate) const CONTEXT_ID_IP: u8 = 0x00;
 
 /// Maximum packets per H3 RX batch before flush.
 const H3_RX_BATCH_SIZE: usize = 128;
@@ -75,7 +75,7 @@ const H3_RX_BATCH_SIZE: usize = 128;
 /// 51B base (QUIC v1 worst-case) + 8B optional DATAGRAM Length = 59B.
 /// See `docs/protocol.md` § MTU Guidance for the full byte-by-byte breakdown.
 /// QUIC `max_send/recv_udp_payload_size` = `TUN_MTU + CONNECT_IP_OVERHEAD`.
-const CONNECT_IP_OVERHEAD: usize = 59;
+pub(crate) const CONNECT_IP_OVERHEAD: usize = 59;
 
 // ========== Auth Helpers ==========
 
