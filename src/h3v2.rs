@@ -33,9 +33,6 @@ use tokio::time;
 use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
 use tracing::{debug, info, warn};
 
-/// Maximum datagrams drained per recv cycle.
-const DGRAM_DRAIN_LIMIT: usize = 128;
-
 /// Duration used as "infinite" timeout when quiche returns None.
 const MAX_TIMEOUT: Duration = Duration::from_secs(86400);
 
@@ -639,7 +636,7 @@ async fn drain_datagrams(
     let mut ok_pkts: u64 = 0;
     let mut ok_bytes: u64 = 0;
 
-    for _ in 0..DGRAM_DRAIN_LIMIT {
+    loop {
         match conn.dgram_recv(dgram_buf) {
             Ok(len) => {
                 let data = &dgram_buf[..len];
