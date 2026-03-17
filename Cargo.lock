@@ -1386,6 +1386,7 @@ dependencies = [
  "ipnet-trie",
  "libc",
  "mimalloc",
+ "octets",
  "prometheus-client 0.24.0",
  "quiche",
  "quinn-udp",

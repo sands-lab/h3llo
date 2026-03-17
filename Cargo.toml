@@ -32,6 +32,7 @@ foundations = { version = "5", default-features = false, features = ["metrics", 
 rustls-pemfile = "2"
 http = "1"
 bytes = "1"
+octets = "0.3"
 subtle = "2"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -93,5 +94,6 @@ harness = false
 # - tokio-quiche: must match patched quiche API
 [patch.crates-io]
 datagram-socket = { git = "https://github.com/Tonny-Gu/quiche" }
+octets = { git = "https://github.com/Tonny-Gu/quiche" }
 quiche = { git = "https://github.com/Tonny-Gu/quiche" }
 tokio-quiche = { git = "https://github.com/Tonny-Gu/quiche" }

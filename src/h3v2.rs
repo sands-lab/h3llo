@@ -20,6 +20,7 @@ use crate::events::Event;
 use crate::h3::{CONNECT_IP_OVERHEAD, CONTEXT_ID_IP};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::tun::alloc_packet_buf;
+use octets::{varint_len, varint_parse_len, OctetsMut};
 use quiche::h3::NameValue;
 use rand::Rng;
 use std::collections::HashSet;
@@ -37,59 +38,6 @@ const DGRAM_DRAIN_LIMIT: usize = 128;
 
 /// Duration used as "infinite" timeout when quiche returns None.
 const MAX_TIMEOUT: Duration = Duration::from_secs(86400);
-
-// ========== QUIC Varint Codec (RFC 9000 §16) ==========
-
-/// Encodes a u64 as a QUIC variable-length integer.
-///
-/// # Panics (debug only)
-///
-/// Panics in debug builds if `val >= 2^62`, which violates RFC 9000 §16.
-fn encode_varint(val: u64) -> Vec<u8> {
-    debug_assert!(
-        val < (1u64 << 62),
-        "varint value {val} exceeds RFC 9000 §16 maximum (2^62-1)"
-    );
-    if val < 64 {
-        vec![val as u8]
-    } else if val < 16384 {
-        vec![0x40 | ((val >> 8) as u8), (val & 0xff) as u8]
-    } else if val < 1_073_741_824 {
-        let b = (val as u32).to_be_bytes();
-        vec![0x80 | b[0], b[1], b[2], b[3]]
-    } else {
-        let b = val.to_be_bytes();
-        vec![0xc0 | b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]
-    }
-}
-
-/// Decodes a QUIC variable-length integer. Returns `(value, bytes_consumed)`.
-fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
-    if buf.is_empty() {
-        return None;
-    }
-    let len = 1usize << (buf[0] >> 6);
-    if buf.len() < len {
-        return None;
-    }
-    let val = match len {
-        1 => (buf[0] & 0x3f) as u64,
-        2 => u16::from_be_bytes([buf[0] & 0x3f, buf[1]]) as u64,
-        4 => u32::from_be_bytes([buf[0] & 0x3f, buf[1], buf[2], buf[3]]) as u64,
-        8 => u64::from_be_bytes([
-            buf[0] & 0x3f,
-            buf[1],
-            buf[2],
-            buf[3],
-            buf[4],
-            buf[5],
-            buf[6],
-            buf[7],
-        ]),
-        _ => return None,
-    };
-    Some((val, len))
-}
 
 // ========== Connection Handle ==========
 
@@ -557,7 +505,14 @@ async fn drive_client_handshake(
 
     // QSI = stream_id / 4 per draft-ietf-masque-connect-ip
     let qsi = stream_id / 4;
-    let qsi_bytes = encode_varint(qsi);
+    let qsi_bytes = {
+        let len = varint_len(qsi);
+        let mut buf = [0u8; 8];
+        OctetsMut::with_slice(&mut buf)
+            .put_varint(qsi)
+            .expect("qsi fits varint");
+        buf[..len].to_vec()
+    };
 
     loop {
         tokio::select! {
@@ -688,10 +643,15 @@ async fn drain_datagrams(
         match conn.dgram_recv(dgram_buf) {
             Ok(len) => {
                 let data = &dgram_buf[..len];
-                let Some((_qsi, qsi_len)) = decode_varint(data) else {
+                let Some(&first) = data.first() else {
                     counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
                     continue;
                 };
+                let qsi_len = varint_parse_len(first);
+                if data.len() < qsi_len {
+                    counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
+                    continue;
+                }
                 let rest = &data[qsi_len..];
                 if rest.is_empty() || rest[0] != CONTEXT_ID_IP {
                     counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
@@ -782,36 +742,27 @@ fn process_h3_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn varint_roundtrip() {
-        for val in [0, 1, 63, 64, 16383, 16384, 1_073_741_823, 1_073_741_824] {
-            let enc = encode_varint(val);
-            let (dec, len) = decode_varint(&enc).unwrap();
-            assert_eq!(dec, val);
-            assert_eq!(len, enc.len());
-        }
-    }
-
-    #[test]
-    fn decode_varint_empty_and_truncated() {
-        assert!(decode_varint(&[]).is_none());
-        assert!(decode_varint(&[0x40]).is_none()); // 2-byte prefix, only 1 byte provided
-    }
+    use octets::Octets;
 
     #[test]
     fn datagram_framing_encode_decode() {
         let ip_payload = b"test ip packet";
-        let qsi_bytes = encode_varint(0); // stream_id=0, qsi=0
+        // Encode qsi=0 (stream_id=0/4): single byte 0x00.
+        let qsi_len = varint_len(0);
+        let mut qsi_buf = [0u8; 8];
+        OctetsMut::with_slice(&mut qsi_buf).put_varint(0).unwrap();
+        let qsi_bytes = &qsi_buf[..qsi_len];
+
         let mut buf = alloc_packet_buf(ip_payload);
         assert!(buf.add_prefix(&[CONTEXT_ID_IP]));
-        assert!(buf.add_prefix(&qsi_bytes));
+        assert!(buf.add_prefix(qsi_bytes));
 
         let data = &buf[..];
-        let (qsi, qsi_len) = decode_varint(data).unwrap();
+        let parsed_qsi_len = varint_parse_len(data[0]);
+        let qsi = Octets::with_slice(data).get_varint().unwrap();
         assert_eq!(qsi, 0);
-        assert_eq!(data[qsi_len], CONTEXT_ID_IP);
-        assert_eq!(&data[qsi_len + 1..], ip_payload);
+        assert_eq!(data[parsed_qsi_len], CONTEXT_ID_IP);
+        assert_eq!(&data[parsed_qsi_len + 1..], ip_payload);
     }
 
     #[test]
