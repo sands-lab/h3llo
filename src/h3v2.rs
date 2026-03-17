@@ -477,7 +477,7 @@ async fn advance_phase(
             qsi_bytes,
         } => {
             process_h3_events(&mut h3_conn, conn, peer_id);
-            let ingress_open = drain_datagrams(conn, dgram_buf, ingress_tx, rx_counters).await;
+            let ingress_open = drain_ingress(conn, dgram_buf, ingress_tx, rx_counters).await;
             if !ingress_open {
                 return Ok(None); // Signal graceful shutdown.
             }
@@ -523,7 +523,7 @@ fn spawn_h3_client(
         let mut tx_counters = Counters::new(Source::Http3, Direction::Tx);
 
         // Send initial QUIC ClientHello.
-        flush_quic_send(&mut conn, &mut send_buf, &udp_send_tx).await;
+        drain_send(&mut conn, &mut send_buf, &udp_send_tx).await;
 
         let mut phase = H3Phase::QuicHandshake { hs };
         let mut ticker = time::interval(metrics_interval);
@@ -541,13 +541,13 @@ fn spawn_h3_client(
                         phase.notify_handshake_error("UDP Rx closed");
                         return Ok(());
                     };
-                    feed_packets(&mut conn, &packets, &mut recv_buf, recv_info);
+                    handle_recv(&mut conn, &packets, &mut recv_buf, recv_info);
                     let Some(new_phase) = advance_phase(
                         phase, &mut conn, &mut dgram_buf, &ingress_tx, &mut rx_counters, &peer_id,
                     ).await? else {
                         // Graceful shutdown (TUN ingress channel closed).
                         conn.close(true, 0, b"shutdown").ok();
-                        flush_quic_send(&mut conn, &mut send_buf, &udp_send_tx).await;
+                        drain_send(&mut conn, &mut send_buf, &udp_send_tx).await;
                         return Ok(());
                     };
                     phase = new_phase;
@@ -555,14 +555,14 @@ fn spawn_h3_client(
                 maybe_batch = egress_rx.recv(), if was_established => {
                     let Some(packets) = maybe_batch else {
                         conn.close(true, 0, b"shutdown").ok();
-                        flush_quic_send(&mut conn, &mut send_buf, &udp_send_tx).await;
+                        drain_send(&mut conn, &mut send_buf, &udp_send_tx).await;
                         return Ok(());
                     };
                     // SAFETY: `if was_established` guard guarantees `phase` is `Established`.
                     let H3Phase::Established { ref qsi_bytes, .. } = phase else {
                         unreachable!("egress arm fires only when was_established == true");
                     };
-                    send_datagrams(&mut conn, packets, qsi_bytes, &mut tx_counters);
+                    handle_egress(&mut conn, packets, qsi_bytes, &mut tx_counters);
                 }
                 _ = &mut timer => {
                     conn.on_timeout();
@@ -585,7 +585,7 @@ fn spawn_h3_client(
             }
 
             // Common post-arm: flush QUIC output and reset timer.
-            flush_quic_send(&mut conn, &mut send_buf, &udp_send_tx).await;
+            drain_send(&mut conn, &mut send_buf, &udp_send_tx).await;
             reset_timer(timer.as_mut(), &conn);
 
             if conn.is_closed() {
@@ -614,8 +614,8 @@ fn reset_timer(timer: std::pin::Pin<&mut time::Sleep>, conn: &quiche::Connection
 
 // ========== Helper Functions ==========
 
-/// Feeds encrypted UDP packets into quiche, using a shared recv_buf.
-fn feed_packets(
+/// Decrypts a batch of received UDP packets by feeding them into quiche.
+fn handle_recv(
     conn: &mut quiche::Connection,
     batch: &[PooledBuf],
     recv_buf: &mut [u8],
@@ -637,10 +637,10 @@ fn feed_packets(
     }
 }
 
-/// Flushes pending QUIC output packets to BareUDP TX.
+/// Drains pending QUIC output packets to BareUDP TX.
 ///
 /// Uses `try_send` to avoid blocking the QUIC event loop on backpressure.
-async fn flush_quic_send(
+async fn drain_send(
     conn: &mut quiche::Connection,
     send_buf: &mut [u8],
     udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
@@ -663,11 +663,11 @@ async fn flush_quic_send(
     }
 }
 
-/// Drains QUIC DATAGRAMs, strips QSI varint + Context ID, sends IP packets to TUN.
+/// Drains inbound QUIC DATAGRAMs, strips QSI varint + Context ID, sends IP packets to TUN.
 ///
 /// Returns `false` if the ingress channel has closed (TUN side gone), so the
 /// caller can exit gracefully — consistent with the bare.rs actor pattern.
-async fn drain_datagrams(
+async fn drain_ingress(
     conn: &mut quiche::Connection,
     dgram_buf: &mut [u8],
     ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
@@ -719,8 +719,8 @@ async fn drain_datagrams(
         .await
 }
 
-/// Prepends QSI varint + Context ID to IP packets and queues them as QUIC DATAGRAMs.
-fn send_datagrams(
+/// Encodes egress IP packets as QUIC DATAGRAMs with QSI varint + Context ID prefix.
+fn handle_egress(
     conn: &mut quiche::Connection,
     packets: Vec<PooledBuf>,
     qsi_bytes: &[u8],
