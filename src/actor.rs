@@ -97,6 +97,15 @@ pub enum ActorError {
         reason: String,
     },
 
+    /// Raw QUIC engine actor exited with error.
+    #[error("quic_engine[{peer_id}]: {reason}")]
+    QuicEngine {
+        /// Peer identifier.
+        peer_id: String,
+        /// Failure reason.
+        reason: String,
+    },
+
     /// Management API server exited with I/O error.
     #[error("api[{addr}]: server failed: {reason}")]
     ApiServer {
@@ -129,6 +138,7 @@ impl ActorError {
             ActorError::BareTxSend { .. } => ActorKind::Restartable,
             ActorError::H3RxRecv { .. } => ActorKind::Restartable,
             ActorError::H3TxSend { .. } => ActorKind::Restartable,
+            ActorError::QuicEngine { .. } => ActorKind::Restartable,
         }
     }
 }

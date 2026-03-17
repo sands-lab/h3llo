@@ -1387,6 +1387,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "prometheus-client 0.24.0",
+ "quiche",
  "quinn-udp",
  "rand 0.10.0",
  "rcgen",
