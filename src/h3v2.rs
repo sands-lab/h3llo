@@ -206,16 +206,16 @@ pub async fn dial_h3_client<P: RouteProbe>(
         .map_err(|e| DialError::Socket(format!("bare_tx: {e}")))?;
 
     // Spawn BareUDP actors.
-    let (engine_rx_tx, engine_rx_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.packet_queue_depth);
+    let (udp_recv_tx, udp_recv_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.packet_queue_depth);
     let accepted = HashSet::from([remote_addr.ip()]);
     let (_udp_rx_cmd, udp_rx_handle) = spawn_udp_rx(
         bare_rx,
         accepted,
-        engine_rx_tx,
+        udp_recv_tx,
         events_tx.clone(),
         tuning.metrics_push_interval,
     );
-    let (udp_tx_sender, udp_tx_handle) =
+    let (udp_send_tx, udp_tx_handle) =
         spawn_udp_tx(bare_tx, peer_id.to_string(), events_tx.clone(), tuning);
 
     // Create quiche config and connection.
@@ -251,8 +251,8 @@ pub async fn dial_h3_client<P: RouteProbe>(
         local_addr,
         remote_addr,
         peer_id.to_string(),
-        engine_rx_rx,
-        udp_tx_sender,
+        udp_recv_rx,
+        udp_send_tx,
         ingress_tx,
         events_tx,
         tuning,
@@ -299,7 +299,7 @@ struct ClientHandshake {
 ///
 /// Encodes the three sequential phases of CONNECT-IP establishment,
 /// each carrying only the data relevant to that phase. Transitions
-/// happen in the `udp_rx.recv()` arm of the single event loop.
+/// happen in the `udp_recv_rx.recv()` arm of the single event loop.
 ///
 /// Packet counters live outside the enum in `spawn_h3_client` locals, since
 /// they are session-level accumulators rather than per-phase state.
@@ -366,7 +366,7 @@ fn encode_qsi(qsi: u64) -> Vec<u8> {
 /// Advances the H3 client phase after feeding UDP packets to quiche.
 ///
 /// Handles state transitions: `QuicHandshake` → `H3Handshake` → `Established`.
-/// Called from the `udp_rx.recv()` arm of the unified event loop.
+/// Called from the `udp_recv_rx.recv()` arm of the unified event loop.
 ///
 /// # Returns
 ///
@@ -498,8 +498,8 @@ fn spawn_h3_client(
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     peer_id: String,
-    mut udp_rx: mpsc::Receiver<Vec<PooledBuf>>,
-    udp_tx: mpsc::Sender<Vec<PooledBuf>>,
+    mut udp_recv_rx: mpsc::Receiver<Vec<PooledBuf>>,
+    udp_send_tx: mpsc::Sender<Vec<PooledBuf>>,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     tuning: &Tuning,
@@ -523,7 +523,7 @@ fn spawn_h3_client(
         let mut tx_counters = Counters::new(Source::Http3, Direction::Tx);
 
         // Send initial QUIC ClientHello.
-        flush_quic_send(&mut conn, &mut send_buf, &udp_tx).await;
+        flush_quic_send(&mut conn, &mut send_buf, &udp_send_tx).await;
 
         let mut phase = H3Phase::QuicHandshake { hs };
         let mut ticker = time::interval(metrics_interval);
@@ -536,7 +536,7 @@ fn spawn_h3_client(
         loop {
             let was_established = phase.is_established();
             tokio::select! {
-                maybe_batch = udp_rx.recv() => {
+                maybe_batch = udp_recv_rx.recv() => {
                     let Some(packets) = maybe_batch else {
                         phase.notify_handshake_error("UDP Rx closed");
                         return Ok(());
@@ -547,7 +547,7 @@ fn spawn_h3_client(
                     ).await? else {
                         // Graceful shutdown (TUN ingress channel closed).
                         conn.close(true, 0, b"shutdown").ok();
-                        flush_quic_send(&mut conn, &mut send_buf, &udp_tx).await;
+                        flush_quic_send(&mut conn, &mut send_buf, &udp_send_tx).await;
                         return Ok(());
                     };
                     phase = new_phase;
@@ -555,7 +555,7 @@ fn spawn_h3_client(
                 maybe_batch = egress_rx.recv(), if was_established => {
                     let Some(packets) = maybe_batch else {
                         conn.close(true, 0, b"shutdown").ok();
-                        flush_quic_send(&mut conn, &mut send_buf, &udp_tx).await;
+                        flush_quic_send(&mut conn, &mut send_buf, &udp_send_tx).await;
                         return Ok(());
                     };
                     // SAFETY: `if was_established` guard guarantees `phase` is `Established`.
@@ -585,7 +585,7 @@ fn spawn_h3_client(
             }
 
             // Common post-arm: flush QUIC output and reset timer.
-            flush_quic_send(&mut conn, &mut send_buf, &udp_tx).await;
+            flush_quic_send(&mut conn, &mut send_buf, &udp_send_tx).await;
             reset_timer(timer.as_mut(), &conn);
 
             if conn.is_closed() {
@@ -643,7 +643,7 @@ fn feed_packets(
 async fn flush_quic_send(
     conn: &mut quiche::Connection,
     send_buf: &mut [u8],
-    udp_tx: &mpsc::Sender<Vec<PooledBuf>>,
+    udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
 ) {
     let mut batch: Vec<PooledBuf> = Vec::new();
     loop {
@@ -658,7 +658,7 @@ async fn flush_quic_send(
             }
         }
     }
-    if !batch.is_empty() && udp_tx.try_send(batch).is_err() {
+    if !batch.is_empty() && udp_send_tx.try_send(batch).is_err() {
         debug!("BareUDP TX channel full or closed; dropping QUIC output batch");
     }
 }
