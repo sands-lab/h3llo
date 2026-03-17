@@ -558,9 +558,11 @@ fn spawn_h3_client(
                         flush_quic_send(&mut conn, &mut send_buf, &udp_tx).await;
                         return Ok(());
                     };
-                    if let H3Phase::Established { ref qsi_bytes, .. } = phase {
-                        send_datagrams(&mut conn, packets, qsi_bytes, &mut tx_counters);
-                    }
+                    // SAFETY: `if was_established` guard guarantees `phase` is `Established`.
+                    let H3Phase::Established { ref qsi_bytes, .. } = phase else {
+                        unreachable!("egress arm fires only when was_established == true");
+                    };
+                    send_datagrams(&mut conn, packets, qsi_bytes, &mut tx_counters);
                 }
                 _ = &mut timer => {
                     conn.on_timeout();
