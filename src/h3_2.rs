@@ -17,6 +17,7 @@ use crate::bare::{bare_rx_from_socket, bare_tx_from_socket, spawn_udp_rx, spawn_
 use crate::bind::{make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::Event;
+use crate::h3::{CONNECT_IP_OVERHEAD, CONTEXT_ID_IP};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::tun::alloc_packet_buf;
 use quiche::h3::NameValue;
@@ -31,12 +32,6 @@ use tokio::time;
 use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
 use tracing::{debug, info, warn};
 
-/// Context ID for IP payloads per RFC 9484 (always 0).
-const CONTEXT_ID_IP: u8 = 0x00;
-
-/// Conservative CONNECT-IP encapsulation overhead in bytes.
-const CONNECT_IP_OVERHEAD: usize = 59;
-
 /// Maximum datagrams drained per recv cycle.
 const DGRAM_DRAIN_LIMIT: usize = 128;
 
@@ -46,7 +41,15 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(86400);
 // ========== QUIC Varint Codec (RFC 9000 §16) ==========
 
 /// Encodes a u64 as a QUIC variable-length integer.
+///
+/// # Panics (debug only)
+///
+/// Panics in debug builds if `val >= 2^62`, which violates RFC 9000 §16.
 fn encode_varint(val: u64) -> Vec<u8> {
+    debug_assert!(
+        val < (1u64 << 62),
+        "varint value {val} exceeds RFC 9000 §16 maximum (2^62-1)"
+    );
     if val < 64 {
         vec![val as u8]
     } else if val < 16384 {
@@ -151,12 +154,16 @@ fn make_quiche_config(tuning: &Tuning, tun_mtu: u16) -> Result<quiche::Config, D
     let payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
     config.set_max_recv_udp_payload_size(payload_size);
     config.set_max_send_udp_payload_size(payload_size);
+    // 10 MB connection-level flow control window (sufficient for tunneled traffic bursts).
     config.set_initial_max_data(10_000_000);
+    // 1 MB per-stream window for the CONNECT-IP control stream.
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
     config.set_initial_max_stream_data_uni(1_000_000);
+    // Allow up to 100 concurrent bidirectional/unidirectional streams.
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
+    // Enable QUIC DATAGRAM with a queue of 1024 send and 1024 recv slots.
     config.enable_dgram(true, 1024, 1024);
     config.set_max_idle_timeout(tuning.h3_max_idle_timeout.as_millis() as u64);
     config
@@ -164,6 +171,7 @@ fn make_quiche_config(tuning: &Tuning, tun_mtu: u16) -> Result<quiche::Config, D
         .map_err(|e| {
             DialError::Handshake(format!("cc algorithm '{}': {e}", tuning.h3_cc_algorithm))
         })?;
+    config.enable_pacing(tuning.h3_enable_pacing);
 
     if tuning.h3_insecure_skip_verify {
         config.verify_peer(false);
@@ -420,12 +428,18 @@ fn spawn_quic_engine(
                     let Some(packets) = maybe_batch else { return Ok(()); };
                     feed_packets(&mut conn, &packets, &mut recv_buf, recv_info);
                     process_h3_events(&mut h3_conn, &mut conn, &peer_id);
-                    drain_datagrams(
+                    let ingress_open = drain_datagrams(
                         &mut conn,
                         &mut dgram_buf,
                         &ingress_tx,
                         &mut rx_counters,
                     ).await;
+                    if !ingress_open {
+                        // TUN ingress channel closed; shut down cleanly.
+                        conn.close(true, 0, b"shutdown").ok();
+                        flush_quic_send(&mut conn, &mut send_buf, &udp_tx).await;
+                        return Ok(());
+                    }
                     flush_quic_send(&mut conn, &mut send_buf, &udp_tx).await;
                     reset_timer(timer.as_mut(), &conn);
                 }
@@ -615,6 +629,12 @@ fn feed_packets(
     info: quiche::RecvInfo,
 ) {
     for pkt in batch {
+        debug_assert!(
+            pkt.len() <= recv_buf.len(),
+            "packet ({} B) exceeds recv_buf ({} B)",
+            pkt.len(),
+            recv_buf.len()
+        );
         let len = pkt.len().min(recv_buf.len());
         recv_buf[..len].copy_from_slice(&pkt[..len]);
         match conn.recv(&mut recv_buf[..len], info) {
@@ -645,18 +665,21 @@ async fn flush_quic_send(
             }
         }
     }
-    if !batch.is_empty() {
-        let _ = udp_tx.try_send(batch);
+    if !batch.is_empty() && udp_tx.try_send(batch).is_err() {
+        debug!("BareUDP TX channel full or closed; dropping QUIC output batch");
     }
 }
 
 /// Drains QUIC DATAGRAMs, strips QSI varint + Context ID, sends IP packets to TUN.
+///
+/// Returns `false` if the ingress channel has closed (TUN side gone), so the
+/// caller can exit gracefully — consistent with the bare.rs actor pattern.
 async fn drain_datagrams(
     conn: &mut quiche::Connection,
     dgram_buf: &mut [u8],
     ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
     counters: &mut Counters,
-) {
+) -> bool {
     let mut batch: Vec<PooledBuf> = Vec::new();
     let mut ok_pkts: u64 = 0;
     let mut ok_bytes: u64 = 0;
@@ -675,6 +698,10 @@ async fn drain_datagrams(
                     continue;
                 }
                 let ip_pkt = &rest[1..];
+                if ip_pkt.is_empty() {
+                    counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
+                    continue;
+                }
                 batch.push(alloc_packet_buf(ip_pkt));
                 ok_pkts += 1;
                 ok_bytes += ip_pkt.len() as u64;
@@ -686,11 +713,12 @@ async fn drain_datagrams(
             }
         }
     }
-    if !batch.is_empty() {
-        counters
-            .send_and_record(ingress_tx, batch, ok_pkts, ok_bytes)
-            .await;
+    if batch.is_empty() {
+        return true;
     }
+    counters
+        .send_and_record(ingress_tx, batch, ok_pkts, ok_bytes)
+        .await
 }
 
 /// Prepends QSI varint + Context ID to IP packets and queues them as QUIC DATAGRAMs.
