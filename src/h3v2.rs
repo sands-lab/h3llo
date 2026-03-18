@@ -199,6 +199,14 @@ impl H3ClientEngine {
         drain_send(&mut self.conn, self.max_udp_payload, &self.udp_send_tx).await;
     }
 
+    /// Close the QUIC connection and flush pending packets.
+    ///
+    /// Callers should `return` immediately after awaiting this method.
+    async fn close_flush(&mut self, reason: &[u8]) {
+        self.conn.close(true, 0, reason).ok();
+        self.flush_send().await;
+    }
+
     /// Returns `true` when the connection is fully ready for datagram forwarding.
     fn connect_ready(&self) -> bool {
         let Some(sess) = self.session.as_ref() else {
@@ -404,8 +412,7 @@ impl H3ClientEngine {
             tokio::select! {
                 maybe_batch = self.udp_recv_rx.recv() => {
                     let Some(packets) = maybe_batch else {
-                        self.conn.close(true, 0, b"udp rx closed").ok();
-                        self.flush_send().await;
+                        self.close_flush(b"udp rx closed").await;
                         return Ok(());
                     };
 
@@ -415,24 +422,21 @@ impl H3ClientEngine {
                         Ok(ConnectPoll::Pending | ConnectPoll::Accepted) => {}
                         Ok(ConnectPoll::Rejected { status }) => {
                             let reason = format!("CONNECT-IP rejected after establish: {status}");
-                            self.conn.close(true, 0, b"connect-ip rejected").ok();
-                            self.flush_send().await;
+                            self.close_flush(b"connect-ip rejected").await;
                             return Err(ActorError::H3Client {
                                 peer_id: self.peer_id,
                                 reason,
                             });
                         }
                         Ok(ConnectPoll::Closed { reason }) => {
-                            self.conn.close(true, 0, b"connect-ip control closed").ok();
-                            self.flush_send().await;
+                            self.close_flush(b"connect-ip control closed").await;
                             return Err(ActorError::H3Client {
                                 peer_id: self.peer_id,
                                 reason,
                             });
                         }
                         Err(e) => {
-                            self.conn.close(true, 0, b"h3 poll error").ok();
-                            self.flush_send().await;
+                            self.close_flush(b"h3 poll error").await;
                             return Err(ActorError::H3Client {
                                 peer_id: self.peer_id,
                                 reason: e.to_string(),
@@ -455,16 +459,14 @@ impl H3ClientEngine {
                     ).await;
 
                     if !ingress_open {
-                        self.conn.close(true, 0, b"shutdown").ok();
-                        self.flush_send().await;
+                        self.close_flush(b"shutdown").await;
                         return Ok(());
                     }
                 }
 
                 maybe_batch = self.egress_rx.recv() => {
                     let Some(packets) = maybe_batch else {
-                        self.conn.close(true, 0, b"shutdown").ok();
-                        self.flush_send().await;
+                        self.close_flush(b"shutdown").await;
                         return Ok(());
                     };
 
