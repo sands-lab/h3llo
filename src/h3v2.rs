@@ -20,14 +20,15 @@ use crate::events::Event;
 use crate::h3::{CONNECT_IP_OVERHEAD, CONTEXT_ID_IP};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::tun::alloc_uninit_packet_buf;
-use octets::{varint_len, varint_parse_len, OctetsMut};
+use octets::{varint_len, varint_parse_len, Octets, OctetsMut};
 use quiche::h3::NameValue;
 use rand::Rng;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::runtime::Handle as RuntimeHandle;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
@@ -128,16 +129,401 @@ fn make_quiche_config(
     Ok(config)
 }
 
+// ========== H3 Client Engine ==========
+
+/// H3 control/session state bound to the CONNECT-IP request.
+struct H3Session {
+    /// H3 connection for polling events and sending datagrams.
+    ///
+    /// Boxed because `quiche::h3::Connection` is ~544 B.
+    h3_conn: Box<quiche::h3::Connection>,
+    /// Stream ID of the CONNECT-IP request.
+    connect_stream_id: u64,
+    /// Quarter Stream ID for DATAGRAM framing validation.
+    expected_qsi: u64,
+    /// Pre-encoded QSI varint bytes for DATAGRAM framing prefix.
+    qsi_bytes: Vec<u8>,
+    /// Whether the CONNECT-IP request has been accepted (200 OK received).
+    connect_accepted: bool,
+}
+
+/// Single actor state for both startup and established phases.
+///
+/// Owns the QUIC connection and all I/O channels. The `establish` method
+/// drives handshake, then `run` handles steady-state datagram forwarding.
+struct H3ClientEngine {
+    conn: quiche::Connection,
+    session: Option<H3Session>,
+
+    authority: String,
+    connect_path: String,
+    auth_header: String,
+
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    peer_id: String,
+    max_udp_payload: usize,
+
+    udp_recv_rx: mpsc::Receiver<Vec<PooledBuf>>,
+    udp_send_tx: mpsc::Sender<Vec<PooledBuf>>,
+
+    egress_rx: mpsc::Receiver<Vec<PooledBuf>>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+    events_tx: mpsc::UnboundedSender<Event>,
+
+    metrics_interval: Duration,
+    keepalive_interval: Duration,
+}
+
+/// Result of polling H3 events for the CONNECT-IP control stream.
+enum ConnectPoll {
+    /// No actionable events yet.
+    Pending,
+    /// CONNECT-IP 200 OK received (or was already received).
+    Accepted,
+    /// CONNECT-IP rejected with the given status code.
+    Rejected { status: String },
+    /// CONNECT-IP stream closed or errored.
+    Closed { reason: String },
+}
+
+impl H3ClientEngine {
+    fn recv_info(&self) -> quiche::RecvInfo {
+        quiche::RecvInfo {
+            from: self.remote_addr,
+            to: self.local_addr,
+        }
+    }
+
+    async fn flush_send(&mut self) {
+        drain_send(&mut self.conn, self.max_udp_payload, &self.udp_send_tx).await;
+    }
+
+    /// Returns `true` when the connection is fully ready for datagram forwarding.
+    fn connect_ready(&self) -> bool {
+        let Some(sess) = self.session.as_ref() else {
+            return false;
+        };
+
+        sess.connect_accepted
+            && sess.h3_conn.dgram_enabled_by_peer(&self.conn)
+            && sess.h3_conn.extended_connect_enabled_by_peer()
+    }
+
+    /// Startup phase: wait for QUIC establishment + H3 CONNECT-IP acceptance.
+    async fn establish(mut self) -> Result<Self, DialError> {
+        let recv_info = self.recv_info();
+
+        // Send initial QUIC packets (e.g. ClientHello).
+        self.flush_send().await;
+
+        let timer = time::sleep(self.conn.timeout().unwrap_or(MAX_TIMEOUT));
+        tokio::pin!(timer);
+
+        loop {
+            tokio::select! {
+                maybe_batch = self.udp_recv_rx.recv() => {
+                    let Some(packets) = maybe_batch else {
+                        return Err(DialError::Handshake("UDP Rx closed during startup".into()));
+                    };
+
+                    handle_recv(&mut self.conn, packets, recv_info);
+
+                    if self.session.is_none() && self.conn.is_established() {
+                        debug!(%self.peer_id, "QUIC established; starting H3 CONNECT-IP");
+                        self.start_h3_connect()?;
+                    }
+
+                    match self.poll_connect_response()? {
+                        ConnectPoll::Pending => {}
+                        ConnectPoll::Accepted => {
+                            if self.connect_ready() {
+                                return Ok(self);
+                            }
+                        }
+                        ConnectPoll::Rejected { status } => {
+                            return Err(DialError::Rejected(status));
+                        }
+                        ConnectPoll::Closed { reason } => {
+                            return Err(DialError::Handshake(reason));
+                        }
+                    }
+
+                    // Covers the case where CONNECT was accepted earlier and peer capabilities
+                    // become visible on a later iteration.
+                    if self.connect_ready() {
+                        return Ok(self);
+                    }
+                }
+
+                _ = &mut timer => {
+                    self.conn.on_timeout();
+                }
+            }
+
+            self.flush_send().await;
+            reset_timer(timer.as_mut(), &self.conn);
+
+            if self.conn.is_closed() {
+                return Err(DialError::Handshake(
+                    "QUIC connection closed during startup".into(),
+                ));
+            }
+        }
+    }
+
+    /// Creates H3 connection, sends CONNECT-IP request, and stores session state.
+    fn start_h3_connect(&mut self) -> Result<(), DialError> {
+        let h3_config = quiche::h3::Config::new()
+            .map_err(|e| DialError::Handshake(format!("h3 config: {e}")))?;
+
+        let mut h3_conn = quiche::h3::Connection::with_transport(&mut self.conn, &h3_config)
+            .map_err(|e| DialError::Handshake(format!("h3 connection: {e}")))?;
+
+        let connect_headers = vec![
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"connect-ip"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", self.authority.as_bytes()),
+            quiche::h3::Header::new(b":path", self.connect_path.as_bytes()),
+            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+            quiche::h3::Header::new(b"authorization", self.auth_header.as_bytes()),
+        ];
+
+        let connect_stream_id = h3_conn
+            .send_request(&mut self.conn, &connect_headers, false)
+            .map_err(|e| DialError::Handshake(format!("send CONNECT: {e}")))?;
+
+        let expected_qsi = connect_stream_id / 4;
+        let qsi_bytes = encode_qsi(expected_qsi);
+
+        self.session = Some(H3Session {
+            h3_conn: Box::new(h3_conn),
+            connect_stream_id,
+            expected_qsi,
+            qsi_bytes,
+            connect_accepted: false,
+        });
+
+        Ok(())
+    }
+
+    /// The only legal place to interpret H3 control events for the CONNECT-IP request.
+    fn poll_connect_response(&mut self) -> Result<ConnectPoll, DialError> {
+        let (conn, session) = match (&mut self.conn, &mut self.session) {
+            (conn, Some(session)) => (conn, session),
+            (_, None) => return Ok(ConnectPoll::Pending),
+        };
+
+        loop {
+            match session.h3_conn.poll(conn) {
+                Ok((sid, quiche::h3::Event::Headers { list, .. })) => {
+                    if sid != session.connect_stream_id {
+                        debug!(%self.peer_id, sid, "ignoring headers on non-CONNECT stream");
+                        continue;
+                    }
+
+                    let status = list
+                        .iter()
+                        .find(|h| h.name() == b":status")
+                        .map(|h| String::from_utf8_lossy(h.value()).to_string());
+
+                    match status.as_deref() {
+                        Some("200") => {
+                            session.connect_accepted = true;
+                        }
+                        Some(code) => {
+                            return Ok(ConnectPoll::Rejected {
+                                status: code.to_string(),
+                            });
+                        }
+                        None => {
+                            return Ok(ConnectPoll::Closed {
+                                reason: "missing :status on CONNECT-IP response".into(),
+                            });
+                        }
+                    }
+                }
+
+                Ok((sid, quiche::h3::Event::Finished)) => {
+                    if sid == session.connect_stream_id {
+                        return Ok(ConnectPoll::Closed {
+                            reason: "CONNECT-IP stream finished".into(),
+                        });
+                    }
+                }
+
+                Ok((sid, quiche::h3::Event::Reset(code))) => {
+                    if sid == session.connect_stream_id {
+                        return Ok(ConnectPoll::Closed {
+                            reason: format!("CONNECT-IP stream reset: {code}"),
+                        });
+                    }
+                }
+
+                Ok((_sid, quiche::h3::Event::GoAway)) => {
+                    info!(%self.peer_id, "received H3 GOAWAY");
+                }
+
+                Ok((_sid, quiche::h3::Event::PriorityUpdate)) => {}
+
+                Ok((_sid, ev)) => {
+                    debug!(%self.peer_id, event = ?ev, "ignoring unrelated H3 event");
+                }
+
+                Err(quiche::h3::Error::Done) => {
+                    return Ok(if session.connect_accepted {
+                        ConnectPoll::Accepted
+                    } else {
+                        ConnectPoll::Pending
+                    });
+                }
+
+                Err(e) => {
+                    return Err(DialError::Handshake(format!("H3 poll: {e}")));
+                }
+            }
+        }
+    }
+
+    /// Established phase: steady-state datagram forwarding.
+    async fn run(mut self) -> ActorExitResult {
+        let recv_info = self.recv_info();
+
+        let mut rx_counters = Counters::new(Source::Http3, Direction::Rx);
+        let mut tx_counters = Counters::new(Source::Http3, Direction::Tx);
+
+        let mut ticker = time::interval(self.metrics_interval);
+        let mut keepalive = time::interval(self.keepalive_interval);
+        keepalive.tick().await;
+
+        let timer = time::sleep(self.conn.timeout().unwrap_or(MAX_TIMEOUT));
+        tokio::pin!(timer);
+
+        loop {
+            tokio::select! {
+                maybe_batch = self.udp_recv_rx.recv() => {
+                    let Some(packets) = maybe_batch else {
+                        self.conn.close(true, 0, b"udp rx closed").ok();
+                        self.flush_send().await;
+                        return Ok(());
+                    };
+
+                    handle_recv(&mut self.conn, packets, recv_info);
+
+                    match self.poll_connect_response() {
+                        Ok(ConnectPoll::Pending | ConnectPoll::Accepted) => {}
+                        Ok(ConnectPoll::Rejected { status }) => {
+                            let reason = format!("CONNECT-IP rejected after establish: {status}");
+                            self.conn.close(true, 0, b"connect-ip rejected").ok();
+                            self.flush_send().await;
+                            return Err(ActorError::H3Client {
+                                peer_id: self.peer_id,
+                                reason,
+                            });
+                        }
+                        Ok(ConnectPoll::Closed { reason }) => {
+                            self.conn.close(true, 0, b"connect-ip control closed").ok();
+                            self.flush_send().await;
+                            return Err(ActorError::H3Client {
+                                peer_id: self.peer_id,
+                                reason,
+                            });
+                        }
+                        Err(e) => {
+                            self.conn.close(true, 0, b"h3 poll error").ok();
+                            self.flush_send().await;
+                            return Err(ActorError::H3Client {
+                                peer_id: self.peer_id,
+                                reason: e.to_string(),
+                            });
+                        }
+                    }
+
+                    let expected_qsi = self
+                        .session
+                        .as_ref()
+                        .expect("session present after establish")
+                        .expected_qsi;
+
+                    let ingress_open = drain_ingress_checked(
+                        &mut self.conn,
+                        self.max_udp_payload,
+                        &self.ingress_tx,
+                        &mut rx_counters,
+                        expected_qsi,
+                    ).await;
+
+                    if !ingress_open {
+                        self.conn.close(true, 0, b"shutdown").ok();
+                        self.flush_send().await;
+                        return Ok(());
+                    }
+                }
+
+                maybe_batch = self.egress_rx.recv() => {
+                    let Some(packets) = maybe_batch else {
+                        self.conn.close(true, 0, b"shutdown").ok();
+                        self.flush_send().await;
+                        return Ok(());
+                    };
+
+                    // Clone is tiny here (QSI varint only) and keeps borrowing simple.
+                    let qsi_bytes = self
+                        .session
+                        .as_ref()
+                        .expect("session present after establish")
+                        .qsi_bytes
+                        .clone();
+
+                    handle_egress(
+                        &mut self.conn,
+                        packets,
+                        &qsi_bytes,
+                        &mut tx_counters,
+                    );
+                }
+
+                _ = &mut timer => {
+                    self.conn.on_timeout();
+                }
+
+                _ = keepalive.tick() => {
+                    self.conn.send_ack_eliciting().ok();
+                }
+
+                _ = ticker.tick() => {
+                    let rx = rx_counters.snapshot(Some(&self.peer_id), Some(self.remote_addr));
+                    let tx = tx_counters.snapshot(Some(&self.peer_id), Some(self.remote_addr));
+                    let _ = self.events_tx.send(Event::Metrics(rx));
+                    let _ = self.events_tx.send(Event::Metrics(tx));
+                }
+            }
+
+            self.flush_send().await;
+            reset_timer(timer.as_mut(), &self.conn);
+
+            if self.conn.is_closed() {
+                return Err(ActorError::H3Client {
+                    peer_id: self.peer_id,
+                    reason: "QUIC connection closed".into(),
+                });
+            }
+        }
+    }
+}
+
 // ========== Public Dial Function ==========
 
 /// Establishes an outbound H3 client CONNECT-IP connection.
 ///
 /// Creates a UDP socket, spawns BareUDP Rx/Tx actors on cloned socket
-/// handles, spawns the H3 client actor, and waits for the QUIC+H3
-/// handshake to complete.
+/// handles, builds the H3 client engine, and drives QUIC+H3 handshake
+/// on the crypto runtime before entering steady-state forwarding.
 ///
 /// # Arguments
 ///
+/// * `crypto_rt` - Runtime handle for spawning the H3 client engine.
 /// * `peer_h3` - Peer HTTP/3 configuration including endpoint, token, and TLS options.
 /// * `remote_addr` - Resolved remote server socket address.
 /// * `peer_id` - Authenticated peer identifier for logging and metrics.
@@ -153,6 +539,7 @@ fn make_quiche_config(
 /// Returns `DialError` on socket, handshake, or timeout failure.
 #[allow(clippy::too_many_arguments)]
 pub async fn dial_h3_client<P: RouteProbe>(
+    crypto_rt: &RuntimeHandle,
     peer_h3: &PeerH3,
     remote_addr: SocketAddr,
     peer_id: &str,
@@ -167,12 +554,17 @@ pub async fn dial_h3_client<P: RouteProbe>(
         .endpoint
         .as_ref()
         .ok_or_else(|| DialError::Socket("peer_h3.endpoint is None".into()))?;
+
     let server_name = peer_h3.sni.as_deref().unwrap_or(&endpoint.host);
+
     let authority = if endpoint.port == 443 {
         endpoint.host.clone()
     } else {
         format!("{}:{}", endpoint.host, endpoint.port)
     };
+
+    let connect_path = endpoint.path.clone();
+    let auth_header = generate_bearer_auth(&peer_h3.token);
 
     // Create unconnected UDP socket (BareUDP needs sendmsg with explicit dest).
     let socket = make_unbound_udp_socket(
@@ -234,48 +626,56 @@ pub async fn dial_h3_client<P: RouteProbe>(
     )
     .map_err(|e| DialError::Handshake(format!("quiche connect: {e}")))?;
 
-    // Build CONNECT-IP headers.
-    let auth_header = generate_bearer_auth(&peer_h3.token);
-    let connect_headers = vec![
-        quiche::h3::Header::new(b":method", b"CONNECT"),
-        quiche::h3::Header::new(b":protocol", b"connect-ip"),
-        quiche::h3::Header::new(b":scheme", b"https"),
-        quiche::h3::Header::new(b":authority", authority.as_bytes()),
-        quiche::h3::Header::new(b":path", endpoint.path.as_bytes()),
-        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-        quiche::h3::Header::new(b"authorization", auth_header.as_bytes()),
-    ];
+    let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.packet_queue_depth);
 
-    // Spawn H3 client actor.
-    let (established_tx, established_rx) = oneshot::channel();
-    let (egress_tx, engine_handle) = spawn_h3_client(
+    let engine = H3ClientEngine {
         conn,
+        session: None,
+
+        authority,
+        connect_path,
+        auth_header,
+
         local_addr,
         remote_addr,
-        peer_id.to_string(),
+        peer_id: peer_id.to_string(),
         max_udp_payload,
-        udp_recv_rx,
-        udp_send_tx,
-        ingress_tx,
-        events_tx,
-        tuning,
-        ClientHandshake {
-            established_tx,
-            connect_headers,
-        },
-    );
 
-    // Wait for handshake.
-    match time::timeout(tuning.h3_handshake_timeout, established_rx).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(reason))) => return Err(DialError::Handshake(reason)),
-        Ok(Err(_)) => {
-            return Err(DialError::Handshake(
-                "engine exited during handshake".into(),
-            ))
+        udp_recv_rx,
+        udp_send_tx: udp_send_tx.clone(),
+
+        egress_rx,
+        ingress_tx,
+        events_tx: events_tx.clone(),
+
+        metrics_interval: tuning.metrics_push_interval,
+        keepalive_interval: tuning.h3_keepalive_interval,
+    };
+
+    let startup_handle = crypto_rt.spawn(engine.establish());
+
+    let engine = match time::timeout(tuning.h3_handshake_timeout, startup_handle).await {
+        Ok(Ok(Ok(engine))) => engine,
+        Ok(Ok(Err(err))) => {
+            udp_rx_handle.abort();
+            udp_tx_handle.abort();
+            return Err(err);
         }
-        Err(_) => return Err(DialError::Timeout(tuning.h3_handshake_timeout)),
-    }
+        Ok(Err(join_err)) => {
+            udp_rx_handle.abort();
+            udp_tx_handle.abort();
+            return Err(DialError::Handshake(format!(
+                "startup task join error: {join_err}"
+            )));
+        }
+        Err(_) => {
+            udp_rx_handle.abort();
+            udp_tx_handle.abort();
+            return Err(DialError::Timeout(tuning.h3_handshake_timeout));
+        }
+    };
+
+    let engine_handle = crypto_rt.spawn(engine.run());
 
     info!(%peer_id, %remote_addr, "h3 client connection established");
     Ok(H3ClientConn {
@@ -288,73 +688,7 @@ pub async fn dial_h3_client<P: RouteProbe>(
     })
 }
 
-// ========== H3 Client Actor ==========
-
-/// CONNECT-IP handshake state consumed by the H3 client actor.
-struct ClientHandshake {
-    established_tx: oneshot::Sender<Result<(), String>>,
-    connect_headers: Vec<quiche::h3::Header>,
-}
-
-// ========== H3 Client State Machine ==========
-
-/// Protocol phase of the H3 client connection state machine.
-///
-/// Encodes the three sequential phases of CONNECT-IP establishment,
-/// each carrying only the data relevant to that phase. Transitions
-/// happen in the `udp_recv_rx.recv()` arm of the single event loop.
-///
-/// Packet counters live outside the enum in `spawn_h3_client` locals, since
-/// they are session-level accumulators rather than per-phase state.
-enum H3Phase {
-    /// QUIC/TLS handshake in progress; H3 layer not yet created.
-    QuicHandshake {
-        /// Handshake notification and CONNECT headers, consumed on transition.
-        hs: ClientHandshake,
-    },
-    /// QUIC established; negotiating H3 SETTINGS and awaiting CONNECT-IP 200.
-    H3Handshake {
-        /// H3 connection for polling events.
-        ///
-        /// Boxed to keep enum variant sizes balanced (`quiche::h3::Connection` is ~544 B).
-        h3_conn: Box<quiche::h3::Connection>,
-        /// QUIC Stream ID varint prefix for DATAGRAM framing.
-        qsi_bytes: Vec<u8>,
-        /// Handshake completion notifier, consumed on 200 OK or error.
-        established_tx: oneshot::Sender<Result<(), String>>,
-    },
-    /// CONNECT-IP established; steady-state datagram forwarding.
-    Established {
-        /// H3 connection for polling events and sending datagrams.
-        ///
-        /// Boxed to keep enum variant sizes balanced (`quiche::h3::Connection` is ~544 B).
-        h3_conn: Box<quiche::h3::Connection>,
-        /// QUIC Stream ID varint prefix for DATAGRAM framing.
-        qsi_bytes: Vec<u8>,
-    },
-}
-
-impl H3Phase {
-    /// Returns `true` when the connection is in steady-state datagram forwarding.
-    fn is_established(&self) -> bool {
-        matches!(self, H3Phase::Established { .. })
-    }
-
-    /// Notifies the handshake waiter of an error, consuming the phase.
-    ///
-    /// No-op in `Established` phase (already notified on 200 OK).
-    fn notify_handshake_error(self, reason: &str) {
-        match self {
-            H3Phase::QuicHandshake { hs } => {
-                let _ = hs.established_tx.send(Err(reason.into()));
-            }
-            H3Phase::H3Handshake { established_tx, .. } => {
-                let _ = established_tx.send(Err(reason.into()));
-            }
-            H3Phase::Established { .. } => {}
-        }
-    }
-}
+// ========== QSI Helpers ==========
 
 /// Encodes a Quarter Stream ID as a QUIC varint byte sequence.
 fn encode_qsi(qsi: u64) -> Vec<u8> {
@@ -366,241 +700,22 @@ fn encode_qsi(qsi: u64) -> Vec<u8> {
     buf[..len].to_vec()
 }
 
-/// Advances the H3 client phase after feeding UDP packets to quiche.
+/// Parses a Quarter Stream ID varint from the start of a buffer.
 ///
-/// Handles state transitions: `QuicHandshake` → `H3Handshake` → `Established`.
-/// Called from the `udp_recv_rx.recv()` arm of the unified event loop.
-///
-/// # Returns
-///
-/// - `Ok(Some(phase))` — continue with the returned phase.
-/// - `Ok(None)` — graceful shutdown (TUN ingress channel closed).
-/// - `Err(e)` — fatal error; actor should exit.
-async fn advance_phase(
-    phase: H3Phase,
-    conn: &mut quiche::Connection,
-    max_udp_payload: usize,
-    ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
-    rx_counters: &mut Counters,
-    peer_id: &str,
-) -> Result<Option<H3Phase>, ActorError> {
-    let err = |reason: String| ActorError::H3Client {
-        peer_id: peer_id.to_string(),
-        reason,
-    };
-
-    match phase {
-        H3Phase::QuicHandshake { hs } => {
-            if !conn.is_established() {
-                return Ok(Some(H3Phase::QuicHandshake { hs }));
-            }
-            debug!(%peer_id, "QUIC handshake complete, starting H3 negotiation");
-
-            // Destructure for independent ownership. If H3 setup fails,
-            // established_tx drops → RecvError in dial_h3_client.
-            let ClientHandshake {
-                established_tx,
-                connect_headers,
-            } = hs;
-
-            let h3_config =
-                quiche::h3::Config::new().map_err(|e| err(format!("h3 config: {e}")))?;
-            let mut h3_conn = quiche::h3::Connection::with_transport(conn, &h3_config)
-                .map_err(|e| err(format!("h3 connection: {e}")))?;
-            let stream_id = h3_conn
-                .send_request(conn, &connect_headers, false)
-                .map_err(|e| err(format!("send CONNECT: {e}")))?;
-
-            // QSI = stream_id / 4 per draft-ietf-masque-connect-ip.
-            let qsi_bytes = encode_qsi(stream_id / 4);
-
-            Ok(Some(H3Phase::H3Handshake {
-                h3_conn: Box::new(h3_conn),
-                qsi_bytes,
-                established_tx,
-            }))
-        }
-
-        H3Phase::H3Handshake {
-            mut h3_conn,
-            qsi_bytes,
-            established_tx,
-        } => {
-            // Poll H3 events for CONNECT-IP 200 OK response.
-            loop {
-                match h3_conn.poll(conn) {
-                    Ok((_sid, quiche::h3::Event::Headers { list, .. })) => {
-                        let status = list
-                            .iter()
-                            .find(|h| h.name() == b":status")
-                            .map(|h| h.value().to_vec());
-                        match status.as_deref() {
-                            Some(b"200") => {
-                                info!(%peer_id, "CONNECT-IP accepted");
-                                let _ = established_tx.send(Ok(()));
-                                return Ok(Some(H3Phase::Established { h3_conn, qsi_bytes }));
-                            }
-                            Some(s) => {
-                                let code = String::from_utf8_lossy(s).to_string();
-                                let _ = established_tx.send(Err(format!("rejected: {code}")));
-                                return Err(err(format!("CONNECT-IP rejected: {code}")));
-                            }
-                            None => {
-                                let _ = established_tx.send(Err("missing :status".into()));
-                                return Err(err("missing :status".into()));
-                            }
-                        }
-                    }
-                    Ok((_sid, quiche::h3::Event::GoAway)) => {
-                        let _ = established_tx.send(Err("GoAway".into()));
-                        return Err(err("GoAway during handshake".into()));
-                    }
-                    Ok((_sid, ev)) => {
-                        debug!(%peer_id, event = ?ev, "ignoring H3 event during handshake");
-                        continue;
-                    }
-                    Err(quiche::h3::Error::Done) => {
-                        return Ok(Some(H3Phase::H3Handshake {
-                            h3_conn,
-                            qsi_bytes,
-                            established_tx,
-                        }));
-                    }
-                    Err(e) => {
-                        let msg = format!("H3 poll: {e}");
-                        let _ = established_tx.send(Err(msg.clone()));
-                        return Err(err(msg));
-                    }
-                }
-            }
-        }
-
-        H3Phase::Established {
-            mut h3_conn,
-            qsi_bytes,
-        } => {
-            process_h3_events(&mut h3_conn, conn, peer_id);
-            let ingress_open = drain_ingress(conn, max_udp_payload, ingress_tx, rx_counters).await;
-            if !ingress_open {
-                return Ok(None); // Signal graceful shutdown.
-            }
-            Ok(Some(H3Phase::Established { h3_conn, qsi_bytes }))
-        }
+/// Returns `(qsi_value, qsi_byte_length)` on success.
+fn parse_qsi(buf: &[u8]) -> Option<(u64, usize)> {
+    let first = *buf.first()?;
+    let qsi_len = varint_parse_len(first);
+    if buf.len() < qsi_len {
+        return None;
     }
+
+    let mut octets = Octets::with_slice(buf);
+    let qsi = octets.get_varint().ok()?;
+    Some((qsi, qsi_len))
 }
 
-/// Spawns the H3 client actor with a single-loop state machine.
-///
-/// Returns `(egress_tx, JoinHandle)` where `egress_tx` accepts IP packets
-/// from the TUN for encryption and transmission. The actor drives QUIC
-/// handshake, H3 CONNECT-IP negotiation, and steady-state datagram
-/// forwarding in one unified `tokio::select!` loop.
-#[allow(clippy::too_many_arguments)]
-fn spawn_h3_client(
-    mut conn: quiche::Connection,
-    local_addr: SocketAddr,
-    remote_addr: SocketAddr,
-    peer_id: String,
-    max_udp_payload: usize,
-    mut udp_recv_rx: mpsc::Receiver<Vec<PooledBuf>>,
-    udp_send_tx: mpsc::Sender<Vec<PooledBuf>>,
-    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-    events_tx: mpsc::UnboundedSender<Event>,
-    tuning: &Tuning,
-    hs: ClientHandshake,
-) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
-    let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.packet_queue_depth);
-    let metrics_interval = tuning.metrics_push_interval;
-    let keepalive_interval = tuning.h3_keepalive_interval;
-
-    let handle = tokio::spawn(async move {
-        let recv_info = quiche::RecvInfo {
-            from: remote_addr,
-            to: local_addr,
-        };
-
-        // Session-level counters, live for the duration of the Established phase.
-        let mut rx_counters = Counters::new(Source::Http3, Direction::Rx);
-        let mut tx_counters = Counters::new(Source::Http3, Direction::Tx);
-
-        // Send initial QUIC ClientHello.
-        drain_send(&mut conn, max_udp_payload, &udp_send_tx).await;
-
-        let mut phase = H3Phase::QuicHandshake { hs };
-        let mut ticker = time::interval(metrics_interval);
-        let mut keepalive = time::interval(keepalive_interval);
-        keepalive.tick().await; // consume the immediate first tick
-
-        let timer = time::sleep(conn.timeout().unwrap_or(MAX_TIMEOUT));
-        tokio::pin!(timer);
-
-        loop {
-            let was_established = phase.is_established();
-            tokio::select! {
-                maybe_batch = udp_recv_rx.recv() => {
-                    let Some(packets) = maybe_batch else {
-                        phase.notify_handshake_error("UDP Rx closed");
-                        return Ok(());
-                    };
-                    handle_recv(&mut conn, packets, recv_info);
-                    let Some(new_phase) = advance_phase(
-                        phase, &mut conn, max_udp_payload, &ingress_tx, &mut rx_counters, &peer_id,
-                    ).await? else {
-                        // Graceful shutdown (TUN ingress channel closed).
-                        conn.close(true, 0, b"shutdown").ok();
-                        drain_send(&mut conn, max_udp_payload, &udp_send_tx).await;
-                        return Ok(());
-                    };
-                    phase = new_phase;
-                }
-                maybe_batch = egress_rx.recv(), if was_established => {
-                    let Some(packets) = maybe_batch else {
-                        conn.close(true, 0, b"shutdown").ok();
-                        drain_send(&mut conn, max_udp_payload, &udp_send_tx).await;
-                        return Ok(());
-                    };
-                    // SAFETY: `if was_established` guard guarantees `phase` is `Established`.
-                    let H3Phase::Established { ref qsi_bytes, .. } = phase else {
-                        unreachable!("egress arm fires only when was_established == true");
-                    };
-                    handle_egress(&mut conn, packets, qsi_bytes, &mut tx_counters);
-                }
-                _ = &mut timer => {
-                    conn.on_timeout();
-                }
-                _ = keepalive.tick(), if was_established => {
-                    conn.send_ack_eliciting().ok();
-                }
-                _ = ticker.tick(), if was_established => {
-                    let rx = rx_counters.snapshot(Some(&peer_id), Some(remote_addr));
-                    let tx = tx_counters.snapshot(Some(&peer_id), Some(remote_addr));
-                    let _ = events_tx.send(Event::Metrics(rx));
-                    let _ = events_tx.send(Event::Metrics(tx));
-                }
-            }
-
-            // Reset intervals on first transition to Established to avoid burst ticks.
-            if !was_established && phase.is_established() {
-                keepalive.reset();
-                ticker.reset();
-            }
-
-            // Common post-arm: flush QUIC output and reset timer.
-            drain_send(&mut conn, max_udp_payload, &udp_send_tx).await;
-            reset_timer(timer.as_mut(), &conn);
-
-            if conn.is_closed() {
-                phase.notify_handshake_error("QUIC connection closed");
-                return Err(ActorError::H3Client {
-                    peer_id,
-                    reason: "QUIC connection closed".into(),
-                });
-            }
-        }
-    });
-
-    (egress_tx, handle)
-}
+// ========== Helper Functions ==========
 
 /// Resets the pinned timer to the next quiche timeout deadline.
 ///
@@ -612,8 +727,6 @@ fn reset_timer(timer: std::pin::Pin<&mut time::Sleep>, conn: &quiche::Connection
     };
     timer.reset(deadline);
 }
-
-// ========== Helper Functions ==========
 
 /// Decrypts a batch of received UDP packets by feeding them into quiche.
 ///
@@ -658,19 +771,20 @@ async fn drain_send(
     }
 }
 
-/// Drains inbound QUIC DATAGRAMs, strips QSI varint + Context ID, sends IP packets to TUN.
+/// Drains inbound QUIC DATAGRAMs with QSI validation, strips framing, sends IP packets to TUN.
 ///
-/// Allocates each datagram directly from the pool and strips the framing
-/// prefix via `pop_front`, avoiding an intermediate copy. The stripped bytes
-/// become additional headroom for downstream `add_prefix` consumers.
+/// Validates that the Quarter Stream ID matches `expected_qsi` before accepting
+/// each datagram. Allocates each datagram directly from the pool and strips the
+/// framing prefix via `pop_front`, avoiding an intermediate copy.
 ///
 /// Returns `false` if the ingress channel has closed (TUN side gone), so the
 /// caller can exit gracefully — consistent with the bare.rs actor pattern.
-async fn drain_ingress(
+async fn drain_ingress_checked(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
     ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
     counters: &mut Counters,
+    expected_qsi: u64,
 ) -> bool {
     let mut batch: Vec<PooledBuf> = Vec::new();
     let mut ok_pkts: u64 = 0;
@@ -681,23 +795,29 @@ async fn drain_ingress(
         match conn.dgram_recv(&mut buf) {
             Ok(len) => {
                 buf.truncate(len);
-                let Some(&first) = buf.first() else {
+
+                let Some((qsi, qsi_len)) = parse_qsi(&buf) else {
                     counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
                     continue;
                 };
-                let qsi_len = varint_parse_len(first);
-                // prefix = QSI varint + Context ID byte
+
+                if qsi != expected_qsi {
+                    counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
+                    continue;
+                }
+
                 let prefix_len = qsi_len + 1;
                 if len < prefix_len || buf[qsi_len] != CONTEXT_ID_IP {
                     counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
                     continue;
                 }
-                // Strip QSI + Context ID; these bytes become extra headroom.
+
                 buf.pop_front(prefix_len);
                 if buf.is_empty() {
                     counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
                     continue;
                 }
+
                 ok_pkts += 1;
                 ok_bytes += buf.len() as u64;
                 batch.push(buf);
@@ -709,9 +829,11 @@ async fn drain_ingress(
             }
         }
     }
+
     if batch.is_empty() {
         return true;
     }
+
     counters
         .send_and_record(ingress_tx, batch, ok_pkts, ok_bytes)
         .await
@@ -752,54 +874,25 @@ fn handle_egress(
     }
 }
 
-/// Drains H3 stream events (GoAway, Reset, etc.) during steady-state operation.
-fn process_h3_events(
-    h3_conn: &mut quiche::h3::Connection,
-    conn: &mut quiche::Connection,
-    peer_id: &str,
-) {
-    loop {
-        match h3_conn.poll(conn) {
-            Ok((_sid, quiche::h3::Event::GoAway)) => {
-                info!(%peer_id, "received GoAway");
-            }
-            Ok((_sid, ev)) => {
-                debug!(%peer_id, event = ?ev, "ignoring H3 event");
-            }
-            Err(quiche::h3::Error::Done) => break,
-            Err(e) => {
-                debug!(%peer_id, error = ?e, "H3 poll error");
-                break;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tun::alloc_packet_buf;
-    use octets::Octets;
 
     #[test]
     fn datagram_framing_encode_decode() {
         let ip_payload = b"test ip packet";
-        // Encode qsi=0 (stream_id=0/4): single byte 0x00.
-        let qsi_len = varint_len(0);
-        let mut qsi_buf = [0u8; 8];
-        OctetsMut::with_slice(&mut qsi_buf).put_varint(0).unwrap();
-        let qsi_bytes = &qsi_buf[..qsi_len];
+        let qsi_bytes = encode_qsi(0);
 
         let mut buf = alloc_packet_buf(ip_payload);
         assert!(buf.add_prefix(&[CONTEXT_ID_IP]));
-        assert!(buf.add_prefix(qsi_bytes));
+        assert!(buf.add_prefix(&qsi_bytes));
 
         let data = &buf[..];
-        let parsed_qsi_len = varint_parse_len(data[0]);
-        let qsi = Octets::with_slice(data).get_varint().unwrap();
+        let (qsi, qsi_len) = parse_qsi(data).expect("valid QSI");
         assert_eq!(qsi, 0);
-        assert_eq!(data[parsed_qsi_len], CONTEXT_ID_IP);
-        assert_eq!(&data[parsed_qsi_len + 1..], ip_payload);
+        assert_eq!(data[qsi_len], CONTEXT_ID_IP);
+        assert_eq!(&data[qsi_len + 1..], ip_payload);
     }
 
     #[test]
@@ -866,49 +959,20 @@ mod tests {
     }
 
     #[test]
-    fn advance_phase_noop_before_quic_established() {
-        // Verify advance_phase returns QuicHandshake unchanged when QUIC is not established.
-        let mut config = make_quiche_config(&Tuning::default(), 1350).unwrap();
-        let scid = quiche::ConnectionId::from_ref(&[0u8; 16]);
-        let local: SocketAddr = "127.0.0.1:4433".parse().unwrap();
-        let remote: SocketAddr = "127.0.0.1:5555".parse().unwrap();
-        let mut conn =
-            quiche::connect(Some("localhost"), &scid, local, remote, &mut config).unwrap();
-        let (established_tx, _established_rx) = oneshot::channel();
-        let hs = ClientHandshake {
-            established_tx,
-            connect_headers: vec![],
-        };
-        let phase = H3Phase::QuicHandshake { hs };
-        let (ingress_tx, _ingress_rx) = mpsc::channel(1);
-        let mut rx_counters = Counters::new(Source::Http3, Direction::Rx);
+    fn parse_qsi_roundtrip() {
+        // Single-byte varints.
+        assert_eq!(parse_qsi(&[0x00]), Some((0, 1)));
+        assert_eq!(parse_qsi(&[0x01]), Some((1, 1)));
+        assert_eq!(parse_qsi(&[0x3f]), Some((63, 1)));
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let result = rt.block_on(advance_phase(
-            phase,
-            &mut conn,
-            1350 + CONNECT_IP_OVERHEAD,
-            &ingress_tx,
-            &mut rx_counters,
-            "test-peer",
-        ));
-        let new_phase = result.unwrap().expect("should return Some");
-        assert!(matches!(new_phase, H3Phase::QuicHandshake { .. }));
-        assert!(!new_phase.is_established());
-    }
+        // Two-byte varint via encode_qsi roundtrip.
+        let encoded = encode_qsi(64);
+        assert_eq!(parse_qsi(&encoded), Some((64, 2)));
 
-    #[test]
-    fn h3_phase_is_established_false_for_handshake() {
-        let (tx, _rx) = oneshot::channel();
-        let phase = H3Phase::QuicHandshake {
-            hs: ClientHandshake {
-                established_tx: tx,
-                connect_headers: vec![],
-            },
-        };
-        assert!(!phase.is_established());
+        // Empty buffer.
+        assert_eq!(parse_qsi(&[]), None);
+
+        // Truncated 2-byte varint (first byte indicates 2-byte encoding).
+        assert_eq!(parse_qsi(&[0x40]), None);
     }
 }
