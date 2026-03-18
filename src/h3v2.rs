@@ -440,7 +440,7 @@ impl H3ClientEngine {
                         }
                     }
 
-                    let ingress_open = drain_ingress_checked(
+                    let ingress_open = drain_ingress(
                         &mut self.conn,
                         self.max_udp_payload,
                         &self.ingress_tx,
@@ -638,24 +638,20 @@ pub async fn dial_h3_client<P: RouteProbe>(
 
     let startup_handle = crypto_rt.spawn(engine.establish());
 
-    let engine = match time::timeout(tuning.h3_handshake_timeout, startup_handle).await {
-        Ok(Ok(Ok(engine))) => engine,
-        Ok(Ok(Err(err))) => {
+    let result = match time::timeout(tuning.h3_handshake_timeout, startup_handle).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_err)) => Err(DialError::Handshake(format!(
+            "startup task join error: {join_err}"
+        ))),
+        Err(_) => Err(DialError::Timeout(tuning.h3_handshake_timeout)),
+    };
+
+    let engine = match result {
+        Ok(engine) => engine,
+        Err(err) => {
             udp_rx_handle.abort();
             udp_tx_handle.abort();
             return Err(err);
-        }
-        Ok(Err(join_err)) => {
-            udp_rx_handle.abort();
-            udp_tx_handle.abort();
-            return Err(DialError::Handshake(format!(
-                "startup task join error: {join_err}"
-            )));
-        }
-        Err(_) => {
-            udp_rx_handle.abort();
-            udp_tx_handle.abort();
-            return Err(DialError::Timeout(tuning.h3_handshake_timeout));
         }
     };
 
@@ -755,15 +751,33 @@ async fn drain_send(
     }
 }
 
+/// Validates and strips QSI + Context ID framing from a DATAGRAM buffer.
+///
+/// Returns the prefix length to strip on success, or `None` for any framing error.
+fn validate_datagram_framing(buf: &[u8], expected_qsi: u64) -> Option<usize> {
+    let (qsi, qsi_len) = decode_qsi(buf)?;
+    if qsi != expected_qsi {
+        return None;
+    }
+    let prefix_len = qsi_len + 1;
+    if buf.len() < prefix_len || buf[qsi_len] != CONTEXT_ID_IP {
+        return None;
+    }
+    // Must have IP payload after the prefix.
+    if buf.len() == prefix_len {
+        return None;
+    }
+    Some(prefix_len)
+}
+
 /// Drains inbound QUIC DATAGRAMs with QSI validation, strips framing, sends IP packets to TUN.
 ///
-/// Validates that the Quarter Stream ID matches `expected_qsi` before accepting
-/// each datagram. Allocates each datagram directly from the pool and strips the
-/// framing prefix via `pop_front`, avoiding an intermediate copy.
+/// Allocates each datagram directly from the pool and strips the framing prefix
+/// via `pop_front`, avoiding an intermediate copy.
 ///
 /// Returns `false` if the ingress channel has closed (TUN side gone), so the
 /// caller can exit gracefully — consistent with the bare.rs actor pattern.
-async fn drain_ingress_checked(
+async fn drain_ingress(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
     ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
@@ -780,28 +794,12 @@ async fn drain_ingress_checked(
             Ok(len) => {
                 buf.truncate(len);
 
-                let Some((qsi, qsi_len)) = decode_qsi(&buf) else {
+                let Some(prefix_len) = validate_datagram_framing(&buf, expected_qsi) else {
                     counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
                     continue;
                 };
 
-                if qsi != expected_qsi {
-                    counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
-                    continue;
-                }
-
-                let prefix_len = qsi_len + 1;
-                if len < prefix_len || buf[qsi_len] != CONTEXT_ID_IP {
-                    counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
-                    continue;
-                }
-
                 buf.pop_front(prefix_len);
-                if buf.is_empty() {
-                    counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
-                    continue;
-                }
-
                 ok_pkts += 1;
                 ok_bytes += buf.len() as u64;
                 batch.push(buf);
@@ -834,11 +832,7 @@ fn handle_egress(
     let mut ok_bytes: u64 = 0;
     for mut pkt in packets {
         let pkt_len = pkt.len() as u64;
-        if !pkt.add_prefix(&[CONTEXT_ID_IP]) {
-            counters.record_drop(DropReason::NoHeadroom, 1, pkt_len);
-            continue;
-        }
-        if !pkt.add_prefix(qsi_bytes) {
+        if !pkt.add_prefix(&[CONTEXT_ID_IP]) || !pkt.add_prefix(qsi_bytes) {
             counters.record_drop(DropReason::NoHeadroom, 1, pkt_len);
             continue;
         }
