@@ -243,12 +243,7 @@ impl H3ClientEngine {
                     }
 
                     match self.poll_connect_response()? {
-                        ConnectPoll::Pending => {}
-                        ConnectPoll::Accepted => {
-                            if self.connect_ready() {
-                                return Ok(self);
-                            }
-                        }
+                        ConnectPoll::Pending | ConnectPoll::Accepted => {}
                         ConnectPoll::Rejected { status } => {
                             return Err(DialError::Rejected(status));
                         }
@@ -257,8 +252,6 @@ impl H3ClientEngine {
                         }
                     }
 
-                    // Covers the case where CONNECT was accepted earlier and peer capabilities
-                    // become visible on a later iteration.
                     if self.connect_ready() {
                         return Ok(self);
                     }
@@ -702,10 +695,10 @@ fn encode_qsi(qsi: u64) -> Vec<u8> {
     buf[..len].to_vec()
 }
 
-/// Parses a Quarter Stream ID varint from the start of a buffer.
+/// Decodes a Quarter Stream ID varint from the start of a buffer.
 ///
 /// Returns `(qsi_value, qsi_byte_length)` on success.
-fn parse_qsi(buf: &[u8]) -> Option<(u64, usize)> {
+fn decode_qsi(buf: &[u8]) -> Option<(u64, usize)> {
     let first = *buf.first()?;
     let qsi_len = varint_parse_len(first);
     if buf.len() < qsi_len {
@@ -798,7 +791,7 @@ async fn drain_ingress_checked(
             Ok(len) => {
                 buf.truncate(len);
 
-                let Some((qsi, qsi_len)) = parse_qsi(&buf) else {
+                let Some((qsi, qsi_len)) = decode_qsi(&buf) else {
                     counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
                     continue;
                 };
@@ -891,7 +884,7 @@ mod tests {
         assert!(buf.add_prefix(&qsi_bytes));
 
         let data = &buf[..];
-        let (qsi, qsi_len) = parse_qsi(data).expect("valid QSI");
+        let (qsi, qsi_len) = decode_qsi(data).expect("valid QSI");
         assert_eq!(qsi, 0);
         assert_eq!(data[qsi_len], CONTEXT_ID_IP);
         assert_eq!(&data[qsi_len + 1..], ip_payload);
@@ -961,20 +954,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_qsi_roundtrip() {
+    fn decode_qsi_roundtrip() {
         // Single-byte varints.
-        assert_eq!(parse_qsi(&[0x00]), Some((0, 1)));
-        assert_eq!(parse_qsi(&[0x01]), Some((1, 1)));
-        assert_eq!(parse_qsi(&[0x3f]), Some((63, 1)));
+        assert_eq!(decode_qsi(&[0x00]), Some((0, 1)));
+        assert_eq!(decode_qsi(&[0x01]), Some((1, 1)));
+        assert_eq!(decode_qsi(&[0x3f]), Some((63, 1)));
 
-        // Two-byte varint via encode_qsi roundtrip.
+        // Two-byte varint via QSI roundtrip.
         let encoded = encode_qsi(64);
-        assert_eq!(parse_qsi(&encoded), Some((64, 2)));
+        assert_eq!(decode_qsi(&encoded), Some((64, 2)));
 
         // Empty buffer.
-        assert_eq!(parse_qsi(&[]), None);
+        assert_eq!(decode_qsi(&[]), None);
 
         // Truncated 2-byte varint (first byte indicates 2-byte encoding).
-        assert_eq!(parse_qsi(&[0x40]), None);
+        assert_eq!(decode_qsi(&[0x40]), None);
     }
 }
