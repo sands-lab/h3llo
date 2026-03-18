@@ -187,6 +187,92 @@ enum ConnectPoll {
     Closed { reason: String },
 }
 
+impl H3Session {
+    /// Returns `true` when the CONNECT-IP session is fully ready for datagram forwarding.
+    fn connect_ready(&self, conn: &quiche::Connection) -> bool {
+        self.connect_accepted
+            && self.h3_conn.dgram_enabled_by_peer(conn)
+            && self.h3_conn.extended_connect_enabled_by_peer()
+    }
+
+    /// Polls H3 events for the CONNECT-IP control stream.
+    fn poll_connect_response(
+        &mut self,
+        conn: &mut quiche::Connection,
+        peer_id: &str,
+    ) -> Result<ConnectPoll, DialError> {
+        loop {
+            match self.h3_conn.poll(conn) {
+                Ok((sid, quiche::h3::Event::Headers { list, .. })) => {
+                    if sid != self.connect_stream_id {
+                        debug!(%peer_id, sid, "ignoring headers on non-CONNECT stream");
+                        continue;
+                    }
+
+                    let status = list
+                        .iter()
+                        .find(|h| h.name() == b":status")
+                        .map(|h| String::from_utf8_lossy(h.value()).to_string());
+
+                    match status.as_deref() {
+                        Some("200") => {
+                            self.connect_accepted = true;
+                        }
+                        Some(code) => {
+                            return Ok(ConnectPoll::Rejected {
+                                status: code.to_string(),
+                            });
+                        }
+                        None => {
+                            return Ok(ConnectPoll::Closed {
+                                reason: "missing :status on CONNECT-IP response".into(),
+                            });
+                        }
+                    }
+                }
+
+                Ok((sid, quiche::h3::Event::Finished)) => {
+                    if sid == self.connect_stream_id {
+                        return Ok(ConnectPoll::Closed {
+                            reason: "CONNECT-IP stream finished".into(),
+                        });
+                    }
+                }
+
+                Ok((sid, quiche::h3::Event::Reset(code))) => {
+                    if sid == self.connect_stream_id {
+                        return Ok(ConnectPoll::Closed {
+                            reason: format!("CONNECT-IP stream reset: {code}"),
+                        });
+                    }
+                }
+
+                Ok((_sid, quiche::h3::Event::GoAway)) => {
+                    info!(%peer_id, "received H3 GOAWAY");
+                }
+
+                Ok((_sid, quiche::h3::Event::PriorityUpdate)) => {}
+
+                Ok((_sid, ev)) => {
+                    debug!(%peer_id, event = ?ev, "ignoring unrelated H3 event");
+                }
+
+                Err(quiche::h3::Error::Done) => {
+                    return Ok(if self.connect_accepted {
+                        ConnectPoll::Accepted
+                    } else {
+                        ConnectPoll::Pending
+                    });
+                }
+
+                Err(e) => {
+                    return Err(DialError::Handshake(format!("H3 poll: {e}")));
+                }
+            }
+        }
+    }
+}
+
 impl H3ClientEngine {
     fn recv_info(&self) -> quiche::RecvInfo {
         quiche::RecvInfo {
@@ -205,17 +291,6 @@ impl H3ClientEngine {
     async fn close_flush(&mut self, reason: &[u8]) {
         self.conn.close(true, 0, reason).ok();
         self.flush_send().await;
-    }
-
-    /// Returns `true` when the connection is fully ready for datagram forwarding.
-    fn connect_ready(&self) -> bool {
-        let Some(sess) = self.session.as_ref() else {
-            return false;
-        };
-
-        sess.connect_accepted
-            && sess.h3_conn.dgram_enabled_by_peer(&self.conn)
-            && sess.h3_conn.extended_connect_enabled_by_peer()
     }
 
     /// Startup phase: wait for QUIC establishment + H3 CONNECT-IP acceptance.
@@ -242,18 +317,20 @@ impl H3ClientEngine {
                         self.start_h3_connect()?;
                     }
 
-                    match self.poll_connect_response()? {
-                        ConnectPoll::Pending | ConnectPoll::Accepted => {}
-                        ConnectPoll::Rejected { status } => {
-                            return Err(DialError::Rejected(status));
+                    if let Some(session) = &mut self.session {
+                        match session.poll_connect_response(&mut self.conn, &self.peer_id)? {
+                            ConnectPoll::Pending | ConnectPoll::Accepted => {}
+                            ConnectPoll::Rejected { status } => {
+                                return Err(DialError::Rejected(status));
+                            }
+                            ConnectPoll::Closed { reason } => {
+                                return Err(DialError::Handshake(reason));
+                            }
                         }
-                        ConnectPoll::Closed { reason } => {
-                            return Err(DialError::Handshake(reason));
-                        }
-                    }
 
-                    if self.connect_ready() {
-                        return Ok(self);
+                        if session.connect_ready(&self.conn) {
+                            return Ok(self);
+                        }
                     }
                 }
 
@@ -309,87 +386,13 @@ impl H3ClientEngine {
         Ok(())
     }
 
-    /// The only legal place to interpret H3 control events for the CONNECT-IP request.
-    fn poll_connect_response(&mut self) -> Result<ConnectPoll, DialError> {
-        let (conn, session) = match (&mut self.conn, &mut self.session) {
-            (conn, Some(session)) => (conn, session),
-            (_, None) => return Ok(ConnectPoll::Pending),
-        };
-
-        loop {
-            match session.h3_conn.poll(conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, .. })) => {
-                    if sid != session.connect_stream_id {
-                        debug!(%self.peer_id, sid, "ignoring headers on non-CONNECT stream");
-                        continue;
-                    }
-
-                    let status = list
-                        .iter()
-                        .find(|h| h.name() == b":status")
-                        .map(|h| String::from_utf8_lossy(h.value()).to_string());
-
-                    match status.as_deref() {
-                        Some("200") => {
-                            session.connect_accepted = true;
-                        }
-                        Some(code) => {
-                            return Ok(ConnectPoll::Rejected {
-                                status: code.to_string(),
-                            });
-                        }
-                        None => {
-                            return Ok(ConnectPoll::Closed {
-                                reason: "missing :status on CONNECT-IP response".into(),
-                            });
-                        }
-                    }
-                }
-
-                Ok((sid, quiche::h3::Event::Finished)) => {
-                    if sid == session.connect_stream_id {
-                        return Ok(ConnectPoll::Closed {
-                            reason: "CONNECT-IP stream finished".into(),
-                        });
-                    }
-                }
-
-                Ok((sid, quiche::h3::Event::Reset(code))) => {
-                    if sid == session.connect_stream_id {
-                        return Ok(ConnectPoll::Closed {
-                            reason: format!("CONNECT-IP stream reset: {code}"),
-                        });
-                    }
-                }
-
-                Ok((_sid, quiche::h3::Event::GoAway)) => {
-                    info!(%self.peer_id, "received H3 GOAWAY");
-                }
-
-                Ok((_sid, quiche::h3::Event::PriorityUpdate)) => {}
-
-                Ok((_sid, ev)) => {
-                    debug!(%self.peer_id, event = ?ev, "ignoring unrelated H3 event");
-                }
-
-                Err(quiche::h3::Error::Done) => {
-                    return Ok(if session.connect_accepted {
-                        ConnectPoll::Accepted
-                    } else {
-                        ConnectPoll::Pending
-                    });
-                }
-
-                Err(e) => {
-                    return Err(DialError::Handshake(format!("H3 poll: {e}")));
-                }
-            }
-        }
-    }
-
     /// Established phase: steady-state datagram forwarding.
     async fn run(mut self) -> ActorExitResult {
         let recv_info = self.recv_info();
+        let mut session = self
+            .session
+            .take()
+            .expect("session present after establish");
 
         let mut rx_counters = Counters::new(Source::Http3, Direction::Rx);
         let mut tx_counters = Counters::new(Source::Http3, Direction::Tx);
@@ -411,7 +414,7 @@ impl H3ClientEngine {
 
                     handle_recv(&mut self.conn, packets, recv_info);
 
-                    match self.poll_connect_response() {
+                    match session.poll_connect_response(&mut self.conn, &self.peer_id) {
                         Ok(ConnectPoll::Pending | ConnectPoll::Accepted) => {}
                         Ok(ConnectPoll::Rejected { status }) => {
                             let reason = format!("CONNECT-IP rejected after establish: {status}");
@@ -437,18 +440,12 @@ impl H3ClientEngine {
                         }
                     }
 
-                    let expected_qsi = self
-                        .session
-                        .as_ref()
-                        .expect("session present after establish")
-                        .expected_qsi;
-
                     let ingress_open = drain_ingress_checked(
                         &mut self.conn,
                         self.max_udp_payload,
                         &self.ingress_tx,
                         &mut rx_counters,
-                        expected_qsi,
+                        session.expected_qsi,
                     ).await;
 
                     if !ingress_open {
@@ -463,18 +460,10 @@ impl H3ClientEngine {
                         return Ok(());
                     };
 
-                    // Clone is tiny here (QSI varint only) and keeps borrowing simple.
-                    let qsi_bytes = self
-                        .session
-                        .as_ref()
-                        .expect("session present after establish")
-                        .qsi_bytes
-                        .clone();
-
                     handle_egress(
                         &mut self.conn,
                         packets,
-                        &qsi_bytes,
+                        &session.qsi_bytes,
                         &mut tx_counters,
                     );
                 }
