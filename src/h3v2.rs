@@ -19,7 +19,7 @@ use crate::config::{PeerH3, Tuning};
 use crate::events::Event;
 use crate::h3::{CONNECT_IP_OVERHEAD, CONTEXT_ID_IP};
 use crate::metrics::{Counters, Direction, DropReason, Source};
-use crate::tun::alloc_packet_buf;
+use crate::tun::alloc_uninit_packet_buf;
 use octets::{varint_len, varint_parse_len, OctetsMut};
 use quiche::h3::NameValue;
 use rand::Rng;
@@ -30,7 +30,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
-use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
+use tokio_quiche::buf_factory::PooledBuf;
 use tracing::{debug, info, warn};
 
 /// Duration used as "infinite" timeout when quiche returns None.
@@ -89,16 +89,18 @@ pub enum DialError {
 // ========== Configuration Helper ==========
 
 /// Creates a quiche QUIC configuration from h3llo tuning parameters.
-fn make_quiche_config(tuning: &Tuning, tun_mtu: u16) -> Result<quiche::Config, DialError> {
+fn make_quiche_config(
+    tuning: &Tuning,
+    max_udp_payload: usize,
+) -> Result<quiche::Config, DialError> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| DialError::Handshake(format!("quiche config: {e}")))?;
     config
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .map_err(|e| DialError::Handshake(format!("ALPN: {e}")))?;
 
-    let payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
-    config.set_max_recv_udp_payload_size(payload_size);
-    config.set_max_send_udp_payload_size(payload_size);
+    config.set_max_recv_udp_payload_size(max_udp_payload);
+    config.set_max_send_udp_payload_size(max_udp_payload);
     // 10 MB connection-level flow control window (sufficient for tunneled traffic bursts).
     config.set_initial_max_data(10_000_000);
     // 1 MB per-stream window for the CONNECT-IP control stream.
@@ -199,8 +201,8 @@ pub async fn dial_h3_client<P: RouteProbe>(
     let tx_socket = UdpSocket::from_std(std_socket)
         .map_err(|e| DialError::Socket(format!("from_std tx: {e}")))?;
 
-    let mtu = tun_mtu as usize + CONNECT_IP_OVERHEAD;
-    let bare_rx = bare_rx_from_socket(rx_socket, mtu)
+    let max_udp_payload = tun_mtu as usize + CONNECT_IP_OVERHEAD;
+    let bare_rx = bare_rx_from_socket(rx_socket, max_udp_payload)
         .map_err(|e| DialError::Socket(format!("bare_rx: {e}")))?;
     let bare_tx = bare_tx_from_socket(tx_socket, remote_addr, tuning.udp_enable_offload)
         .map_err(|e| DialError::Socket(format!("bare_tx: {e}")))?;
@@ -219,7 +221,7 @@ pub async fn dial_h3_client<P: RouteProbe>(
         spawn_udp_tx(bare_tx, peer_id.to_string(), events_tx.clone(), tuning);
 
     // Create quiche config and connection.
-    let mut config = make_quiche_config(tuning, tun_mtu)?;
+    let mut config = make_quiche_config(tuning, max_udp_payload)?;
     let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
     rand::rng().fill_bytes(&mut scid_bytes);
     let scid = quiche::ConnectionId::from_ref(&scid_bytes);
@@ -251,6 +253,7 @@ pub async fn dial_h3_client<P: RouteProbe>(
         local_addr,
         remote_addr,
         peer_id.to_string(),
+        max_udp_payload,
         udp_recv_rx,
         udp_send_tx,
         ingress_tx,
@@ -376,7 +379,7 @@ fn encode_qsi(qsi: u64) -> Vec<u8> {
 async fn advance_phase(
     phase: H3Phase,
     conn: &mut quiche::Connection,
-    dgram_buf: &mut [u8],
+    max_udp_payload: usize,
     ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
     rx_counters: &mut Counters,
     peer_id: &str,
@@ -477,7 +480,7 @@ async fn advance_phase(
             qsi_bytes,
         } => {
             process_h3_events(&mut h3_conn, conn, peer_id);
-            let ingress_open = drain_ingress(conn, dgram_buf, ingress_tx, rx_counters).await;
+            let ingress_open = drain_ingress(conn, max_udp_payload, ingress_tx, rx_counters).await;
             if !ingress_open {
                 return Ok(None); // Signal graceful shutdown.
             }
@@ -498,6 +501,7 @@ fn spawn_h3_client(
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     peer_id: String,
+    max_udp_payload: usize,
     mut udp_recv_rx: mpsc::Receiver<Vec<PooledBuf>>,
     udp_send_tx: mpsc::Sender<Vec<PooledBuf>>,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
@@ -510,9 +514,6 @@ fn spawn_h3_client(
     let keepalive_interval = tuning.h3_keepalive_interval;
 
     let handle = tokio::spawn(async move {
-        let mut send_buf = vec![0u8; 65535];
-        let mut recv_buf = vec![0u8; 65535];
-        let mut dgram_buf = vec![0u8; 65535];
         let recv_info = quiche::RecvInfo {
             from: remote_addr,
             to: local_addr,
@@ -523,7 +524,7 @@ fn spawn_h3_client(
         let mut tx_counters = Counters::new(Source::Http3, Direction::Tx);
 
         // Send initial QUIC ClientHello.
-        drain_send(&mut conn, &mut send_buf, &udp_send_tx).await;
+        drain_send(&mut conn, max_udp_payload, &udp_send_tx).await;
 
         let mut phase = H3Phase::QuicHandshake { hs };
         let mut ticker = time::interval(metrics_interval);
@@ -541,13 +542,13 @@ fn spawn_h3_client(
                         phase.notify_handshake_error("UDP Rx closed");
                         return Ok(());
                     };
-                    handle_recv(&mut conn, &packets, &mut recv_buf, recv_info);
+                    handle_recv(&mut conn, packets, recv_info);
                     let Some(new_phase) = advance_phase(
-                        phase, &mut conn, &mut dgram_buf, &ingress_tx, &mut rx_counters, &peer_id,
+                        phase, &mut conn, max_udp_payload, &ingress_tx, &mut rx_counters, &peer_id,
                     ).await? else {
                         // Graceful shutdown (TUN ingress channel closed).
                         conn.close(true, 0, b"shutdown").ok();
-                        drain_send(&mut conn, &mut send_buf, &udp_send_tx).await;
+                        drain_send(&mut conn, max_udp_payload, &udp_send_tx).await;
                         return Ok(());
                     };
                     phase = new_phase;
@@ -555,7 +556,7 @@ fn spawn_h3_client(
                 maybe_batch = egress_rx.recv(), if was_established => {
                     let Some(packets) = maybe_batch else {
                         conn.close(true, 0, b"shutdown").ok();
-                        drain_send(&mut conn, &mut send_buf, &udp_send_tx).await;
+                        drain_send(&mut conn, max_udp_payload, &udp_send_tx).await;
                         return Ok(());
                     };
                     // SAFETY: `if was_established` guard guarantees `phase` is `Established`.
@@ -585,7 +586,7 @@ fn spawn_h3_client(
             }
 
             // Common post-arm: flush QUIC output and reset timer.
-            drain_send(&mut conn, &mut send_buf, &udp_send_tx).await;
+            drain_send(&mut conn, max_udp_payload, &udp_send_tx).await;
             reset_timer(timer.as_mut(), &conn);
 
             if conn.is_closed() {
@@ -615,22 +616,12 @@ fn reset_timer(timer: std::pin::Pin<&mut time::Sleep>, conn: &quiche::Connection
 // ========== Helper Functions ==========
 
 /// Decrypts a batch of received UDP packets by feeding them into quiche.
-fn handle_recv(
-    conn: &mut quiche::Connection,
-    batch: &[PooledBuf],
-    recv_buf: &mut [u8],
-    info: quiche::RecvInfo,
-) {
-    for pkt in batch {
-        debug_assert!(
-            pkt.len() <= recv_buf.len(),
-            "packet ({} B) exceeds recv_buf ({} B)",
-            pkt.len(),
-            recv_buf.len()
-        );
-        let len = pkt.len().min(recv_buf.len());
-        recv_buf[..len].copy_from_slice(&pkt[..len]);
-        match conn.recv(&mut recv_buf[..len], info) {
+///
+/// Takes ownership of the batch to pass each buffer mutably to `conn.recv()`,
+/// avoiding an intermediate copy through a shared receive buffer.
+fn handle_recv(conn: &mut quiche::Connection, batch: Vec<PooledBuf>, info: quiche::RecvInfo) {
+    for mut pkt in batch {
+        match conn.recv(&mut pkt, info) {
             Ok(_) | Err(quiche::Error::Done) => {}
             Err(e) => debug!(error = ?e, "quiche recv (non-fatal)"),
         }
@@ -639,17 +630,21 @@ fn handle_recv(
 
 /// Drains pending QUIC output packets to BareUDP TX.
 ///
+/// Allocates each packet directly from the pool and writes into it with
+/// `conn.send()`, avoiding an intermediate copy through a shared buffer.
 /// Uses `try_send` to avoid blocking the QUIC event loop on backpressure.
 async fn drain_send(
     conn: &mut quiche::Connection,
-    send_buf: &mut [u8],
+    max_udp_payload: usize,
     udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
 ) {
     let mut batch: Vec<PooledBuf> = Vec::new();
     loop {
-        match conn.send(send_buf) {
+        let mut buf = alloc_uninit_packet_buf(max_udp_payload);
+        match conn.send(&mut buf) {
             Ok((len, _send_info)) => {
-                batch.push(BufFactory::buf_from_slice(&send_buf[..len]));
+                buf.truncate(len);
+                batch.push(buf);
             }
             Err(quiche::Error::Done) => break,
             Err(e) => {
@@ -665,11 +660,15 @@ async fn drain_send(
 
 /// Drains inbound QUIC DATAGRAMs, strips QSI varint + Context ID, sends IP packets to TUN.
 ///
+/// Allocates each datagram directly from the pool and strips the framing
+/// prefix via `pop_front`, avoiding an intermediate copy. The stripped bytes
+/// become additional headroom for downstream `add_prefix` consumers.
+///
 /// Returns `false` if the ingress channel has closed (TUN side gone), so the
 /// caller can exit gracefully — consistent with the bare.rs actor pattern.
 async fn drain_ingress(
     conn: &mut quiche::Connection,
-    dgram_buf: &mut [u8],
+    max_udp_payload: usize,
     ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
     counters: &mut Counters,
 ) -> bool {
@@ -678,31 +677,30 @@ async fn drain_ingress(
     let mut ok_bytes: u64 = 0;
 
     loop {
-        match conn.dgram_recv(dgram_buf) {
+        let mut buf = alloc_uninit_packet_buf(max_udp_payload);
+        match conn.dgram_recv(&mut buf) {
             Ok(len) => {
-                let data = &dgram_buf[..len];
-                let Some(&first) = data.first() else {
+                buf.truncate(len);
+                let Some(&first) = buf.first() else {
                     counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
                     continue;
                 };
                 let qsi_len = varint_parse_len(first);
-                if data.len() < qsi_len {
+                // prefix = QSI varint + Context ID byte
+                let prefix_len = qsi_len + 1;
+                if len < prefix_len || buf[qsi_len] != CONTEXT_ID_IP {
                     counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
                     continue;
                 }
-                let rest = &data[qsi_len..];
-                if rest.is_empty() || rest[0] != CONTEXT_ID_IP {
+                // Strip QSI + Context ID; these bytes become extra headroom.
+                buf.pop_front(prefix_len);
+                if buf.is_empty() {
                     counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
                     continue;
                 }
-                let ip_pkt = &rest[1..];
-                if ip_pkt.is_empty() {
-                    counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
-                    continue;
-                }
-                batch.push(alloc_packet_buf(ip_pkt));
                 ok_pkts += 1;
-                ok_bytes += ip_pkt.len() as u64;
+                ok_bytes += buf.len() as u64;
+                batch.push(buf);
             }
             Err(quiche::Error::Done) => break,
             Err(e) => {
@@ -780,6 +778,7 @@ fn process_h3_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tun::alloc_packet_buf;
     use octets::Octets;
 
     #[test]
@@ -882,7 +881,6 @@ mod tests {
         };
         let phase = H3Phase::QuicHandshake { hs };
         let (ingress_tx, _ingress_rx) = mpsc::channel(1);
-        let mut dgram_buf = vec![0u8; 65535];
         let mut rx_counters = Counters::new(Source::Http3, Direction::Rx);
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -892,7 +890,7 @@ mod tests {
         let result = rt.block_on(advance_phase(
             phase,
             &mut conn,
-            &mut dgram_buf,
+            1350 + CONNECT_IP_OVERHEAD,
             &ingress_tx,
             &mut rx_counters,
             "test-peer",
