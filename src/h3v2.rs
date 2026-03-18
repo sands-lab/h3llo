@@ -25,7 +25,7 @@ use quiche::h3::NameValue;
 use rand::Rng;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
@@ -273,6 +273,15 @@ impl H3Session {
     }
 }
 
+/// Batch of IP packets waiting for `ingress_tx` capacity, with deferred metrics.
+struct PendingIngress {
+    batch: Vec<PooledBuf>,
+    pkts: u64,
+    bytes: u64,
+    /// When the batch first became pending (for congestion duration tracking).
+    since: Instant,
+}
+
 impl H3ClientEngine {
     fn recv_info(&self) -> quiche::RecvInfo {
         quiche::RecvInfo {
@@ -281,16 +290,11 @@ impl H3ClientEngine {
         }
     }
 
-    async fn flush_send(&mut self) {
-        drain_send(&mut self.conn, self.max_udp_payload, &self.udp_send_tx).await;
-    }
-
-    /// Close the QUIC connection and flush pending packets.
+    /// Best-effort flush of QUIC output to the UDP send channel.
     ///
-    /// Callers should `return` immediately after awaiting this method.
-    async fn close_flush(&mut self, reason: &[u8]) {
-        self.conn.close(true, 0, reason).ok();
-        self.flush_send().await;
+    /// Used during handshake and close, where pending-send tracking is unnecessary.
+    fn flush_send(&mut self) {
+        let _ = drain_send(&mut self.conn, self.max_udp_payload, &self.udp_send_tx);
     }
 
     /// Startup phase: wait for QUIC establishment + H3 CONNECT-IP acceptance.
@@ -298,7 +302,7 @@ impl H3ClientEngine {
         let recv_info = self.recv_info();
 
         // Send initial QUIC packets (e.g. ClientHello).
-        self.flush_send().await;
+        self.flush_send();
 
         let timer = time::sleep(self.conn.timeout().unwrap_or(MAX_TIMEOUT));
         tokio::pin!(timer);
@@ -339,7 +343,7 @@ impl H3ClientEngine {
                 }
             }
 
-            self.flush_send().await;
+            self.flush_send();
             reset_timer(timer.as_mut(), &self.conn);
 
             if self.conn.is_closed() {
@@ -387,6 +391,11 @@ impl H3ClientEngine {
     }
 
     /// Established phase: steady-state datagram forwarding.
+    ///
+    /// Uses three pending slots for zero-drop backpressure:
+    /// - `pending_ingress`: IP packets from dgram_recv waiting for `ingress_tx` capacity.
+    /// - `pending_egress`: IP packets from TUN waiting for `conn.dgram_send()` capacity.
+    /// - `pending_send`: encrypted QUIC packets waiting for `udp_send_tx` capacity.
     async fn run(mut self) -> ActorExitResult {
         let recv_info = self.recv_info();
         let mut session = self
@@ -394,102 +403,180 @@ impl H3ClientEngine {
             .take()
             .expect("session present after establish");
 
+        // Destructure into locals to avoid &mut self vs &self.field borrow
+        // conflicts inside tokio::select! (reserve() holds &Sender across arms).
+        let mut conn = self.conn;
+        let mut udp_recv_rx = self.udp_recv_rx;
+        let udp_send_tx = self.udp_send_tx;
+        let mut egress_rx = self.egress_rx;
+        let ingress_tx = self.ingress_tx;
+        let events_tx = self.events_tx;
+        let peer_id = self.peer_id;
+        let remote_addr = self.remote_addr;
+        let max_udp_payload = self.max_udp_payload;
+
         let mut rx_counters = Counters::new(Source::Http3, Direction::Rx);
         let mut tx_counters = Counters::new(Source::Http3, Direction::Tx);
+
+        let mut pending_ingress: Option<PendingIngress> = None;
+        let mut pending_egress: Option<Vec<PooledBuf>> = None;
+        let mut pending_send: Option<Vec<PooledBuf>> = None;
 
         let mut ticker = time::interval(self.metrics_interval);
         let mut keepalive = time::interval(self.keepalive_interval);
         keepalive.tick().await;
 
-        let timer = time::sleep(self.conn.timeout().unwrap_or(MAX_TIMEOUT));
+        let timer = time::sleep(conn.timeout().unwrap_or(MAX_TIMEOUT));
         tokio::pin!(timer);
+
+        /// Inline close helper: sends QUIC close frame and best-effort flushes.
+        macro_rules! close_flush {
+            ($reason:expr) => {{
+                conn.close(true, 0, $reason).ok();
+                let _ = drain_send(&mut conn, max_udp_payload, &udp_send_tx);
+            }};
+        }
 
         loop {
             tokio::select! {
-                maybe_batch = self.udp_recv_rx.recv() => {
+                // UDP → quiche → dgram_recv → ingress_tx.
+                // Blocked when ingress is pending (no room for more datagrams) or
+                // send is pending (no point feeding quiche if output can't leave).
+                maybe_batch = udp_recv_rx.recv(),
+                    if pending_ingress.is_none() && pending_send.is_none() =>
+                {
                     let Some(packets) = maybe_batch else {
-                        self.close_flush(b"udp rx closed").await;
+                        close_flush!(b"udp rx closed");
                         return Ok(());
                     };
 
-                    handle_recv(&mut self.conn, packets, recv_info);
+                    handle_recv(&mut conn, packets, recv_info);
 
-                    match session.poll_connect_response(&mut self.conn, &self.peer_id) {
+                    match session.poll_connect_response(&mut conn, &peer_id) {
                         Ok(ConnectPoll::Pending | ConnectPoll::Accepted) => {}
                         Ok(ConnectPoll::Rejected { status }) => {
-                            let reason = format!("CONNECT-IP rejected after establish: {status}");
-                            self.close_flush(b"connect-ip rejected").await;
-                            return Err(ActorError::H3Client {
-                                peer_id: self.peer_id,
-                                reason,
-                            });
+                            let reason =
+                                format!("CONNECT-IP rejected after establish: {status}");
+                            close_flush!(b"connect-ip rejected");
+                            return Err(ActorError::H3Client { peer_id, reason });
                         }
                         Ok(ConnectPoll::Closed { reason }) => {
-                            self.close_flush(b"connect-ip control closed").await;
-                            return Err(ActorError::H3Client {
-                                peer_id: self.peer_id,
-                                reason,
-                            });
+                            close_flush!(b"connect-ip control closed");
+                            return Err(ActorError::H3Client { peer_id, reason });
                         }
                         Err(e) => {
-                            self.close_flush(b"h3 poll error").await;
+                            close_flush!(b"h3 poll error");
                             return Err(ActorError::H3Client {
-                                peer_id: self.peer_id,
+                                peer_id,
                                 reason: e.to_string(),
                             });
                         }
                     }
 
-                    let ingress_open = drain_ingress(
-                        &mut self.conn,
-                        self.max_udp_payload,
-                        &self.ingress_tx,
+                    if let Some((batch, pkts, bytes)) = collect_ingress(
+                        &mut conn,
+                        max_udp_payload,
                         &mut rx_counters,
                         session.expected_qsi,
-                    ).await;
-
-                    if !ingress_open {
-                        self.close_flush(b"shutdown").await;
-                        return Ok(());
+                    ) {
+                        match ingress_tx.try_send(batch) {
+                            Ok(()) => {
+                                rx_counters.record_success(pkts, bytes);
+                            }
+                            Err(mpsc::error::TrySendError::Full(batch)) => {
+                                pending_ingress = Some(PendingIngress {
+                                    batch, pkts, bytes,
+                                    since: Instant::now(),
+                                });
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                close_flush!(b"shutdown");
+                                return Ok(());
+                            }
+                        }
                     }
                 }
 
-                maybe_batch = self.egress_rx.recv() => {
+                // Drain pending ingress when ingress_tx has capacity.
+                permit_res = ingress_tx.reserve(),
+                    if pending_ingress.is_some() =>
+                {
+                    match permit_res {
+                        Ok(permit) => {
+                            let pi = pending_ingress.take().unwrap();
+                            rx_counters.record_queue_full(pi.since.elapsed());
+                            rx_counters.record_success(pi.pkts, pi.bytes);
+                            permit.send(pi.batch);
+                        }
+                        Err(_closed) => {
+                            close_flush!(b"shutdown");
+                            return Ok(());
+                        }
+                    }
+                }
+
+                // TUN → dgram_send. Blocked when egress is pending (dgram queue full).
+                maybe_batch = egress_rx.recv(),
+                    if pending_egress.is_none() =>
+                {
                     let Some(packets) = maybe_batch else {
-                        self.close_flush(b"shutdown").await;
+                        close_flush!(b"shutdown");
                         return Ok(());
                     };
 
-                    handle_egress(
-                        &mut self.conn,
+                    pending_egress = handle_egress(
+                        &mut conn,
                         packets,
                         &session.qsi_bytes,
                         &mut tx_counters,
                     );
                 }
 
+                // Drain pending send when udp_send_tx has capacity.
+                permit_res = udp_send_tx.reserve(),
+                    if pending_send.is_some() =>
+                {
+                    match permit_res {
+                        Ok(permit) => {
+                            permit.send(pending_send.take().unwrap());
+                        }
+                        Err(_closed) => {
+                            close_flush!(b"udp tx closed");
+                            return Ok(());
+                        }
+                    }
+                }
+
                 _ = &mut timer => {
-                    self.conn.on_timeout();
+                    conn.on_timeout();
                 }
 
                 _ = keepalive.tick() => {
-                    self.conn.send_ack_eliciting().ok();
+                    conn.send_ack_eliciting().ok();
                 }
 
                 _ = ticker.tick() => {
-                    let rx = rx_counters.snapshot(Some(&self.peer_id), Some(self.remote_addr));
-                    let tx = tx_counters.snapshot(Some(&self.peer_id), Some(self.remote_addr));
-                    let _ = self.events_tx.send(Event::Metrics(rx));
-                    let _ = self.events_tx.send(Event::Metrics(tx));
+                    let rx = rx_counters.snapshot(Some(&peer_id), Some(remote_addr));
+                    let tx = tx_counters.snapshot(Some(&peer_id), Some(remote_addr));
+                    let _ = events_tx.send(Event::Metrics(rx));
+                    let _ = events_tx.send(Event::Metrics(tx));
                 }
             }
 
-            self.flush_send().await;
-            reset_timer(timer.as_mut(), &self.conn);
+            flush_and_retry_egress(
+                &mut conn,
+                max_udp_payload,
+                &udp_send_tx,
+                &mut pending_egress,
+                &mut pending_send,
+                &session.qsi_bytes,
+                &mut tx_counters,
+            );
+            reset_timer(timer.as_mut(), &conn);
 
-            if self.conn.is_closed() {
+            if conn.is_closed() {
                 return Err(ActorError::H3Client {
-                    peer_id: self.peer_id,
+                    peer_id,
                     reason: "QUIC connection closed".into(),
                 });
             }
@@ -723,14 +810,13 @@ fn handle_recv(conn: &mut quiche::Connection, batch: Vec<PooledBuf>, info: quich
 
 /// Drains pending QUIC output packets to BareUDP TX.
 ///
-/// Allocates each packet directly from the pool and writes into it with
-/// `conn.send()`, avoiding an intermediate copy through a shared buffer.
-/// Uses `try_send` to avoid blocking the QUIC event loop on backpressure.
-async fn drain_send(
+/// Returns the batch when `udp_send_tx` is full so the caller can store it
+/// as `pending_send` and retry via `reserve()`.
+fn drain_send(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
     udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
-) {
+) -> Option<Vec<PooledBuf>> {
     let mut batch: Vec<PooledBuf> = Vec::new();
     loop {
         let mut buf = alloc_uninit_packet_buf(max_udp_payload);
@@ -746,8 +832,13 @@ async fn drain_send(
             }
         }
     }
-    if !batch.is_empty() && udp_send_tx.try_send(batch).is_err() {
-        debug!("BareUDP TX channel full or closed; dropping QUIC output batch");
+    if batch.is_empty() {
+        return None;
+    }
+    match udp_send_tx.try_send(batch) {
+        Ok(()) => None,
+        Err(mpsc::error::TrySendError::Full(batch)) => Some(batch),
+        Err(mpsc::error::TrySendError::Closed(_)) => None,
     }
 }
 
@@ -770,20 +861,17 @@ fn validate_datagram_framing(buf: &[u8], expected_qsi: u64) -> Option<usize> {
     Some(prefix_len)
 }
 
-/// Drains inbound QUIC DATAGRAMs with QSI validation, strips framing, sends IP packets to TUN.
+/// Collects inbound QUIC DATAGRAMs with QSI validation and strips framing.
 ///
-/// Allocates each datagram directly from the pool and strips the framing prefix
-/// via `pop_front`, avoiding an intermediate copy.
-///
-/// Returns `false` if the ingress channel has closed (TUN side gone), so the
-/// caller can exit gracefully — consistent with the bare.rs actor pattern.
-async fn drain_ingress(
+/// Returns `(batch, pkts, bytes)` if any valid datagrams were collected, or
+/// `None` if the dgram queue was empty. The caller is responsible for sending
+/// the batch to `ingress_tx` (via `try_send` / pending pattern).
+fn collect_ingress(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
-    ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
     counters: &mut Counters,
     expected_qsi: u64,
-) -> bool {
+) -> Option<(Vec<PooledBuf>, u64, u64)> {
     let mut batch: Vec<PooledBuf> = Vec::new();
     let mut ok_pkts: u64 = 0;
     let mut ok_bytes: u64 = 0;
@@ -813,24 +901,28 @@ async fn drain_ingress(
     }
 
     if batch.is_empty() {
-        return true;
+        return None;
     }
 
-    counters
-        .send_and_record(ingress_tx, batch, ok_pkts, ok_bytes)
-        .await
+    Some((batch, ok_pkts, ok_bytes))
 }
 
 /// Encodes egress IP packets as QUIC DATAGRAMs with QSI varint + Context ID prefix.
+///
+/// Returns unsent packets (with framing stripped) when the dgram queue is full,
+/// so the caller can store them as `pending_egress` for retry after `flush_send`.
 fn handle_egress(
     conn: &mut quiche::Connection,
     packets: Vec<PooledBuf>,
     qsi_bytes: &[u8],
     counters: &mut Counters,
-) {
+) -> Option<Vec<PooledBuf>> {
+    let prefix_len = qsi_bytes.len() + 1;
     let mut ok_pkts: u64 = 0;
     let mut ok_bytes: u64 = 0;
-    for mut pkt in packets {
+    let mut iter = packets.into_iter();
+
+    while let Some(mut pkt) = iter.next() {
         let pkt_len = pkt.len() as u64;
         if !pkt.add_prefix(&[CONTEXT_ID_IP]) || !pkt.add_prefix(qsi_bytes) {
             counters.record_drop(DropReason::NoHeadroom, 1, pkt_len);
@@ -842,13 +934,58 @@ fn handle_egress(
                 ok_bytes += pkt_len;
             }
             Err(e) => {
-                debug!(error = ?e, "dgram_send failed");
-                counters.record_drop(DropReason::SendError, 1, pkt_len);
+                debug!(error = ?e, "dgram_send full; {} pkts pending", 1 + iter.size_hint().0);
+                // Undo framing on the failed packet and collect remaining.
+                pkt.pop_front(prefix_len);
+                let mut remaining = vec![pkt];
+                remaining.extend(iter);
+                if ok_pkts > 0 {
+                    counters.record_success(ok_pkts, ok_bytes);
+                }
+                return Some(remaining);
             }
         }
     }
+
     if ok_pkts > 0 {
         counters.record_success(ok_pkts, ok_bytes);
+    }
+    None
+}
+
+/// Retries pending egress datagrams and flushes QUIC output, with two-phase retry.
+///
+/// Phase 1: retry `pending_egress` (previous `drain_send` may have freed dgram space).
+/// Phase 2: `drain_send` encrypts queued datagrams into QUIC packets.
+/// Phase 3: retry `pending_egress` again (`drain_send` may have freed more space).
+/// Phase 4: final `drain_send` to flush any new QUIC output from phase 3.
+fn flush_and_retry_egress(
+    conn: &mut quiche::Connection,
+    max_udp_payload: usize,
+    udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
+    pending_egress: &mut Option<Vec<PooledBuf>>,
+    pending_send: &mut Option<Vec<PooledBuf>>,
+    qsi_bytes: &[u8],
+    tx_counters: &mut Counters,
+) {
+    // Phase 1: retry pending egress before drain.
+    if let Some(remaining) = pending_egress.take() {
+        *pending_egress = handle_egress(conn, remaining, qsi_bytes, tx_counters);
+    }
+
+    // Phase 2: drain conn.send() → udp_send_tx.
+    if pending_send.is_none() {
+        *pending_send = drain_send(conn, max_udp_payload, udp_send_tx);
+    }
+
+    // Phase 3: drain_send may have freed dgram queue space → retry again.
+    if let Some(remaining) = pending_egress.take() {
+        *pending_egress = handle_egress(conn, remaining, qsi_bytes, tx_counters);
+    }
+
+    // Phase 4: flush any new QUIC output from retried datagrams.
+    if pending_send.is_none() {
+        *pending_send = drain_send(conn, max_udp_payload, udp_send_tx);
     }
 }
 
