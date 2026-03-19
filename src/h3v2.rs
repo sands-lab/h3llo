@@ -273,11 +273,20 @@ impl H3Session {
     }
 }
 
-/// IP packets waiting for `ingress_tx` capacity.
-struct PendingIngress {
+/// Packet batch waiting for downstream capacity, with congestion timing.
+struct PendingBatch {
     batch: Vec<PooledBuf>,
     /// When the batch first became pending (for congestion duration tracking).
     since: Instant,
+}
+
+impl PendingBatch {
+    fn new(batch: Vec<PooledBuf>) -> Self {
+        Self {
+            batch,
+            since: Instant::now(),
+        }
+    }
 }
 
 impl H3ClientEngine {
@@ -418,9 +427,9 @@ impl H3ClientEngine {
         let mut rx_counters = Counters::new(Source::Http3, Direction::Rx);
         let mut tx_counters = Counters::new(Source::Http3, Direction::Tx);
 
-        let mut pending_ingress: Option<PendingIngress> = None;
-        let mut pending_egress: Option<Vec<PooledBuf>> = None;
-        let mut pending_send: Option<Vec<PooledBuf>> = None;
+        let mut pending_ingress: Option<PendingBatch> = None;
+        let mut pending_egress: Option<PendingBatch> = None;
+        let mut pending_send: Option<PendingBatch> = None;
 
         let mut ticker = time::interval(self.metrics_interval);
         let mut keepalive = time::interval(self.keepalive_interval);
@@ -484,10 +493,7 @@ impl H3ClientEngine {
                         match ingress_tx.try_send(batch) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(batch)) => {
-                                pending_ingress = Some(PendingIngress {
-                                    batch,
-                                    since: Instant::now(),
-                                });
+                                pending_ingress = Some(PendingBatch::new(batch));
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 close_flush!(b"shutdown");
@@ -523,12 +529,14 @@ impl H3ClientEngine {
                         return Ok(());
                     };
 
-                    pending_egress = handle_router_egress(
+                    if let Some(remaining) = handle_router_egress(
                         &mut conn,
                         packets,
                         &session.qsi_bytes,
                         &mut tx_counters,
-                    );
+                    ) {
+                        pending_egress = Some(PendingBatch::new(remaining));
+                    }
                 }
 
                 // Drain pending send when udp_send_tx has capacity.
@@ -537,7 +545,9 @@ impl H3ClientEngine {
                 {
                     match permit_res {
                         Ok(permit) => {
-                            permit.send(pending_send.take().unwrap());
+                            let ps = pending_send.take().unwrap();
+                            tx_counters.record_queue_full(ps.since.elapsed());
+                            permit.send(ps.batch);
                         }
                         Err(_closed) => {
                             close_flush!(b"udp tx closed");
@@ -951,21 +961,20 @@ fn handle_router_egress(
 
 /// Collects QUIC output and tries to send it to `udp_send_tx`.
 ///
-/// Returns `Some(batch)` when the channel is full so the caller can store it
-/// as `pending_send` for retry via `reserve()`. Returns `None` if no output
-/// was available or send succeeded.
+/// Returns a `PendingBatch` when the channel is full so the caller can
+/// store it as `pending_send` for retry via `reserve()`.
 fn flush_udp_send(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
     udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
-) -> Option<Vec<PooledBuf>> {
+) -> Option<PendingBatch> {
     let batch = collect_udp_send(conn, max_udp_payload);
     if batch.is_empty() {
         return None;
     }
     match udp_send_tx.try_send(batch) {
         Ok(()) => None,
-        Err(mpsc::error::TrySendError::Full(batch)) => Some(batch),
+        Err(mpsc::error::TrySendError::Full(batch)) => Some(PendingBatch::new(batch)),
         Err(mpsc::error::TrySendError::Closed(_)) => None,
     }
 }
@@ -979,8 +988,8 @@ fn flush_and_retry_router_egress(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
     udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
-    pending_egress: &mut Option<Vec<PooledBuf>>,
-    pending_send: &mut Option<Vec<PooledBuf>>,
+    pending_egress: &mut Option<PendingBatch>,
+    pending_send: &mut Option<PendingBatch>,
     qsi_bytes: &[u8],
     tx_counters: &mut Counters,
 ) {
@@ -990,8 +999,11 @@ fn flush_and_retry_router_egress(
     }
 
     // Step 2: retry pending egress with freed capacity.
-    if let Some(remaining) = pending_egress.take() {
-        *pending_egress = handle_router_egress(conn, remaining, qsi_bytes, tx_counters);
+    if let Some(pb) = pending_egress.take() {
+        tx_counters.record_queue_full(pb.since.elapsed());
+        if let Some(remaining) = handle_router_egress(conn, pb.batch, qsi_bytes, tx_counters) {
+            *pending_egress = Some(PendingBatch::new(remaining));
+        }
     }
 
     // Step 3: flush new QUIC output from successful retries.
