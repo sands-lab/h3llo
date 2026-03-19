@@ -422,10 +422,13 @@ impl PendingBatch {
     }
 }
 
-enum LoopStatus {
-    Continue,
-    ExitOk(&'static [u8]),
-    ExitErr {
+/// Exit reason for the established-phase event loop.
+///
+/// Carried out of the loop via `break` so that QUIC close + UDP flush
+/// happen exactly once, after the loop.
+enum LoopExit {
+    Ok(&'static [u8]),
+    Err {
         close_reason: &'static [u8],
         reason: String,
     },
@@ -459,16 +462,16 @@ impl RunState {
         packets: Vec<PooledBuf>,
         recv_info: quiche::RecvInfo,
         ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
-    ) -> LoopStatus {
+    ) -> Result<(), LoopExit> {
         handle_udp_recv(conn, packets, recv_info);
 
         match session.poll_connect_response(conn, &meta.peer_id) {
             Ok(ConnectProgress::Pending | ConnectProgress::Ready) => {}
             Err(err) => {
-                return LoopStatus::ExitErr {
+                return Err(LoopExit::Err {
                     close_reason: err.close_reason(),
                     reason: err.into_actor_reason(),
-                };
+                });
             }
         }
 
@@ -482,40 +485,30 @@ impl RunState {
             ),
         ) {
             Ok(pending) => pending,
-            Err(()) => return LoopStatus::ExitOk(b"shutdown"),
+            Err(()) => return Err(LoopExit::Ok(b"shutdown")),
         };
 
-        LoopStatus::Continue
+        Ok(())
     }
 
     fn drain_pending_ingress(
         &mut self,
         permit_res: Result<mpsc::Permit<'_, Vec<PooledBuf>>, mpsc::error::SendError<()>>,
-    ) -> LoopStatus {
-        if PendingBatch::resume(&mut self.pending_ingress, permit_res, |waited| {
+    ) -> Result<(), LoopExit> {
+        PendingBatch::resume(&mut self.pending_ingress, permit_res, |waited| {
             self.rx_counters.record_queue_full(waited);
         })
-        .is_err()
-        {
-            return LoopStatus::ExitOk(b"shutdown");
-        }
-
-        LoopStatus::Continue
+        .map_err(|()| LoopExit::Ok(b"shutdown"))
     }
 
     fn drain_pending_send(
         &mut self,
         permit_res: Result<mpsc::Permit<'_, Vec<PooledBuf>>, mpsc::error::SendError<()>>,
-    ) -> LoopStatus {
-        if PendingBatch::resume(&mut self.pending_send, permit_res, |waited| {
+    ) -> Result<(), LoopExit> {
+        PendingBatch::resume(&mut self.pending_send, permit_res, |waited| {
             self.tx_counters.record_queue_full(waited);
         })
-        .is_err()
-        {
-            return LoopStatus::ExitOk(b"udp tx closed");
-        }
-
-        LoopStatus::Continue
+        .map_err(|()| LoopExit::Ok(b"udp tx closed"))
     }
 
     fn flush_and_retry(
@@ -560,28 +553,18 @@ impl RunState {
     }
 }
 
-impl LoopStatus {
-    fn finish(
-        self,
-        conn: &mut quiche::Connection,
-        meta: &EngineMeta,
-        udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
-    ) -> Option<ActorExitResult> {
+impl LoopExit {
+    fn close_reason(&self) -> &'static [u8] {
         match self {
-            Self::Continue => None,
-            Self::ExitOk(reason) => {
-                conn.close(true, 0, reason).ok();
-                let _ = flush_udp_send(conn, meta.max_udp_payload, udp_send_tx);
-                Some(Ok(()))
-            }
-            Self::ExitErr {
-                close_reason,
-                reason,
-            } => {
-                conn.close(true, 0, close_reason).ok();
-                let _ = flush_udp_send(conn, meta.max_udp_payload, udp_send_tx);
-                Some(Err(meta.actor_error(reason)))
-            }
+            Self::Ok(r) => r,
+            Self::Err { close_reason, .. } => close_reason,
+        }
+    }
+
+    fn into_result(self, meta: &EngineMeta) -> ActorExitResult {
+        match self {
+            Self::Ok(_) => Ok(()),
+            Self::Err { reason, .. } => Err(meta.actor_error(reason)),
         }
     }
 }
@@ -722,7 +705,7 @@ impl H3ClientEngine {
         let timer = time::sleep(conn.timeout().unwrap_or(MAX_TIMEOUT));
         tokio::pin!(timer);
 
-        loop {
+        let exit: LoopExit = loop {
             let ingress_pending = run_state.pending_ingress.is_some();
             let egress_pending = run_state.pending_egress.is_some();
             let send_pending = run_state.pending_send.is_some();
@@ -736,24 +719,18 @@ impl H3ClientEngine {
                     if !ingress_pending =>
                 {
                     let Some(packets) = maybe_batch else {
-                        if let Some(result) = LoopStatus::ExitOk(b"udp rx closed")
-                            .finish(&mut conn, &meta, &udp_send_tx)
-                        {
-                            return result;
-                        }
-                        unreachable!("ExitOk always returns");
+                        break LoopExit::Ok(b"udp rx closed");
                     };
 
-                    let status = run_state.handle_udp_batch(
+                    if let Err(exit) = run_state.handle_udp_batch(
                         &mut conn,
                         &mut session,
                         &meta,
                         packets,
                         recv_info,
                         &ingress_tx,
-                    );
-                    if let Some(result) = status.finish(&mut conn, &meta, &udp_send_tx) {
-                        return result;
+                    ) {
+                        break exit;
                     }
                 }
 
@@ -761,9 +738,8 @@ impl H3ClientEngine {
                 permit_res = ingress_tx.reserve(),
                     if ingress_pending =>
                 {
-                    let status = run_state.drain_pending_ingress(permit_res);
-                    if let Some(result) = status.finish(&mut conn, &meta, &udp_send_tx) {
-                        return result;
+                    if let Err(exit) = run_state.drain_pending_ingress(permit_res) {
+                        break exit;
                     }
                 }
 
@@ -772,12 +748,7 @@ impl H3ClientEngine {
                     if !egress_pending =>
                 {
                     let Some(packets) = maybe_batch else {
-                        if let Some(result) =
-                            LoopStatus::ExitOk(b"shutdown").finish(&mut conn, &meta, &udp_send_tx)
-                        {
-                            return result;
-                        }
-                        unreachable!("ExitOk always returns");
+                        break LoopExit::Ok(b"shutdown");
                     };
 
                     if let Some(remaining) = handle_router_egress(
@@ -794,9 +765,8 @@ impl H3ClientEngine {
                 permit_res = udp_send_tx.reserve(),
                     if send_pending =>
                 {
-                    let status = run_state.drain_pending_send(permit_res);
-                    if let Some(result) = status.finish(&mut conn, &meta, &udp_send_tx) {
-                        return result;
+                    if let Err(exit) = run_state.drain_pending_send(permit_res) {
+                        break exit;
                     }
                 }
 
@@ -817,14 +787,25 @@ impl H3ClientEngine {
                 .flush_and_retry(&mut conn, &session, &meta, &udp_send_tx)
                 .is_err()
             {
-                return Err(meta.actor_error("BareUDP TX channel closed"));
+                break LoopExit::Err {
+                    close_reason: b"udp tx closed",
+                    reason: "BareUDP TX channel closed".into(),
+                };
             }
             reset_timer(timer.as_mut(), &conn);
 
             if conn.is_closed() {
-                return Err(meta.actor_error("QUIC connection closed"));
+                break LoopExit::Err {
+                    close_reason: b"conn closed",
+                    reason: "QUIC connection closed".into(),
+                };
             }
-        }
+        };
+
+        // Single cleanup point: close QUIC and flush remaining packets.
+        conn.close(true, 0, exit.close_reason()).ok();
+        let _ = flush_udp_send(&mut conn, meta.max_udp_payload, &udp_send_tx);
+        exit.into_result(&meta)
     }
 }
 
