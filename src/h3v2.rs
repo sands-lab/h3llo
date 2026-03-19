@@ -139,10 +139,8 @@ struct H3Session {
     h3_conn: Box<quiche::h3::Connection>,
     /// Stream ID of the CONNECT-IP request.
     connect_stream_id: u64,
-    /// Quarter Stream ID for DATAGRAM framing validation.
-    expected_qsi: u64,
-    /// Pre-encoded QSI varint bytes for DATAGRAM framing prefix.
-    qsi_bytes: Vec<u8>,
+    /// CONNECT-IP DATAGRAM framing codec for this request stream.
+    datagram_codec: ConnectIpDatagramCodec,
     /// Whether the CONNECT-IP request has been accepted (200 OK received).
     connect_accepted: bool,
 }
@@ -159,32 +157,137 @@ struct H3ClientEngine {
     connect_path: String,
     auth_header: String,
 
-    local_addr: SocketAddr,
-    remote_addr: SocketAddr,
-    peer_id: String,
-    max_udp_payload: usize,
-
-    udp_recv_rx: mpsc::Receiver<Vec<PooledBuf>>,
-    udp_send_tx: mpsc::Sender<Vec<PooledBuf>>,
-
-    egress_rx: mpsc::Receiver<Vec<PooledBuf>>,
-    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-    events_tx: mpsc::UnboundedSender<Event>,
+    io: EngineIo,
+    meta: EngineMeta,
+    run_state: RunState,
 
     metrics_interval: Duration,
     keepalive_interval: Duration,
 }
 
-/// Result of polling H3 events for the CONNECT-IP control stream.
-enum ConnectPoll {
-    /// No actionable events yet.
+/// Channels owned by the H3 client actor.
+struct EngineIo {
+    udp_recv_rx: mpsc::Receiver<Vec<PooledBuf>>,
+    udp_send_tx: mpsc::Sender<Vec<PooledBuf>>,
+    egress_rx: mpsc::Receiver<Vec<PooledBuf>>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+    events_tx: mpsc::UnboundedSender<Event>,
+}
+
+/// Connection metadata shared across startup and established phases.
+struct EngineMeta {
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    peer_id: String,
+    max_udp_payload: usize,
+}
+
+impl EngineMeta {
+    fn recv_info(&self) -> quiche::RecvInfo {
+        quiche::RecvInfo {
+            from: self.remote_addr,
+            to: self.local_addr,
+        }
+    }
+
+    fn actor_error(&self, reason: impl Into<String>) -> ActorError {
+        ActorError::H3Client {
+            peer_id: self.peer_id.clone(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Result of advancing CONNECT-IP control-plane state.
+enum ConnectProgress {
+    /// CONNECT-IP is not ready for datagram forwarding yet.
     Pending,
-    /// CONNECT-IP 200 OK received (or was already received).
-    Accepted,
+    /// CONNECT-IP is fully established and ready for datagrams.
+    Ready,
+}
+
+/// Error raised while advancing CONNECT-IP control-plane state.
+enum ConnectFailure {
     /// CONNECT-IP rejected with the given status code.
-    Rejected { status: String },
-    /// CONNECT-IP stream closed or errored.
-    Closed { reason: String },
+    Rejected(String),
+    /// CONNECT-IP stream closed unexpectedly.
+    Closed(String),
+    /// H3 control-plane polling itself failed.
+    Poll(String),
+}
+
+impl ConnectFailure {
+    fn close_reason(&self) -> &'static [u8] {
+        match self {
+            Self::Rejected(_) => b"connect-ip rejected",
+            Self::Closed(_) => b"connect-ip control closed",
+            Self::Poll(_) => b"h3 poll error",
+        }
+    }
+
+    fn into_dial_error(self) -> DialError {
+        match self {
+            Self::Rejected(status) => DialError::Rejected(status),
+            Self::Closed(reason) | Self::Poll(reason) => DialError::Handshake(reason),
+        }
+    }
+
+    fn into_actor_reason(self) -> String {
+        match self {
+            Self::Rejected(status) => format!("CONNECT-IP rejected after establish: {status}"),
+            Self::Closed(reason) | Self::Poll(reason) => reason,
+        }
+    }
+}
+
+/// CONNECT-IP DATAGRAM framing codec bound to one CONNECT request stream.
+struct ConnectIpDatagramCodec {
+    expected_qsi: u64,
+    qsi_bytes: Vec<u8>,
+}
+
+impl ConnectIpDatagramCodec {
+    fn new(connect_stream_id: u64) -> Self {
+        let expected_qsi = connect_stream_id / 4;
+        let qsi_bytes = encode_qsi(expected_qsi);
+        Self {
+            expected_qsi,
+            qsi_bytes,
+        }
+    }
+
+    fn prefix_len(&self) -> usize {
+        self.qsi_bytes.len() + 1
+    }
+
+    fn prepend(&self, packet: &mut PooledBuf) -> bool {
+        packet.add_prefix(&[CONTEXT_ID_IP]) && packet.add_prefix(&self.qsi_bytes)
+    }
+
+    fn strip(&self, packet: &mut PooledBuf) -> bool {
+        let Some((qsi, qsi_len)) = decode_qsi(packet) else {
+            return false;
+        };
+        if qsi != self.expected_qsi {
+            return false;
+        }
+
+        let prefix_len = qsi_len + 1;
+        if packet.len() < prefix_len || packet[qsi_len] != CONTEXT_ID_IP {
+            return false;
+        }
+        if packet.len() == prefix_len {
+            return false;
+        }
+
+        debug_assert_eq!(prefix_len, self.prefix_len());
+        packet.pop_front(prefix_len);
+        true
+    }
+
+    fn undo_prefix(&self, packet: &mut PooledBuf) {
+        packet.pop_front(self.prefix_len());
+    }
 }
 
 impl H3Session {
@@ -200,7 +303,7 @@ impl H3Session {
         &mut self,
         conn: &mut quiche::Connection,
         peer_id: &str,
-    ) -> Result<ConnectPoll, DialError> {
+    ) -> Result<ConnectProgress, ConnectFailure> {
         loop {
             match self.h3_conn.poll(conn) {
                 Ok((sid, quiche::h3::Event::Headers { list, .. })) => {
@@ -219,31 +322,27 @@ impl H3Session {
                             self.connect_accepted = true;
                         }
                         Some(code) => {
-                            return Ok(ConnectPoll::Rejected {
-                                status: code.to_string(),
-                            });
+                            return Err(ConnectFailure::Rejected(code.to_string()));
                         }
                         None => {
-                            return Ok(ConnectPoll::Closed {
-                                reason: "missing :status on CONNECT-IP response".into(),
-                            });
+                            return Err(ConnectFailure::Closed(
+                                "missing :status on CONNECT-IP response".into(),
+                            ));
                         }
                     }
                 }
 
                 Ok((sid, quiche::h3::Event::Finished)) => {
                     if sid == self.connect_stream_id {
-                        return Ok(ConnectPoll::Closed {
-                            reason: "CONNECT-IP stream finished".into(),
-                        });
+                        return Err(ConnectFailure::Closed("CONNECT-IP stream finished".into()));
                     }
                 }
 
                 Ok((sid, quiche::h3::Event::Reset(code))) => {
                     if sid == self.connect_stream_id {
-                        return Ok(ConnectPoll::Closed {
-                            reason: format!("CONNECT-IP stream reset: {code}"),
-                        });
+                        return Err(ConnectFailure::Closed(format!(
+                            "CONNECT-IP stream reset: {code}"
+                        )));
                     }
                 }
 
@@ -258,15 +357,15 @@ impl H3Session {
                 }
 
                 Err(quiche::h3::Error::Done) => {
-                    return Ok(if self.connect_accepted {
-                        ConnectPoll::Accepted
+                    return Ok(if self.connect_ready(conn) {
+                        ConnectProgress::Ready
                     } else {
-                        ConnectPoll::Pending
+                        ConnectProgress::Pending
                     });
                 }
 
                 Err(e) => {
-                    return Err(DialError::Handshake(format!("H3 poll: {e}")));
+                    return Err(ConnectFailure::Poll(format!("H3 poll: {e}")));
                 }
             }
         }
@@ -287,14 +386,209 @@ impl PendingBatch {
             since: Instant::now(),
         }
     }
+
+    fn enqueue(
+        tx: &mpsc::Sender<Vec<PooledBuf>>,
+        batch: Vec<PooledBuf>,
+    ) -> Result<Option<Self>, ()> {
+        if batch.is_empty() {
+            return Ok(None);
+        }
+
+        match tx.try_send(batch) {
+            Ok(()) => Ok(None),
+            Err(mpsc::error::TrySendError::Full(batch)) => Ok(Some(Self::new(batch))),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
+    }
+
+    fn resume<F>(
+        slot: &mut Option<Self>,
+        permit_res: Result<mpsc::Permit<'_, Vec<PooledBuf>>, mpsc::error::SendError<()>>,
+        on_waited: F,
+    ) -> Result<(), ()>
+    where
+        F: FnOnce(Duration),
+    {
+        match permit_res {
+            Ok(permit) => {
+                let pending = slot.take().expect("pending batch present");
+                on_waited(pending.since.elapsed());
+                permit.send(pending.batch);
+                Ok(())
+            }
+            Err(_closed) => Err(()),
+        }
+    }
+}
+
+enum LoopStatus {
+    Continue,
+    ExitOk(&'static [u8]),
+    ExitErr {
+        close_reason: &'static [u8],
+        reason: String,
+    },
+}
+
+/// Established-phase mutable state that does not own transport resources.
+struct RunState {
+    rx_counters: Counters,
+    tx_counters: Counters,
+    pending_ingress: Option<PendingBatch>,
+    pending_egress: Option<PendingBatch>,
+    pending_send: Option<PendingBatch>,
+}
+
+impl RunState {
+    fn new() -> Self {
+        Self {
+            rx_counters: Counters::new(Source::Http3, Direction::Rx),
+            tx_counters: Counters::new(Source::Http3, Direction::Tx),
+            pending_ingress: None,
+            pending_egress: None,
+            pending_send: None,
+        }
+    }
+
+    fn handle_udp_batch(
+        &mut self,
+        conn: &mut quiche::Connection,
+        session: &mut H3Session,
+        meta: &EngineMeta,
+        packets: Vec<PooledBuf>,
+        recv_info: quiche::RecvInfo,
+        ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
+    ) -> LoopStatus {
+        handle_udp_recv(conn, packets, recv_info);
+
+        match session.poll_connect_response(conn, &meta.peer_id) {
+            Ok(ConnectProgress::Pending | ConnectProgress::Ready) => {}
+            Err(err) => {
+                return LoopStatus::ExitErr {
+                    close_reason: err.close_reason(),
+                    reason: err.into_actor_reason(),
+                };
+            }
+        }
+
+        self.pending_ingress = match PendingBatch::enqueue(
+            ingress_tx,
+            collect_router_ingress(
+                conn,
+                meta.max_udp_payload,
+                &mut self.rx_counters,
+                &session.datagram_codec,
+            ),
+        ) {
+            Ok(pending) => pending,
+            Err(()) => return LoopStatus::ExitOk(b"shutdown"),
+        };
+
+        LoopStatus::Continue
+    }
+
+    fn drain_pending_ingress(
+        &mut self,
+        permit_res: Result<mpsc::Permit<'_, Vec<PooledBuf>>, mpsc::error::SendError<()>>,
+    ) -> LoopStatus {
+        if PendingBatch::resume(&mut self.pending_ingress, permit_res, |waited| {
+            self.rx_counters.record_queue_full(waited);
+        })
+        .is_err()
+        {
+            return LoopStatus::ExitOk(b"shutdown");
+        }
+
+        LoopStatus::Continue
+    }
+
+    fn drain_pending_send(
+        &mut self,
+        permit_res: Result<mpsc::Permit<'_, Vec<PooledBuf>>, mpsc::error::SendError<()>>,
+    ) -> LoopStatus {
+        if PendingBatch::resume(&mut self.pending_send, permit_res, |waited| {
+            self.tx_counters.record_queue_full(waited);
+        })
+        .is_err()
+        {
+            return LoopStatus::ExitOk(b"udp tx closed");
+        }
+
+        LoopStatus::Continue
+    }
+
+    fn flush_and_retry(
+        &mut self,
+        conn: &mut quiche::Connection,
+        session: &H3Session,
+        meta: &EngineMeta,
+        udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
+    ) -> Result<(), ()> {
+        if self.pending_send.is_none() {
+            self.pending_send = flush_udp_send(conn, meta.max_udp_payload, udp_send_tx)?;
+        }
+
+        if let Some(pending) = self.pending_egress.take() {
+            self.tx_counters.record_queue_full(pending.since.elapsed());
+            if let Some(remaining) = handle_router_egress(
+                conn,
+                pending.batch,
+                &session.datagram_codec,
+                &mut self.tx_counters,
+            ) {
+                self.pending_egress = Some(PendingBatch::new(remaining));
+            }
+        }
+
+        if self.pending_send.is_none() {
+            self.pending_send = flush_udp_send(conn, meta.max_udp_payload, udp_send_tx)?;
+        }
+
+        Ok(())
+    }
+
+    fn emit_metrics(&self, meta: &EngineMeta, events_tx: &mpsc::UnboundedSender<Event>) {
+        let rx = self
+            .rx_counters
+            .snapshot(Some(&meta.peer_id), Some(meta.remote_addr));
+        let tx = self
+            .tx_counters
+            .snapshot(Some(&meta.peer_id), Some(meta.remote_addr));
+        let _ = events_tx.send(Event::Metrics(rx));
+        let _ = events_tx.send(Event::Metrics(tx));
+    }
+}
+
+impl LoopStatus {
+    fn finish(
+        self,
+        conn: &mut quiche::Connection,
+        meta: &EngineMeta,
+        udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
+    ) -> Option<ActorExitResult> {
+        match self {
+            Self::Continue => None,
+            Self::ExitOk(reason) => {
+                conn.close(true, 0, reason).ok();
+                let _ = flush_udp_send(conn, meta.max_udp_payload, udp_send_tx);
+                Some(Ok(()))
+            }
+            Self::ExitErr {
+                close_reason,
+                reason,
+            } => {
+                conn.close(true, 0, close_reason).ok();
+                let _ = flush_udp_send(conn, meta.max_udp_payload, udp_send_tx);
+                Some(Err(meta.actor_error(reason)))
+            }
+        }
+    }
 }
 
 impl H3ClientEngine {
     fn recv_info(&self) -> quiche::RecvInfo {
-        quiche::RecvInfo {
-            from: self.remote_addr,
-            to: self.local_addr,
-        }
+        self.meta.recv_info()
     }
 
     /// Best-effort flush of QUIC output to the UDP send channel.
@@ -304,7 +598,11 @@ impl H3ClientEngine {
     /// handshake and CONNECTION_CLOSE is best-effort.
     fn flush_send(&mut self) {
         // Best-effort: ignore both Full and Closed during handshake/shutdown.
-        let _ = flush_udp_send(&mut self.conn, self.max_udp_payload, &self.udp_send_tx);
+        let _ = flush_udp_send(
+            &mut self.conn,
+            self.meta.max_udp_payload,
+            &self.io.udp_send_tx,
+        );
     }
 
     /// Startup phase: wait for QUIC establishment + H3 CONNECT-IP acceptance.
@@ -319,7 +617,7 @@ impl H3ClientEngine {
 
         loop {
             tokio::select! {
-                maybe_batch = self.udp_recv_rx.recv() => {
+                maybe_batch = self.io.udp_recv_rx.recv() => {
                     let Some(packets) = maybe_batch else {
                         return Err(DialError::Handshake("UDP Rx closed during startup".into()));
                     };
@@ -327,23 +625,15 @@ impl H3ClientEngine {
                     handle_udp_recv(&mut self.conn, packets, recv_info);
 
                     if self.session.is_none() && self.conn.is_established() {
-                        debug!(%self.peer_id, "QUIC established; starting H3 CONNECT-IP");
+                        debug!(%self.meta.peer_id, "QUIC established; starting H3 CONNECT-IP");
                         self.start_h3_connect()?;
                     }
 
                     if let Some(session) = &mut self.session {
-                        match session.poll_connect_response(&mut self.conn, &self.peer_id)? {
-                            ConnectPoll::Pending | ConnectPoll::Accepted => {}
-                            ConnectPoll::Rejected { status } => {
-                                return Err(DialError::Rejected(status));
-                            }
-                            ConnectPoll::Closed { reason } => {
-                                return Err(DialError::Handshake(reason));
-                            }
-                        }
-
-                        if session.connect_ready(&self.conn) {
-                            return Ok(self);
+                        match session.poll_connect_response(&mut self.conn, &self.meta.peer_id) {
+                            Ok(ConnectProgress::Pending) => {}
+                            Ok(ConnectProgress::Ready) => return Ok(self),
+                            Err(err) => return Err(err.into_dial_error()),
                         }
                     }
                 }
@@ -386,14 +676,10 @@ impl H3ClientEngine {
             .send_request(&mut self.conn, &connect_headers, false)
             .map_err(|e| DialError::Handshake(format!("send CONNECT: {e}")))?;
 
-        let expected_qsi = connect_stream_id / 4;
-        let qsi_bytes = encode_qsi(expected_qsi);
-
         self.session = Some(H3Session {
             h3_conn: Box::new(h3_conn),
             connect_stream_id,
-            expected_qsi,
-            qsi_bytes,
+            datagram_codec: ConnectIpDatagramCodec::new(connect_stream_id),
             connect_accepted: false,
         });
 
@@ -406,154 +692,111 @@ impl H3ClientEngine {
     /// - `pending_ingress`: IP packets from dgram_recv waiting for `ingress_tx` capacity.
     /// - `pending_egress`: IP packets from TUN waiting for `conn.dgram_send()` capacity.
     /// - `pending_send`: encrypted QUIC packets waiting for `udp_send_tx` capacity.
-    async fn run(mut self) -> ActorExitResult {
+    async fn run(self) -> ActorExitResult {
         let recv_info = self.recv_info();
-        let mut session = self
-            .session
-            .take()
-            .expect("session present after establish");
 
-        // Destructure into locals to avoid &mut self vs &self.field borrow
-        // conflicts inside tokio::select! (reserve() holds &Sender across arms).
-        let mut conn = self.conn;
-        let mut udp_recv_rx = self.udp_recv_rx;
-        let udp_send_tx = self.udp_send_tx;
-        let mut egress_rx = self.egress_rx;
-        let ingress_tx = self.ingress_tx;
-        let events_tx = self.events_tx;
-        let peer_id = self.peer_id;
-        let remote_addr = self.remote_addr;
-        let max_udp_payload = self.max_udp_payload;
+        let H3ClientEngine {
+            mut conn,
+            session,
+            io,
+            meta,
+            run_state,
+            metrics_interval,
+            keepalive_interval,
+            ..
+        } = self;
+        let mut session = session.expect("session present after establish");
+        let EngineIo {
+            mut udp_recv_rx,
+            udp_send_tx,
+            mut egress_rx,
+            ingress_tx,
+            events_tx,
+        } = io;
+        let mut run_state = run_state;
 
-        let mut rx_counters = Counters::new(Source::Http3, Direction::Rx);
-        let mut tx_counters = Counters::new(Source::Http3, Direction::Tx);
-
-        let mut pending_ingress: Option<PendingBatch> = None;
-        let mut pending_egress: Option<PendingBatch> = None;
-        let mut pending_send: Option<PendingBatch> = None;
-
-        let mut ticker = time::interval(self.metrics_interval);
-        let mut keepalive = time::interval(self.keepalive_interval);
+        let mut ticker = time::interval(metrics_interval);
+        let mut keepalive = time::interval(keepalive_interval);
         keepalive.tick().await;
 
         let timer = time::sleep(conn.timeout().unwrap_or(MAX_TIMEOUT));
         tokio::pin!(timer);
 
-        /// Inline close helper: sends QUIC close frame and best-effort flushes.
-        macro_rules! close_flush {
-            ($reason:expr) => {{
-                conn.close(true, 0, $reason).ok();
-                let _ = flush_udp_send(&mut conn, max_udp_payload, &udp_send_tx);
-            }};
-        }
-
         loop {
+            let ingress_pending = run_state.pending_ingress.is_some();
+            let egress_pending = run_state.pending_egress.is_some();
+            let send_pending = run_state.pending_send.is_some();
+
             tokio::select! {
                 // UDP → quiche → dgram_recv → ingress_tx.
                 // Blocked only when ingress is pending (no room for more datagrams).
                 // NOT blocked by pending_send — ACKs arriving here may resolve
                 // pending_egress, and pending_send drains quickly via reserve().
                 maybe_batch = udp_recv_rx.recv(),
-                    if pending_ingress.is_none() =>
+                    if !ingress_pending =>
                 {
                     let Some(packets) = maybe_batch else {
-                        close_flush!(b"udp rx closed");
-                        return Ok(());
+                        if let Some(result) = LoopStatus::ExitOk(b"udp rx closed")
+                            .finish(&mut conn, &meta, &udp_send_tx)
+                        {
+                            return result;
+                        }
+                        unreachable!("ExitOk always returns");
                     };
 
-                    handle_udp_recv(&mut conn, packets, recv_info);
-
-                    match session.poll_connect_response(&mut conn, &peer_id) {
-                        Ok(ConnectPoll::Pending | ConnectPoll::Accepted) => {}
-                        Ok(ConnectPoll::Rejected { status }) => {
-                            let reason =
-                                format!("CONNECT-IP rejected after establish: {status}");
-                            close_flush!(b"connect-ip rejected");
-                            return Err(ActorError::H3Client { peer_id, reason });
-                        }
-                        Ok(ConnectPoll::Closed { reason }) => {
-                            close_flush!(b"connect-ip control closed");
-                            return Err(ActorError::H3Client { peer_id, reason });
-                        }
-                        Err(e) => {
-                            close_flush!(b"h3 poll error");
-                            return Err(ActorError::H3Client {
-                                peer_id,
-                                reason: e.to_string(),
-                            });
-                        }
-                    }
-
-                    let batch = collect_router_ingress(
+                    let status = run_state.handle_udp_batch(
                         &mut conn,
-                        max_udp_payload,
-                        &mut rx_counters,
-                        session.expected_qsi,
+                        &mut session,
+                        &meta,
+                        packets,
+                        recv_info,
+                        &ingress_tx,
                     );
-                    if !batch.is_empty() {
-                        match ingress_tx.try_send(batch) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(batch)) => {
-                                pending_ingress = Some(PendingBatch::new(batch));
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                close_flush!(b"shutdown");
-                                return Ok(());
-                            }
-                        }
+                    if let Some(result) = status.finish(&mut conn, &meta, &udp_send_tx) {
+                        return result;
                     }
                 }
 
                 // Drain pending ingress when ingress_tx has capacity.
                 permit_res = ingress_tx.reserve(),
-                    if pending_ingress.is_some() =>
+                    if ingress_pending =>
                 {
-                    match permit_res {
-                        Ok(permit) => {
-                            let pi = pending_ingress.take().unwrap();
-                            rx_counters.record_queue_full(pi.since.elapsed());
-                            permit.send(pi.batch);
-                        }
-                        Err(_closed) => {
-                            close_flush!(b"shutdown");
-                            return Ok(());
-                        }
+                    let status = run_state.drain_pending_ingress(permit_res);
+                    if let Some(result) = status.finish(&mut conn, &meta, &udp_send_tx) {
+                        return result;
                     }
                 }
 
                 // TUN → dgram_send. Blocked when egress is pending (dgram queue full).
                 maybe_batch = egress_rx.recv(),
-                    if pending_egress.is_none() =>
+                    if !egress_pending =>
                 {
                     let Some(packets) = maybe_batch else {
-                        close_flush!(b"shutdown");
-                        return Ok(());
+                        if let Some(result) =
+                            LoopStatus::ExitOk(b"shutdown").finish(&mut conn, &meta, &udp_send_tx)
+                        {
+                            return result;
+                        }
+                        unreachable!("ExitOk always returns");
                     };
 
                     if let Some(remaining) = handle_router_egress(
                         &mut conn,
                         packets,
-                        &session.qsi_bytes,
-                        &mut tx_counters,
+                        &session.datagram_codec,
+                        &mut run_state.tx_counters,
                     ) {
-                        pending_egress = Some(PendingBatch::new(remaining));
+                        run_state.pending_egress = Some(PendingBatch::new(remaining));
                     }
                 }
 
                 // Drain pending send when udp_send_tx has capacity.
                 permit_res = udp_send_tx.reserve(),
-                    if pending_send.is_some() =>
+                    if send_pending =>
                 {
-                    match permit_res {
-                        Ok(permit) => {
-                            let ps = pending_send.take().unwrap();
-                            tx_counters.record_queue_full(ps.since.elapsed());
-                            permit.send(ps.batch);
-                        }
-                        Err(_closed) => {
-                            close_flush!(b"udp tx closed");
-                            return Ok(());
-                        }
+                    let status = run_state.drain_pending_send(permit_res);
+                    if let Some(result) = status.finish(&mut conn, &meta, &udp_send_tx) {
+                        return result;
                     }
                 }
 
@@ -566,36 +809,20 @@ impl H3ClientEngine {
                 }
 
                 _ = ticker.tick() => {
-                    let rx = rx_counters.snapshot(Some(&peer_id), Some(remote_addr));
-                    let tx = tx_counters.snapshot(Some(&peer_id), Some(remote_addr));
-                    let _ = events_tx.send(Event::Metrics(rx));
-                    let _ = events_tx.send(Event::Metrics(tx));
+                    run_state.emit_metrics(&meta, &events_tx);
                 }
             }
 
-            if flush_and_retry_router_egress(
-                &mut conn,
-                max_udp_payload,
-                &udp_send_tx,
-                &mut pending_egress,
-                &mut pending_send,
-                &session.qsi_bytes,
-                &mut tx_counters,
-            )
-            .is_err()
+            if run_state
+                .flush_and_retry(&mut conn, &session, &meta, &udp_send_tx)
+                .is_err()
             {
-                return Err(ActorError::H3Client {
-                    peer_id,
-                    reason: "BareUDP TX channel closed".into(),
-                });
+                return Err(meta.actor_error("BareUDP TX channel closed"));
             }
             reset_timer(timer.as_mut(), &conn);
 
             if conn.is_closed() {
-                return Err(ActorError::H3Client {
-                    peer_id,
-                    reason: "QUIC connection closed".into(),
-                });
+                return Err(meta.actor_error("QUIC connection closed"));
             }
         }
     }
@@ -724,17 +951,20 @@ pub async fn dial_h3_client<P: RouteProbe>(
         connect_path,
         auth_header,
 
-        local_addr,
-        remote_addr,
-        peer_id: peer_id.to_string(),
-        max_udp_payload,
-
-        udp_recv_rx,
-        udp_send_tx: udp_send_tx.clone(),
-
-        egress_rx,
-        ingress_tx,
-        events_tx: events_tx.clone(),
+        io: EngineIo {
+            udp_recv_rx,
+            udp_send_tx: udp_send_tx.clone(),
+            egress_rx,
+            ingress_tx,
+            events_tx: events_tx.clone(),
+        },
+        meta: EngineMeta {
+            local_addr,
+            remote_addr,
+            peer_id: peer_id.to_string(),
+            max_udp_payload,
+        },
+        run_state: RunState::new(),
 
         metrics_interval: tuning.metrics_push_interval,
         keepalive_interval: tuning.h3_keepalive_interval,
@@ -854,25 +1084,6 @@ fn collect_udp_send(conn: &mut quiche::Connection, max_udp_payload: usize) -> Ve
     batch
 }
 
-/// Validates and strips QSI + Context ID framing from a DATAGRAM buffer.
-///
-/// Returns the prefix length to strip on success, or `None` for any framing error.
-fn validate_datagram_framing(buf: &[u8], expected_qsi: u64) -> Option<usize> {
-    let (qsi, qsi_len) = decode_qsi(buf)?;
-    if qsi != expected_qsi {
-        return None;
-    }
-    let prefix_len = qsi_len + 1;
-    if buf.len() < prefix_len || buf[qsi_len] != CONTEXT_ID_IP {
-        return None;
-    }
-    // Must have IP payload after the prefix.
-    if buf.len() == prefix_len {
-        return None;
-    }
-    Some(prefix_len)
-}
-
 /// Collects inbound QUIC DATAGRAMs with QSI validation and strips framing.
 ///
 /// Records Rx success counters at decode time (Rx = decoded from QUIC, not
@@ -882,7 +1093,7 @@ fn collect_router_ingress(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
     counters: &mut Counters,
-    expected_qsi: u64,
+    codec: &ConnectIpDatagramCodec,
 ) -> Vec<PooledBuf> {
     let mut batch: Vec<PooledBuf> = Vec::new();
     let mut ok_pkts: u64 = 0;
@@ -894,12 +1105,10 @@ fn collect_router_ingress(
             Ok(len) => {
                 buf.truncate(len);
 
-                let Some(prefix_len) = validate_datagram_framing(&buf, expected_qsi) else {
+                if !codec.strip(&mut buf) {
                     counters.record_drop(DropReason::InvalidFraming, 1, len as u64);
                     continue;
-                };
-
-                buf.pop_front(prefix_len);
+                }
                 ok_pkts += 1;
                 ok_bytes += buf.len() as u64;
                 batch.push(buf);
@@ -925,17 +1134,16 @@ fn collect_router_ingress(
 fn handle_router_egress(
     conn: &mut quiche::Connection,
     packets: Vec<PooledBuf>,
-    qsi_bytes: &[u8],
+    codec: &ConnectIpDatagramCodec,
     counters: &mut Counters,
 ) -> Option<Vec<PooledBuf>> {
-    let prefix_len = qsi_bytes.len() + 1;
     let mut ok_pkts: u64 = 0;
     let mut ok_bytes: u64 = 0;
     let mut iter = packets.into_iter();
 
     while let Some(mut pkt) = iter.next() {
         let pkt_len = pkt.len() as u64;
-        if !pkt.add_prefix(&[CONTEXT_ID_IP]) || !pkt.add_prefix(qsi_bytes) {
+        if !codec.prepend(&mut pkt) {
             counters.record_drop(DropReason::NoHeadroom, 1, pkt_len);
             continue;
         }
@@ -950,7 +1158,7 @@ fn handle_router_egress(
                     "dgram_send queue full; {} pkts pending",
                     1 + iter.size_hint().0
                 );
-                pkt.pop_front(prefix_len);
+                codec.undo_prefix(&mut pkt);
                 let mut remaining = vec![pkt];
                 remaining.extend(iter);
                 if ok_pkts > 0 {
@@ -982,52 +1190,7 @@ fn flush_udp_send(
     max_udp_payload: usize,
     udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
 ) -> Result<Option<PendingBatch>, ()> {
-    let batch = collect_udp_send(conn, max_udp_payload);
-    if batch.is_empty() {
-        return Ok(None);
-    }
-    match udp_send_tx.try_send(batch) {
-        Ok(()) => Ok(None),
-        Err(mpsc::error::TrySendError::Full(batch)) => Ok(Some(PendingBatch::new(batch))),
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
-    }
-}
-
-/// Flushes QUIC output and retries pending egress datagrams.
-///
-/// 1. `conn.send()` drains the dgram queue, freeing space for retries.
-/// 2. Retry `pending_egress` with the freed capacity.
-/// 3. Flush any new QUIC output produced by successful retries.
-///
-/// Returns `Err(())` if `udp_send_tx` is closed.
-fn flush_and_retry_router_egress(
-    conn: &mut quiche::Connection,
-    max_udp_payload: usize,
-    udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
-    pending_egress: &mut Option<PendingBatch>,
-    pending_send: &mut Option<PendingBatch>,
-    qsi_bytes: &[u8],
-    tx_counters: &mut Counters,
-) -> Result<(), ()> {
-    // Step 1: flush QUIC output — conn.send() frees dgram queue slots.
-    if pending_send.is_none() {
-        *pending_send = flush_udp_send(conn, max_udp_payload, udp_send_tx)?;
-    }
-
-    // Step 2: retry pending egress with freed capacity.
-    if let Some(pb) = pending_egress.take() {
-        tx_counters.record_queue_full(pb.since.elapsed());
-        if let Some(remaining) = handle_router_egress(conn, pb.batch, qsi_bytes, tx_counters) {
-            *pending_egress = Some(PendingBatch::new(remaining));
-        }
-    }
-
-    // Step 3: flush new QUIC output from successful retries.
-    if pending_send.is_none() {
-        *pending_send = flush_udp_send(conn, max_udp_payload, udp_send_tx)?;
-    }
-
-    Ok(())
+    PendingBatch::enqueue(udp_send_tx, collect_udp_send(conn, max_udp_payload))
 }
 
 #[cfg(test)]
