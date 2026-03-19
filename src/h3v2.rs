@@ -778,13 +778,12 @@ impl H3ClientEngine {
 
 /// Establishes an outbound H3 client CONNECT-IP connection.
 ///
-/// Creates a UDP socket, spawns BareUDP Rx/Tx actors on cloned socket
-/// handles, builds the H3 client engine, and drives QUIC+H3 handshake
-/// on the crypto runtime before entering steady-state forwarding.
+/// Creates a UDP socket, spawns BareUDP Rx/Tx actors (on the caller's
+/// runtime via `tokio::spawn`), builds the H3 client engine, and drives
+/// QUIC+H3 handshake on `crypto_rt` before entering steady-state forwarding.
 ///
 /// # Arguments
 ///
-/// * `crypto_rt` - Runtime handle for spawning the H3 client engine.
 /// * `peer_h3` - Peer HTTP/3 configuration including endpoint, token, and TLS options.
 /// * `remote_addr` - Resolved remote server socket address.
 /// * `peer_id` - Authenticated peer identifier for logging and metrics.
@@ -792,6 +791,7 @@ impl H3ClientEngine {
 /// * `tun_mtu` - TUN MTU in bytes, used for QUIC payload sizing.
 /// * `probe` - Route probe for interface selection.
 /// * `tuning` - Tuning parameters (timeouts, buffers, congestion control).
+/// * `crypto_rt` - Runtime handle for the H3 engine (handshake + forwarding).
 /// * `ingress_tx` - Channel to forward decrypted IP packets toward the TUN.
 /// * `events_tx` - Channel for emitting metrics events.
 ///
@@ -800,7 +800,6 @@ impl H3ClientEngine {
 /// Returns `DialError` on socket, handshake, or timeout failure.
 #[allow(clippy::too_many_arguments)]
 pub async fn dial_h3_client<P: RouteProbe>(
-    crypto_rt: &RuntimeHandle,
     peer_h3: &PeerH3,
     remote_addr: SocketAddr,
     peer_id: &str,
@@ -808,6 +807,7 @@ pub async fn dial_h3_client<P: RouteProbe>(
     tun_mtu: u16,
     probe: &P,
     tuning: &Tuning,
+    crypto_rt: &RuntimeHandle,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
 ) -> Result<H3ClientConn, DialError> {
