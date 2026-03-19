@@ -448,10 +448,11 @@ impl H3ClientEngine {
         loop {
             tokio::select! {
                 // UDP → quiche → dgram_recv → ingress_tx.
-                // Blocked when ingress is pending (no room for more datagrams) or
-                // send is pending (no point feeding quiche if output can't leave).
+                // Blocked only when ingress is pending (no room for more datagrams).
+                // NOT blocked by pending_send — ACKs arriving here may resolve
+                // pending_egress, and pending_send drains quickly via reserve().
                 maybe_batch = udp_recv_rx.recv(),
-                    if pending_ingress.is_none() && pending_send.is_none() =>
+                    if pending_ingress.is_none() =>
                 {
                     let Some(packets) = maybe_batch else {
                         close_flush!(b"udp rx closed");
