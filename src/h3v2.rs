@@ -975,12 +975,11 @@ fn flush_udp_send(
     }
 }
 
-/// Retries pending egress datagrams and flushes QUIC output, with two-phase retry.
+/// Flushes QUIC output and retries pending egress datagrams.
 ///
-/// Phase 1: retry `pending_egress` (previous collect/send may have freed dgram space).
-/// Phase 2: collect + try-send QUIC output.
-/// Phase 3: retry `pending_egress` again (phase 2 may have freed more space).
-/// Phase 4: final collect + try-send for any new QUIC output from phase 3.
+/// 1. `conn.send()` drains the dgram queue, freeing space for retries.
+/// 2. Retry `pending_egress` with the freed capacity.
+/// 3. Flush any new QUIC output produced by successful retries.
 fn flush_and_retry_router_egress(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
@@ -990,22 +989,17 @@ fn flush_and_retry_router_egress(
     qsi_bytes: &[u8],
     tx_counters: &mut Counters,
 ) {
-    // Phase 1: retry pending egress before drain.
-    if let Some(remaining) = pending_egress.take() {
-        *pending_egress = handle_router_egress(conn, remaining, qsi_bytes, tx_counters);
-    }
-
-    // Phase 2: collect QUIC output → try_send to udp_send_tx.
+    // Step 1: flush QUIC output — conn.send() frees dgram queue slots.
     if pending_send.is_none() {
         *pending_send = flush_udp_send(conn, max_udp_payload, udp_send_tx);
     }
 
-    // Phase 3: drain may have freed dgram queue space → retry again.
+    // Step 2: retry pending egress with freed capacity.
     if let Some(remaining) = pending_egress.take() {
         *pending_egress = handle_router_egress(conn, remaining, qsi_bytes, tx_counters);
     }
 
-    // Phase 4: flush any new QUIC output from retried datagrams.
+    // Step 3: flush new QUIC output from successful retries.
     if pending_send.is_none() {
         *pending_send = flush_udp_send(conn, max_udp_payload, udp_send_tx);
     }
