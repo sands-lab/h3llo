@@ -40,7 +40,7 @@ pub enum BareUdpRxCommand {
 pub struct BareUdpRx {
     socket: UdpSocket,
     state: UdpSocketState,
-    mtu: usize,
+    max_udp_payload: usize,
 }
 
 /// Creates a BareUDP RX actor state from a pre-existing socket.
@@ -50,10 +50,17 @@ pub struct BareUdpRx {
 /// # Errors
 ///
 /// Returns `UdpError::Socket` if quinn-udp state init fails.
-pub(crate) fn bare_rx_from_socket(socket: UdpSocket, mtu: usize) -> Result<BareUdpRx, UdpError> {
+pub(crate) fn bare_rx_from_socket(
+    socket: UdpSocket,
+    max_udp_payload: usize,
+) -> Result<BareUdpRx, UdpError> {
     let state = UdpSocketState::new(UdpSockRef::from(&socket))
         .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
-    Ok(BareUdpRx { socket, state, mtu })
+    Ok(BareUdpRx {
+        socket,
+        state,
+        max_udp_payload,
+    })
 }
 
 /// Creates a BareUDP TX actor state from a pre-existing unconnected socket.
@@ -83,7 +90,7 @@ pub(crate) fn bare_tx_from_socket(
 /// # Arguments
 ///
 /// * `listen` - Resolved socket address to bind.
-/// * `mtu` - MTU for buffer sizing.
+/// * `max_udp_payload` - Maximum UDP payload size for buffer sizing.
 /// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
 ///
 /// # Errors
@@ -91,13 +98,17 @@ pub(crate) fn bare_tx_from_socket(
 /// Returns `UdpError::Socket` when socket binding fails.
 pub fn make_bare_rx(
     listen: SocketAddr,
-    mtu: usize,
+    max_udp_payload: usize,
     socket_buffer_bytes: usize,
 ) -> Result<BareUdpRx, UdpError> {
     let socket = make_server_udp_socket(listen, socket_buffer_bytes)?;
     let state = UdpSocketState::new(UdpSockRef::from(&socket))
         .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
-    Ok(BareUdpRx { socket, state, mtu })
+    Ok(BareUdpRx {
+        socket,
+        state,
+        max_udp_payload,
+    })
 }
 
 /// Provides send-only access to an unconnected BareUDP socket with quinn-udp GSO support.
@@ -181,7 +192,11 @@ pub fn spawn_udp_rx(
     // Actor creates and owns its command channel receiver
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-    let BareUdpRx { socket, state, mtu } = rx;
+    let BareUdpRx {
+        socket,
+        state,
+        max_udp_payload,
+    } = rx;
     let local_addr = socket
         .local_addr()
         .map(|a| a.to_string())
@@ -193,7 +208,7 @@ pub fn spawn_udp_rx(
         // on the socket; a buffer smaller than gro_segments() would silently
         // truncate coalesced datagrams, causing packet loss.
         let gro_segments = state.gro_segments();
-        let mut buf = vec![0u8; mtu * gro_segments];
+        let mut buf = vec![0u8; max_udp_payload * gro_segments];
         let mut counters = Counters::new(Source::BareUdp, Direction::Rx);
         let mut ticker = time::interval(interval);
         let mut meta = RecvMeta::default();
@@ -391,9 +406,13 @@ mod tests {
     use tokio_quiche::buf_factory::BufFactory;
 
     /// Creates a `BareUdpRx` directly from a socket for testing.
-    fn test_bare_rx(socket: UdpSocket, mtu: usize) -> BareUdpRx {
+    fn test_bare_rx(socket: UdpSocket, max_udp_payload: usize) -> BareUdpRx {
         let state = UdpSocketState::new(UdpSockRef::from(&socket)).unwrap();
-        BareUdpRx { socket, state, mtu }
+        BareUdpRx {
+            socket,
+            state,
+            max_udp_payload,
+        }
     }
 
     /// Creates a test `Tuning` with a custom metrics push interval.
@@ -423,7 +442,7 @@ mod tests {
         let result = make_bare_rx(listen, 1500, 0);
         assert!(result.is_ok());
         let rx = result.unwrap();
-        assert_eq!(rx.mtu, 1500);
+        assert_eq!(rx.max_udp_payload, 1500);
     }
 
     // ========== make_bare_tx Tests ==========
