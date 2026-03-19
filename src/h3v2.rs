@@ -296,10 +296,7 @@ impl H3ClientEngine {
     /// Drops on channel backpressure — acceptable because quiche retransmits during
     /// handshake and CONNECTION_CLOSE is best-effort.
     fn flush_send(&mut self) {
-        let batch = collect_udp_send(&mut self.conn, self.max_udp_payload);
-        if !batch.is_empty() {
-            let _ = self.udp_send_tx.try_send(batch);
-        }
+        let _ = flush_udp_send(&mut self.conn, self.max_udp_payload, &self.udp_send_tx);
     }
 
     /// Startup phase: wait for QUIC establishment + H3 CONNECT-IP acceptance.
@@ -438,10 +435,7 @@ impl H3ClientEngine {
         macro_rules! close_flush {
             ($reason:expr) => {{
                 conn.close(true, 0, $reason).ok();
-                let batch = collect_udp_send(&mut conn, max_udp_payload);
-                if !batch.is_empty() {
-                    let _ = udp_send_tx.try_send(batch);
-                }
+                let _ = flush_udp_send(&mut conn, max_udp_payload, &udp_send_tx);
             }};
         }
 
@@ -960,14 +954,20 @@ fn handle_router_egress(
     None
 }
 
-/// Tries to send a QUIC output batch to `udp_send_tx`.
+/// Collects QUIC output and tries to send it to `udp_send_tx`.
 ///
 /// Returns `Some(batch)` when the channel is full so the caller can store it
-/// as `pending_send` for retry via `reserve()`.
-fn try_send_udp(
+/// as `pending_send` for retry via `reserve()`. Returns `None` if no output
+/// was available or send succeeded.
+fn flush_udp_send(
+    conn: &mut quiche::Connection,
+    max_udp_payload: usize,
     udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
-    batch: Vec<PooledBuf>,
 ) -> Option<Vec<PooledBuf>> {
+    let batch = collect_udp_send(conn, max_udp_payload);
+    if batch.is_empty() {
+        return None;
+    }
     match udp_send_tx.try_send(batch) {
         Ok(()) => None,
         Err(mpsc::error::TrySendError::Full(batch)) => Some(batch),
@@ -997,10 +997,7 @@ fn flush_and_retry_router_egress(
 
     // Phase 2: collect QUIC output → try_send to udp_send_tx.
     if pending_send.is_none() {
-        let batch = collect_udp_send(conn, max_udp_payload);
-        if !batch.is_empty() {
-            *pending_send = try_send_udp(udp_send_tx, batch);
-        }
+        *pending_send = flush_udp_send(conn, max_udp_payload, udp_send_tx);
     }
 
     // Phase 3: drain may have freed dgram queue space → retry again.
@@ -1010,10 +1007,7 @@ fn flush_and_retry_router_egress(
 
     // Phase 4: flush any new QUIC output from retried datagrams.
     if pending_send.is_none() {
-        let batch = collect_udp_send(conn, max_udp_payload);
-        if !batch.is_empty() {
-            *pending_send = try_send_udp(udp_send_tx, batch);
-        }
+        *pending_send = flush_udp_send(conn, max_udp_payload, udp_send_tx);
     }
 }
 
