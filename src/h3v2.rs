@@ -681,22 +681,21 @@ impl H3ClientEngine {
         let H3ClientEngine {
             mut conn,
             session,
-            io,
+            io:
+                EngineIo {
+                    mut udp_recv_rx,
+                    udp_send_tx,
+                    mut egress_rx,
+                    ingress_tx,
+                    events_tx,
+                },
             meta,
-            run_state,
+            mut run_state,
             metrics_interval,
             keepalive_interval,
             ..
         } = self;
         let mut session = session.expect("session present after establish");
-        let EngineIo {
-            mut udp_recv_rx,
-            udp_send_tx,
-            mut egress_rx,
-            ingress_tx,
-            events_tx,
-        } = io;
-        let mut run_state = run_state;
 
         let mut ticker = time::interval(metrics_interval);
         let mut keepalive = time::interval(keepalive_interval);
