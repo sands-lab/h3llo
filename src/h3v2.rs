@@ -741,13 +741,19 @@ pub async fn dial_h3_client<P: RouteProbe>(
     };
 
     let startup_handle = crypto_rt.spawn(engine.establish());
+    tokio::pin!(startup_handle);
 
-    let result = match time::timeout(tuning.h3_handshake_timeout, startup_handle).await {
+    let result = match time::timeout(tuning.h3_handshake_timeout, &mut startup_handle).await {
         Ok(Ok(result)) => result,
         Ok(Err(join_err)) => Err(DialError::Handshake(format!(
             "startup task join error: {join_err}"
         ))),
-        Err(_) => Err(DialError::Timeout(tuning.h3_handshake_timeout)),
+        Err(_) => {
+            // Abort the detached establish task — dropping JoinHandle only
+            // detaches in Tokio, it does not cancel the spawned task.
+            startup_handle.abort();
+            Err(DialError::Timeout(tuning.h3_handshake_timeout))
+        }
     };
 
     let engine = match result {
