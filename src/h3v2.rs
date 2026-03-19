@@ -153,10 +153,6 @@ struct H3ClientEngine {
     conn: quiche::Connection,
     session: Option<H3Session>,
 
-    authority: String,
-    connect_path: String,
-    auth_header: String,
-
     io: EngineIo,
     meta: EngineMeta,
     run_state: RunState,
@@ -513,10 +509,6 @@ impl LoopExit {
 }
 
 impl H3ClientEngine {
-    fn recv_info(&self) -> quiche::RecvInfo {
-        self.meta.recv_info()
-    }
-
     /// Best-effort flush of QUIC output to the UDP send channel.
     ///
     /// Used during handshake and close, where pending-send tracking is unnecessary.
@@ -532,8 +524,13 @@ impl H3ClientEngine {
     }
 
     /// Startup phase: wait for QUIC establishment + H3 CONNECT-IP acceptance.
-    async fn establish(mut self) -> Result<Self, DialError> {
-        let recv_info = self.recv_info();
+    async fn establish(
+        mut self,
+        authority: String,
+        connect_path: String,
+        auth_header: String,
+    ) -> Result<Self, DialError> {
+        let recv_info = self.meta.recv_info();
 
         // Send initial QUIC packets (e.g. ClientHello).
         self.flush_send();
@@ -552,7 +549,10 @@ impl H3ClientEngine {
 
                     if self.session.is_none() && self.conn.is_established() {
                         debug!(%self.meta.peer_id, "QUIC established; starting H3 CONNECT-IP");
-                        self.start_h3_connect()?;
+                        Self::start_h3_connect(
+                            &mut self.conn, &mut self.session,
+                            &authority, &connect_path, &auth_header,
+                        )?;
                     }
 
                     if let Some(session) = &mut self.session {
@@ -581,28 +581,34 @@ impl H3ClientEngine {
     }
 
     /// Creates H3 connection, sends CONNECT-IP request, and stores session state.
-    fn start_h3_connect(&mut self) -> Result<(), DialError> {
+    fn start_h3_connect(
+        conn: &mut quiche::Connection,
+        session: &mut Option<H3Session>,
+        authority: &str,
+        connect_path: &str,
+        auth_header: &str,
+    ) -> Result<(), DialError> {
         let h3_config = quiche::h3::Config::new()
             .map_err(|e| DialError::Handshake(format!("h3 config: {e}")))?;
 
-        let mut h3_conn = quiche::h3::Connection::with_transport(&mut self.conn, &h3_config)
+        let mut h3_conn = quiche::h3::Connection::with_transport(conn, &h3_config)
             .map_err(|e| DialError::Handshake(format!("h3 connection: {e}")))?;
 
         let connect_headers = vec![
             quiche::h3::Header::new(b":method", b"CONNECT"),
             quiche::h3::Header::new(b":protocol", b"connect-ip"),
             quiche::h3::Header::new(b":scheme", b"https"),
-            quiche::h3::Header::new(b":authority", self.authority.as_bytes()),
-            quiche::h3::Header::new(b":path", self.connect_path.as_bytes()),
+            quiche::h3::Header::new(b":authority", authority.as_bytes()),
+            quiche::h3::Header::new(b":path", connect_path.as_bytes()),
             quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-            quiche::h3::Header::new(b"authorization", self.auth_header.as_bytes()),
+            quiche::h3::Header::new(b"authorization", auth_header.as_bytes()),
         ];
 
         let connect_stream_id = h3_conn
-            .send_request(&mut self.conn, &connect_headers, false)
+            .send_request(conn, &connect_headers, false)
             .map_err(|e| DialError::Handshake(format!("send CONNECT: {e}")))?;
 
-        self.session = Some(H3Session {
+        *session = Some(H3Session {
             h3_conn: Box::new(h3_conn),
             connect_stream_id,
             datagram_codec: ConnectIpDatagramCodec::new(connect_stream_id),
@@ -619,7 +625,7 @@ impl H3ClientEngine {
     /// - `pending_egress`: IP packets from TUN waiting for `conn.dgram_send()` capacity.
     /// - `pending_send`: encrypted QUIC packets waiting for `udp_send_tx` capacity.
     async fn run(self) -> ActorExitResult {
-        let recv_info = self.recv_info();
+        let recv_info = self.meta.recv_info();
 
         let H3ClientEngine {
             mut conn,
@@ -636,7 +642,6 @@ impl H3ClientEngine {
             mut run_state,
             metrics_interval,
             keepalive_interval,
-            ..
         } = self;
         let mut session = session.expect("session present after establish");
 
@@ -888,10 +893,6 @@ pub async fn dial_h3_client<P: RouteProbe>(
         conn,
         session: None,
 
-        authority,
-        connect_path,
-        auth_header,
-
         io: EngineIo {
             udp_recv_rx,
             udp_send_tx: udp_send_tx.clone(),
@@ -911,7 +912,7 @@ pub async fn dial_h3_client<P: RouteProbe>(
         keepalive_interval: tuning.h3_keepalive_interval,
     };
 
-    let startup_handle = crypto_rt.spawn(engine.establish());
+    let startup_handle = crypto_rt.spawn(engine.establish(authority, connect_path, auth_header));
     tokio::pin!(startup_handle);
 
     let result = match time::timeout(tuning.h3_handshake_timeout, &mut startup_handle).await {
@@ -982,11 +983,7 @@ fn decode_qsi(buf: &[u8]) -> Option<(u64, usize)> {
 ///
 /// Uses `MAX_TIMEOUT` as sentinel when quiche returns `None` (no pending timers).
 fn reset_timer(timer: std::pin::Pin<&mut time::Sleep>, conn: &quiche::Connection) {
-    let deadline = match conn.timeout() {
-        Some(d) => time::Instant::now() + d,
-        None => time::Instant::now() + MAX_TIMEOUT,
-    };
-    timer.reset(deadline);
+    timer.reset(time::Instant::now() + conn.timeout().unwrap_or(MAX_TIMEOUT));
 }
 
 /// Decrypts a batch of received UDP packets by feeding them into quiche.
@@ -1007,7 +1004,7 @@ fn handle_udp_recv(conn: &mut quiche::Connection, batch: Vec<PooledBuf>, info: q
 /// Pure function with no channel dependency — the caller is responsible for
 /// sending the batch via `try_send` + `pending_send` pattern.
 fn collect_udp_send(conn: &mut quiche::Connection, max_udp_payload: usize) -> Vec<PooledBuf> {
-    let mut batch: Vec<PooledBuf> = Vec::new();
+    let mut batch = Vec::new();
     loop {
         let mut buf = alloc_uninit_packet_buf(max_udp_payload);
         match conn.send(&mut buf) {
@@ -1036,7 +1033,7 @@ fn collect_router_ingress(
     counters: &mut Counters,
     codec: &ConnectIpDatagramCodec,
 ) -> Vec<PooledBuf> {
-    let mut batch: Vec<PooledBuf> = Vec::new();
+    let mut batch = Vec::new();
     let mut ok_pkts: u64 = 0;
     let mut ok_bytes: u64 = 0;
 
