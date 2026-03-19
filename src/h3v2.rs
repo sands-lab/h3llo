@@ -296,7 +296,7 @@ impl H3ClientEngine {
     /// Drops on channel backpressure — acceptable because quiche retransmits during
     /// handshake and CONNECTION_CLOSE is best-effort.
     fn flush_send(&mut self) {
-        let batch = collect_quic_output(&mut self.conn, self.max_udp_payload);
+        let batch = collect_udp_send(&mut self.conn, self.max_udp_payload);
         if !batch.is_empty() {
             let _ = self.udp_send_tx.try_send(batch);
         }
@@ -319,7 +319,7 @@ impl H3ClientEngine {
                         return Err(DialError::Handshake("UDP Rx closed during startup".into()));
                     };
 
-                    handle_recv(&mut self.conn, packets, recv_info);
+                    handle_udp_recv(&mut self.conn, packets, recv_info);
 
                     if self.session.is_none() && self.conn.is_established() {
                         debug!(%self.peer_id, "QUIC established; starting H3 CONNECT-IP");
@@ -438,7 +438,7 @@ impl H3ClientEngine {
         macro_rules! close_flush {
             ($reason:expr) => {{
                 conn.close(true, 0, $reason).ok();
-                let batch = collect_quic_output(&mut conn, max_udp_payload);
+                let batch = collect_udp_send(&mut conn, max_udp_payload);
                 if !batch.is_empty() {
                     let _ = udp_send_tx.try_send(batch);
                 }
@@ -458,7 +458,7 @@ impl H3ClientEngine {
                         return Ok(());
                     };
 
-                    handle_recv(&mut conn, packets, recv_info);
+                    handle_udp_recv(&mut conn, packets, recv_info);
 
                     match session.poll_connect_response(&mut conn, &peer_id) {
                         Ok(ConnectPoll::Pending | ConnectPoll::Accepted) => {}
@@ -481,7 +481,7 @@ impl H3ClientEngine {
                         }
                     }
 
-                    if let Some((batch, pkts, bytes)) = collect_ingress(
+                    if let Some((batch, pkts, bytes)) = collect_router_ingress(
                         &mut conn,
                         max_udp_payload,
                         &mut rx_counters,
@@ -532,7 +532,7 @@ impl H3ClientEngine {
                         return Ok(());
                     };
 
-                    pending_egress = handle_egress(
+                    pending_egress = handle_router_egress(
                         &mut conn,
                         packets,
                         &session.qsi_bytes,
@@ -571,7 +571,7 @@ impl H3ClientEngine {
                 }
             }
 
-            flush_and_retry_egress(
+            flush_and_retry_router_egress(
                 &mut conn,
                 max_udp_payload,
                 &udp_send_tx,
@@ -807,7 +807,7 @@ fn reset_timer(timer: std::pin::Pin<&mut time::Sleep>, conn: &quiche::Connection
 ///
 /// Takes ownership of the batch to pass each buffer mutably to `conn.recv()`,
 /// avoiding an intermediate copy through a shared receive buffer.
-fn handle_recv(conn: &mut quiche::Connection, batch: Vec<PooledBuf>, info: quiche::RecvInfo) {
+fn handle_udp_recv(conn: &mut quiche::Connection, batch: Vec<PooledBuf>, info: quiche::RecvInfo) {
     for mut pkt in batch {
         match conn.recv(&mut pkt, info) {
             Ok(_) | Err(quiche::Error::Done) => {}
@@ -820,7 +820,7 @@ fn handle_recv(conn: &mut quiche::Connection, batch: Vec<PooledBuf>, info: quich
 ///
 /// Pure function with no channel dependency — the caller is responsible for
 /// sending the batch via `try_send` + `pending_send` pattern.
-fn collect_quic_output(conn: &mut quiche::Connection, max_udp_payload: usize) -> Vec<PooledBuf> {
+fn collect_udp_send(conn: &mut quiche::Connection, max_udp_payload: usize) -> Vec<PooledBuf> {
     let mut batch: Vec<PooledBuf> = Vec::new();
     loop {
         let mut buf = alloc_uninit_packet_buf(max_udp_payload);
@@ -863,7 +863,7 @@ fn validate_datagram_framing(buf: &[u8], expected_qsi: u64) -> Option<usize> {
 /// Returns `(batch, pkts, bytes)` if any valid datagrams were collected, or
 /// `None` if the dgram queue was empty. The caller is responsible for sending
 /// the batch to `ingress_tx` (via `try_send` / pending pattern).
-fn collect_ingress(
+fn collect_router_ingress(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
     counters: &mut Counters,
@@ -908,7 +908,7 @@ fn collect_ingress(
 ///
 /// Returns unsent packets (with framing stripped) when the dgram queue is full,
 /// so the caller can store them as `pending_egress` for retry after `flush_send`.
-fn handle_egress(
+fn handle_router_egress(
     conn: &mut quiche::Connection,
     packets: Vec<PooledBuf>,
     qsi_bytes: &[u8],
@@ -963,7 +963,7 @@ fn handle_egress(
 ///
 /// Returns `Some(batch)` when the channel is full so the caller can store it
 /// as `pending_send` for retry via `reserve()`.
-fn try_send_quic_output(
+fn try_send_udp(
     udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
     batch: Vec<PooledBuf>,
 ) -> Option<Vec<PooledBuf>> {
@@ -980,7 +980,7 @@ fn try_send_quic_output(
 /// Phase 2: collect + try-send QUIC output.
 /// Phase 3: retry `pending_egress` again (phase 2 may have freed more space).
 /// Phase 4: final collect + try-send for any new QUIC output from phase 3.
-fn flush_and_retry_egress(
+fn flush_and_retry_router_egress(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
     udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
@@ -991,27 +991,27 @@ fn flush_and_retry_egress(
 ) {
     // Phase 1: retry pending egress before drain.
     if let Some(remaining) = pending_egress.take() {
-        *pending_egress = handle_egress(conn, remaining, qsi_bytes, tx_counters);
+        *pending_egress = handle_router_egress(conn, remaining, qsi_bytes, tx_counters);
     }
 
     // Phase 2: collect QUIC output → try_send to udp_send_tx.
     if pending_send.is_none() {
-        let batch = collect_quic_output(conn, max_udp_payload);
+        let batch = collect_udp_send(conn, max_udp_payload);
         if !batch.is_empty() {
-            *pending_send = try_send_quic_output(udp_send_tx, batch);
+            *pending_send = try_send_udp(udp_send_tx, batch);
         }
     }
 
     // Phase 3: drain may have freed dgram queue space → retry again.
     if let Some(remaining) = pending_egress.take() {
-        *pending_egress = handle_egress(conn, remaining, qsi_bytes, tx_counters);
+        *pending_egress = handle_router_egress(conn, remaining, qsi_bytes, tx_counters);
     }
 
     // Phase 4: flush any new QUIC output from retried datagrams.
     if pending_send.is_none() {
-        let batch = collect_quic_output(conn, max_udp_payload);
+        let batch = collect_udp_send(conn, max_udp_payload);
         if !batch.is_empty() {
-            *pending_send = try_send_quic_output(udp_send_tx, batch);
+            *pending_send = try_send_udp(udp_send_tx, batch);
         }
     }
 }
