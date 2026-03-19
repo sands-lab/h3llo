@@ -273,11 +273,9 @@ impl H3Session {
     }
 }
 
-/// Batch of IP packets waiting for `ingress_tx` capacity, with deferred metrics.
+/// IP packets waiting for `ingress_tx` capacity.
 struct PendingIngress {
     batch: Vec<PooledBuf>,
-    pkts: u64,
-    bytes: u64,
     /// When the batch first became pending (for congestion duration tracking).
     since: Instant,
 }
@@ -476,19 +474,18 @@ impl H3ClientEngine {
                         }
                     }
 
-                    if let Some((batch, pkts, bytes)) = collect_router_ingress(
+                    let batch = collect_router_ingress(
                         &mut conn,
                         max_udp_payload,
                         &mut rx_counters,
                         session.expected_qsi,
-                    ) {
+                    );
+                    if !batch.is_empty() {
                         match ingress_tx.try_send(batch) {
-                            Ok(()) => {
-                                rx_counters.record_success(pkts, bytes);
-                            }
+                            Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(batch)) => {
                                 pending_ingress = Some(PendingIngress {
-                                    batch, pkts, bytes,
+                                    batch,
                                     since: Instant::now(),
                                 });
                             }
@@ -508,7 +505,6 @@ impl H3ClientEngine {
                         Ok(permit) => {
                             let pi = pending_ingress.take().unwrap();
                             rx_counters.record_queue_full(pi.since.elapsed());
-                            rx_counters.record_success(pi.pkts, pi.bytes);
                             permit.send(pi.batch);
                         }
                         Err(_closed) => {
@@ -855,15 +851,15 @@ fn validate_datagram_framing(buf: &[u8], expected_qsi: u64) -> Option<usize> {
 
 /// Collects inbound QUIC DATAGRAMs with QSI validation and strips framing.
 ///
-/// Returns `(batch, pkts, bytes)` if any valid datagrams were collected, or
-/// `None` if the dgram queue was empty. The caller is responsible for sending
-/// the batch to `ingress_tx` (via `try_send` / pending pattern).
+/// Records Rx success counters at decode time (Rx = decoded from QUIC, not
+/// downstream delivery). Returns the batch for the caller to send via
+/// `try_send` / pending pattern.
 fn collect_router_ingress(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
     counters: &mut Counters,
     expected_qsi: u64,
-) -> Option<(Vec<PooledBuf>, u64, u64)> {
+) -> Vec<PooledBuf> {
     let mut batch: Vec<PooledBuf> = Vec::new();
     let mut ok_pkts: u64 = 0;
     let mut ok_bytes: u64 = 0;
@@ -892,11 +888,10 @@ fn collect_router_ingress(
         }
     }
 
-    if batch.is_empty() {
-        return None;
+    if ok_pkts > 0 {
+        counters.record_success(ok_pkts, ok_bytes);
     }
-
-    Some((batch, ok_pkts, ok_bytes))
+    batch
 }
 
 /// Encodes egress IP packets as QUIC DATAGRAMs with QSI varint + Context ID prefix.
