@@ -454,63 +454,6 @@ impl RunState {
         }
     }
 
-    fn handle_udp_batch(
-        &mut self,
-        conn: &mut quiche::Connection,
-        session: &mut H3Session,
-        meta: &EngineMeta,
-        packets: Vec<PooledBuf>,
-        recv_info: quiche::RecvInfo,
-        ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
-    ) -> Result<(), LoopExit> {
-        handle_udp_recv(conn, packets, recv_info);
-
-        match session.poll_connect_response(conn, &meta.peer_id) {
-            Ok(ConnectProgress::Pending | ConnectProgress::Ready) => {}
-            Err(err) => {
-                return Err(LoopExit::Err {
-                    close_reason: err.close_reason(),
-                    reason: err.into_actor_reason(),
-                });
-            }
-        }
-
-        self.pending_ingress = match PendingBatch::enqueue(
-            ingress_tx,
-            collect_router_ingress(
-                conn,
-                meta.max_udp_payload,
-                &mut self.rx_counters,
-                &session.datagram_codec,
-            ),
-        ) {
-            Ok(pending) => pending,
-            Err(()) => return Err(LoopExit::Ok(b"shutdown")),
-        };
-
-        Ok(())
-    }
-
-    fn drain_pending_ingress(
-        &mut self,
-        permit_res: Result<mpsc::Permit<'_, Vec<PooledBuf>>, mpsc::error::SendError<()>>,
-    ) -> Result<(), LoopExit> {
-        PendingBatch::resume(&mut self.pending_ingress, permit_res, |waited| {
-            self.rx_counters.record_queue_full(waited);
-        })
-        .map_err(|()| LoopExit::Ok(b"shutdown"))
-    }
-
-    fn drain_pending_send(
-        &mut self,
-        permit_res: Result<mpsc::Permit<'_, Vec<PooledBuf>>, mpsc::error::SendError<()>>,
-    ) -> Result<(), LoopExit> {
-        PendingBatch::resume(&mut self.pending_send, permit_res, |waited| {
-            self.tx_counters.record_queue_full(waited);
-        })
-        .map_err(|()| LoopExit::Ok(b"udp tx closed"))
-    }
-
     fn flush_and_retry(
         &mut self,
         conn: &mut quiche::Connection,
@@ -721,24 +664,39 @@ impl H3ClientEngine {
                         break LoopExit::Ok(b"udp rx closed");
                     };
 
-                    if let Err(exit) = run_state.handle_udp_batch(
-                        &mut conn,
-                        &mut session,
-                        &meta,
-                        packets,
-                        recv_info,
-                        &ingress_tx,
-                    ) {
-                        break exit;
+                    handle_udp_recv(&mut conn, packets, recv_info);
+
+                    match session.poll_connect_response(&mut conn, &meta.peer_id) {
+                        Ok(ConnectProgress::Pending | ConnectProgress::Ready) => {}
+                        Err(err) => break LoopExit::Err {
+                            close_reason: err.close_reason(),
+                            reason: err.into_actor_reason(),
+                        },
                     }
+
+                    run_state.pending_ingress = match PendingBatch::enqueue(
+                        &ingress_tx,
+                        collect_router_ingress(
+                            &mut conn,
+                            meta.max_udp_payload,
+                            &mut run_state.rx_counters,
+                            &session.datagram_codec,
+                        ),
+                    ) {
+                        Ok(pending) => pending,
+                        Err(()) => break LoopExit::Ok(b"shutdown"),
+                    };
                 }
 
                 // Drain pending ingress when ingress_tx has capacity.
                 permit_res = ingress_tx.reserve(),
                     if ingress_pending =>
                 {
-                    if let Err(exit) = run_state.drain_pending_ingress(permit_res) {
-                        break exit;
+                    if PendingBatch::resume(
+                        &mut run_state.pending_ingress, permit_res,
+                        |waited| run_state.rx_counters.record_queue_full(waited),
+                    ).is_err() {
+                        break LoopExit::Ok(b"shutdown");
                     }
                 }
 
@@ -764,8 +722,11 @@ impl H3ClientEngine {
                 permit_res = udp_send_tx.reserve(),
                     if send_pending =>
                 {
-                    if let Err(exit) = run_state.drain_pending_send(permit_res) {
-                        break exit;
+                    if PendingBatch::resume(
+                        &mut run_state.pending_send, permit_res,
+                        |waited| run_state.tx_counters.record_queue_full(waited),
+                    ).is_err() {
+                        break LoopExit::Ok(b"udp tx closed");
                     }
                 }
 
