@@ -303,6 +303,7 @@ impl H3ClientEngine {
     /// Drops on channel backpressure — acceptable because quiche retransmits during
     /// handshake and CONNECTION_CLOSE is best-effort.
     fn flush_send(&mut self) {
+        // Best-effort: ignore both Full and Closed during handshake/shutdown.
         let _ = flush_udp_send(&mut self.conn, self.max_udp_payload, &self.udp_send_tx);
     }
 
@@ -572,7 +573,7 @@ impl H3ClientEngine {
                 }
             }
 
-            flush_and_retry_router_egress(
+            if flush_and_retry_router_egress(
                 &mut conn,
                 max_udp_payload,
                 &udp_send_tx,
@@ -580,7 +581,14 @@ impl H3ClientEngine {
                 &mut pending_send,
                 &session.qsi_bytes,
                 &mut tx_counters,
-            );
+            )
+            .is_err()
+            {
+                return Err(ActorError::H3Client {
+                    peer_id,
+                    reason: "BareUDP TX channel closed".into(),
+                });
+            }
             reset_timer(timer.as_mut(), &conn);
 
             if conn.is_closed() {
@@ -961,21 +969,21 @@ fn handle_router_egress(
 
 /// Collects QUIC output and tries to send it to `udp_send_tx`.
 ///
-/// Returns a `PendingBatch` when the channel is full so the caller can
-/// store it as `pending_send` for retry via `reserve()`.
+/// Returns `Ok(Some(batch))` when the channel is full (store as `pending_send`),
+/// `Ok(None)` on success or empty, `Err(())` when the channel is closed.
 fn flush_udp_send(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
     udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
-) -> Option<PendingBatch> {
+) -> Result<Option<PendingBatch>, ()> {
     let batch = collect_udp_send(conn, max_udp_payload);
     if batch.is_empty() {
-        return None;
+        return Ok(None);
     }
     match udp_send_tx.try_send(batch) {
-        Ok(()) => None,
-        Err(mpsc::error::TrySendError::Full(batch)) => Some(PendingBatch::new(batch)),
-        Err(mpsc::error::TrySendError::Closed(_)) => None,
+        Ok(()) => Ok(None),
+        Err(mpsc::error::TrySendError::Full(batch)) => Ok(Some(PendingBatch::new(batch))),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
     }
 }
 
@@ -984,6 +992,8 @@ fn flush_udp_send(
 /// 1. `conn.send()` drains the dgram queue, freeing space for retries.
 /// 2. Retry `pending_egress` with the freed capacity.
 /// 3. Flush any new QUIC output produced by successful retries.
+///
+/// Returns `Err(())` if `udp_send_tx` is closed.
 fn flush_and_retry_router_egress(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
@@ -992,10 +1002,10 @@ fn flush_and_retry_router_egress(
     pending_send: &mut Option<PendingBatch>,
     qsi_bytes: &[u8],
     tx_counters: &mut Counters,
-) {
+) -> Result<(), ()> {
     // Step 1: flush QUIC output — conn.send() frees dgram queue slots.
     if pending_send.is_none() {
-        *pending_send = flush_udp_send(conn, max_udp_payload, udp_send_tx);
+        *pending_send = flush_udp_send(conn, max_udp_payload, udp_send_tx)?;
     }
 
     // Step 2: retry pending egress with freed capacity.
@@ -1008,8 +1018,10 @@ fn flush_and_retry_router_egress(
 
     // Step 3: flush new QUIC output from successful retries.
     if pending_send.is_none() {
-        *pending_send = flush_udp_send(conn, max_udp_payload, udp_send_tx);
+        *pending_send = flush_udp_send(conn, max_udp_payload, udp_send_tx)?;
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
