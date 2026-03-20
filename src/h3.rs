@@ -1187,10 +1187,107 @@ pub fn spawn_h3_listener(
     (cmd_tx, handle, bound_addr)
 }
 
+// ========== Test Support ==========
+
+/// Shared test utilities for H3 integration tests across modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::config::{H3Endpoint, PeerH3, Tuning};
+    use std::net::SocketAddr;
+
+    /// Test certificate bundle with temporary files.
+    ///
+    /// Generates a self-signed TLS certificate for `localhost` / `127.0.0.1`
+    /// using rcgen. The temporary files are cleaned up on drop.
+    pub struct TestCertBundle {
+        cert_file: tempfile::NamedTempFile,
+        key_file: tempfile::NamedTempFile,
+    }
+
+    impl TestCertBundle {
+        /// Generates a self-signed certificate for localhost using rcgen.
+        pub fn generate() -> Self {
+            use rcgen::{generate_simple_self_signed, CertifiedKey};
+            use std::io::Write;
+
+            let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+            let CertifiedKey { cert, signing_key } =
+                generate_simple_self_signed(subject_alt_names).expect("cert generation");
+
+            let mut cert_file = tempfile::NamedTempFile::new().expect("create cert temp file");
+            cert_file
+                .write_all(cert.pem().as_bytes())
+                .expect("write cert");
+
+            let mut key_file = tempfile::NamedTempFile::new().expect("create key temp file");
+            key_file
+                .write_all(signing_key.serialize_pem().as_bytes())
+                .expect("write key");
+
+            Self {
+                cert_file,
+                key_file,
+            }
+        }
+
+        /// Returns the path to the certificate PEM file.
+        pub fn cert_path(&self) -> &std::path::Path {
+            self.cert_file.path()
+        }
+
+        /// Returns the path to the private key PEM file.
+        pub fn key_path(&self) -> &std::path::Path {
+            self.key_file.path()
+        }
+    }
+
+    /// Returns `Tuning` with `h3_insecure_skip_verify: true` for tests using self-signed certs.
+    pub fn insecure_tuning() -> Tuning {
+        Tuning {
+            h3_insecure_skip_verify: true,
+            ..Default::default()
+        }
+    }
+
+    /// Creates a test `PeerH3` config pointing at the given server address.
+    pub fn test_peer_h3(bound_addr: SocketAddr, token: &str) -> PeerH3 {
+        PeerH3 {
+            endpoint: Some(H3Endpoint {
+                host: "localhost".to_string(),
+                port: bound_addr.port(),
+                path: "/.well-known/masque/udp/*/*/".to_string(),
+            }),
+            token: token.to_string(),
+            bindif: None,
+            sni: None,
+        }
+    }
+
+    /// Waits for an `H3ConnectedEvent` on the events channel, with timeout.
+    ///
+    /// Skips non-H3Connected events (e.g. metrics). Panics on timeout or if
+    /// the channel closes before an H3Connected event arrives.
+    pub async fn await_server_connection(
+        events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::events::Event>,
+    ) -> crate::events::H3ConnectedEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = events_rx.recv().await {
+                if let crate::events::Event::H3Connected(connected) = event {
+                    return connected;
+                }
+            }
+            panic!("events channel closed without H3Connected");
+        })
+        .await
+        .expect("timeout waiting for H3Connected event")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bind::test_support::FakeRouteProbe;
+    use test_support::{await_server_connection, insecure_tuning, test_peer_h3, TestCertBundle};
 
     // ========== Auth Helper Tests ==========
 
@@ -1392,49 +1489,6 @@ mod tests {
         assert!(err.to_string().contains("cert expired"));
     }
 
-    // ========== Test Utilities ==========
-
-    /// Test certificate bundle with temporary files.
-    struct TestCertBundle {
-        cert_file: tempfile::NamedTempFile,
-        key_file: tempfile::NamedTempFile,
-    }
-
-    impl TestCertBundle {
-        /// Generates a self-signed certificate for localhost using rcgen.
-        fn generate() -> Self {
-            use rcgen::{generate_simple_self_signed, CertifiedKey};
-            use std::io::Write;
-
-            let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-            let CertifiedKey { cert, signing_key } =
-                generate_simple_self_signed(subject_alt_names).expect("cert generation");
-
-            let mut cert_file = tempfile::NamedTempFile::new().expect("create cert temp file");
-            cert_file
-                .write_all(cert.pem().as_bytes())
-                .expect("write cert");
-
-            let mut key_file = tempfile::NamedTempFile::new().expect("create key temp file");
-            key_file
-                .write_all(signing_key.serialize_pem().as_bytes())
-                .expect("write key");
-
-            Self {
-                cert_file,
-                key_file,
-            }
-        }
-
-        fn cert_path(&self) -> &std::path::Path {
-            self.cert_file.path()
-        }
-
-        fn key_path(&self) -> &std::path::Path {
-            self.key_file.path()
-        }
-    }
-
     // ========== find_header_value Tests ==========
 
     #[test]
@@ -1574,31 +1628,6 @@ mod tests {
         );
     }
 
-    // ========== Test Helper: build PeerH3 for dial tests ==========
-
-    /// Returns `Tuning` with `h3_insecure_skip_verify: true` for tests using self-signed certs.
-    fn insecure_tuning() -> Tuning {
-        Tuning {
-            h3_insecure_skip_verify: true,
-            ..Default::default()
-        }
-    }
-
-    /// Creates a test `PeerH3` for integration tests.
-    fn test_peer_h3(bound_addr: SocketAddr, token: &str) -> crate::config::PeerH3 {
-        use crate::config::{H3Endpoint, PeerH3};
-        PeerH3 {
-            endpoint: Some(H3Endpoint {
-                host: "localhost".to_string(),
-                port: bound_addr.port(),
-                path: "/.well-known/masque/udp/*/*/".to_string(),
-            }),
-            token: token.to_string(),
-            bindif: None,
-            sni: None,
-        }
-    }
-
     // ========== Client-Server Integration Tests ==========
     //
     // These tests perform real QUIC/H3 handshakes over loopback. They use
@@ -1606,7 +1635,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_success() {
-        use crate::events::{ConnectionDirection, Event};
+        use crate::events::ConnectionDirection;
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1652,17 +1681,7 @@ mod tests {
         assert_eq!(client_conn.peer_id, peer_id);
 
         // Server should emit an H3Connected event
-        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout waiting for server connection")
-        .expect("no H3Connected event received");
+        let server_event = await_server_connection(&mut events_rx).await;
         assert_eq!(server_event.connection.peer_id, peer_id);
         assert_eq!(server_event.direction, ConnectionDirection::Inbound);
 
@@ -1672,7 +1691,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_success_with_sni_override() {
-        use crate::events::{ConnectionDirection, Event};
+        use crate::events::ConnectionDirection;
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1720,17 +1739,7 @@ mod tests {
         assert_eq!(client_conn.peer_id, peer_id);
 
         // Server should emit an H3Connected event
-        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout waiting for server connection")
-        .expect("no H3Connected event received");
+        let server_event = await_server_connection(&mut events_rx).await;
         assert_eq!(server_event.connection.peer_id, peer_id);
         assert_eq!(server_event.direction, ConnectionDirection::Inbound);
 
@@ -1741,8 +1750,6 @@ mod tests {
 
     #[tokio::test]
     async fn h3_connection_into_actors_preserves_peer_id() {
-        use crate::events::Event;
-
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -1778,17 +1785,7 @@ mod tests {
         .await
         .expect("dial");
 
-        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout")
-        .expect("no conn");
+        let server_event = await_server_connection(&mut events_rx).await;
 
         let (rx, tx) = server_event.connection.into_actors();
         assert_eq!(rx.peer_id, peer_id);
@@ -1905,7 +1902,6 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_roundtrip() {
-        use crate::events::Event;
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
 
@@ -1944,17 +1940,7 @@ mod tests {
         .await
         .expect("dial failed");
 
-        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = listener_events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout")
-        .expect("no connection");
+        let server_event = await_server_connection(&mut listener_events_rx).await;
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let metrics_interval = Duration::from_secs(60);
@@ -1999,7 +1985,6 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_bidirectional() {
-        use crate::events::Event;
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
 
@@ -2038,17 +2023,7 @@ mod tests {
         .await
         .expect("dial failed");
 
-        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = listener_events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout")
-        .expect("no connection");
+        let server_event = await_server_connection(&mut listener_events_rx).await;
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let metrics_interval = Duration::from_secs(60);
@@ -2123,8 +2098,6 @@ mod tests {
 
     #[tokio::test]
     async fn connection_graceful_shutdown() {
-        use crate::events::Event;
-
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -2160,17 +2133,7 @@ mod tests {
         .await
         .expect("dial failed");
 
-        let _server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout")
-        .expect("no connection");
+        let _server_event = await_server_connection(&mut events_rx).await;
 
         // Graceful shutdown: drop command channel with active connection
         drop(cmd_tx);
