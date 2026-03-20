@@ -1637,7 +1637,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_success() {
-        use crate::events::{ConnectionDirection, Event};
+        use crate::events::ConnectionDirection;
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1693,7 +1693,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_success_with_sni_override() {
-        use crate::events::{ConnectionDirection, Event};
+        use crate::events::ConnectionDirection;
 
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1752,8 +1752,6 @@ mod tests {
 
     #[tokio::test]
     async fn h3_connection_into_actors_preserves_peer_id() {
-        use crate::events::Event;
-
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -1906,7 +1904,6 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_roundtrip() {
-        use crate::events::Event;
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
 
@@ -1990,7 +1987,6 @@ mod tests {
 
     #[tokio::test]
     async fn datagram_bidirectional() {
-        use crate::events::Event;
         use crate::helpers::test_packets::make_ipv4_packet;
         use std::net::Ipv4Addr;
 
@@ -2104,8 +2100,6 @@ mod tests {
 
     #[tokio::test]
     async fn connection_graceful_shutdown() {
-        use crate::events::Event;
-
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
