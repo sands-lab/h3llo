@@ -14,7 +14,9 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_bearer_auth, validate_connect_auth};
-use crate::bare::{bare_rx_from_socket, bare_tx_from_socket, spawn_udp_rx, spawn_udp_tx};
+use crate::bare::{
+    bare_rx_from_socket, bare_tx_from_socket, spawn_server_udp_rx, spawn_udp_rx, spawn_udp_tx,
+};
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::Event;
@@ -23,14 +25,11 @@ use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::tun::alloc_uninit_packet_buf;
 use octets::{varint_len, varint_parse_len, Octets, OctetsMut};
 use quiche::h3::NameValue;
-use quinn_udp::{RecvMeta, UdpSockRef, UdpSocketState};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
-use std::io::IoSliceMut;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
@@ -1293,16 +1292,14 @@ fn flush_server_send(
     }
 }
 
-/// Spawns the H3v2 listener as a multiplexed engine on `crypto_rt`.
+/// Spawns the H3v2 listener with separated I/O and crypto:
 ///
-/// A single event loop owns all server connections and performs:
-/// 1. quinn-udp GRO-aware recv
-/// 2. CID-based routing to the correct `quiche::Connection`
-/// 3. Version negotiation and new connection acceptance
-/// 4. QUIC crypto + H3 CONNECT-IP handshake + datagram forwarding
-/// 5. Inline `send_to` (no per-connection BareUDP Tx actors)
+/// - **Recv actor** (I/O thread via `tokio::spawn`): quinn-udp GRO-aware recv,
+///   sends `(SocketAddr, Vec<PooledBuf>)` batches via channel.
+/// - **Multiplexed engine** (`crypto_rt`): CID routing, QUIC crypto, H3 handshake,
+///   datagram forwarding, inline `send_to`.
 ///
-/// Returns command sender, join handle, and bound address.
+/// Returns command sender, engine join handle, and bound address.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_h3v2_listener(
     listener: H3v2Listener,
@@ -1329,23 +1326,57 @@ pub fn spawn_h3v2_listener(
     let tuning = tuning.clone();
     let handshake_timeout = tuning.h3_handshake_timeout;
 
+    // Clone socket: recv_std → recv actor (I/O thread), std_socket → engine (crypto_rt).
+    let recv_std = match std_socket.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            let handle = crypto_rt.spawn(async move {
+                Err(ActorError::BareRxRecv {
+                    addr: bound_addr.to_string(),
+                    source: e,
+                })
+            });
+            return (cmd_tx, handle, bound_addr);
+        }
+    };
+
+    // Recv actor on I/O thread — reuses BareUDP recv with source addr tagging.
+    let (udp_recv_tx, mut udp_recv_rx) =
+        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
+    let recv_socket = match UdpSocket::from_std(recv_std) {
+        Ok(s) => s,
+        Err(e) => {
+            let handle = crypto_rt.spawn(async move {
+                Err(ActorError::BareRxRecv {
+                    addr: bound_addr.to_string(),
+                    source: e,
+                })
+            });
+            return (cmd_tx, handle, bound_addr);
+        }
+    };
+    let bare_rx = match bare_rx_from_socket(recv_socket, max_udp_payload) {
+        Ok(rx) => rx,
+        Err(e) => {
+            let handle = crypto_rt.spawn(async move {
+                Err(ActorError::BareRxRecv {
+                    addr: bound_addr.to_string(),
+                    source: std::io::Error::other(e.to_string()),
+                })
+            });
+            return (cmd_tx, handle, bound_addr);
+        }
+    };
+    let _recv_handle = spawn_server_udp_rx(bare_rx, udp_recv_tx);
+
+    // Multiplexed engine on crypto_rt.
     let handle = crypto_rt.spawn(async move {
-        let socket = UdpSocket::from_std(std_socket).map_err(|e| ActorError::BareRxRecv {
+        let send_socket = UdpSocket::from_std(std_socket).map_err(|e| ActorError::BareRxRecv {
             addr: bound_addr.to_string(),
             source: e,
         })?;
-        let recv_state =
-            UdpSocketState::new(UdpSockRef::from(&socket)).map_err(|e| ActorError::BareRxRecv {
-                addr: bound_addr.to_string(),
-                source: std::io::Error::other(format!("quinn-udp state: {e}")),
-            })?;
-
-        let gro_segments = recv_state.gro_segments();
-        let mut recv_buf = vec![0u8; max_udp_payload * gro_segments];
-        let mut meta = vec![RecvMeta::default()];
         let mut send_buf = vec![0u8; max_udp_payload];
 
-        // CID → conn_id routing table.
         let mut cid_table: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut connections: HashMap<usize, ServerConn> = HashMap::new();
         let mut next_conn_id: usize = 0;
@@ -1361,38 +1392,18 @@ pub fn spawn_h3v2_listener(
 
         loop {
             tokio::select! {
-                _ = socket.readable() => {
-                    let result = socket.try_io(Interest::READABLE, || {
-                        recv_state.recv(
-                            UdpSockRef::from(&socket),
-                            &mut [IoSliceMut::new(&mut recv_buf)],
-                            &mut meta,
-                        )
-                    });
+                maybe_pkt = udp_recv_rx.recv() => {
+                    let Some((remote, mut batch)) = maybe_pkt else {
+                        return Err(ActorError::BareRxRecv {
+                            addr: bound_addr.to_string(),
+                            source: std::io::Error::other("recv actor closed"),
+                        });
+                    };
 
-                    match result {
-                        Ok(0) => continue,
-                        Ok(_) if meta[0].len == 0 => continue,
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => {
-                            return Err(ActorError::BareRxRecv {
-                                addr: bound_addr.to_string(),
-                                source: e,
-                            });
-                        }
-                    }
-
-                    let remote = meta[0].addr;
-                    let stride = meta[0].stride.min(meta[0].len);
-                    let total_len = meta[0].len;
-
-                    // Parse QUIC header from the first GRO segment for CID routing.
-                    // GRO coalesces per-flow, so all segments share the same DCID.
+                    // Parse QUIC header from first packet for CID routing.
                     let (dcid, hdr_ty, hdr_version, client_scid) = {
                         let hdr = match quiche::Header::from_slice(
-                            &mut recv_buf[..stride],
+                            &mut batch[0],
                             quiche::MAX_CONN_ID_LEN,
                         ) {
                             Ok(hdr) => hdr,
@@ -1413,18 +1424,12 @@ pub fn spawn_h3v2_listener(
                                 from: sc.remote_addr,
                                 to: bound_addr,
                             };
-                            for chunk in recv_buf[..total_len].chunks_mut(stride) {
-                                match sc.conn.recv(chunk, recv_info) {
-                                    Ok(_) | Err(quiche::Error::Done) => {}
-                                    Err(e) => debug!(error = ?e, "quiche recv (non-fatal)"),
-                                }
-                            }
+                            handle_udp_recv(&mut sc.conn, batch, recv_info);
 
                             if !sc.established {
                                 match advance_server_handshake(sc, &peer_tokens) {
                                     Ok(Some(ref peer_id)) => {
                                         info!(%peer_id, %remote, "server: CONNECT-IP established");
-                                        // TODO: Emit H3ServerConn to orchestrator.
                                     }
                                     Ok(None) => {}
                                     Err(e) => {
@@ -1436,26 +1441,25 @@ pub fn spawn_h3v2_listener(
                                 if !drain_server_h3_events(&mut sc.conn, session) {
                                     sc.conn.close(true, 0, b"h3 control closed").ok();
                                 } else {
-                                    let batch = collect_router_ingress(
+                                    let dgrams = collect_router_ingress(
                                         &mut sc.conn,
                                         max_udp_payload,
                                         &mut sc.rx_counters,
                                         &session.datagram_codec,
                                     );
-                                    if !batch.is_empty() {
-                                        let _ = ingress_tx.try_send(batch);
+                                    if !dgrams.is_empty() {
+                                        let _ = ingress_tx.try_send(dgrams);
                                     }
                                 }
                             }
 
                             flush_server_send(
-                                &mut sc.conn, &socket, sc.remote_addr, &mut send_buf,
+                                &mut sc.conn, &send_socket, sc.remote_addr, &mut send_buf,
                             );
                         }
                         continue;
                     }
 
-                    // Only accept Initial packets for new connections.
                     if hdr_ty != quiche::Type::Initial {
                         continue;
                     }
@@ -1467,7 +1471,7 @@ pub fn spawn_h3v2_listener(
                             &quiche::ConnectionId::from_ref(&dcid),
                             &mut send_buf,
                         ) {
-                            let _ = socket.try_send_to(&send_buf[..len], remote);
+                            let _ = send_socket.try_send_to(&send_buf[..len], remote);
                         }
                         continue;
                     }
@@ -1494,9 +1498,7 @@ pub fn spawn_h3v2_listener(
 
                     // Feed the Initial packet.
                     let recv_info = quiche::RecvInfo { from: remote, to: bound_addr };
-                    for chunk in recv_buf[..total_len].chunks_mut(stride) {
-                        conn.recv(chunk, recv_info).ok();
-                    }
+                    handle_udp_recv(&mut conn, batch, recv_info);
 
                     let conn_id = next_conn_id;
                     next_conn_id += 1;
@@ -1522,7 +1524,7 @@ pub fn spawn_h3v2_listener(
                         cids,
                     };
 
-                    flush_server_send(&mut sc.conn, &socket, remote, &mut send_buf);
+                    flush_server_send(&mut sc.conn, &send_socket, remote, &mut send_buf);
                     connections.insert(conn_id, sc);
                 }
 
@@ -1530,7 +1532,7 @@ pub fn spawn_h3v2_listener(
                     for sc in connections.values_mut() {
                         sc.conn.on_timeout();
                         flush_server_send(
-                            &mut sc.conn, &socket, sc.remote_addr, &mut send_buf,
+                            &mut sc.conn, &send_socket, sc.remote_addr, &mut send_buf,
                         );
                     }
                 }
@@ -1540,14 +1542,13 @@ pub fn spawn_h3v2_listener(
                         if sc.established {
                             sc.conn.send_ack_eliciting().ok();
                             flush_server_send(
-                                &mut sc.conn, &socket, sc.remote_addr, &mut send_buf,
+                                &mut sc.conn, &send_socket, sc.remote_addr, &mut send_buf,
                             );
                         }
                     }
                 }
 
                 _ = ticker.tick() => {
-                    // Remove closed and handshake-timed-out connections.
                     let remove: Vec<usize> = connections
                         .iter()
                         .filter(|(_, sc)| {
@@ -1562,7 +1563,7 @@ pub fn spawn_h3v2_listener(
                             if !sc.conn.is_closed() {
                                 sc.conn.close(true, 0, b"handshake timeout").ok();
                                 flush_server_send(
-                                    &mut sc.conn, &socket, sc.remote_addr, &mut send_buf,
+                                    &mut sc.conn, &send_socket, sc.remote_addr, &mut send_buf,
                                 );
                             }
                         }
@@ -1573,7 +1574,6 @@ pub fn spawn_h3v2_listener(
                         }
                     }
 
-                    // Emit metrics.
                     for sc in connections.values() {
                         let rx = sc.rx_counters.snapshot(
                             Some(&sc.peer_id), Some(sc.remote_addr),
@@ -1597,7 +1597,6 @@ pub fn spawn_h3v2_listener(
                 }
             }
 
-            // Reset timer to earliest connection timeout.
             let next = connections
                 .values()
                 .filter_map(|sc| sc.conn.timeout())
