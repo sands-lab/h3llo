@@ -1134,7 +1134,9 @@ fn flush_udp_send(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::ActorKind;
     use crate::tun::alloc_packet_buf;
+    use tokio_quiche::buf_factory::BufFactory;
 
     #[test]
     fn datagram_framing_encode_decode() {
@@ -1231,5 +1233,259 @@ mod tests {
 
         // Truncated 2-byte varint (first byte indicates 2-byte encoding).
         assert_eq!(decode_qsi(&[0x40]), None);
+    }
+
+    // ========== Test Helpers ==========
+
+    fn test_meta() -> EngineMeta {
+        EngineMeta {
+            local_addr: "127.0.0.1:5000".parse().unwrap(),
+            remote_addr: "10.0.0.1:443".parse().unwrap(),
+            peer_id: "peer-x".into(),
+            max_udp_payload: 1400,
+        }
+    }
+
+    // ========== ConnectFailure Tests ==========
+
+    #[test]
+    fn connect_failure_close_reason() {
+        assert_eq!(
+            ConnectFailure::Rejected("403".into()).close_reason(),
+            b"connect-ip rejected"
+        );
+        assert_eq!(
+            ConnectFailure::Closed("stream fin".into()).close_reason(),
+            b"connect-ip control closed"
+        );
+        assert_eq!(
+            ConnectFailure::Poll("h3 error".into()).close_reason(),
+            b"h3 poll error"
+        );
+    }
+
+    #[test]
+    fn connect_failure_into_dial_error() {
+        let err = ConnectFailure::Rejected("403".into()).into_dial_error();
+        assert!(matches!(err, DialError::Rejected(s) if s == "403"));
+
+        let err = ConnectFailure::Closed("stream closed".into()).into_dial_error();
+        assert!(matches!(err, DialError::Handshake(s) if s == "stream closed"));
+
+        let err = ConnectFailure::Poll("poll failed".into()).into_dial_error();
+        assert!(matches!(err, DialError::Handshake(s) if s == "poll failed"));
+    }
+
+    #[test]
+    fn connect_failure_into_actor_reason() {
+        let reason = ConnectFailure::Rejected("403".into()).into_actor_reason();
+        assert!(reason.contains("CONNECT-IP rejected"));
+        assert!(reason.contains("403"));
+
+        let reason = ConnectFailure::Closed("fin".into()).into_actor_reason();
+        assert_eq!(reason, "fin");
+
+        let reason = ConnectFailure::Poll("poll err".into()).into_actor_reason();
+        assert_eq!(reason, "poll err");
+    }
+
+    // ========== LoopExit Tests ==========
+
+    #[test]
+    fn loop_exit_close_reason() {
+        let ok = LoopExit::Ok(b"shutdown");
+        assert_eq!(ok.close_reason(), b"shutdown");
+
+        let err = LoopExit::Err {
+            close_reason: b"conn closed",
+            reason: "QUIC closed".into(),
+        };
+        assert_eq!(err.close_reason(), b"conn closed");
+    }
+
+    #[test]
+    fn loop_exit_into_result_ok() {
+        let exit = LoopExit::Ok(b"graceful");
+        assert!(exit.into_result(&test_meta()).is_ok());
+    }
+
+    #[test]
+    fn loop_exit_into_result_err() {
+        let exit = LoopExit::Err {
+            close_reason: b"conn closed",
+            reason: "QUIC connection closed".into(),
+        };
+        let result = exit.into_result(&test_meta());
+        let err = result.unwrap_err();
+        assert!(matches!(&err, ActorError::H3Client { peer_id, reason }
+            if peer_id == "peer-x" && reason == "QUIC connection closed"
+        ));
+        assert_eq!(err.kind(), ActorKind::Restartable);
+    }
+
+    // ========== PendingBatch Tests ==========
+
+    #[test]
+    fn pending_batch_enqueue_empty_returns_none() {
+        let (tx, _rx) = mpsc::channel::<Vec<PooledBuf>>(1);
+        let result = PendingBatch::enqueue(&tx, vec![]);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn pending_batch_enqueue_success() {
+        let (tx, mut rx) = mpsc::channel::<Vec<PooledBuf>>(1);
+        let batch = vec![alloc_packet_buf(b"pkt1")];
+        let result = PendingBatch::enqueue(&tx, batch);
+        assert!(matches!(result, Ok(None)));
+        // Verify the batch was actually sent.
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn pending_batch_enqueue_full_returns_pending() {
+        let (tx, _rx) = mpsc::channel::<Vec<PooledBuf>>(1);
+        // Fill the channel directly, not via the function under test.
+        let _ = tx.try_send(vec![alloc_packet_buf(b"fill")]);
+        let batch = vec![alloc_packet_buf(b"overflow")];
+        let result = PendingBatch::enqueue(&tx, batch);
+        assert!(matches!(result, Ok(Some(_))));
+    }
+
+    #[test]
+    fn pending_batch_enqueue_closed_returns_err() {
+        let (tx, rx) = mpsc::channel::<Vec<PooledBuf>>(1);
+        drop(rx);
+        let batch = vec![alloc_packet_buf(b"orphan")];
+        let result = PendingBatch::enqueue(&tx, batch);
+        assert!(matches!(result, Err(())));
+    }
+
+    // ========== EngineMeta Tests ==========
+
+    #[test]
+    fn engine_meta_recv_info() {
+        let meta = test_meta();
+        let info = meta.recv_info();
+        assert_eq!(info.from, meta.remote_addr);
+        assert_eq!(info.to, meta.local_addr);
+    }
+
+    #[test]
+    fn engine_meta_actor_error() {
+        let meta = test_meta();
+        let err = meta.actor_error("connection reset");
+        assert!(matches!(&err, ActorError::H3Client { peer_id, reason }
+            if peer_id == "peer-x" && reason == "connection reset"
+        ));
+        assert_eq!(err.kind(), ActorKind::Restartable);
+    }
+
+    // ========== ConnectIpDatagramCodec Tests ==========
+
+    #[test]
+    fn codec_new_qsi_and_prefix_len() {
+        for (stream_id, expect_qsi, expect_prefix) in
+            [(0, 0, 2), (4, 1, 2), (256, 64, 3), (1024, 256, 3)]
+        {
+            let codec = ConnectIpDatagramCodec::new(stream_id);
+            assert_eq!(codec.expected_qsi, expect_qsi, "sid={stream_id}");
+            assert_eq!(codec.qsi_bytes, encode_qsi(expect_qsi), "sid={stream_id}");
+            assert_eq!(codec.prefix_len(), expect_prefix, "sid={stream_id}");
+        }
+    }
+
+    #[test]
+    fn codec_prepend_adds_qsi_then_context_id() {
+        let codec = ConnectIpDatagramCodec::new(0);
+        let mut buf = alloc_packet_buf(b"payload");
+        assert!(codec.prepend(&mut buf));
+        assert_eq!(buf[0], 0x00); // QSI
+        assert_eq!(buf[1], CONTEXT_ID_IP); // Context ID
+        assert_eq!(&buf[2..], b"payload");
+    }
+
+    #[test]
+    fn codec_strip_happy_path() {
+        let codec = ConnectIpDatagramCodec::new(0);
+        let mut framed = vec![0x00, CONTEXT_ID_IP];
+        framed.extend_from_slice(b"ip packet");
+        let mut buf = BufFactory::dgram_from_vec(framed);
+        assert!(codec.strip(&mut buf));
+        assert_eq!(&buf[..], b"ip packet");
+    }
+
+    #[test]
+    fn codec_strip_rejects_wrong_qsi() {
+        let codec = ConnectIpDatagramCodec::new(0);
+        let mut buf = BufFactory::dgram_from_vec(vec![0x01, CONTEXT_ID_IP, 0xFF]);
+        assert!(!codec.strip(&mut buf));
+    }
+
+    #[test]
+    fn codec_strip_rejects_wrong_context_id() {
+        let codec = ConnectIpDatagramCodec::new(0);
+        let mut buf = BufFactory::dgram_from_vec(vec![0x00, 0x01, 0xFF]);
+        assert!(!codec.strip(&mut buf));
+    }
+
+    #[test]
+    fn codec_strip_rejects_empty_payload() {
+        let codec = ConnectIpDatagramCodec::new(0);
+        let mut buf = BufFactory::dgram_from_vec(vec![0x00, CONTEXT_ID_IP]);
+        assert!(!codec.strip(&mut buf));
+    }
+
+    #[test]
+    fn codec_strip_rejects_too_short() {
+        let codec = ConnectIpDatagramCodec::new(0);
+        let mut buf = BufFactory::dgram_from_vec(vec![0x00]);
+        assert!(!codec.strip(&mut buf));
+    }
+
+    #[test]
+    fn codec_strip_rejects_empty_buffer() {
+        let codec = ConnectIpDatagramCodec::new(0);
+        let mut buf = BufFactory::dgram_from_vec(vec![]);
+        assert!(!codec.strip(&mut buf));
+    }
+
+    #[test]
+    fn codec_roundtrip_prepend_strip() {
+        for stream_id in [0u64, 4, 252, 256, 1024] {
+            let codec = ConnectIpDatagramCodec::new(stream_id);
+            let payload = b"roundtrip test payload";
+            let mut buf = alloc_packet_buf(payload);
+            assert!(
+                codec.prepend(&mut buf),
+                "prepend failed for sid={stream_id}"
+            );
+            let framed_data = buf[..].to_vec();
+            let mut recv_buf = BufFactory::dgram_from_vec(framed_data);
+            assert!(
+                codec.strip(&mut recv_buf),
+                "strip failed for sid={stream_id}"
+            );
+            assert_eq!(&recv_buf[..], payload);
+        }
+    }
+
+    #[test]
+    fn codec_undo_prefix_restores_payload() {
+        let codec = ConnectIpDatagramCodec::new(0);
+        let mut buf = alloc_packet_buf(b"undo test");
+        assert!(codec.prepend(&mut buf));
+        codec.undo_prefix(&mut buf);
+        assert_eq!(&buf[..], b"undo test");
+    }
+
+    // ========== RunState Tests ==========
+
+    #[test]
+    fn run_state_new_has_no_pending() {
+        let state = RunState::new();
+        assert!(state.pending_ingress.is_none());
+        assert!(state.pending_egress.is_none());
+        assert!(state.pending_send.is_none());
     }
 }
