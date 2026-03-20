@@ -144,7 +144,8 @@ impl std::fmt::Debug for H3ServerConn {
 /// Validates CONNECT-IP headers on a raw quiche H3 request (server-side).
 ///
 /// Checks `:method=CONNECT`, `:protocol=connect-ip`, `capsule-protocol=?1`
-/// per RFC 9484.
+/// per RFC 9484. Pseudo-headers use exact `==` (always lowercased by HTTP/3
+/// framing per RFC 9114 §4.2); regular headers use case-insensitive matching.
 fn validate_server_connect_headers(headers: &[quiche::h3::Header]) -> Result<(), String> {
     let method = headers
         .iter()
@@ -1384,7 +1385,9 @@ pub fn spawn_h3v2_listener(
                     let remote = meta[0].addr;
                     let stride = meta[0].stride.min(meta[0].len);
 
-                    // Parse QUIC header from recv buffer (zero-copy).
+                    // Parse QUIC header from the first GRO segment for CID routing.
+                    // GRO coalesces per-flow, so all segments in a batch share
+                    // the same DCID — routing by the first segment is sufficient.
                     let hdr = match quiche::Header::from_slice(
                         &mut buf[..stride],
                         quiche::MAX_CONN_ID_LEN,
@@ -1480,10 +1483,15 @@ pub fn spawn_h3v2_listener(
                     // Per-connection engine channels.
                     let (udp_recv_tx, udp_recv_rx) =
                         mpsc::channel::<Vec<PooledBuf>>(tuning.packet_queue_depth);
-                    let (_egress_tx, egress_rx) =
+                    let (egress_tx, egress_rx) =
                         mpsc::channel::<Vec<PooledBuf>>(tuning.packet_queue_depth);
 
                     // Register CIDs: initial client DCID + server SCID.
+                    // TODO: Track NEW_CONNECTION_ID / RETIRE_CONNECTION_ID to
+                    // keep the router CID table in sync with quiche's internal
+                    // CID lifecycle. Without this, CID rotation will cause
+                    // packets to be silently dropped. Acceptable for stable-NAT
+                    // VPN use where CID rotation is infrequent.
                     connections.insert(dcid.clone(), udp_recv_tx.clone());
                     connections.insert(scid_bytes.to_vec(), udp_recv_tx.clone());
 
@@ -1512,13 +1520,37 @@ pub fn spawn_h3v2_listener(
 
                     // Spawn engine on crypto_rt.
                     let peer_tokens_clone = peer_tokens.clone();
+                    let handshake_timeout = tuning.h3_handshake_timeout;
                     let _engine_handle = crypto_rt.spawn(async move {
+                        // Hold egress_tx alive so the engine's egress_rx.recv()
+                        // blocks rather than returning None immediately. Once
+                        // H3ServerConn emission is implemented, this sender will
+                        // be handed to the orchestrator for Router → engine forwarding.
+                        let _egress_tx = egress_tx;
+
                         let mut engine = engine;
-                        let peer_id = engine.accept_h3(peer_tokens_clone).await
-                            .map_err(|e| ActorError::H3Server {
-                                peer_id: engine.meta.peer_id.clone(),
-                                reason: e.to_string(),
-                            })?;
+                        let accept_result = time::timeout(
+                            handshake_timeout,
+                            engine.accept_h3(peer_tokens_clone),
+                        )
+                        .await;
+                        let peer_id = match accept_result {
+                            Ok(Ok(id)) => id,
+                            Ok(Err(e)) => {
+                                return Err(ActorError::H3Server {
+                                    peer_id: engine.meta.peer_id.clone(),
+                                    reason: e.to_string(),
+                                });
+                            }
+                            Err(_) => {
+                                return Err(ActorError::H3Server {
+                                    peer_id: engine.meta.peer_id.clone(),
+                                    reason: format!(
+                                        "CONNECT-IP handshake timed out after {handshake_timeout:?}"
+                                    ),
+                                });
+                            }
+                        };
                         // TODO: Emit H3ServerConn to orchestrator via events channel.
                         info!(%peer_id, "server engine: CONNECT-IP established");
                         engine.run().await
