@@ -1187,10 +1187,90 @@ pub fn spawn_h3_listener(
     (cmd_tx, handle, bound_addr)
 }
 
+// ========== Test Support ==========
+
+/// Shared test utilities for H3 integration tests across modules.
+///
+/// Available in test builds and with the `test-utils` feature.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) mod test_support {
+    use crate::config::{H3Endpoint, PeerH3, Tuning};
+    use std::net::SocketAddr;
+
+    /// Test certificate bundle with temporary files.
+    ///
+    /// Generates a self-signed TLS certificate for `localhost` / `127.0.0.1`
+    /// using rcgen. The temporary files are cleaned up on drop.
+    pub struct TestCertBundle {
+        cert_file: tempfile::NamedTempFile,
+        key_file: tempfile::NamedTempFile,
+    }
+
+    impl TestCertBundle {
+        /// Generates a self-signed certificate for localhost using rcgen.
+        pub fn generate() -> Self {
+            use rcgen::{generate_simple_self_signed, CertifiedKey};
+            use std::io::Write;
+
+            let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+            let CertifiedKey { cert, signing_key } =
+                generate_simple_self_signed(subject_alt_names).expect("cert generation");
+
+            let mut cert_file = tempfile::NamedTempFile::new().expect("create cert temp file");
+            cert_file
+                .write_all(cert.pem().as_bytes())
+                .expect("write cert");
+
+            let mut key_file = tempfile::NamedTempFile::new().expect("create key temp file");
+            key_file
+                .write_all(signing_key.serialize_pem().as_bytes())
+                .expect("write key");
+
+            Self {
+                cert_file,
+                key_file,
+            }
+        }
+
+        /// Returns the path to the certificate PEM file.
+        pub fn cert_path(&self) -> &std::path::Path {
+            self.cert_file.path()
+        }
+
+        /// Returns the path to the private key PEM file.
+        pub fn key_path(&self) -> &std::path::Path {
+            self.key_file.path()
+        }
+    }
+
+    /// Returns `Tuning` with `h3_insecure_skip_verify: true` for tests using self-signed certs.
+    pub fn insecure_tuning() -> Tuning {
+        Tuning {
+            h3_insecure_skip_verify: true,
+            ..Default::default()
+        }
+    }
+
+    /// Creates a test `PeerH3` config pointing at the given server address.
+    pub fn test_peer_h3(bound_addr: SocketAddr, token: &str) -> PeerH3 {
+        PeerH3 {
+            endpoint: Some(H3Endpoint {
+                host: "localhost".to_string(),
+                port: bound_addr.port(),
+                path: "/.well-known/masque/udp/*/*/".to_string(),
+            }),
+            token: token.to_string(),
+            bindif: None,
+            sni: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bind::test_support::FakeRouteProbe;
+    use test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
 
     // ========== Auth Helper Tests ==========
 
@@ -1392,49 +1472,6 @@ mod tests {
         assert!(err.to_string().contains("cert expired"));
     }
 
-    // ========== Test Utilities ==========
-
-    /// Test certificate bundle with temporary files.
-    struct TestCertBundle {
-        cert_file: tempfile::NamedTempFile,
-        key_file: tempfile::NamedTempFile,
-    }
-
-    impl TestCertBundle {
-        /// Generates a self-signed certificate for localhost using rcgen.
-        fn generate() -> Self {
-            use rcgen::{generate_simple_self_signed, CertifiedKey};
-            use std::io::Write;
-
-            let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-            let CertifiedKey { cert, signing_key } =
-                generate_simple_self_signed(subject_alt_names).expect("cert generation");
-
-            let mut cert_file = tempfile::NamedTempFile::new().expect("create cert temp file");
-            cert_file
-                .write_all(cert.pem().as_bytes())
-                .expect("write cert");
-
-            let mut key_file = tempfile::NamedTempFile::new().expect("create key temp file");
-            key_file
-                .write_all(signing_key.serialize_pem().as_bytes())
-                .expect("write key");
-
-            Self {
-                cert_file,
-                key_file,
-            }
-        }
-
-        fn cert_path(&self) -> &std::path::Path {
-            self.cert_file.path()
-        }
-
-        fn key_path(&self) -> &std::path::Path {
-            self.key_file.path()
-        }
-    }
-
     // ========== find_header_value Tests ==========
 
     #[test]
@@ -1572,31 +1609,6 @@ mod tests {
             matches!(result, Ok(Ok(Ok(())))),
             "listener should shut down cleanly"
         );
-    }
-
-    // ========== Test Helper: build PeerH3 for dial tests ==========
-
-    /// Returns `Tuning` with `h3_insecure_skip_verify: true` for tests using self-signed certs.
-    fn insecure_tuning() -> Tuning {
-        Tuning {
-            h3_insecure_skip_verify: true,
-            ..Default::default()
-        }
-    }
-
-    /// Creates a test `PeerH3` for integration tests.
-    fn test_peer_h3(bound_addr: SocketAddr, token: &str) -> crate::config::PeerH3 {
-        use crate::config::{H3Endpoint, PeerH3};
-        PeerH3 {
-            endpoint: Some(H3Endpoint {
-                host: "localhost".to_string(),
-                port: bound_addr.port(),
-                path: "/.well-known/masque/udp/*/*/".to_string(),
-            }),
-            token: token.to_string(),
-            bindif: None,
-            sni: None,
-        }
     }
 
     // ========== Client-Server Integration Tests ==========
