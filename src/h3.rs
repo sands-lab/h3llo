@@ -1264,13 +1264,32 @@ pub(crate) mod test_support {
             sni: None,
         }
     }
+
+    /// Waits for an `H3ConnectedEvent` on the events channel, with timeout.
+    ///
+    /// Skips non-H3Connected events (e.g. metrics). Panics on timeout or if
+    /// the channel closes before an H3Connected event arrives.
+    pub async fn await_server_connection(
+        events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::events::Event>,
+    ) -> crate::events::H3ConnectedEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = events_rx.recv().await {
+                if let crate::events::Event::H3Connected(connected) = event {
+                    return connected;
+                }
+            }
+            panic!("events channel closed without H3Connected");
+        })
+        .await
+        .expect("timeout waiting for H3Connected event")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bind::test_support::FakeRouteProbe;
-    use test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
+    use test_support::{await_server_connection, insecure_tuning, test_peer_h3, TestCertBundle};
 
     // ========== Auth Helper Tests ==========
 
@@ -1664,17 +1683,7 @@ mod tests {
         assert_eq!(client_conn.peer_id, peer_id);
 
         // Server should emit an H3Connected event
-        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout waiting for server connection")
-        .expect("no H3Connected event received");
+        let server_event = await_server_connection(&mut events_rx).await;
         assert_eq!(server_event.connection.peer_id, peer_id);
         assert_eq!(server_event.direction, ConnectionDirection::Inbound);
 
@@ -1732,17 +1741,7 @@ mod tests {
         assert_eq!(client_conn.peer_id, peer_id);
 
         // Server should emit an H3Connected event
-        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout waiting for server connection")
-        .expect("no H3Connected event received");
+        let server_event = await_server_connection(&mut events_rx).await;
         assert_eq!(server_event.connection.peer_id, peer_id);
         assert_eq!(server_event.direction, ConnectionDirection::Inbound);
 
@@ -1790,17 +1789,7 @@ mod tests {
         .await
         .expect("dial");
 
-        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout")
-        .expect("no conn");
+        let server_event = await_server_connection(&mut events_rx).await;
 
         let (rx, tx) = server_event.connection.into_actors();
         assert_eq!(rx.peer_id, peer_id);
@@ -1956,17 +1945,7 @@ mod tests {
         .await
         .expect("dial failed");
 
-        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = listener_events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout")
-        .expect("no connection");
+        let server_event = await_server_connection(&mut listener_events_rx).await;
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let metrics_interval = Duration::from_secs(60);
@@ -2050,17 +2029,7 @@ mod tests {
         .await
         .expect("dial failed");
 
-        let server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = listener_events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout")
-        .expect("no connection");
+        let server_event = await_server_connection(&mut listener_events_rx).await;
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let metrics_interval = Duration::from_secs(60);
@@ -2172,17 +2141,7 @@ mod tests {
         .await
         .expect("dial failed");
 
-        let _server_event = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return Some(connected);
-                }
-            }
-            None
-        })
-        .await
-        .expect("timeout")
-        .expect("no connection");
+        let _server_event = await_server_connection(&mut events_rx).await;
 
         // Graceful shutdown: drop command channel with active connection
         drop(cmd_tx);

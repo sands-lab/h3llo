@@ -1163,7 +1163,7 @@ mod tests {
     use crate::actor::ActorKind;
     use crate::bind::test_support::FakeRouteProbe;
     use crate::config::default_mtu;
-    use crate::events::{ConnectionDirection, Event, H3ConnectedEvent};
+    use crate::events::{ConnectionDirection, Event};
     use crate::h3::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::h3::{make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx};
     use crate::tun::alloc_packet_buf;
@@ -1525,21 +1525,7 @@ mod tests {
 
     // ========== Integration Test Helpers ==========
 
-    /// Waits for an `H3ConnectedEvent` on the events channel, with timeout.
-    async fn await_server_connection(
-        events_rx: &mut mpsc::UnboundedReceiver<Event>,
-    ) -> H3ConnectedEvent {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return connected;
-                }
-            }
-            panic!("events channel closed without H3Connected");
-        })
-        .await
-        .expect("timeout waiting for H3Connected event")
-    }
+    use crate::h3::test_support::await_server_connection;
 
     /// Test server wrapping h3.rs listener with cert and handle lifecycle management.
     struct TestServer {
@@ -1848,11 +1834,15 @@ mod tests {
         } = conn;
         drop(tx);
 
-        // Engine handle should terminate within a reasonable timeout.
-        let engine_result = tokio::time::timeout(Duration::from_secs(5), engine_handle).await;
+        // Engine handle should terminate cleanly within a reasonable timeout.
+        let engine_result = tokio::time::timeout(Duration::from_secs(5), engine_handle)
+            .await
+            .expect("engine_handle did not terminate in time")
+            .expect("engine task panicked");
         assert!(
             engine_result.is_ok(),
-            "engine_handle did not terminate in time"
+            "engine exited with error: {:?}",
+            engine_result
         );
 
         // UDP actors may be aborted by the engine or complete on their own.
