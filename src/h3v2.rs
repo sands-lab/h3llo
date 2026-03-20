@@ -1825,8 +1825,11 @@ mod tests {
         let _server_event = await_server_connection(&mut server.events_rx).await;
 
         // Drop the egress sender to trigger client shutdown.
+        // Keep udp_rx_cmd alive so the BareUDP RX actor doesn't exit
+        // before the engine processes the egress channel closure.
         let H3ClientConn {
             engine_handle,
+            udp_rx_cmd: _udp_rx_cmd,
             udp_rx_handle,
             udp_tx_handle,
             tx,

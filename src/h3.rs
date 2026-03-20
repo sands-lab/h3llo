@@ -1190,9 +1190,7 @@ pub fn spawn_h3_listener(
 // ========== Test Support ==========
 
 /// Shared test utilities for H3 integration tests across modules.
-///
-/// Available in test builds and with the `test-utils` feature.
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(test)]
 pub(crate) mod test_support {
     use crate::config::{H3Endpoint, PeerH3, Tuning};
     use std::net::SocketAddr;
