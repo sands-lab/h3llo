@@ -56,14 +56,12 @@ pub fn spawn_bare_rx(
             tokio::select! {
                 maybe = udp_rx.recv() => {
                     let Some((remote, batch)) = maybe else { return Ok(()); };
+                    let count = batch.len() as u64;
+                    let bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
                     if !accepted_sources.contains(&remote.ip()) {
-                        let count = batch.len() as u64;
-                        let bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
                         counters.record_drop(DropReason::DisallowedSource, count, bytes);
                         continue;
                     }
-                    let count = batch.len() as u64;
-                    let bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
                     if !counters.send_and_record(&ingress_tx, batch, count, bytes).await {
                         return Ok(());
                     }
@@ -92,7 +90,8 @@ pub fn spawn_bare_rx(
 ///
 /// Receives `Vec<PooledBuf>` from the router, stamps each batch with the
 /// peer's destination address, and forwards to the UDP TX actor.
-/// Records metrics **after** successful channel send (correct pattern).
+/// Records metrics after successful channel send to avoid inflating
+/// counters when the downstream actor is unavailable.
 ///
 /// # Arguments
 ///
@@ -382,7 +381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_rx_exits_when_udp_rx_closed() {
+    async fn bare_rx_exits_when_cmd_channel_closed() {
         let (_udp_tx, udp_rx) = mpsc::channel(4);
         let (ingress_tx, _ingress_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
@@ -395,14 +394,13 @@ mod tests {
             Duration::from_secs(60),
         );
 
-        // Drop the sender side of udp_rx
-        drop(cmd_tx); // Drop cmd_tx first, but the relevant channel is udp_tx
-                      // udp_tx already dropped (not captured)
+        // Drop cmd_tx to signal shutdown via command channel closure.
+        drop(cmd_tx);
 
         let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
         assert!(
             matches!(result, Ok(Ok(Ok(())))),
-            "bare_rx should exit gracefully when udp_rx closed, got {result:?}"
+            "bare_rx should exit gracefully when cmd channel closed, got {result:?}"
         );
     }
 
