@@ -43,6 +43,11 @@ pub(crate) struct H3Session {
     pub(crate) datagram_codec: ConnectIpDatagramCodec,
     /// Whether the CONNECT-IP request has been accepted (200 OK received).
     pub(crate) connect_accepted: bool,
+    /// Authenticated peer ID set during server-side CONNECT-IP acceptance.
+    ///
+    /// `None` for client sessions. Consumed by the caller via `.take()`
+    /// after `poll_h3_events` returns [`ConnectProgress::Ready`].
+    pub(crate) accepted_peer_id: Option<String>,
 }
 
 impl H3Session {
@@ -57,6 +62,7 @@ impl H3Session {
             connect_stream_id: 0,
             datagram_codec: ConnectIpDatagramCodec::new(0),
             connect_accepted: false,
+            accepted_peer_id: None,
         })
     }
 
@@ -102,8 +108,6 @@ impl H3Session {
             &[quiche::h3::Header],
         ) -> Result<HeaderAction, ConnectFailure>,
     {
-        let mut accepted_peer_id: Option<String> = None;
-
         loop {
             match self.h3_conn.poll(conn) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
@@ -121,7 +125,7 @@ impl H3Session {
                         } => {
                             self.bind_connect_stream(sid);
                             self.mark_connect_accepted();
-                            accepted_peer_id = pid;
+                            self.accepted_peer_id = pid;
                         }
                         HeaderAction::Ignore => {}
                     }
@@ -154,7 +158,7 @@ impl H3Session {
 
                 Err(quiche::h3::Error::Done) => {
                     return Ok(if self.connect_ready(conn) {
-                        ConnectProgress::Ready(accepted_peer_id.take())
+                        ConnectProgress::Ready
                     } else {
                         ConnectProgress::Pending
                     });
@@ -175,10 +179,7 @@ pub(crate) enum ConnectProgress {
     /// CONNECT-IP is not ready for datagram forwarding yet.
     Pending,
     /// CONNECT-IP is fully established and ready for datagrams.
-    ///
-    /// Carries the authenticated peer ID for server-side acceptance
-    /// (`Some(peer_id)`), or `None` for client / steady-state.
-    Ready(Option<String>),
+    Ready,
 }
 
 /// Error raised while advancing CONNECT-IP control-plane state.

@@ -520,7 +520,7 @@ impl H3Engine {
                         &meta.peer_id,
                         &mut |_, _, _, _| Ok(HeaderAction::Ignore),
                     ) {
-                        Ok(ConnectProgress::Pending | ConnectProgress::Ready(_)) => {}
+                        Ok(ConnectProgress::Pending | ConnectProgress::Ready) => {}
                         Err(err) => break LoopExit::Err {
                             close_reason: err.close_reason(),
                             reason: err.into_actor_reason(),

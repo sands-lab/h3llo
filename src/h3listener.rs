@@ -294,10 +294,13 @@ impl H3Engine {
                             )
                             .map_err(|e| ServerError::Accept(e.into_actor_reason()))?
                         {
-                            ConnectProgress::Ready(peer_id) => {
-                                self.flush_send();
-                                self.meta.peer_id = peer_id
+                            ConnectProgress::Ready => {
+                                let peer_id = session
+                                    .accepted_peer_id
+                                    .take()
                                     .expect("peer_id set by server handler");
+                                self.flush_send();
+                                self.meta.peer_id = peer_id;
                                 return Ok(self);
                             }
                             ConnectProgress::Pending => {}

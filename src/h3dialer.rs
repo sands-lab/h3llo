@@ -159,7 +159,7 @@ impl H3Engine {
                             },
                         ) {
                             Ok(ConnectProgress::Pending) => {}
-                            Ok(ConnectProgress::Ready(_)) => return Ok(self),
+                            Ok(ConnectProgress::Ready) => return Ok(self),
                             Err(err) => return Err(DialError::from(err)),
                         }
                     }
