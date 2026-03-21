@@ -558,6 +558,10 @@ pub(crate) struct EngineMeta {
 }
 
 impl EngineMeta {
+    // TODO: For QUIC path migration / NAT rebinding, recv_info should be
+    // constructed per-batch from the actual source address instead of using
+    // a fixed remote_addr. Currently all callers (establish, accept, run)
+    // ignore the per-batch remote and use this fixed value.
     pub(crate) fn recv_info(&self) -> quiche::RecvInfo {
         quiche::RecvInfo {
             from: self.remote_addr,
