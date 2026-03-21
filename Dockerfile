@@ -16,12 +16,14 @@
 #   runtime (default) - Minimal Alpine production image
 #   export            - Bare binary for release asset extraction
 #   test              - Adds diagnostic tools for integration tests
+#   ci-runner         - Rust toolchain + Docker CLI for DooD test execution
 #
 # Usage:
 #   docker buildx build --platform linux/amd64 --target runtime -t h3llo:latest --load .
 #   docker buildx build --platform linux/arm64 --target runtime -t h3llo:arm64 --load .
 #   docker buildx build --target export --output type=local,dest=./out .
 #   docker buildx build --platform linux/amd64 --target test -t h3llo:test --load .
+#   docker buildx build --platform linux/amd64 --target ci-runner -t h3llo:ci-runner --load .
 
 # Stage 1: Chef - Install cargo-chef on native build platform (no QEMU emulation)
 FROM --platform=$BUILDPLATFORM rust:slim-trixie AS chef
@@ -161,3 +163,18 @@ RUN apk add --no-cache iproute2 iputils-ping iperf3
 # Include pre-built test binaries for Container Test Pattern
 COPY --from=builder /app/out/integration-container-tun /usr/local/bin/
 COPY --from=builder /app/out/integration-container-route /usr/local/bin/
+
+# Stage 6: CI Runner - Rust toolchain + Docker CLI for running test harnesses.
+# Uses DooD (Docker-outside-of-Docker): mount host Docker socket at runtime.
+# Usage:
+#   docker buildx build --platform linux/amd64 --target ci-runner -t h3llo:ci-runner --load .
+#   docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:$PWD" -w "$PWD" \
+#     h3llo:ci-runner cargo test --test e2e -- --ignored --nocapture
+FROM --platform=$BUILDPLATFORM rust:slim-trixie AS ci-runner
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    docker.io \
+    pkg-config libssl-dev \
+    cmake make perl golang-go git \
+    clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app

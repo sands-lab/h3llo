@@ -66,12 +66,32 @@ jobs:
           target: test
           platforms: linux/amd64
           load: true
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run integration tests
-        run: cargo test --test integration --features test-utils -- --ignored --nocapture
-      - name: Run E2E tests
-        run: cargo test --test e2e -- --ignored --nocapture
+      - name: Build CI runner image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          builder: ${{ steps.buildx.outputs.name }}
+          push: false
+          tags: h3llo:ci-runner
+          target: ci-runner
+          platforms: linux/amd64
+          load: true
+      - name: Run integration tests in container
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}:${{ github.workspace }}" \
+            -w "${{ github.workspace }}" \
+            h3llo:ci-runner \
+            cargo test --test integration --features test-utils -- --ignored --nocapture
+      - name: Run E2E tests in container
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}:${{ github.workspace }}" \
+            -w "${{ github.workspace }}" \
+            h3llo:ci-runner \
+            cargo test --test e2e -- --ignored --nocapture
 
   # Build multi-arch Docker images in parallel with lint and test jobs.
   # Runs on PRs too (for cross-compilation validation) but skips push.
