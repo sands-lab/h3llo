@@ -309,16 +309,18 @@ Run tests inside the container (DooD mode):
 ```bash
 docker run --rm \
   --user "$(id -u):$(id -g)" \
+  -e CARGO_HOME="$PWD/.cargo" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$PWD:$PWD" -w "$PWD" \
   h3llo:ci-runner \
   cargo test --test e2e -- --ignored --nocapture
 ```
 
-The `--user` flag ensures build artifacts (`target/`) retain the host user's
-ownership. The workspace is volume-mounted at the same path, so `target/`
-persists on the self-hosted runner between CI runs (only the first-ever run
-compiles from scratch).
+The `--user` flag ensures build artifacts retain the host user's ownership.
+`CARGO_HOME` is redirected into the workspace so the registry/index cache
+also persists across runs. Both `target/` and `.cargo/` live on the host
+filesystem via volume mount, so only the first-ever run downloads and
+compiles from scratch.
 
 ## SSL/TLS Certificates
 
