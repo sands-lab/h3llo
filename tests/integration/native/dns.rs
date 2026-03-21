@@ -72,7 +72,10 @@ async fn start_coredns() -> (ContainerAsync<GenericImage>, SocketAddr) {
         .get_host_port_ipv4(ContainerPort::Udp(53))
         .await
         .unwrap();
-    let server: SocketAddr = format!("{host}:{port}").parse().unwrap();
+    let server: SocketAddr = std::net::ToSocketAddrs::to_socket_addrs(&format!("{host}:{port}"))
+        .expect("resolve container host")
+        .next()
+        .expect("at least one address");
     (container, server)
 }
 
