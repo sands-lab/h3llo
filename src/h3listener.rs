@@ -1288,13 +1288,9 @@ mod tests {
             dial_new_client(server.bound_addr, token, peer_id).await;
         assert_eq!(conn.peer_id, peer_id);
 
-        // Destructure to avoid partial move.
-        let TestH3v2Server {
-            cmd_tx,
-            _handle: handle,
-            ..
-        } = server;
-        drop(cmd_tx);
+        // Drop command sender to trigger listener shutdown.
+        let handle = server._handle;
+        drop(server.cmd_tx);
 
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
             .await
