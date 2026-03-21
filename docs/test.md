@@ -309,6 +309,7 @@ Run tests inside the container (DooD mode):
 ```bash
 docker run --rm \
   --user "$(id -u):$(id -g)" \
+  --group-add "$(stat -c '%g' /var/run/docker.sock)" \
   -e CARGO_HOME="$PWD/.cargo" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$PWD:$PWD" -w "$PWD" \

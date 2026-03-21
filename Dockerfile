@@ -169,6 +169,8 @@ COPY --from=builder /app/out/integration-container-route /usr/local/bin/
 # Usage:
 #   docker buildx build --platform linux/amd64 --target ci-runner -t h3llo:ci-runner --load .
 #   docker run --rm --user "$(id -u):$(id -g)" \
+#     --group-add "$(stat -c '%g' /var/run/docker.sock)" \
+#     -e CARGO_HOME="$PWD/.cargo" \
 #     -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:$PWD" -w "$PWD" \
 #     h3llo:ci-runner cargo test --test e2e -- --ignored --nocapture
 FROM rust:slim-trixie AS ci-runner
