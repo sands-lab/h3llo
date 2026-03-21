@@ -210,7 +210,7 @@ impl ConnectIpDatagramCodec {
         let Some((qsi, qsi_len)) = decode_qsi(packet) else {
             return false;
         };
-        if qsi != self.expected_qsi {
+        if qsi != self.expected_qsi || qsi_len != self.qsi_bytes.len() {
             return false;
         }
 
@@ -222,7 +222,6 @@ impl ConnectIpDatagramCodec {
             return false;
         }
 
-        debug_assert_eq!(prefix_len, self.prefix_len());
         packet.pop_front(prefix_len);
         true
     }
@@ -355,6 +354,14 @@ mod tests {
     fn codec_strip_rejects_wrong_qsi() {
         let codec = ConnectIpDatagramCodec::new(0);
         let mut buf = BufFactory::dgram_from_vec(vec![0x01, CONTEXT_ID_IP, 0xFF]);
+        assert!(!codec.strip(&mut buf));
+    }
+
+    #[test]
+    fn codec_strip_rejects_non_canonical_qsi() {
+        // QSI=0 encoded as 2-byte varint 0x4000 instead of canonical 1-byte 0x00.
+        let codec = ConnectIpDatagramCodec::new(0);
+        let mut buf = BufFactory::dgram_from_vec(vec![0x40, 0x00, CONTEXT_ID_IP, 0xFF]);
         assert!(!codec.strip(&mut buf));
     }
 
