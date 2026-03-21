@@ -168,9 +168,10 @@ COPY --from=builder /app/out/integration-container-route /usr/local/bin/
 # Uses DooD (Docker-outside-of-Docker): mount host Docker socket at runtime.
 # Usage:
 #   docker buildx build --platform linux/amd64 --target ci-runner -t h3llo:ci-runner --load .
-#   docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:$PWD" -w "$PWD" \
+#   docker run --rm --user "$(id -u):$(id -g)" \
+#     -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:$PWD" -w "$PWD" \
 #     h3llo:ci-runner cargo test --test e2e -- --ignored --nocapture
-FROM --platform=$BUILDPLATFORM rust:slim-trixie AS ci-runner
+FROM rust:slim-trixie AS ci-runner
 RUN apt-get update && apt-get install -y --no-install-recommends \
     docker.io \
     pkg-config libssl-dev \

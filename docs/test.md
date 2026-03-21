@@ -308,13 +308,15 @@ docker buildx build --platform linux/amd64 --target ci-runner -t h3llo:ci-runner
 Run tests inside the container (DooD mode):
 ```bash
 docker run --rm \
+  --user "$(id -u):$(id -g)" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$PWD:$PWD" -w "$PWD" \
   h3llo:ci-runner \
   cargo test --test e2e -- --ignored --nocapture
 ```
 
-The workspace is volume-mounted at the same path, so the `target/` directory
+The `--user` flag ensures build artifacts (`target/`) retain the host user's
+ownership. The workspace is volume-mounted at the same path, so `target/`
 persists on the self-hosted runner between CI runs (only the first-ever run
 compiles from scratch).
 
