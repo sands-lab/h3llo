@@ -5,7 +5,7 @@
 //! output parsing shared across all E2E test modules.
 
 use std::process::Command;
-use testcontainers::core::{ContainerPort, Mount, WaitFor};
+use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
@@ -157,34 +157,25 @@ peers:
 
 /// Starts a BareUDP h3llo node in a Docker container.
 ///
-/// Writes config to `temp_dir`, creates a privileged container with the config
-/// bind-mounted, and returns the running container handle.
+/// Injects config via `with_copy_to` (no host-side temp files needed).
 ///
 /// # Arguments
 ///
 /// * `ctx` - Test context for unique naming and network
-/// * `temp_dir` - Directory for config file (must outlive returned container)
-/// * `role` - Logical role name; used for container name and config filename
+/// * `role` - Logical role name; used for container name
 /// * `config` - YAML config string
 pub async fn start_bareudp_node(
     ctx: &TestContext,
-    temp_dir: &std::path::Path,
     role: &str,
     config: &str,
 ) -> ContainerAsync<GenericImage> {
-    let config_path = temp_dir.join(format!("{role}.yaml"));
-    std::fs::write(&config_path, config).unwrap_or_else(|e| panic!("write {role} config: {e}"));
-
     GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
         .with_wait_for(WaitFor::seconds(2))
         .with_container_name(ctx.container_name(role))
         .with_network(ctx.network())
         .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
+        .with_copy_to("/etc/h3llo/config.yaml", config.as_bytes().to_vec())
         .start()
         .await
         .unwrap_or_else(|e| panic!("start {role}: {e}"))

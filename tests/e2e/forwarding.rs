@@ -17,7 +17,6 @@ use super::common::{assert_ping, bareudp_config, start_bareudp_node, BareUdpPeer
 #[ignore = "requires Docker and pre-built image"]
 async fn test_three_node_bareudp_forwarding() {
     let ctx = TestContext::new();
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
 
     let name_a = ctx.container_name("node-a-fwd");
     let fqdn_a = ctx.fqdn("node-a-fwd");
@@ -63,9 +62,9 @@ async fn test_three_node_bareudp_forwarding() {
         }],
     );
 
-    let node_a = start_bareudp_node(&ctx, temp_dir.path(), "node-a-fwd", &cfg_a).await;
-    let relay = start_bareudp_node(&ctx, temp_dir.path(), "relay-fwd", &cfg_relay).await;
-    let node_c = start_bareudp_node(&ctx, temp_dir.path(), "node-c-fwd", &cfg_c).await;
+    let node_a = start_bareudp_node(&ctx, "node-a-fwd", &cfg_a).await;
+    let relay = start_bareudp_node(&ctx, "relay-fwd", &cfg_relay).await;
+    let node_c = start_bareudp_node(&ctx, "node-c-fwd", &cfg_c).await;
 
     // Wait for DNS refresh cycles to resolve all peers (1s interval + buffer).
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -81,5 +80,4 @@ async fn test_three_node_bareudp_forwarding() {
     drop(node_c);
     drop(relay);
     drop(node_a);
-    drop(temp_dir);
 }

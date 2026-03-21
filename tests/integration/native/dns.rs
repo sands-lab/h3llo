@@ -20,7 +20,7 @@ use h3llo::config::{LocalDns, Tuning};
 use h3llo::dns::{make_dns, spawn_dns, DnsCommand};
 use h3llo::events::Event;
 use h3llo::test_utils::FakeRouteProbe;
-use testcontainers::core::{ContainerPort, Mount, WaitFor};
+use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::mpsc;
@@ -50,25 +50,16 @@ ipv6only 3600 IN AAAA 2001:db8::1
 "#;
 
 /// Spawns a CoreDNS container with zone file and returns the mapped host port.
-///
-/// The returned `TempDir` must outlive the container to keep bind mounts valid.
-async fn start_coredns() -> (ContainerAsync<GenericImage>, tempfile::TempDir, u16) {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    std::fs::write(dir.path().join("Corefile"), COREFILE).unwrap();
-    std::fs::write(dir.path().join("test.h3llo.zone"), ZONE_FILE).unwrap();
-
+async fn start_coredns() -> (ContainerAsync<GenericImage>, u16) {
     let container = GenericImage::new("coredns/coredns", "1.12.0")
         .with_wait_for(WaitFor::message_on_stdout("CoreDNS-"))
         .with_exposed_port(ContainerPort::Udp(53))
         .with_cmd(["-conf", "/etc/coredns/Corefile"])
-        .with_mount(Mount::bind_mount(
-            dir.path().join("Corefile").to_str().unwrap(),
-            "/etc/coredns/Corefile",
-        ))
-        .with_mount(Mount::bind_mount(
-            dir.path().join("test.h3llo.zone").to_str().unwrap(),
+        .with_copy_to("/etc/coredns/Corefile", COREFILE.as_bytes().to_vec())
+        .with_copy_to(
             "/etc/coredns/test.h3llo.zone",
-        ))
+            ZONE_FILE.as_bytes().to_vec(),
+        )
         .start()
         .await
         .expect("failed to start CoreDNS container");
@@ -77,7 +68,7 @@ async fn start_coredns() -> (ContainerAsync<GenericImage>, tempfile::TempDir, u1
         .get_host_port_ipv4(ContainerPort::Udp(53))
         .await
         .unwrap();
-    (container, dir, port)
+    (container, port)
 }
 
 /// Spawns a DNS resolver targeting the given server address.
@@ -151,7 +142,7 @@ fn hosts(names: &[&str]) -> HashSet<String> {
 #[tokio::test]
 #[ignore] // Requires Docker
 async fn dns_resolve_single_a_record() {
-    let (_container, _dir, port) = start_coredns().await;
+    let (_container, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
@@ -182,7 +173,7 @@ async fn dns_resolve_single_a_record() {
 #[tokio::test]
 #[ignore]
 async fn dns_resolve_multiple_records() {
-    let (_container, _dir, port) = start_coredns().await;
+    let (_container, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
@@ -217,7 +208,7 @@ async fn dns_resolve_multiple_records() {
 #[tokio::test]
 #[ignore]
 async fn dns_resolve_aaaa_only() {
-    let (_container, _dir, port) = start_coredns().await;
+    let (_container, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
@@ -245,7 +236,7 @@ async fn dns_resolve_aaaa_only() {
 #[tokio::test]
 #[ignore]
 async fn dns_resolve_nxdomain_emits_no_events() {
-    let (_container, _dir, port) = start_coredns().await;
+    let (_container, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
@@ -274,7 +265,7 @@ async fn dns_resolve_nxdomain_emits_no_events() {
 #[tokio::test]
 #[ignore]
 async fn dns_resolve_multiple_hostnames() {
-    let (_container, _dir, port) = start_coredns().await;
+    let (_container, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 

@@ -20,7 +20,6 @@ use super::common::{assert_ping, bareudp_config, start_bareudp_node, BareUdpPeer
 #[ignore = "requires Docker and pre-built image"]
 async fn test_two_node_bareudp_tunnel() {
     let ctx = TestContext::new();
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
 
     let name_a = ctx.container_name("node-a");
     let name_b = ctx.container_name("node-b");
@@ -44,8 +43,8 @@ async fn test_two_node_bareudp_tunnel() {
         }],
     );
 
-    let node_a = start_bareudp_node(&ctx, temp_dir.path(), "node-a", &cfg_a).await;
-    let node_b = start_bareudp_node(&ctx, temp_dir.path(), "node-b", &cfg_b).await;
+    let node_a = start_bareudp_node(&ctx, "node-a", &cfg_a).await;
+    let node_b = start_bareudp_node(&ctx, "node-b", &cfg_b).await;
 
     // Wait for DNS refresh cycles to resolve both peers (1s interval + buffer)
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -55,7 +54,6 @@ async fn test_two_node_bareudp_tunnel() {
 
     drop(node_b);
     drop(node_a);
-    drop(temp_dir);
 }
 
 /// Integration test: BareUDP source IP filtering.
@@ -66,7 +64,6 @@ async fn test_two_node_bareudp_tunnel() {
 #[ignore = "requires Docker and pre-built image"]
 async fn test_source_ip_filtering() {
     let ctx = TestContext::new();
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
 
     let name_a = ctx.container_name("node-a-filter");
     let fqdn_a = ctx.fqdn("node-a-filter");
@@ -92,8 +89,8 @@ async fn test_source_ip_filtering() {
         }],
     );
 
-    let node_a = start_bareudp_node(&ctx, temp_dir.path(), "node-a-filter", &cfg_a).await;
-    let node_c = start_bareudp_node(&ctx, temp_dir.path(), "node-c", &cfg_c).await;
+    let node_a = start_bareudp_node(&ctx, "node-a-filter", &cfg_a).await;
+    let node_c = start_bareudp_node(&ctx, "node-c", &cfg_c).await;
 
     // Wait for DNS refresh cycles (1s interval + buffer)
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -122,7 +119,6 @@ async fn test_source_ip_filtering() {
 
     drop(node_c);
     drop(node_a);
-    drop(temp_dir);
 }
 
 /// Integration test: MTU boundary checks.
@@ -133,7 +129,6 @@ async fn test_source_ip_filtering() {
 #[ignore = "requires Docker and pre-built image"]
 async fn test_mtu_boundary_drop() {
     let ctx = TestContext::new();
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
 
     let name_a = ctx.container_name("node-a-mtu");
     let name_b = ctx.container_name("node-b-mtu");
@@ -157,8 +152,8 @@ async fn test_mtu_boundary_drop() {
         }],
     );
 
-    let node_a = start_bareudp_node(&ctx, temp_dir.path(), "node-a-mtu", &cfg_a).await;
-    let node_b = start_bareudp_node(&ctx, temp_dir.path(), "node-b-mtu", &cfg_b).await;
+    let node_a = start_bareudp_node(&ctx, "node-a-mtu", &cfg_a).await;
+    let node_b = start_bareudp_node(&ctx, "node-b-mtu", &cfg_b).await;
 
     // Wait for DNS refresh cycles to resolve both peers (1s interval + buffer)
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -226,5 +221,4 @@ async fn test_mtu_boundary_drop() {
 
     drop(node_b);
     drop(node_a);
-    drop(temp_dir);
 }

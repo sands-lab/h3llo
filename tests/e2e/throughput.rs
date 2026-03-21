@@ -5,7 +5,7 @@
 //! BareUDP and HTTP/3 transports.
 
 use std::time::Duration;
-use testcontainers::core::{ContainerPort, Mount, WaitFor};
+use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
@@ -87,7 +87,6 @@ async fn run_iperf3_throughput(
 #[ignore = "requires Docker and pre-built image"]
 async fn test_bareudp_tcp_throughput() {
     let ctx = TestContext::new();
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
 
     let name_a = ctx.container_name("node-a-tp");
     let name_b = ctx.container_name("node-b-tp");
@@ -111,8 +110,8 @@ async fn test_bareudp_tcp_throughput() {
         }],
     );
 
-    let node_a = start_bareudp_node(&ctx, temp_dir.path(), "node-a-tp", &cfg_a).await;
-    let node_b = start_bareudp_node(&ctx, temp_dir.path(), "node-b-tp", &cfg_b).await;
+    let node_a = start_bareudp_node(&ctx, "node-a-tp", &cfg_a).await;
+    let node_b = start_bareudp_node(&ctx, "node-b-tp", &cfg_b).await;
 
     // Wait for DNS refresh and tunnel establishment
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -121,7 +120,6 @@ async fn test_bareudp_tcp_throughput() {
 
     drop(node_b);
     drop(node_a);
-    drop(temp_dir);
 }
 
 /// HTTP/3 TCP throughput test.
@@ -132,14 +130,13 @@ async fn test_bareudp_tcp_throughput() {
 #[ignore = "requires Docker and pre-built image with H3 support"]
 async fn test_h3_tcp_throughput() {
     let ctx = TestContext::new();
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
 
     let name_a = ctx.container_name("node-a-tp-h3");
     let name_b = ctx.container_name("node-b-tp-h3");
 
     // Generate certificates for both nodes
-    let (node_a_cert, node_a_key) = generate_test_certs(temp_dir.path(), &name_a, ctx.network());
-    let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), &name_b, ctx.network());
+    let (node_a_cert, node_a_key) = generate_test_certs(&name_a, ctx.network());
+    let (node_b_cert, node_b_key) = generate_test_certs(&name_b, ctx.network());
 
     let shared_secret = "throughput-test-secret";
     let node_a_config = h3_node_config(
@@ -161,29 +158,15 @@ async fn test_h3_tcp_throughput() {
         "/certs/key.pem",
     );
 
-    let node_a_config_path = temp_dir.path().join("node-a-tp-h3.yaml");
-    let node_b_config_path = temp_dir.path().join("node-b-tp-h3.yaml");
-    std::fs::write(&node_a_config_path, &node_a_config).expect("write node-a config");
-    std::fs::write(&node_b_config_path, &node_b_config).expect("write node-b config");
-
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(443))
         .with_wait_for(WaitFor::seconds(2))
         .with_container_name(&name_a)
         .with_network(ctx.network())
         .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_a_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_a_cert.to_str().unwrap(),
-            "/certs/cert.pem",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_a_key.to_str().unwrap(),
-            "/certs/key.pem",
-        ))
+        .with_copy_to("/etc/h3llo/config.yaml", node_a_config.into_bytes())
+        .with_copy_to("/certs/cert.pem", node_a_cert)
+        .with_copy_to("/certs/key.pem", node_a_key)
         .start()
         .await
         .expect("start node-a-tp-h3");
@@ -194,18 +177,9 @@ async fn test_h3_tcp_throughput() {
         .with_container_name(&name_b)
         .with_network(ctx.network())
         .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_b_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_b_cert.to_str().unwrap(),
-            "/certs/cert.pem",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_b_key.to_str().unwrap(),
-            "/certs/key.pem",
-        ))
+        .with_copy_to("/etc/h3llo/config.yaml", node_b_config.into_bytes())
+        .with_copy_to("/certs/cert.pem", node_b_cert)
+        .with_copy_to("/certs/key.pem", node_b_key)
         .start()
         .await
         .expect("start node-b-tp-h3");
@@ -217,5 +191,4 @@ async fn test_h3_tcp_throughput() {
 
     drop(node_b);
     drop(node_a);
-    drop(temp_dir);
 }

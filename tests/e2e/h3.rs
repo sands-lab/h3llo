@@ -5,30 +5,24 @@
 //!
 //! Run with: `cargo test --test e2e -- --ignored --nocapture`
 
-use std::io::Write;
 use std::time::Duration;
-use testcontainers::core::{ContainerPort, Mount, WaitFor};
+use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use super::common::{assert_ping, TestContext, TEST_IMAGE, TEST_TAG};
 
-/// Generates self-signed certificates for testing.
+/// Generates self-signed certificate and key PEM bytes for testing.
 ///
 /// # Arguments
 ///
-/// * `temp_dir` - Directory to write PEM files into
 /// * `hostname` - Primary hostname for the certificate
 /// * `network` - Docker network name for FQDN SAN entry
 ///
 /// # Returns
 ///
-/// Tuple of `(cert_path, key_path)` pointing to PEM files in `temp_dir`.
-pub(super) fn generate_test_certs(
-    temp_dir: &std::path::Path,
-    hostname: &str,
-    network: &str,
-) -> (std::path::PathBuf, std::path::PathBuf) {
+/// Tuple of `(cert_pem_bytes, key_pem_bytes)`.
+pub(super) fn generate_test_certs(hostname: &str, network: &str) -> (Vec<u8>, Vec<u8>) {
     use rcgen::{generate_simple_self_signed, CertifiedKey};
 
     let subject_alt_names = vec![
@@ -40,20 +34,10 @@ pub(super) fn generate_test_certs(
     let CertifiedKey { cert, signing_key } =
         generate_simple_self_signed(subject_alt_names).expect("cert generation");
 
-    let cert_path = temp_dir.join(format!("{}-cert.pem", hostname));
-    let key_path = temp_dir.join(format!("{}-key.pem", hostname));
-
-    let mut cert_file = std::fs::File::create(&cert_path).expect("create cert file");
-    cert_file
-        .write_all(cert.pem().as_bytes())
-        .expect("write cert");
-
-    let mut key_file = std::fs::File::create(&key_path).expect("create key file");
-    key_file
-        .write_all(signing_key.serialize_pem().as_bytes())
-        .expect("write key");
-
-    (cert_path, key_path)
+    (
+        cert.pem().into_bytes(),
+        signing_key.serialize_pem().into_bytes(),
+    )
 }
 
 /// Test configuration template for H3 node.
@@ -115,14 +99,13 @@ tuning:
 #[ignore = "requires Docker and pre-built image with H3 support"]
 async fn test_two_node_h3_tunnel() {
     let ctx = TestContext::new();
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
 
     let name_a = ctx.container_name("node-a-h3");
     let name_b = ctx.container_name("node-b-h3");
 
     // Generate certificates for both nodes
-    let (node_a_cert, node_a_key) = generate_test_certs(temp_dir.path(), &name_a, ctx.network());
-    let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), &name_b, ctx.network());
+    let (node_a_cert, node_a_key) = generate_test_certs(&name_a, ctx.network());
+    let (node_b_cert, node_b_key) = generate_test_certs(&name_b, ctx.network());
 
     // Create config files
     // The token must match cross-wise: Node_A.peers[B].token == Node_B.peers[A].token
@@ -148,11 +131,6 @@ async fn test_two_node_h3_tunnel() {
         "/certs/key.pem",
     );
 
-    let node_a_config_path = temp_dir.path().join("node-a-h3.yaml");
-    let node_b_config_path = temp_dir.path().join("node-b-h3.yaml");
-    std::fs::write(&node_a_config_path, node_a_config).expect("write node-a config");
-    std::fs::write(&node_b_config_path, node_b_config).expect("write node-b config");
-
     // Start both nodes
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(443))
@@ -160,18 +138,9 @@ async fn test_two_node_h3_tunnel() {
         .with_container_name(&name_a)
         .with_network(ctx.network())
         .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_a_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_a_cert.to_str().unwrap(),
-            "/certs/cert.pem",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_a_key.to_str().unwrap(),
-            "/certs/key.pem",
-        ))
+        .with_copy_to("/etc/h3llo/config.yaml", node_a_config.into_bytes())
+        .with_copy_to("/certs/cert.pem", node_a_cert)
+        .with_copy_to("/certs/key.pem", node_a_key)
         .start()
         .await
         .expect("start node-a");
@@ -182,18 +151,9 @@ async fn test_two_node_h3_tunnel() {
         .with_container_name(&name_b)
         .with_network(ctx.network())
         .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_b_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_b_cert.to_str().unwrap(),
-            "/certs/cert.pem",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_b_key.to_str().unwrap(),
-            "/certs/key.pem",
-        ))
+        .with_copy_to("/etc/h3llo/config.yaml", node_b_config.into_bytes())
+        .with_copy_to("/certs/cert.pem", node_b_cert)
+        .with_copy_to("/certs/key.pem", node_b_key)
         .start()
         .await
         .expect("start node-b");
@@ -206,5 +166,4 @@ async fn test_two_node_h3_tunnel() {
 
     drop(node_b);
     drop(node_a);
-    drop(temp_dir);
 }

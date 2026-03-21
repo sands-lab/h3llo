@@ -15,7 +15,7 @@
 //! Run with: `cargo test --test e2e -- --ignored --nocapture`
 
 use std::time::Duration;
-use testcontainers::core::{ContainerPort, Mount, WaitFor};
+use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
@@ -92,14 +92,13 @@ tuning:
 #[ignore = "requires Docker and pre-built image"]
 async fn test_multipath_dual_subnet_mixed_transport() {
     let ctx = TestContext::new();
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
 
     let name_a = ctx.container_name("node-a-mp");
     let name_b = ctx.container_name("node-b-mp");
 
     // Generate TLS certificates for both nodes
-    let (node_a_cert, node_a_key) = generate_test_certs(temp_dir.path(), &name_a, ctx.network());
-    let (node_b_cert, node_b_key) = generate_test_certs(temp_dir.path(), &name_b, ctx.network());
+    let (node_a_cert, node_a_key) = generate_test_certs(&name_a, ctx.network());
+    let (node_b_cert, node_b_key) = generate_test_certs(&name_b, ctx.network());
 
     // Peer IDs must be unique within a config. Use "-bare"/"-h3" suffixes to
     // distinguish the two transport peers pointing at the same container.
@@ -130,11 +129,6 @@ async fn test_multipath_dual_subnet_mixed_transport() {
         "/certs/key.pem",
     );
 
-    let node_a_config_path = temp_dir.path().join("node-a-mp.yaml");
-    let node_b_config_path = temp_dir.path().join("node-b-mp.yaml");
-    std::fs::write(&node_a_config_path, &node_a_config).expect("write node-a config");
-    std::fs::write(&node_b_config_path, &node_b_config).expect("write node-b config");
-
     // Start Node A
     let node_a = GenericImage::new(TEST_IMAGE, TEST_TAG)
         .with_exposed_port(ContainerPort::Udp(5353))
@@ -143,18 +137,9 @@ async fn test_multipath_dual_subnet_mixed_transport() {
         .with_container_name(&name_a)
         .with_network(ctx.network())
         .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_a_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_a_cert.to_str().unwrap(),
-            "/certs/cert.pem",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_a_key.to_str().unwrap(),
-            "/certs/key.pem",
-        ))
+        .with_copy_to("/etc/h3llo/config.yaml", node_a_config.into_bytes())
+        .with_copy_to("/certs/cert.pem", node_a_cert)
+        .with_copy_to("/certs/key.pem", node_a_key)
         .start()
         .await
         .expect("start node-a");
@@ -167,18 +152,9 @@ async fn test_multipath_dual_subnet_mixed_transport() {
         .with_container_name(&name_b)
         .with_network(ctx.network())
         .with_privileged(true)
-        .with_mount(Mount::bind_mount(
-            node_b_config_path.to_str().unwrap(),
-            "/etc/h3llo/config.yaml",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_b_cert.to_str().unwrap(),
-            "/certs/cert.pem",
-        ))
-        .with_mount(Mount::bind_mount(
-            node_b_key.to_str().unwrap(),
-            "/certs/key.pem",
-        ))
+        .with_copy_to("/etc/h3llo/config.yaml", node_b_config.into_bytes())
+        .with_copy_to("/certs/cert.pem", node_b_cert)
+        .with_copy_to("/certs/key.pem", node_b_key)
         .start()
         .await
         .expect("start node-b");
@@ -194,5 +170,4 @@ async fn test_multipath_dual_subnet_mixed_transport() {
 
     drop(node_b);
     drop(node_a);
-    drop(temp_dir);
 }
