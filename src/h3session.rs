@@ -7,13 +7,27 @@
 
 use crate::h3::CONTEXT_ID_IP;
 use octets::{varint_len, varint_parse_len, Octets, OctetsMut};
-use quiche::h3::NameValue;
 use std::time::Duration;
 use tokio_quiche::buf_factory::PooledBuf;
 use tracing::debug;
 
 /// Duration used as "infinite" timeout when quiche returns None.
 pub(crate) const MAX_TIMEOUT: Duration = Duration::from_secs(86400);
+
+// ========== Header Action ==========
+
+/// Action returned by the header handler callback in [`H3Session::poll_h3_events`].
+pub(crate) enum HeaderAction {
+    /// Accept the CONNECT-IP stream: bind stream + mark accepted.
+    /// `peer_id` carries the authenticated identity for server-side
+    /// acceptance (`None` for client).
+    Accept {
+        stream_id: u64,
+        peer_id: Option<String>,
+    },
+    /// Ignore this header event (non-CONNECT stream or post-establishment).
+    Ignore,
+}
 
 // ========== H3 Session ==========
 
@@ -64,52 +78,63 @@ impl H3Session {
             && self.h3_conn.extended_connect_enabled_by_peer()
     }
 
-    /// Polls H3 events for the CONNECT-IP control stream.
+    /// Polls H3 events with a caller-supplied header handler.
     ///
-    /// Used during both client handshake (establish) and steady-state forwarding
-    /// (run loop). Post-establishment, the header-parsing branch is unreachable
-    /// (server never sees `:status`; client's `connect_ready()` is already true).
-    pub(crate) fn poll_h3_events(
+    /// The generic `on_headers` callback processes role-specific header logic:
+    /// - **Client**: checks `:status=200`, returns `Accept` or error.
+    /// - **Server**: validates CONNECT-IP + auth, sends 200 OK,
+    ///   returns `Accept { peer_id: Some(...) }` or error.
+    /// - **Post-establishment**: use an ignore-all handler.
+    ///
+    /// After `connect_accepted` is true, headers are silently ignored
+    /// regardless of the handler.
+    pub(crate) fn poll_h3_events<F>(
         &mut self,
         conn: &mut quiche::Connection,
         peer_id: &str,
-    ) -> Result<ConnectProgress, ConnectFailure> {
+        on_headers: &mut F,
+    ) -> Result<ConnectProgress, ConnectFailure>
+    where
+        F: FnMut(
+            &mut quiche::h3::Connection,
+            &mut quiche::Connection,
+            u64,
+            &[quiche::h3::Header],
+        ) -> Result<HeaderAction, ConnectFailure>,
+    {
+        let mut accepted_peer_id: Option<String> = None;
+
         loop {
             match self.h3_conn.poll(conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, .. })) => {
-                    if sid != self.connect_stream_id {
-                        debug!(%peer_id, sid, "ignoring headers on non-CONNECT stream");
+                Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                    // Post-acceptance headers (including duplicate CONNECT-IP
+                    // requests) are silently ignored rather than hard-rejected,
+                    // avoiding unnecessary connection teardown.
+                    if self.connect_accepted {
+                        debug!(%peer_id, stream_id, "ignoring headers post-establishment");
                         continue;
                     }
-
-                    let status = list
-                        .iter()
-                        .find(|h| h.name() == b":status")
-                        .map(|h| String::from_utf8_lossy(h.value()).to_string());
-
-                    match status.as_deref() {
-                        Some("200") => {
+                    match on_headers(&mut self.h3_conn, conn, stream_id, &list)? {
+                        HeaderAction::Accept {
+                            stream_id: sid,
+                            peer_id: pid,
+                        } => {
+                            self.bind_connect_stream(sid);
                             self.mark_connect_accepted();
+                            accepted_peer_id = pid;
                         }
-                        Some(code) => {
-                            return Err(ConnectFailure::Rejected(code.to_string()));
-                        }
-                        None => {
-                            return Err(ConnectFailure::Closed(
-                                "missing :status on CONNECT-IP response".into(),
-                            ));
-                        }
+                        HeaderAction::Ignore => {}
                     }
                 }
 
-                Ok((sid, quiche::h3::Event::Finished)) => {
-                    if sid == self.connect_stream_id {
+                Ok((stream_id, quiche::h3::Event::Finished)) => {
+                    if stream_id == self.connect_stream_id {
                         return Err(ConnectFailure::Closed("CONNECT-IP stream finished".into()));
                     }
                 }
 
-                Ok((sid, quiche::h3::Event::Reset(code))) => {
-                    if sid == self.connect_stream_id {
+                Ok((stream_id, quiche::h3::Event::Reset(code))) => {
+                    if stream_id == self.connect_stream_id {
                         return Err(ConnectFailure::Closed(format!(
                             "CONNECT-IP stream reset: {code}"
                         )));
@@ -129,7 +154,7 @@ impl H3Session {
 
                 Err(quiche::h3::Error::Done) => {
                     return Ok(if self.connect_ready(conn) {
-                        ConnectProgress::Ready
+                        ConnectProgress::Ready(accepted_peer_id.take())
                     } else {
                         ConnectProgress::Pending
                     });
@@ -150,7 +175,10 @@ pub(crate) enum ConnectProgress {
     /// CONNECT-IP is not ready for datagram forwarding yet.
     Pending,
     /// CONNECT-IP is fully established and ready for datagrams.
-    Ready,
+    ///
+    /// Carries the authenticated peer ID for server-side acceptance
+    /// (`Some(peer_id)`), or `None` for client / steady-state.
+    Ready(Option<String>),
 }
 
 /// Error raised while advancing CONNECT-IP control-plane state.

@@ -13,8 +13,9 @@ use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, EngineRole,
     H3Engine, RunState,
 };
-use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, MAX_TIMEOUT};
+use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
 use crate::udp;
+use quiche::h3::NameValue;
 use rand::Rng;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -129,9 +130,36 @@ impl H3Engine {
                     }
 
                     if let Some(session) = &mut self.session {
-                        match session.poll_h3_events(&mut self.conn, &self.meta.peer_id) {
+                        // Guaranteed set by send_connect_request → bind_connect_stream
+                        // above. Note: stream ID 0 is valid (first client bidi stream).
+                        let connect_sid = session.connect_stream_id;
+                        match session.poll_h3_events(
+                            &mut self.conn,
+                            &self.meta.peer_id,
+                            &mut |_h3, _conn, sid, headers| {
+                                if sid != connect_sid {
+                                    return Ok(HeaderAction::Ignore);
+                                }
+                                let status = headers
+                                    .iter()
+                                    .find(|h| h.name() == b":status")
+                                    .map(|h| String::from_utf8_lossy(h.value()).to_string());
+                                match status.as_deref() {
+                                    Some("200") => Ok(HeaderAction::Accept {
+                                        stream_id: sid,
+                                        peer_id: None,
+                                    }),
+                                    Some(code) => {
+                                        Err(ConnectFailure::Rejected(code.to_string()))
+                                    }
+                                    None => Err(ConnectFailure::Closed(
+                                        "missing :status on CONNECT-IP response".into(),
+                                    )),
+                                }
+                            },
+                        ) {
                             Ok(ConnectProgress::Pending) => {}
-                            Ok(ConnectProgress::Ready) => return Ok(self),
+                            Ok(ConnectProgress::Ready(_)) => return Ok(self),
                             Err(err) => return Err(DialError::from(err)),
                         }
                     }
