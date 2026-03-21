@@ -3,7 +3,7 @@
 //! Validates real DNS resolution against a CoreDNS container with
 //! deterministic zone data. No TUN or BareUDP required.
 //!
-//! Each test creates its own temporary directory and CoreDNS container,
+//! Each test creates its own CoreDNS container with injected config,
 //! making parallel execution safe (`cargo test` default behavior).
 //!
 //! Run with: `cargo test --test integration --features test-utils -- --ignored --nocapture`
