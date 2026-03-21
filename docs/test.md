@@ -117,7 +117,7 @@ NOT side effects (safe for inline tests):
 
 - testcontainers-rs manages container lifecycle automatically
 - Containers run with `--privileged` for CAP_NET_ADMIN (TUN device access)
-- Each test creates isolated containers with bind-mounted configs
+- Each test creates isolated containers with configs injected via `with_copy_to`
 - Cleanup is automatic when containers go out of scope
 
 #### Concurrency Safety
@@ -129,6 +129,23 @@ dynamically generated with FQDNs matching the unique container names.
 This ensures tests are safe to run in parallel — both within a single
 `cargo test` invocation and across concurrent CI runs. The Docker network
 is cleaned up when `TestContext` is dropped.
+
+#### File Injection Pattern
+
+Tests inject configuration files and certificates into containers using
+`with_copy_to()` instead of bind mounts. This approach:
+- Eliminates filesystem path dependencies between host and container
+- Works correctly under Docker-outside-of-Docker (DooD) configurations
+- Removes the need for temporary files on the host
+
+```rust
+let config_yaml = generate_config(...);
+let container = GenericImage::new(TEST_IMAGE, TEST_TAG)
+    .with_copy_to("/etc/h3llo/config.yaml", config_yaml.into_bytes())
+    .with_copy_to("/certs/cert.pem", cert_pem_bytes)
+    .start()
+    .await?;
+```
 
 ### Container Test Logging Requirements
 
@@ -188,10 +205,9 @@ DNS resolver validation against a containerized CoreDNS server with deterministi
 
 #### Concurrency Safety
 
-Each test creates its own `tempfile::tempdir()` for CoreDNS configuration and starts
-an independent CoreDNS container with a unique port mapping. This design ensures tests
-are safe to run in parallel (`cargo test` default behavior) without temp-dir collisions
-or port conflicts.
+Each test starts an independent CoreDNS container with config injected via
+`with_copy_to()` and a unique port mapping. This design ensures tests are safe
+to run in parallel (`cargo test` default behavior) without port conflicts.
 
 ### Container Test Pattern
 
@@ -275,6 +291,32 @@ docker exec <container> ip link set dev eth0 down
 # Simulate recovery
 docker exec <container> ip link set dev eth0 up
 ```
+
+## CI Runner Image
+
+The `ci-runner` Dockerfile stage provides a containerized environment for
+running integration and E2E test harnesses in CI. It contains:
+- Rust stable toolchain (from `rust:slim-trixie` base)
+- Docker CLI (for testcontainers-rs to communicate with Docker daemon)
+- Build dependencies for boring-sys (cmake, clang, perl, go)
+
+Build the CI runner image:
+```bash
+docker buildx build --platform linux/amd64 --target ci-runner -t h3llo:ci-runner --load .
+```
+
+Run tests inside the container (DooD mode):
+```bash
+docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$PWD:$PWD" -w "$PWD" \
+  h3llo:ci-runner \
+  cargo test --test e2e -- --ignored --nocapture
+```
+
+The workspace is volume-mounted at the same path, so the `target/` directory
+persists on the self-hosted runner between CI runs (only the first-ever run
+compiles from scratch).
 
 ## SSL/TLS Certificates
 
