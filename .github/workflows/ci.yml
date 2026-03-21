@@ -76,6 +76,8 @@ jobs:
           target: ci-runner
           platforms: linux/amd64
           load: true
+      - name: Ensure cargo cache directory
+        run: mkdir -p /tmp/ci-cargo-home && chown "$(id -u):$(id -g)" /tmp/ci-cargo-home
       - name: Run integration tests in container
         run: |
           docker run --rm \
