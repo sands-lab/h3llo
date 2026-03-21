@@ -3,7 +3,7 @@
 //! Architecture:
 //! - **UDP RX actor** (I/O thread): GRO-aware recv, emits `(SocketAddr, Vec<PooledBuf>)`.
 //! - **Server UDP TX actor** (I/O thread): shared send actor for all connections.
-//! - **ServerDispatcher** (`crypto_rt`): CID routing, connection acceptance, actor lifecycle.
+//! - **H3Dispatcher** (`crypto_rt`): CID routing, connection acceptance, actor lifecycle.
 //! - **H3Engine** (`crypto_rt`): per-connection unified QUIC/H3 engine with ingress + egress.
 //!
 //! See [`make_h3v2_listener`] + [`spawn_h3v2_listener`] for the public entry points.
@@ -396,19 +396,33 @@ struct ConnActorHandle {
     handle: JoinHandle<ActorExitResult>,
 }
 
+/// Shared channel senders cloned into each per-connection [`H3Engine`].
+#[derive(Clone)]
+struct DispatchIo {
+    /// Tagged UDP send channel shared by all connections.
+    udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+    /// Router ingress channel for decoded IP packets.
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+    /// System event channel (metrics, connection events).
+    events_tx: mpsc::UnboundedSender<Event>,
+}
+
+/// Per-connection parameters extracted from [`Tuning`].
+struct ConnParams {
+    handshake_timeout: Duration,
+    packet_queue_depth: usize,
+    metrics_interval: Duration,
+    keepalive_interval: Duration,
+}
+
 /// CID-routing dispatcher that accepts new connections and forwards packets
 /// to per-connection [`H3Engine`] tasks.
-struct ServerDispatcher {
+struct H3Dispatcher {
     bound_addr: SocketAddr,
     config: quiche::Config,
     max_udp_payload: usize,
-    handshake_timeout: Duration,
-    packet_queue_depth: usize,
-    udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
-    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-    events_tx: mpsc::UnboundedSender<Event>,
-    metrics_interval: Duration,
-    keepalive_interval: Duration,
+    io: DispatchIo,
+    conn_params: ConnParams,
     cid_table: HashMap<Vec<u8>, usize>,
     actors: HashMap<usize, ConnActorHandle>,
     next_conn_id: usize,
@@ -416,7 +430,7 @@ struct ServerDispatcher {
     neg_buf: Vec<u8>,
 }
 
-impl ServerDispatcher {
+impl H3Dispatcher {
     async fn run(
         mut self,
         mut udp_recv_rx: mpsc::Receiver<(SocketAddr, Vec<PooledBuf>)>,
@@ -503,7 +517,7 @@ impl ServerDispatcher {
                 let mut pkt = crate::tun::alloc_uninit_packet_buf(len);
                 pkt[..len].copy_from_slice(&self.neg_buf[..len]);
                 pkt.truncate(len);
-                let _ = self.udp_send_tx.try_send((remote, vec![pkt]));
+                let _ = self.io.udp_send_tx.try_send((remote, vec![pkt]));
             }
             return;
         }
@@ -542,26 +556,22 @@ impl ServerDispatcher {
         }
 
         // Create per-connection channels.
-        let (packet_tx, packet_rx) =
-            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(self.packet_queue_depth);
-        let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(self.packet_queue_depth);
-        let udp_send_tx = self.udp_send_tx.clone();
-        let ingress_tx = self.ingress_tx.clone();
-        let events_tx = self.events_tx.clone();
+        let depth = self.conn_params.packet_queue_depth;
+        let (packet_tx, packet_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(depth);
+        let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(depth);
+        let channels = self.io.clone();
         let peer_tokens = peer_tokens.clone();
-        let handshake_timeout = self.handshake_timeout;
-        let metrics_interval = self.metrics_interval;
-        let keepalive_interval = self.keepalive_interval;
+        let handshake_timeout = self.conn_params.handshake_timeout;
 
         let mut engine = H3Engine {
             conn,
             session: None,
             io: EngineIo {
                 udp_recv_rx: packet_rx,
-                udp_send_tx: udp_send_tx.clone(),
+                udp_send_tx: channels.udp_send_tx,
                 egress_rx,
-                ingress_tx,
-                events_tx,
+                ingress_tx: channels.ingress_tx,
+                events_tx: channels.events_tx,
             },
             meta: EngineMeta {
                 local_addr: self.bound_addr,
@@ -570,8 +580,8 @@ impl ServerDispatcher {
                 max_udp_payload: self.max_udp_payload,
             },
             run_state: RunState::new(),
-            metrics_interval,
-            keepalive_interval,
+            metrics_interval: self.conn_params.metrics_interval,
+            keepalive_interval: self.conn_params.keepalive_interval,
             role: EngineRole::Server,
         };
 
@@ -709,17 +719,21 @@ pub fn spawn_h3v2_listener(
 
     // Dispatcher on crypto_rt.
     let handle = crypto_rt.spawn(async move {
-        let dispatcher = ServerDispatcher {
+        let dispatcher = H3Dispatcher {
             bound_addr,
             config,
             max_udp_payload,
-            handshake_timeout: tuning.h3_handshake_timeout,
-            packet_queue_depth: tuning.packet_queue_depth,
-            udp_send_tx,
-            ingress_tx,
-            events_tx,
-            metrics_interval: tuning.metrics_push_interval,
-            keepalive_interval: tuning.h3_keepalive_interval,
+            io: DispatchIo {
+                udp_send_tx,
+                ingress_tx,
+                events_tx,
+            },
+            conn_params: ConnParams {
+                handshake_timeout: tuning.h3_handshake_timeout,
+                packet_queue_depth: tuning.packet_queue_depth,
+                metrics_interval: tuning.metrics_push_interval,
+                keepalive_interval: tuning.h3_keepalive_interval,
+            },
             cid_table: HashMap::new(),
             actors: HashMap::new(),
             next_conn_id: 0,
