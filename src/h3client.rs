@@ -11,11 +11,11 @@ use crate::config::{PeerH3, Tuning};
 use crate::events::Event;
 use crate::h3::CONNECT_IP_OVERHEAD;
 use crate::h3v2::{
-    apply_transport_config, collect_router_ingress, handle_udp_recv, ConnectFailure,
-    ConnectProgress, H3Session, PendingBatch, MAX_TIMEOUT,
+    apply_transport_config, collect_router_ingress, flush_udp_send, handle_router_egress,
+    handle_udp_recv, reset_timer, ConnectFailure, ConnectProgress, H3Session, PendingBatch,
+    MAX_TIMEOUT,
 };
-use crate::metrics::{Counters, Direction, DropReason, Source};
-use crate::tun::alloc_uninit_packet_buf;
+use crate::metrics::{Counters, Direction, Source};
 use rand::Rng;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // ========== Connection Handle ==========
 
@@ -538,104 +538,6 @@ fn make_client_quiche_config(
     Ok(config)
 }
 
-// ========== Helper Functions ==========
-
-/// Resets the pinned timer to the next quiche timeout deadline.
-///
-/// Uses `MAX_TIMEOUT` as sentinel when quiche returns `None` (no pending timers).
-fn reset_timer(timer: std::pin::Pin<&mut time::Sleep>, conn: &quiche::Connection) {
-    timer.reset(time::Instant::now() + conn.timeout().unwrap_or(MAX_TIMEOUT));
-}
-
-/// Collects pending QUIC output packets into a batch.
-///
-/// Pure function with no channel dependency — the caller is responsible for
-/// sending the batch via `try_send` + `pending_send` pattern.
-fn collect_udp_send(conn: &mut quiche::Connection, max_udp_payload: usize) -> Vec<PooledBuf> {
-    let mut batch = Vec::new();
-    loop {
-        let mut buf = alloc_uninit_packet_buf(max_udp_payload);
-        match conn.send(&mut buf) {
-            Ok((len, _send_info)) => {
-                buf.truncate(len);
-                batch.push(buf);
-            }
-            Err(quiche::Error::Done) => break,
-            Err(e) => {
-                warn!(error = ?e, "quiche send error");
-                break;
-            }
-        }
-    }
-    batch
-}
-
-/// Encodes egress IP packets as QUIC DATAGRAMs with QSI varint + Context ID prefix.
-///
-/// Returns unsent packets (with framing stripped) when the dgram queue is full,
-/// so the caller can store them as `pending_egress` for retry after `flush_send`.
-fn handle_router_egress(
-    conn: &mut quiche::Connection,
-    packets: Vec<PooledBuf>,
-    codec: &crate::h3v2::ConnectIpDatagramCodec,
-    counters: &mut Counters,
-) -> Option<Vec<PooledBuf>> {
-    let mut ok_pkts: u64 = 0;
-    let mut ok_bytes: u64 = 0;
-    let mut iter = packets.into_iter();
-
-    while let Some(mut pkt) = iter.next() {
-        let pkt_len = pkt.len() as u64;
-        if !codec.prepend(&mut pkt) {
-            counters.record_drop(DropReason::NoHeadroom, 1, pkt_len);
-            continue;
-        }
-        match conn.dgram_send(&pkt) {
-            Ok(()) => {
-                ok_pkts += 1;
-                ok_bytes += pkt_len;
-            }
-            Err(quiche::Error::Done) => {
-                // Queue full: undo framing and collect remaining for retry.
-                debug!(
-                    "dgram_send queue full; {} pkts pending",
-                    1 + iter.size_hint().0
-                );
-                codec.undo_prefix(&mut pkt);
-                let mut remaining = vec![pkt];
-                remaining.extend(iter);
-                if ok_pkts > 0 {
-                    counters.record_success(ok_pkts, ok_bytes);
-                }
-                return Some(remaining);
-            }
-            Err(e) => {
-                // Non-queue-full error (e.g. BufferTooShort, InvalidState):
-                // drop to prevent infinite retry.
-                debug!(error = ?e, "dgram_send failed; dropping packet");
-                counters.record_drop(DropReason::SendError, 1, pkt_len);
-            }
-        }
-    }
-
-    if ok_pkts > 0 {
-        counters.record_success(ok_pkts, ok_bytes);
-    }
-    None
-}
-
-/// Collects QUIC output and tries to send it to `udp_send_tx`.
-///
-/// Returns `Ok(Some(batch))` when the channel is full (store as `pending_send`),
-/// `Ok(None)` on success or empty, `Err(())` when the channel is closed.
-fn flush_udp_send(
-    conn: &mut quiche::Connection,
-    max_udp_payload: usize,
-    udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
-) -> Result<Option<PendingBatch>, ()> {
-    PendingBatch::enqueue(udp_send_tx, collect_udp_send(conn, max_udp_payload))
-}
-
 // ========== Public Dial Function ==========
 
 /// Establishes an outbound H3 client CONNECT-IP connection.
@@ -826,7 +728,6 @@ mod tests {
     use crate::h3v2::ConnectFailure;
     use crate::tun::alloc_packet_buf;
     use std::collections::HashMap;
-    use tokio_quiche::buf_factory::BufFactory;
 
     #[test]
     fn dial_error_display() {

@@ -1,8 +1,12 @@
-//! H3 CONNECT-IP server: CID-based multiplexed listener with per-connection engines.
+//! H3 CONNECT-IP server: CID-based dispatcher with per-connection actor engines.
 //!
-//! Uses a single UDP socket with CID routing to multiplex all inbound QUIC
-//! connections. See [`make_h3v2_listener`] + [`spawn_h3v2_listener`] for the
-//! public entry points.
+//! Architecture:
+//! - **UDP RX actor** (I/O thread): GRO-aware recv, emits `(SocketAddr, Vec<PooledBuf>)`.
+//! - **Server UDP TX actor** (I/O thread): shared send actor for all connections.
+//! - **ServerDispatcher** (`crypto_rt`): CID routing, connection acceptance, actor lifecycle.
+//! - **ServerConnActor** (`crypto_rt`): per-connection QUIC/H3 engine with ingress + egress.
+//!
+//! See [`make_h3v2_listener`] + [`spawn_h3v2_listener`] for the public entry points.
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::validate_connect_auth;
@@ -12,8 +16,8 @@ use crate::config::Tuning;
 use crate::events::Event;
 use crate::h3::CONNECT_IP_OVERHEAD;
 use crate::h3v2::{
-    apply_transport_config, collect_router_ingress, handle_udp_recv, H3Session, PendingBatch,
-    MAX_TIMEOUT,
+    apply_transport_config, collect_router_ingress, collect_udp_send, handle_router_egress,
+    handle_udp_recv, reset_timer, H3Session, PendingBatch, MAX_TIMEOUT,
 };
 use crate::metrics::{Counters, Direction, Source};
 use quiche::h3::NameValue;
@@ -21,7 +25,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
@@ -275,160 +279,6 @@ pub fn make_h3v2_listener(
     })
 }
 
-// ========== Per-Connection State ==========
-
-/// Per-connection state in the multiplexed server listener.
-struct ServerConn {
-    conn: quiche::Connection,
-    session: Option<H3Session>,
-    remote_addr: SocketAddr,
-    peer_id: String,
-    phase: ServerConnPhase,
-    rx_counters: Counters,
-    tx_counters: Counters,
-    /// Registered CIDs for cleanup on connection removal.
-    cids: Vec<Vec<u8>>,
-}
-
-/// Server-side connection phase in the multiplexed listener.
-enum ServerConnPhase {
-    Handshaking {
-        started_at: Instant,
-        pending_peer_id: Option<String>,
-    },
-    Established,
-}
-
-impl ServerConn {
-    fn new(conn: quiche::Connection, remote_addr: SocketAddr, cids: Vec<Vec<u8>>) -> Self {
-        Self {
-            conn,
-            session: None,
-            remote_addr,
-            peer_id: remote_addr.to_string(),
-            phase: ServerConnPhase::Handshaking {
-                started_at: Instant::now(),
-                pending_peer_id: None,
-            },
-            rx_counters: Counters::new(Source::Http3, Direction::Rx),
-            tx_counters: Counters::new(Source::Http3, Direction::Tx),
-            cids,
-        }
-    }
-
-    fn recv_info(&self, bound_addr: SocketAddr) -> quiche::RecvInfo {
-        quiche::RecvInfo {
-            from: self.remote_addr,
-            to: bound_addr,
-        }
-    }
-
-    fn is_established(&self) -> bool {
-        matches!(self.phase, ServerConnPhase::Established)
-    }
-
-    fn handshake_timed_out(&self, timeout: Duration) -> bool {
-        match &self.phase {
-            ServerConnPhase::Handshaking { started_at, .. } => started_at.elapsed() > timeout,
-            ServerConnPhase::Established => false,
-        }
-    }
-
-    fn ensure_session(&mut self) -> Result<(), ServerError> {
-        if self.session.is_some() || !self.conn.is_established() {
-            return Ok(());
-        }
-
-        debug!(remote = %self.remote_addr, "QUIC established; awaiting CONNECT-IP request");
-        self.session =
-            Some(H3Session::with_transport(&mut self.conn).map_err(ServerError::Accept)?);
-        Ok(())
-    }
-
-    fn advance_handshake(
-        &mut self,
-        peer_tokens: &HashMap<String, String>,
-    ) -> Result<Option<String>, ServerError> {
-        self.ensure_session()?;
-
-        let progress = {
-            let Some(session) = self.session.as_mut() else {
-                return Ok(None);
-            };
-            let pending_peer_id = match &mut self.phase {
-                ServerConnPhase::Handshaking {
-                    pending_peer_id, ..
-                } => pending_peer_id,
-                ServerConnPhase::Established => return Ok(None),
-            };
-
-            session.poll_connect_request(&mut self.conn, pending_peer_id, peer_tokens)?
-        };
-
-        match progress {
-            ServerConnectProgress::Pending => Ok(None),
-            ServerConnectProgress::Ready(peer_id) => {
-                self.peer_id = peer_id.clone();
-                self.phase = ServerConnPhase::Established;
-                Ok(Some(peer_id))
-            }
-        }
-    }
-
-    fn drain_control(&mut self) -> bool {
-        let Some(session) = self.session.as_mut() else {
-            return false;
-        };
-
-        loop {
-            match session.h3_conn.poll(&mut self.conn) {
-                Ok((sid, quiche::h3::Event::Finished)) if sid == session.connect_stream_id => {
-                    return false;
-                }
-                Ok((sid, quiche::h3::Event::Reset(_))) if sid == session.connect_stream_id => {
-                    return false;
-                }
-                Ok((_sid, quiche::h3::Event::GoAway)) => return false,
-                Ok(_) => {}
-                Err(quiche::h3::Error::Done) => return true,
-                Err(_) => return false,
-            }
-        }
-    }
-
-    fn collect_ingress(&mut self, max_udp_payload: usize) -> Vec<PooledBuf> {
-        let Some(session) = self.session.as_ref() else {
-            return Vec::new();
-        };
-
-        collect_router_ingress(
-            &mut self.conn,
-            max_udp_payload,
-            &mut self.rx_counters,
-            &session.datagram_codec,
-        )
-    }
-
-    fn close(&mut self, reason: &'static [u8]) {
-        self.conn.close(true, 0, reason).ok();
-    }
-
-    fn flush_send(&mut self, socket: &UdpSocket, send_buf: &mut [u8]) {
-        flush_server_send(&mut self.conn, socket, self.remote_addr, send_buf);
-    }
-
-    fn emit_metrics(&self, events_tx: &mpsc::UnboundedSender<Event>) {
-        let rx = self
-            .rx_counters
-            .snapshot(Some(&self.peer_id), Some(self.remote_addr));
-        let tx = self
-            .tx_counters
-            .snapshot(Some(&self.peer_id), Some(self.remote_addr));
-        let _ = events_tx.send(Event::Metrics(rx));
-        let _ = events_tx.send(Event::Metrics(tx));
-    }
-}
-
 // ========== Packet Routing ==========
 
 /// Parsed routing metadata from the first QUIC packet in a batch.
@@ -451,91 +301,367 @@ impl ServerPacketHeader {
     }
 }
 
-/// Flushes QUIC output packets inline via `send_to`.
-fn flush_server_send(
-    conn: &mut quiche::Connection,
-    socket: &UdpSocket,
-    dest: SocketAddr,
-    send_buf: &mut [u8],
+// ========== Server UDP TX Actor ==========
+
+/// Spawns the server UDP TX actor for sending QUIC packets to multiple destinations.
+///
+/// Receives `(SocketAddr, Vec<PooledBuf>)` from per-connection actors and sends
+/// each packet via `try_send_to`. Returns the sender and join handle.
+fn spawn_server_udp_tx(
+    socket: UdpSocket,
+    queue_depth: usize,
+) -> (
+    mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+    JoinHandle<ActorExitResult>,
 ) {
-    loop {
-        match conn.send(send_buf) {
-            Ok((len, _send_info)) => {
-                let _ = socket.try_send_to(&send_buf[..len], dest);
+    let (tx, mut rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(queue_depth);
+    let handle = tokio::spawn(async move {
+        while let Some((dest, packets)) = rx.recv().await {
+            for pkt in &packets {
+                let _ = socket.try_send_to(pkt, dest);
             }
-            Err(quiche::Error::Done) => break,
-            Err(e) => {
-                warn!(error = ?e, "quiche send error");
-                break;
+        }
+        Ok(())
+    });
+    (tx, handle)
+}
+
+// ========== Per-Connection Actor ==========
+
+/// Per-connection server actor owning one QUIC/H3 session.
+///
+/// Created by the dispatcher after `quiche::accept`. Runs handshake, then
+/// steady-state datagram forwarding with per-channel backpressure.
+struct ServerConnActor {
+    conn: quiche::Connection,
+    session: Option<H3Session>,
+    remote_addr: SocketAddr,
+    bound_addr: SocketAddr,
+    max_udp_payload: usize,
+}
+
+impl ServerConnActor {
+    fn recv_info(&self) -> quiche::RecvInfo {
+        quiche::RecvInfo {
+            from: self.remote_addr,
+            to: self.bound_addr,
+        }
+    }
+
+    /// Lazily creates the H3 session once QUIC is established.
+    fn ensure_session(&mut self) -> Result<(), ServerError> {
+        if self.session.is_some() || !self.conn.is_established() {
+            return Ok(());
+        }
+        debug!(remote = %self.remote_addr, "QUIC established; awaiting CONNECT-IP request");
+        self.session =
+            Some(H3Session::with_transport(&mut self.conn).map_err(ServerError::Accept)?);
+        Ok(())
+    }
+
+    /// Flushes QUIC output to the shared TX actor. Best-effort during handshake.
+    fn flush_to_tx(&mut self, udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>) {
+        let batch = collect_udp_send(&mut self.conn, self.max_udp_payload);
+        if !batch.is_empty() {
+            let _ = udp_send_tx.try_send((self.remote_addr, batch));
+        }
+    }
+
+    /// Drains H3 control events. Returns `false` if the CONNECT-IP stream closed.
+    fn drain_control(&mut self) -> bool {
+        let Some(session) = self.session.as_mut() else {
+            return false;
+        };
+        loop {
+            match session.h3_conn.poll(&mut self.conn) {
+                Ok((sid, quiche::h3::Event::Finished)) if sid == session.connect_stream_id => {
+                    return false;
+                }
+                Ok((sid, quiche::h3::Event::Reset(_))) if sid == session.connect_stream_id => {
+                    return false;
+                }
+                Ok((_sid, quiche::h3::Event::GoAway)) => return false,
+                Ok(_) => {}
+                Err(quiche::h3::Error::Done) => return true,
+                Err(_) => return false,
             }
         }
     }
+
+    /// Runs the QUIC + CONNECT-IP handshake, returning the authenticated peer ID.
+    async fn handshake(
+        &mut self,
+        udp_recv_rx: &mut mpsc::Receiver<Vec<PooledBuf>>,
+        udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+        peer_tokens: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> Result<String, ServerError> {
+        let deadline = time::sleep(timeout);
+        tokio::pin!(deadline);
+
+        let recv_info = self.recv_info();
+        let mut pending_peer_id: Option<String> = None;
+
+        loop {
+            tokio::select! {
+                maybe_batch = udp_recv_rx.recv() => {
+                    let Some(batch) = maybe_batch else {
+                        return Err(ServerError::Accept("udp rx closed during handshake".into()));
+                    };
+
+                    handle_udp_recv(&mut self.conn, batch, recv_info);
+                    self.ensure_session()?;
+
+                    if let Some(session) = self.session.as_mut() {
+                        match session.poll_connect_request(
+                            &mut self.conn, &mut pending_peer_id, peer_tokens,
+                        )? {
+                            ServerConnectProgress::Ready(peer_id) => {
+                                self.flush_to_tx(udp_send_tx);
+                                return Ok(peer_id);
+                            }
+                            ServerConnectProgress::Pending => {}
+                        }
+                    }
+
+                    self.flush_to_tx(udp_send_tx);
+                }
+
+                _ = &mut deadline => {
+                    self.conn.close(true, 0, b"handshake timeout").ok();
+                    self.flush_to_tx(udp_send_tx);
+                    return Err(ServerError::Accept("handshake timeout".into()));
+                }
+            }
+        }
+    }
+
+    /// Steady-state datagram forwarding with three-slot backpressure.
+    ///
+    /// Ingress and egress use [`PendingBatch`] for zero-drop backpressure.
+    /// The tagged UDP send channel uses inline try_send/reserve since
+    /// [`PendingBatch`] operates on `Sender<Vec<PooledBuf>>`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        mut self,
+        mut udp_recv_rx: mpsc::Receiver<Vec<PooledBuf>>,
+        udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+        mut egress_rx: mpsc::Receiver<Vec<PooledBuf>>,
+        ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+        events_tx: mpsc::UnboundedSender<Event>,
+        peer_id: String,
+        metrics_interval: Duration,
+        keepalive_interval: Duration,
+    ) -> ActorExitResult {
+        let recv_info = self.recv_info();
+        let session = self
+            .session
+            .take()
+            .expect("session present after handshake");
+
+        let mut rx_counters = Counters::new(Source::Http3, Direction::Rx);
+        let mut tx_counters = Counters::new(Source::Http3, Direction::Tx);
+        let mut pending_ingress: Option<PendingBatch> = None;
+        let mut pending_egress: Option<PendingBatch> = None;
+        let mut pending_send: Option<PendingBatch> = None;
+
+        let mut ticker = time::interval(metrics_interval);
+        let mut keepalive = time::interval(keepalive_interval);
+        keepalive.tick().await;
+
+        let timer = time::sleep(self.conn.timeout().unwrap_or(MAX_TIMEOUT));
+        tokio::pin!(timer);
+
+        loop {
+            let ingress_pending = pending_ingress.is_some();
+            let egress_pending = pending_egress.is_some();
+            let send_pending = pending_send.is_some();
+
+            tokio::select! {
+                // UDP → quiche → dgram_recv → ingress_tx.
+                maybe_batch = udp_recv_rx.recv(), if !ingress_pending => {
+                    let Some(batch) = maybe_batch else {
+                        break;
+                    };
+
+                    handle_udp_recv(&mut self.conn, batch, recv_info);
+
+                    if !self.drain_control() {
+                        self.conn.close(true, 0, b"h3 control closed").ok();
+                        break;
+                    }
+
+                    pending_ingress = match PendingBatch::enqueue(
+                        &ingress_tx,
+                        collect_router_ingress(
+                            &mut self.conn,
+                            self.max_udp_payload,
+                            &mut rx_counters,
+                            &session.datagram_codec,
+                        ),
+                    ) {
+                        Ok(p) => p,
+                        Err(()) => break,
+                    };
+                }
+
+                // Drain pending ingress when ingress_tx has capacity.
+                permit_res = ingress_tx.reserve(), if ingress_pending => {
+                    if PendingBatch::resume(
+                        &mut pending_ingress, permit_res,
+                        |waited| rx_counters.record_queue_full(waited),
+                    ).is_err() {
+                        break;
+                    }
+                }
+
+                // Router egress → dgram_send.
+                maybe_batch = egress_rx.recv(), if !egress_pending => {
+                    let Some(packets) = maybe_batch else {
+                        break;
+                    };
+
+                    if let Some(remaining) = handle_router_egress(
+                        &mut self.conn,
+                        packets,
+                        &session.datagram_codec,
+                        &mut tx_counters,
+                    ) {
+                        pending_egress = Some(PendingBatch::new(remaining));
+                    }
+                }
+
+                // Drain pending send via tagged channel.
+                permit_res = udp_send_tx.reserve(), if send_pending => {
+                    match permit_res {
+                        Ok(permit) => {
+                            let pending = pending_send.take().expect("pending send present");
+                            tx_counters.record_queue_full(pending.since.elapsed());
+                            permit.send((self.remote_addr, pending.batch));
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                _ = &mut timer => {
+                    self.conn.on_timeout();
+                }
+
+                _ = keepalive.tick() => {
+                    self.conn.send_ack_eliciting().ok();
+                }
+
+                _ = ticker.tick() => {
+                    let rx = rx_counters.snapshot(Some(&peer_id), Some(self.remote_addr));
+                    let tx = tx_counters.snapshot(Some(&peer_id), Some(self.remote_addr));
+                    let _ = events_tx.send(Event::Metrics(rx));
+                    let _ = events_tx.send(Event::Metrics(tx));
+                }
+            }
+
+            // Flush QUIC output to UDP TX actor.
+            if pending_send.is_none() {
+                let batch = collect_udp_send(&mut self.conn, self.max_udp_payload);
+                if !batch.is_empty() {
+                    match udp_send_tx.try_send((self.remote_addr, batch)) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full((_, batch))) => {
+                            pending_send = Some(PendingBatch::new(batch));
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                }
+            }
+
+            // Retry pending egress after flush.
+            if let Some(pending) = pending_egress.take() {
+                tx_counters.record_queue_full(pending.since.elapsed());
+                if let Some(remaining) = handle_router_egress(
+                    &mut self.conn,
+                    pending.batch,
+                    &session.datagram_codec,
+                    &mut tx_counters,
+                ) {
+                    pending_egress = Some(PendingBatch::new(remaining));
+                }
+
+                if pending_send.is_none() {
+                    let batch = collect_udp_send(&mut self.conn, self.max_udp_payload);
+                    if !batch.is_empty() {
+                        match udp_send_tx.try_send((self.remote_addr, batch)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full((_, batch))) => {
+                                pending_send = Some(PendingBatch::new(batch));
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                }
+            }
+
+            reset_timer(timer.as_mut(), &self.conn);
+
+            if self.conn.is_closed() {
+                break;
+            }
+        }
+
+        // Single cleanup point.
+        self.conn.close(true, 0, b"shutdown").ok();
+        let batch = collect_udp_send(&mut self.conn, self.max_udp_payload);
+        if !batch.is_empty() {
+            let _ = udp_send_tx.try_send((self.remote_addr, batch));
+        }
+        Ok(())
+    }
 }
 
-// ========== Server Runtime ==========
+// ========== Server Dispatcher ==========
 
-/// Server runtime that multiplexes all inbound H3v2 connections on one socket.
-struct ServerRuntime {
+/// Handle for a spawned per-connection actor.
+struct ConnActorHandle {
+    /// Forward QUIC packets from the dispatcher to this actor.
+    packet_tx: mpsc::Sender<Vec<PooledBuf>>,
+    /// Registered CIDs for cleanup on actor completion.
+    cids: Vec<Vec<u8>>,
+    /// Actor task handle for lifecycle tracking.
+    handle: JoinHandle<ActorExitResult>,
+}
+
+/// CID-routing dispatcher that accepts new connections and forwards packets
+/// to per-connection [`ServerConnActor`] tasks.
+struct ServerDispatcher {
     bound_addr: SocketAddr,
     config: quiche::Config,
     max_udp_payload: usize,
     handshake_timeout: Duration,
-    send_socket: UdpSocket,
-    send_buf: Vec<u8>,
+    packet_queue_depth: usize,
+    udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
+    metrics_interval: Duration,
+    keepalive_interval: Duration,
     cid_table: HashMap<Vec<u8>, usize>,
-    connections: HashMap<usize, ServerConn>,
+    actors: HashMap<usize, ConnActorHandle>,
     next_conn_id: usize,
+    /// Reusable buffer for version negotiation packets only.
+    neg_buf: Vec<u8>,
 }
 
-impl ServerRuntime {
-    fn new(
-        bound_addr: SocketAddr,
-        config: quiche::Config,
-        max_udp_payload: usize,
-        handshake_timeout: Duration,
-        send_socket: UdpSocket,
-        events_tx: mpsc::UnboundedSender<Event>,
-    ) -> Self {
-        Self {
-            bound_addr,
-            config,
-            max_udp_payload,
-            handshake_timeout,
-            send_socket,
-            send_buf: vec![0u8; max_udp_payload],
-            events_tx,
-            cid_table: HashMap::new(),
-            connections: HashMap::new(),
-            next_conn_id: 0,
-        }
-    }
-
+impl ServerDispatcher {
     async fn run(
         mut self,
         mut udp_recv_rx: mpsc::Receiver<(SocketAddr, Vec<PooledBuf>)>,
         mut cmd_rx: mpsc::UnboundedReceiver<H3v2ListenerCommand>,
         mut peer_tokens: HashMap<String, String>,
-        ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-        metrics_interval: Duration,
-        keepalive_interval: Duration,
     ) -> ActorExitResult {
-        let mut ticker = time::interval(metrics_interval);
-        let mut keepalive = time::interval(keepalive_interval);
-        keepalive.tick().await;
+        let mut cleanup_ticker = time::interval(Duration::from_secs(1));
 
-        let timer = time::sleep(MAX_TIMEOUT);
-        tokio::pin!(timer);
-
-        let mut pending_ingress: Option<PendingBatch> = None;
-
-        info!(bound_addr = %self.bound_addr, "h3v2 listener started");
+        info!(bound_addr = %self.bound_addr, "h3v2 dispatcher started");
 
         loop {
-            let ingress_pending = pending_ingress.is_some();
-
             tokio::select! {
-                maybe_pkt = udp_recv_rx.recv(), if !ingress_pending => {
+                maybe_pkt = udp_recv_rx.recv() => {
                     let Some((remote, batch)) = maybe_pkt else {
                         return Err(ActorError::BareRxRecv {
                             addr: self.bound_addr.to_string(),
@@ -543,46 +669,23 @@ impl ServerRuntime {
                         });
                     };
 
-                    let dgrams = self.handle_udp_batch(remote, batch, &peer_tokens);
-                    pending_ingress = match PendingBatch::enqueue(&ingress_tx, dgrams) {
-                        Ok(pending) => pending,
-                        Err(()) => return Ok(()),
-                    };
+                    self.handle_udp_batch(remote, batch, &peer_tokens);
                 }
 
-                permit_res = ingress_tx.reserve(), if ingress_pending => {
-                    if PendingBatch::resume(
-                        &mut pending_ingress, permit_res,
-                        |waited| debug!(waited_ms = waited.as_millis(), "server ingress backpressure"),
-                    ).is_err() {
-                        return Ok(());
-                    }
-                }
-
-                _ = &mut timer => {
-                    self.on_timeout();
-                }
-
-                _ = keepalive.tick() => {
-                    self.on_keepalive();
-                }
-
-                _ = ticker.tick() => {
-                    self.on_metrics_tick();
+                _ = cleanup_ticker.tick() => {
+                    self.cleanup_finished_actors();
                 }
 
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(H3v2ListenerCommand::UpdatePeerTokens(update)) => {
                             peer_tokens = update;
-                            debug!("h3v2 listener: updated peer tokens");
+                            debug!("dispatcher: updated peer tokens");
                         }
                         None => return Ok(()),
                     }
                 }
             }
-
-            self.reset_timer(timer.as_mut());
         }
     }
 
@@ -591,67 +694,33 @@ impl ServerRuntime {
         remote: SocketAddr,
         mut batch: Vec<PooledBuf>,
         peer_tokens: &HashMap<String, String>,
-    ) -> Vec<PooledBuf> {
+    ) {
         let Some(header) = ServerPacketHeader::parse(&mut batch) else {
-            return Vec::new();
+            return;
         };
 
         if let Some(&conn_id) = self.cid_table.get(&header.dcid) {
-            return self.handle_existing_connection(conn_id, batch, peer_tokens);
+            // Forward to existing per-connection actor.
+            if let Some(actor) = self.actors.get(&conn_id) {
+                if actor.packet_tx.try_send(batch).is_err() {
+                    debug!(
+                        conn_id,
+                        "actor packet channel full or closed; dropping batch"
+                    );
+                }
+            }
+            return;
         }
 
-        self.accept_new_connection(remote, batch, header);
-        Vec::new()
+        self.accept_and_spawn(remote, batch, header, peer_tokens);
     }
 
-    fn handle_existing_connection(
-        &mut self,
-        conn_id: usize,
-        batch: Vec<PooledBuf>,
-        peer_tokens: &HashMap<String, String>,
-    ) -> Vec<PooledBuf> {
-        let bound_addr = self.bound_addr;
-        let max_udp_payload = self.max_udp_payload;
-        let send_socket = &self.send_socket;
-        let send_buf = &mut self.send_buf;
-
-        let Some(sc) = self.connections.get_mut(&conn_id) else {
-            return Vec::new();
-        };
-
-        let recv_info = sc.recv_info(bound_addr);
-        handle_udp_recv(&mut sc.conn, batch, recv_info);
-
-        let ingress = if sc.is_established() {
-            if !sc.drain_control() {
-                sc.close(b"h3 control closed");
-                Vec::new()
-            } else {
-                sc.collect_ingress(max_udp_payload)
-            }
-        } else {
-            match sc.advance_handshake(peer_tokens) {
-                Ok(Some(ref peer_id)) => {
-                    info!(%peer_id, remote = %sc.remote_addr, "server: CONNECT-IP established");
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(remote = %sc.remote_addr, error = %e, "server handshake failed");
-                    sc.close(b"handshake failed");
-                }
-            }
-            Vec::new()
-        };
-
-        sc.flush_send(send_socket, send_buf);
-        ingress
-    }
-
-    fn accept_new_connection(
+    fn accept_and_spawn(
         &mut self,
         remote: SocketAddr,
         batch: Vec<PooledBuf>,
         header: ServerPacketHeader,
+        peer_tokens: &HashMap<String, String>,
     ) {
         if header.hdr_ty != quiche::Type::Initial {
             return;
@@ -661,9 +730,12 @@ impl ServerRuntime {
             if let Ok(len) = quiche::negotiate_version(
                 &quiche::ConnectionId::from_ref(&header.client_scid),
                 &quiche::ConnectionId::from_ref(&header.dcid),
-                &mut self.send_buf,
+                &mut self.neg_buf,
             ) {
-                let _ = self.send_socket.try_send_to(&self.send_buf[..len], remote);
+                let mut pkt = crate::tun::alloc_uninit_packet_buf(len);
+                pkt[..len].copy_from_slice(&self.neg_buf[..len]);
+                pkt.truncate(len);
+                let _ = self.udp_send_tx.try_send((remote, vec![pkt]));
             }
             return;
         }
@@ -691,89 +763,107 @@ impl ServerRuntime {
             },
         );
 
+        // Register CIDs before spawning actor so subsequent packets route correctly.
         let conn_id = self.next_conn_id;
         self.next_conn_id += 1;
 
         // TODO: Track NEW_CONNECTION_ID / RETIRE_CONNECTION_ID for CID rotation.
-        // Acceptable for stable-NAT VPN use.
         let cids = vec![header.dcid, scid_bytes.to_vec()];
         for cid in &cids {
             self.cid_table.insert(cid.clone(), conn_id);
         }
 
-        let mut sc = ServerConn::new(conn, remote, cids);
-        sc.flush_send(&self.send_socket, &mut self.send_buf);
-        self.connections.insert(conn_id, sc);
+        let mut actor = ServerConnActor {
+            conn,
+            session: None,
+            remote_addr: remote,
+            bound_addr: self.bound_addr,
+            max_udp_payload: self.max_udp_payload,
+        };
+
+        // Send initial handshake output (ServerHello).
+        actor.flush_to_tx(&self.udp_send_tx);
+
+        // Create per-connection channels.
+        let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<PooledBuf>>(self.packet_queue_depth);
+        let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(self.packet_queue_depth);
+        let udp_send_tx = self.udp_send_tx.clone();
+        let ingress_tx = self.ingress_tx.clone();
+        let events_tx = self.events_tx.clone();
+        let peer_tokens = peer_tokens.clone();
+        let handshake_timeout = self.handshake_timeout;
+        let metrics_interval = self.metrics_interval;
+        let keepalive_interval = self.keepalive_interval;
+
+        // Spawn per-connection actor.
+        let handle = tokio::spawn(async move {
+            // Handshake phase.
+            let peer_id = match actor
+                .handshake(
+                    &mut packet_rx,
+                    &udp_send_tx,
+                    &peer_tokens,
+                    handshake_timeout,
+                )
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(remote = %actor.remote_addr, error = %e, "server handshake failed");
+                    return Ok(());
+                }
+            };
+
+            info!(%peer_id, remote = %actor.remote_addr, "server: CONNECT-IP established");
+
+            // TODO: Emit H3ServerConn { peer_id, remote_addr, tx: egress_tx }
+            // to the orchestrator for routing integration.
+            let _ = &egress_tx; // suppress unused warning for now
+
+            // Steady-state forwarding.
+            actor
+                .run(
+                    packet_rx,
+                    udp_send_tx,
+                    egress_rx,
+                    ingress_tx,
+                    events_tx,
+                    peer_id,
+                    metrics_interval,
+                    keepalive_interval,
+                )
+                .await
+        });
+
+        self.actors.insert(
+            conn_id,
+            ConnActorHandle {
+                packet_tx,
+                cids,
+                handle,
+            },
+        );
     }
 
-    fn on_timeout(&mut self) {
-        let send_socket = &self.send_socket;
-        let send_buf = &mut self.send_buf;
-
-        for sc in self.connections.values_mut() {
-            sc.conn.on_timeout();
-            sc.flush_send(send_socket, send_buf);
-        }
-    }
-
-    fn on_keepalive(&mut self) {
-        let send_socket = &self.send_socket;
-        let send_buf = &mut self.send_buf;
-
-        for sc in self.connections.values_mut() {
-            if !sc.is_established() {
-                continue;
-            }
-
-            sc.conn.send_ack_eliciting().ok();
-            sc.flush_send(send_socket, send_buf);
-        }
-    }
-
-    fn on_metrics_tick(&mut self) {
-        let remove: Vec<usize> = self
-            .connections
+    fn cleanup_finished_actors(&mut self) {
+        let finished: Vec<usize> = self
+            .actors
             .iter()
-            .filter(|(_, sc)| sc.conn.is_closed() || sc.handshake_timed_out(self.handshake_timeout))
+            .filter(|(_, a)| a.handle.is_finished())
             .map(|(&id, _)| id)
             .collect();
 
-        for id in remove {
-            self.remove_connection(id);
-        }
-
-        for sc in self.connections.values() {
-            sc.emit_metrics(&self.events_tx);
-        }
-    }
-
-    fn remove_connection(&mut self, conn_id: usize) {
-        if let Some(sc) = self.connections.get_mut(&conn_id) {
-            if !sc.conn.is_closed() {
-                sc.close(b"handshake timeout");
-                sc.flush_send(&self.send_socket, &mut self.send_buf);
+        for conn_id in finished {
+            if let Some(actor) = self.actors.remove(&conn_id) {
+                for cid in &actor.cids {
+                    self.cid_table.remove(cid);
+                }
             }
         }
-
-        if let Some(sc) = self.connections.remove(&conn_id) {
-            for cid in &sc.cids {
-                self.cid_table.remove(cid);
-            }
-        }
-    }
-
-    fn next_timeout(&self) -> Duration {
-        self.connections
-            .values()
-            .filter_map(|sc| sc.conn.timeout())
-            .min()
-            .unwrap_or(MAX_TIMEOUT)
-    }
-
-    fn reset_timer(&self, timer: std::pin::Pin<&mut time::Sleep>) {
-        timer.reset(time::Instant::now() + self.next_timeout());
     }
 }
+
+// ========== Spawn ==========
 
 fn spawn_listener_start_error(
     crypto_rt: &RuntimeHandle,
@@ -790,12 +880,13 @@ fn spawn_listener_start_error(
 
 /// Spawns the H3v2 listener with separated I/O and crypto:
 ///
-/// - **Recv actor** (I/O thread via `tokio::spawn`): quinn-udp GRO-aware recv,
-///   sends `(SocketAddr, Vec<PooledBuf>)` batches via channel.
-/// - **Multiplexed engine** (`crypto_rt`): CID routing, QUIC crypto, H3 handshake,
-///   datagram forwarding, inline `send_to`.
+/// - **Recv actor** (I/O thread): quinn-udp GRO-aware recv.
+/// - **TX actor** (I/O thread): shared send actor for all connections.
+/// - **Dispatcher** (`crypto_rt`): CID routing, connection acceptance.
+/// - **Per-connection actors** (`crypto_rt`): QUIC crypto, H3 session,
+///   datagram forwarding with backpressure.
 ///
-/// Returns command sender, engine join handle, and bound address.
+/// Returns command sender, dispatcher join handle, and bound address.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_h3v2_listener(
     listener: H3v2Listener,
@@ -820,9 +911,8 @@ pub fn spawn_h3v2_listener(
     } = listener;
 
     let tuning = tuning.clone();
-    let handshake_timeout = tuning.h3_handshake_timeout;
 
-    // Clone socket: recv_std → recv actor (I/O thread), std_socket → engine (crypto_rt).
+    // Clone socket: recv → RX actor, send → TX actor.
     let recv_std = match std_socket.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -830,8 +920,15 @@ pub fn spawn_h3v2_listener(
             return (cmd_tx, handle, bound_addr);
         }
     };
+    let send_std = match std_socket.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            let handle = spawn_listener_start_error(crypto_rt, bound_addr, e);
+            return (cmd_tx, handle, bound_addr);
+        }
+    };
 
-    // Recv actor on I/O thread — reuses BareUDP recv with source addr tagging.
+    // RX actor on I/O thread.
     let (udp_recv_tx, udp_recv_rx) =
         mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
     let recv_socket = match UdpSocket::from_std(recv_std) {
@@ -854,31 +951,36 @@ pub fn spawn_h3v2_listener(
     };
     let _recv_handle = spawn_server_udp_rx(bare_rx, udp_recv_tx);
 
-    // Multiplexed engine on crypto_rt.
+    // TX actor on I/O thread.
+    let send_socket = match UdpSocket::from_std(send_std) {
+        Ok(s) => s,
+        Err(e) => {
+            let handle = spawn_listener_start_error(crypto_rt, bound_addr, e);
+            return (cmd_tx, handle, bound_addr);
+        }
+    };
+    let (udp_send_tx, _tx_handle) = spawn_server_udp_tx(send_socket, tuning.packet_queue_depth);
+
+    // Dispatcher on crypto_rt.
     let handle = crypto_rt.spawn(async move {
-        let send_socket = UdpSocket::from_std(std_socket).map_err(|e| ActorError::BareRxRecv {
-            addr: bound_addr.to_string(),
-            source: e,
-        })?;
-        let runtime = ServerRuntime::new(
+        let dispatcher = ServerDispatcher {
             bound_addr,
             config,
             max_udp_payload,
-            handshake_timeout,
-            send_socket,
+            handshake_timeout: tuning.h3_handshake_timeout,
+            packet_queue_depth: tuning.packet_queue_depth,
+            udp_send_tx,
+            ingress_tx,
             events_tx,
-        );
+            metrics_interval: tuning.metrics_push_interval,
+            keepalive_interval: tuning.h3_keepalive_interval,
+            cid_table: HashMap::new(),
+            actors: HashMap::new(),
+            next_conn_id: 0,
+            neg_buf: vec![0u8; max_udp_payload],
+        };
 
-        runtime
-            .run(
-                udp_recv_rx,
-                cmd_rx,
-                peer_tokens,
-                ingress_tx,
-                tuning.metrics_push_interval,
-                tuning.h3_keepalive_interval,
-            )
-            .await
+        dispatcher.run(udp_recv_rx, cmd_rx, peer_tokens).await
     });
 
     (cmd_tx, handle, bound_addr)

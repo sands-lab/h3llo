@@ -12,8 +12,9 @@ use octets::{varint_len, varint_parse_len, Octets, OctetsMut};
 use quiche::h3::NameValue;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Duration used as "infinite" timeout when quiche returns None.
 pub(crate) const MAX_TIMEOUT: Duration = Duration::from_secs(86400);
@@ -407,6 +408,109 @@ impl PendingBatch {
             Err(_closed) => Err(()),
         }
     }
+}
+
+// ========== QUIC Send Helpers ==========
+
+/// Collects pending QUIC output packets into a batch.
+///
+/// Pure function with no channel dependency — the caller is responsible for
+/// sending the batch via `try_send` + `pending_send` pattern.
+pub(crate) fn collect_udp_send(
+    conn: &mut quiche::Connection,
+    max_udp_payload: usize,
+) -> Vec<PooledBuf> {
+    let mut batch = Vec::new();
+    loop {
+        let mut buf = alloc_uninit_packet_buf(max_udp_payload);
+        match conn.send(&mut buf) {
+            Ok((len, _send_info)) => {
+                buf.truncate(len);
+                batch.push(buf);
+            }
+            Err(quiche::Error::Done) => break,
+            Err(e) => {
+                warn!(error = ?e, "quiche send error");
+                break;
+            }
+        }
+    }
+    batch
+}
+
+/// Collects QUIC output and tries to send it to `udp_send_tx`.
+///
+/// Returns `Ok(Some(batch))` when the channel is full (store as `pending_send`),
+/// `Ok(None)` on success or empty, `Err(())` when the channel is closed.
+pub(crate) fn flush_udp_send(
+    conn: &mut quiche::Connection,
+    max_udp_payload: usize,
+    udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
+) -> Result<Option<PendingBatch>, ()> {
+    PendingBatch::enqueue(udp_send_tx, collect_udp_send(conn, max_udp_payload))
+}
+
+// ========== Router Egress ==========
+
+/// Encodes egress IP packets as QUIC DATAGRAMs with QSI varint + Context ID prefix.
+///
+/// Returns unsent packets (with framing stripped) when the dgram queue is full,
+/// so the caller can store them as `pending_egress` for retry after `flush_send`.
+pub(crate) fn handle_router_egress(
+    conn: &mut quiche::Connection,
+    packets: Vec<PooledBuf>,
+    codec: &ConnectIpDatagramCodec,
+    counters: &mut Counters,
+) -> Option<Vec<PooledBuf>> {
+    let mut ok_pkts: u64 = 0;
+    let mut ok_bytes: u64 = 0;
+    let mut iter = packets.into_iter();
+
+    while let Some(mut pkt) = iter.next() {
+        let pkt_len = pkt.len() as u64;
+        if !codec.prepend(&mut pkt) {
+            counters.record_drop(DropReason::NoHeadroom, 1, pkt_len);
+            continue;
+        }
+        match conn.dgram_send(&pkt) {
+            Ok(()) => {
+                ok_pkts += 1;
+                ok_bytes += pkt_len;
+            }
+            Err(quiche::Error::Done) => {
+                // Queue full: undo framing and collect remaining for retry.
+                debug!(
+                    "dgram_send queue full; {} pkts pending",
+                    1 + iter.size_hint().0
+                );
+                codec.undo_prefix(&mut pkt);
+                let mut remaining = vec![pkt];
+                remaining.extend(iter);
+                if ok_pkts > 0 {
+                    counters.record_success(ok_pkts, ok_bytes);
+                }
+                return Some(remaining);
+            }
+            Err(e) => {
+                // Non-queue-full error (e.g. BufferTooShort, InvalidState):
+                // drop to prevent infinite retry.
+                debug!(error = ?e, "dgram_send failed; dropping packet");
+                counters.record_drop(DropReason::SendError, 1, pkt_len);
+            }
+        }
+    }
+
+    if ok_pkts > 0 {
+        counters.record_success(ok_pkts, ok_bytes);
+    }
+    None
+}
+
+/// Resets the pinned timer to the next quiche timeout deadline.
+///
+/// Uses `MAX_TIMEOUT` as sentinel when quiche returns `None` (no pending timers).
+pub(crate) fn reset_timer(timer: std::pin::Pin<&mut time::Sleep>, conn: &quiche::Connection) {
+    timer.reset(time::Instant::now() + conn.timeout().unwrap_or(MAX_TIMEOUT));
 }
 
 #[cfg(test)]
