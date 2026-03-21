@@ -183,11 +183,6 @@ impl Counters {
         self.stats.succeeded.record(count, total_bytes);
     }
 
-    /// Records a WouldBlock congestion event with the elapsed retry duration.
-    pub(crate) fn record_would_block(&mut self, dur: std::time::Duration) {
-        self.stats.congestion.record_would_block(dur);
-    }
-
     /// Records dropped packets for `reason` with saturation.
     ///
     /// For single-packet recording, pass `count = 1`.

@@ -5,7 +5,6 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::generate_bearer_auth;
-use crate::bare::{bare_rx_from_socket, bare_tx_from_socket, spawn_udp_rx, spawn_udp_tx};
 use crate::bind::{make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::Event;
@@ -16,11 +15,10 @@ use crate::h3v2::{
     MAX_TIMEOUT,
 };
 use crate::metrics::{Counters, Direction, Source};
+use crate::udp;
 use rand::Rng;
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -44,11 +42,9 @@ pub struct H3ClientConn {
     pub tx: mpsc::Sender<Vec<PooledBuf>>,
     /// H3 client actor join handle.
     pub engine_handle: JoinHandle<ActorExitResult>,
-    /// BareUDP Rx actor command sender (kept alive to prevent actor shutdown).
-    pub udp_rx_cmd: mpsc::UnboundedSender<crate::bare::BareUdpRxCommand>,
-    /// BareUDP Rx actor join handle.
+    /// UDP Rx actor join handle.
     pub udp_rx_handle: JoinHandle<ActorExitResult>,
-    /// BareUDP Tx actor join handle.
+    /// UDP Tx actor join handle.
     pub udp_tx_handle: JoinHandle<ActorExitResult>,
 }
 
@@ -120,8 +116,8 @@ enum EngineRole {
 
 /// Channels owned by the engine actor.
 struct EngineIo {
-    udp_recv_rx: mpsc::Receiver<Vec<PooledBuf>>,
-    udp_send_tx: mpsc::Sender<Vec<PooledBuf>>,
+    udp_recv_rx: mpsc::Receiver<(SocketAddr, Vec<PooledBuf>)>,
+    udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     egress_rx: mpsc::Receiver<Vec<PooledBuf>>,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
@@ -190,10 +186,11 @@ impl RunState {
         conn: &mut quiche::Connection,
         session: &H3Session,
         meta: &EngineMeta,
-        udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
+        udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     ) -> Result<(), ()> {
         if self.pending_send.is_none() {
-            self.pending_send = flush_udp_send(conn, meta.max_udp_payload, udp_send_tx)?;
+            self.pending_send =
+                flush_udp_send(conn, meta.max_udp_payload, meta.remote_addr, udp_send_tx)?;
         }
 
         if let Some(pending) = self.pending_egress.take() {
@@ -209,7 +206,8 @@ impl RunState {
         }
 
         if self.pending_send.is_none() {
-            self.pending_send = flush_udp_send(conn, meta.max_udp_payload, udp_send_tx)?;
+            self.pending_send =
+                flush_udp_send(conn, meta.max_udp_payload, meta.remote_addr, udp_send_tx)?;
         }
 
         Ok(())
@@ -254,6 +252,7 @@ impl H3Engine {
         let _ = flush_udp_send(
             &mut self.conn,
             self.meta.max_udp_payload,
+            self.meta.remote_addr,
             &self.io.udp_send_tx,
         );
     }
@@ -276,7 +275,7 @@ impl H3Engine {
         loop {
             tokio::select! {
                 maybe_batch = self.io.udp_recv_rx.recv() => {
-                    let Some(packets) = maybe_batch else {
+                    let Some((_remote, packets)) = maybe_batch else {
                         return Err(DialError::Handshake("UDP Rx closed during startup".into()));
                     };
 
@@ -411,7 +410,7 @@ impl H3Engine {
                 maybe_batch = udp_recv_rx.recv(),
                     if !ingress_pending =>
                 {
-                    let Some(packets) = maybe_batch else {
+                    let Some((_remote, packets)) = maybe_batch else {
                         break LoopExit::Ok(b"udp rx closed");
                     };
 
@@ -473,11 +472,14 @@ impl H3Engine {
                 permit_res = udp_send_tx.reserve(),
                     if send_pending =>
                 {
-                    if PendingBatch::resume(
-                        &mut run_state.pending_send, permit_res,
-                        |waited| run_state.tx_counters.record_queue_full(waited),
-                    ).is_err() {
-                        break LoopExit::Ok(b"udp tx closed");
+                    match permit_res {
+                        Ok(permit) => {
+                            let pending = run_state.pending_send.take()
+                                .expect("pending send present");
+                            run_state.tx_counters.record_queue_full(pending.since.elapsed());
+                            permit.send((meta.remote_addr, pending.batch));
+                        }
+                        Err(_) => break LoopExit::Ok(b"udp tx closed"),
                     }
                 }
 
@@ -515,7 +517,12 @@ impl H3Engine {
 
         // Single cleanup point: close QUIC and flush remaining packets.
         conn.close(true, 0, exit.close_reason()).ok();
-        let _ = flush_udp_send(&mut conn, meta.max_udp_payload, &udp_send_tx);
+        let _ = flush_udp_send(
+            &mut conn,
+            meta.max_udp_payload,
+            meta.remote_addr,
+            &udp_send_tx,
+        );
         exit.into_result(&meta, role)
     }
 }
@@ -606,36 +613,15 @@ pub async fn dial_h3_client<P: RouteProbe>(
         .local_addr()
         .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
 
-    // Clone socket fd for separate RX and TX actors.
-    let std_socket = socket
-        .into_std()
-        .map_err(|e| DialError::Socket(format!("into_std: {e}")))?;
-    let rx_std = std_socket
-        .try_clone()
-        .map_err(|e| DialError::Socket(format!("try_clone: {e}")))?;
-    let rx_socket =
-        UdpSocket::from_std(rx_std).map_err(|e| DialError::Socket(format!("from_std rx: {e}")))?;
-    let tx_socket = UdpSocket::from_std(std_socket)
-        .map_err(|e| DialError::Socket(format!("from_std tx: {e}")))?;
-
     let max_udp_payload = tun_mtu as usize + CONNECT_IP_OVERHEAD;
-    let bare_rx = bare_rx_from_socket(rx_socket, max_udp_payload)
-        .map_err(|e| DialError::Socket(format!("bare_rx: {e}")))?;
-    let bare_tx = bare_tx_from_socket(tx_socket, remote_addr, tuning.udp_enable_offload)
-        .map_err(|e| DialError::Socket(format!("bare_tx: {e}")))?;
+    let (udp_rx, udp_tx) = udp::make_udp(socket, max_udp_payload, tuning.udp_enable_offload)
+        .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
 
-    // Spawn BareUDP actors.
-    let (udp_recv_tx, udp_recv_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.packet_queue_depth);
-    let accepted = HashSet::from([remote_addr.ip()]);
-    let (udp_rx_cmd, udp_rx_handle) = spawn_udp_rx(
-        bare_rx,
-        accepted,
-        udp_recv_tx,
-        events_tx.clone(),
-        tuning.metrics_push_interval,
-    );
-    let (udp_send_tx, udp_tx_handle) =
-        spawn_udp_tx(bare_tx, peer_id.to_string(), events_tx.clone(), tuning);
+    // Spawn generic UDP actors.
+    let (udp_recv_tx, udp_recv_rx) =
+        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
+    let udp_rx_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx);
+    let (udp_send_tx, udp_tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth);
 
     // Create quiche config and connection.
     let mut config = make_client_quiche_config(tuning, max_udp_payload)?;
@@ -710,7 +696,6 @@ pub async fn dial_h3_client<P: RouteProbe>(
         remote_addr,
         tx: egress_tx,
         engine_handle,
-        udp_rx_cmd,
         udp_rx_handle,
         udp_tx_handle,
     })
@@ -744,13 +729,11 @@ mod tests {
     #[tokio::test]
     async fn h3_client_connection_debug_omits_handles() {
         let (tx, _rx) = mpsc::channel::<Vec<PooledBuf>>(1);
-        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let conn = H3ClientConn {
             peer_id: "peer-1".into(),
             remote_addr: "1.2.3.4:443".parse().unwrap(),
             tx,
             engine_handle: tokio::spawn(async { Ok(()) }),
-            udp_rx_cmd: cmd_tx,
             udp_rx_handle: tokio::spawn(async { Ok(()) }),
             udp_tx_handle: tokio::spawn(async { Ok(()) }),
         };
@@ -1160,11 +1143,8 @@ mod tests {
         let _server_event = await_server_connection(&mut server.events_rx).await;
 
         // Drop the egress sender to trigger client shutdown.
-        // Keep udp_rx_cmd alive so the BareUDP RX actor doesn't exit
-        // before the engine processes the egress channel closure.
         let H3ClientConn {
             engine_handle,
-            udp_rx_cmd: _udp_rx_cmd,
             udp_rx_handle,
             udp_tx_handle,
             tx,

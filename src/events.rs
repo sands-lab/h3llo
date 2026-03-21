@@ -112,7 +112,7 @@ impl std::fmt::Debug for ApiEvent {
 
 /// Dial failure notification from a spawned connection task.
 ///
-/// Sent back to the orchestrator when `make_bare_tx` or `dial_h3` fails,
+/// Sent back to the orchestrator when `make_unbound_udp_socket` or `dial_h3` fails,
 /// allowing the orchestrator to clear the in-flight flag and advance backoff.
 #[derive(Debug)]
 pub struct DialFailedEvent {
@@ -124,9 +124,9 @@ pub struct DialFailedEvent {
 
 /// BareUDP TX connection established event.
 ///
-/// Emitted by the async connection task when `make_bare_tx` + `spawn_udp_tx`
-/// succeed. Carries the TX channel sender and actor JoinHandle for
-/// orchestrator registration.
+/// Emitted by the async connection task when `udp::make_udp` +
+/// `udp::spawn_udp_tx` + `spawn_bare_tx` succeed. Carries the TX channel
+/// sender and actor JoinHandles for orchestrator registration.
 pub struct BareConnectedEvent {
     /// Peer identifier from configuration.
     pub peer_id: String,
@@ -136,8 +136,10 @@ pub struct BareConnectedEvent {
     pub dest: SocketAddr,
     /// TX channel for sending packet batches to the bare TX actor.
     pub tx: mpsc::Sender<Vec<PooledBuf>>,
-    /// Join handle for the spawned bare TX actor.
+    /// Join handle for the spawned bare TX adapter actor.
     pub tx_handle: JoinHandle<ActorExitResult>,
+    /// Join handle for the underlying UDP TX I/O actor.
+    pub udp_tx_handle: JoinHandle<ActorExitResult>,
 }
 
 impl std::fmt::Debug for BareConnectedEvent {

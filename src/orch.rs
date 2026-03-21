@@ -1,8 +1,8 @@
 //! Runtime orchestration for BareUDP and HTTP/3 transports.
 
 use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
-use crate::bare::{make_bare_rx, make_bare_tx, spawn_udp_rx, spawn_udp_tx, BareUdpRxCommand};
-use crate::bind::DefaultRouteProbe;
+use crate::bare::{spawn_bare_rx, spawn_bare_tx, BareUdpRxCommand};
+use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, DefaultRouteProbe};
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
@@ -16,6 +16,7 @@ use crate::metrics::{log_quic_metrics, log_transport_metrics, Direction, Labels,
 use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::router::{spawn_router, RouterCommand, RoutingTable};
 use crate::tun;
+use crate::udp;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -239,30 +240,44 @@ impl PeerEntry {
                 let _guard = bare_handle.enter();
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
-                    match make_bare_tx(
+                    match make_unbound_udp_socket(
                         destination,
-                        bindif.as_deref(),
                         Some(&tun_if),
+                        bindif.as_deref(),
                         &probe,
-                        &tuning,
+                        tuning.socket_buffer_bytes(),
                     )
                     .await
                     {
-                        Ok(tx_socket) => {
-                            let (egress_tx, tx_handle) = spawn_udp_tx(
-                                tx_socket,
-                                peer_id.clone(),
-                                events_tx.clone(),
-                                &tuning,
-                            );
-                            let _ = events_tx.send(Event::BareConnected(BareConnectedEvent {
-                                peer_id,
-                                endpoint,
-                                dest: destination,
-                                tx: egress_tx,
-                                tx_handle,
-                            }));
-                        }
+                        Ok(socket) => match udp::make_udp(socket, mtu, tuning.udp_enable_offload) {
+                            Ok((_rx, tx)) => {
+                                let (udp_send_tx, udp_tx_handle) =
+                                    udp::spawn_udp_tx(tx, tuning.packet_queue_depth);
+                                let (egress_tx, bare_tx_handle) = spawn_bare_tx(
+                                    udp_send_tx,
+                                    destination,
+                                    peer_id.clone(),
+                                    events_tx.clone(),
+                                    tuning.metrics_push_interval,
+                                    tuning.packet_queue_depth,
+                                );
+                                let _ = events_tx.send(Event::BareConnected(BareConnectedEvent {
+                                    peer_id,
+                                    endpoint,
+                                    dest: destination,
+                                    tx: egress_tx,
+                                    tx_handle: bare_tx_handle,
+                                    udp_tx_handle,
+                                }));
+                            }
+                            Err(err) => {
+                                warn!(peer = %peer_id, addr = %destination, error = %err, "make_udp failed");
+                                let _ = events_tx.send(Event::DialFailed(DialFailedEvent {
+                                    peer_id,
+                                    ip: dial_ip,
+                                }));
+                            }
+                        },
                         Err(err) => {
                             warn!(peer = %peer_id, addr = %destination, error = %err, "bare tx socket setup failed");
                             let _ = events_tx.send(Event::DialFailed(DialFailedEvent {
@@ -606,24 +621,37 @@ impl Orchestrator {
         let bare_rx_cmd_tx = if let Some(ref local_bare) = config.local.bare {
             let listen_addr = resolve_listen_addr(&local_bare.listen.host, local_bare.listen.port)?;
 
-            // BareUDP RX on BareUDP runtime — UdpSocket registers with BareUDP reactor.
-            let bare_rx = {
+            // Create listen socket and generic UDP RX actor on BareUDP runtime.
+            let udp_rx = {
                 let _guard = bare_rt.handle().enter();
-                make_bare_rx(listen_addr, mtu, tuning.socket_buffer_bytes())
-                    .map_err(|err| OrchestratorError::Udp(err.to_string()))?
+                let socket = make_server_udp_socket(listen_addr, tuning.socket_buffer_bytes())
+                    .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
+                let (udp_rx, _udp_tx) = udp::make_udp(socket, mtu, tuning.udp_enable_offload)
+                    .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
+                // _udp_tx dropped: per-peer TX sockets created in try_connect.
+                udp_rx
+            };
+
+            let (udp_output_tx, udp_output_rx) =
+                mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
+
+            let udp_rx_handle = {
+                let _guard = bare_rt.handle().enter();
+                udp::spawn_udp_rx(udp_rx, udp_output_tx)
             };
 
             let (cmd_tx, bare_rx_handle) = {
                 let _guard = bare_rt.handle().enter();
-                spawn_udp_rx(
-                    bare_rx,
-                    std::collections::HashSet::new(),
+                spawn_bare_rx(
+                    udp_output_rx,
+                    HashSet::new(),
                     ingress_tx.clone(),
                     events_tx.clone(),
                     tuning.metrics_push_interval,
                 )
             };
 
+            join_set.spawn(udp_rx_handle);
             join_set.spawn(bare_rx_handle);
             Some(cmd_tx)
         } else {
@@ -1079,9 +1107,11 @@ impl Orchestrator {
             dest,
             tx,
             tx_handle,
+            udp_tx_handle,
         } = event;
-        // Always register: actor is already running, must be supervised
+        // Always register: actors are already running, must be supervised
         self.join_set.spawn(tx_handle);
+        self.join_set.spawn(udp_tx_handle);
         self.update_bound(&peer_id, Some(endpoint), dest, tx);
     }
 
@@ -2237,6 +2267,7 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(1);
         let tx_handle = tokio::spawn(async { Ok(()) });
+        let udp_tx_handle = tokio::spawn(async { Ok(()) });
 
         let event = BareConnectedEvent {
             peer_id: "unknown-peer".to_string(),
@@ -2247,6 +2278,7 @@ mod tests {
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx,
             tx_handle,
+            udp_tx_handle,
         };
 
         orch.handle_bare_connection(event);
@@ -2269,6 +2301,7 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(1);
         let tx_handle = tokio::spawn(async { Ok(()) });
+        let udp_tx_handle = tokio::spawn(async { Ok(()) });
 
         let event = BareConnectedEvent {
             peer_id: "peer1".to_string(),
@@ -2279,6 +2312,7 @@ mod tests {
             dest: "5.6.7.8:5353".parse().unwrap(),
             tx,
             tx_handle,
+            udp_tx_handle,
         };
 
         orch.handle_bare_connection(event);
@@ -2305,6 +2339,7 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(1);
         let tx_handle = tokio::spawn(async { Ok(()) });
+        let udp_tx_handle = tokio::spawn(async { Ok(()) });
 
         let event = BareConnectedEvent {
             peer_id: "peer1".to_string(),
@@ -2315,6 +2350,7 @@ mod tests {
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx,
             tx_handle,
+            udp_tx_handle,
         };
 
         orch.handle_bare_connection(event);

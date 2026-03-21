@@ -10,7 +10,6 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::validate_connect_auth;
-use crate::bare::{bare_rx_from_socket, spawn_server_udp_rx};
 use crate::bind::make_server_udp_socket;
 use crate::config::Tuning;
 use crate::events::Event;
@@ -20,6 +19,7 @@ use crate::h3v2::{
     handle_udp_recv, reset_timer, H3Session, PendingBatch, MAX_TIMEOUT,
 };
 use crate::metrics::{Counters, Direction, Source};
+use crate::udp;
 use quiche::h3::NameValue;
 use rand::Rng;
 use std::collections::HashMap;
@@ -299,31 +299,6 @@ impl ServerPacketHeader {
             client_scid: hdr.scid.as_ref().to_vec(),
         })
     }
-}
-
-// ========== Server UDP TX Actor ==========
-
-/// Spawns the server UDP TX actor for sending QUIC packets to multiple destinations.
-///
-/// Receives `(SocketAddr, Vec<PooledBuf>)` from per-connection actors and sends
-/// each packet via `try_send_to`. Returns the sender and join handle.
-fn spawn_server_udp_tx(
-    socket: UdpSocket,
-    queue_depth: usize,
-) -> (
-    mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
-    JoinHandle<ActorExitResult>,
-) {
-    let (tx, mut rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(queue_depth);
-    let handle = tokio::spawn(async move {
-        while let Some((dest, packets)) = rx.recv().await {
-            for pkt in &packets {
-                let _ = socket.try_send_to(pkt, dest);
-            }
-        }
-        Ok(())
-    });
-    (tx, handle)
 }
 
 // ========== Per-Connection Actor ==========
@@ -663,7 +638,7 @@ impl ServerDispatcher {
             tokio::select! {
                 maybe_pkt = udp_recv_rx.recv() => {
                     let Some((remote, batch)) = maybe_pkt else {
-                        return Err(ActorError::BareRxRecv {
+                        return Err(ActorError::UdpRxRecv {
                             addr: self.bound_addr.to_string(),
                             source: std::io::Error::other("recv actor closed"),
                         });
@@ -871,7 +846,7 @@ fn spawn_listener_start_error(
     source: std::io::Error,
 ) -> JoinHandle<ActorExitResult> {
     crypto_rt.spawn(async move {
-        Err(ActorError::BareRxRecv {
+        Err(ActorError::UdpRxRecv {
             addr: bound_addr.to_string(),
             source,
         })
@@ -912,34 +887,16 @@ pub fn spawn_h3v2_listener(
 
     let tuning = tuning.clone();
 
-    // Clone socket: recv → RX actor, send → TX actor.
-    let recv_std = match std_socket.try_clone() {
+    // Convert std socket to tokio and create shared UDP actors.
+    let socket = match UdpSocket::from_std(std_socket) {
         Ok(s) => s,
         Err(e) => {
             let handle = spawn_listener_start_error(crypto_rt, bound_addr, e);
             return (cmd_tx, handle, bound_addr);
         }
     };
-    let send_std = match std_socket.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            let handle = spawn_listener_start_error(crypto_rt, bound_addr, e);
-            return (cmd_tx, handle, bound_addr);
-        }
-    };
-
-    // RX actor on I/O thread.
-    let (udp_recv_tx, udp_recv_rx) =
-        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
-    let recv_socket = match UdpSocket::from_std(recv_std) {
-        Ok(s) => s,
-        Err(e) => {
-            let handle = spawn_listener_start_error(crypto_rt, bound_addr, e);
-            return (cmd_tx, handle, bound_addr);
-        }
-    };
-    let bare_rx = match bare_rx_from_socket(recv_socket, max_udp_payload) {
-        Ok(rx) => rx,
+    let (udp_rx, udp_tx) = match udp::make_udp(socket, max_udp_payload, tuning.udp_enable_offload) {
+        Ok(pair) => pair,
         Err(e) => {
             let handle = spawn_listener_start_error(
                 crypto_rt,
@@ -949,17 +906,14 @@ pub fn spawn_h3v2_listener(
             return (cmd_tx, handle, bound_addr);
         }
     };
-    let _recv_handle = spawn_server_udp_rx(bare_rx, udp_recv_tx);
 
-    // TX actor on I/O thread.
-    let send_socket = match UdpSocket::from_std(send_std) {
-        Ok(s) => s,
-        Err(e) => {
-            let handle = spawn_listener_start_error(crypto_rt, bound_addr, e);
-            return (cmd_tx, handle, bound_addr);
-        }
-    };
-    let (udp_send_tx, _tx_handle) = spawn_server_udp_tx(send_socket, tuning.packet_queue_depth);
+    // RX actor on I/O thread.
+    let (udp_recv_tx, udp_recv_rx) =
+        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
+    let _recv_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx);
+
+    // TX actor on I/O thread (GSO-aware, replaces per-packet try_send_to).
+    let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth);
 
     // Dispatcher on crypto_rt.
     let handle = crypto_rt.spawn(async move {

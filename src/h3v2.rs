@@ -10,6 +10,7 @@ use crate::metrics::{Counters, DropReason};
 use crate::tun::alloc_uninit_packet_buf;
 use octets::{varint_len, varint_parse_len, Octets, OctetsMut};
 use quiche::h3::NameValue;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
@@ -438,16 +439,29 @@ pub(crate) fn collect_udp_send(
     batch
 }
 
-/// Collects QUIC output and tries to send it to `udp_send_tx`.
+/// Collects QUIC output and tries to send it to the tagged UDP TX channel.
+///
+/// The destination address is tagged onto each batch for the generic UDP TX actor.
+/// On channel-full, the returned `PendingBatch` stores only the batch (without dest);
+/// the caller re-supplies `dest` at resume time.
 ///
 /// Returns `Ok(Some(batch))` when the channel is full (store as `pending_send`),
 /// `Ok(None)` on success or empty, `Err(())` when the channel is closed.
 pub(crate) fn flush_udp_send(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
-    udp_send_tx: &mpsc::Sender<Vec<PooledBuf>>,
+    dest: SocketAddr,
+    udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
 ) -> Result<Option<PendingBatch>, ()> {
-    PendingBatch::enqueue(udp_send_tx, collect_udp_send(conn, max_udp_payload))
+    let batch = collect_udp_send(conn, max_udp_payload);
+    if batch.is_empty() {
+        return Ok(None);
+    }
+    match udp_send_tx.try_send((dest, batch)) {
+        Ok(()) => Ok(None),
+        Err(mpsc::error::TrySendError::Full((_, batch))) => Ok(Some(PendingBatch::new(batch))),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+    }
 }
 
 // ========== Router Egress ==========

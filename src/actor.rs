@@ -14,10 +14,10 @@ use tracing::error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorKind {
     /// Critical actors whose failure should exit h3llo.
-    /// Includes: tun_rx, tun_tx, bare_rx, dns_resolver
+    /// Includes: tun_rx, tun_tx, udp_rx, dns_resolver
     Critical,
     /// Restartable actors that could be reconnected on failure.
-    /// Includes: bare_tx, h3_tx, h3_rx
+    /// Includes: udp_tx, h3_tx, h3_rx
     /// Note: Reconnection logic is not yet implemented.
     Restartable,
 }
@@ -52,20 +52,20 @@ pub enum ActorError {
         source: io::Error,
     },
 
-    /// BareUDP receive loop exited with I/O error.
-    #[error("bare_rx[{addr}]: recv failed: {source}")]
-    BareRxRecv {
-        /// Local socket address.
+    /// UDP receive loop exited with I/O error.
+    #[error("udp_rx[{addr}]: recv failed: {source}")]
+    UdpRxRecv {
+        /// Local socket address of the UDP actor.
         addr: String,
         /// Underlying I/O error.
         source: io::Error,
     },
 
-    /// BareUDP transmit loop exited with I/O error.
-    #[error("bare_tx[{dest}]: send failed: {source}")]
-    BareTxSend {
-        /// Destination address.
-        dest: String,
+    /// UDP transmit loop exited with I/O error.
+    #[error("udp_tx[{addr}]: send failed: {source}")]
+    UdpTxSend {
+        /// Local socket address of the UDP actor.
+        addr: String,
         /// Underlying I/O error.
         source: io::Error,
     },
@@ -139,12 +139,12 @@ impl ActorError {
             // Critical actors - failure exits h3llo
             ActorError::TunRxRecv { .. } => ActorKind::Critical,
             ActorError::TunTxSend { .. } => ActorKind::Critical,
-            ActorError::BareRxRecv { .. } => ActorKind::Critical,
+            ActorError::UdpRxRecv { .. } => ActorKind::Critical,
             ActorError::DnsRecv { .. } => ActorKind::Critical,
             ActorError::ApiServer { .. } => ActorKind::Critical,
             ActorError::RouterFailed { .. } => ActorKind::Critical,
             // Restartable actors - could be reconnected (future work)
-            ActorError::BareTxSend { .. } => ActorKind::Restartable,
+            ActorError::UdpTxSend { .. } => ActorKind::Restartable,
             ActorError::H3RxRecv { .. } => ActorKind::Restartable,
             ActorError::H3TxSend { .. } => ActorKind::Restartable,
             ActorError::H3Client { .. } => ActorKind::Restartable,
@@ -246,7 +246,7 @@ mod tests {
                 name: "tun0".into(),
                 source: io::Error::other("test"),
             },
-            ActorError::BareRxRecv {
+            ActorError::UdpRxRecv {
                 addr: "0.0.0.0:5353".into(),
                 source: io::Error::other("test"),
             },
@@ -272,8 +272,8 @@ mod tests {
     #[test]
     fn actor_kind_restartable_for_peer_actors() {
         let errors = vec![
-            ActorError::BareTxSend {
-                dest: "1.2.3.4:5353".into(),
+            ActorError::UdpTxSend {
+                addr: "1.2.3.4:5353".into(),
                 source: io::Error::other("test"),
             },
             ActorError::H3RxRecv {
@@ -308,13 +308,13 @@ mod tests {
     }
 
     #[test]
-    fn actor_error_bare_tx_includes_dest() {
-        let err = ActorError::BareTxSend {
-            dest: "192.168.1.1:5353".to_string(),
+    fn actor_error_udp_tx_includes_addr() {
+        let err = ActorError::UdpTxSend {
+            addr: "192.168.1.1:5353".to_string(),
             source: io::Error::other("test"),
         };
         let msg = err.to_string();
-        assert!(msg.contains("bare_tx"));
+        assert!(msg.contains("udp_tx"));
         assert!(msg.contains("192.168.1.1:5353"));
     }
 
