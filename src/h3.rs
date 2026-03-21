@@ -563,11 +563,16 @@ pub async fn dial_h3<P: RouteProbe>(
         Header::new(b"authorization", auth_header.as_bytes()),
     ];
 
-    // Send CONNECT request
+    // Send CONNECT request.
+    // Provide a body_writer to prevent tokio-quiche from sending headers
+    // with fin=true. CONNECT-IP streams must stay open per RFC 9484 §11;
+    // closing the send side would also violate RFC 9297 §2 (datagrams
+    // require the associated stream's send side to be open).
+    let (body_tx, _body_rx) = tokio::sync::oneshot::channel();
     if let Err(e) = controller.request_sender().send(NewClientRequest {
         request_id: 0,
         headers,
-        body_writer: None,
+        body_writer: Some(body_tx),
     }) {
         close_quic_connection(&quic_cmd_tx);
         return Err(DialError::Handshake(format!(

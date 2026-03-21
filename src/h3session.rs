@@ -139,11 +139,7 @@ impl H3Session {
                 }
 
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
-                    // Post-acceptance, the peer closing its send side of the
-                    // CONNECT-IP stream is benign — DATAGRAM forwarding uses
-                    // QUIC DATAGRAM frames, not the request stream.
-                    // Only treat as fatal if the stream closes BEFORE acceptance.
-                    if stream_id == self.connect_stream_id && !self.connect_accepted {
+                    if stream_id == self.connect_stream_id {
                         return Err(ConnectFailure::Closed("CONNECT-IP stream finished".into()));
                     }
                 }
