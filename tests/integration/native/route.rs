@@ -27,7 +27,7 @@ use super::common::{
 #[tokio::test]
 #[ignore = "requires Docker and pre-built test image with embedded binaries"]
 async fn route_container_integration() {
-    if !ensure_image_exists(TEST_IMAGE, TEST_TAG) {
+    if !ensure_image_exists(TEST_IMAGE, TEST_TAG).await {
         panic!(
             "Docker image {TEST_IMAGE}:{TEST_TAG} not found. Build with:\n  \
              docker buildx build --target test -t {TEST_IMAGE}:{TEST_TAG} --load ."
@@ -49,7 +49,7 @@ async fn route_container_integration() {
     eprintln!("Container output:\n{}", String::from_utf8_lossy(&stderr));
 
     // Check exit code
-    let exit_code = get_container_exit_code(container.id());
+    let exit_code = get_container_exit_code(container.id()).await;
     if exit_code != Some(0) {
         panic!("container should exit with code 0, got: {:?}", exit_code);
     }
