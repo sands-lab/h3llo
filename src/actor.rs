@@ -106,6 +106,15 @@ pub enum ActorError {
         reason: String,
     },
 
+    /// H3 server engine actor exited with error.
+    #[error("h3_server[{peer_id}]: {reason}")]
+    H3Server {
+        /// Peer identifier (remote addr until auth completes).
+        peer_id: String,
+        /// Failure reason.
+        reason: String,
+    },
+
     /// Management API server exited with I/O error.
     #[error("api[{addr}]: server failed: {reason}")]
     ApiServer {
@@ -139,6 +148,7 @@ impl ActorError {
             ActorError::H3RxRecv { .. } => ActorKind::Restartable,
             ActorError::H3TxSend { .. } => ActorKind::Restartable,
             ActorError::H3Client { .. } => ActorKind::Restartable,
+            ActorError::H3Server { .. } => ActorKind::Restartable,
         }
     }
 }
@@ -342,6 +352,18 @@ mod tests {
         assert!(msg.contains("h3_tx"));
         assert!(msg.contains("node-3"));
         assert!(msg.contains("flow control blocked"));
+    }
+
+    #[test]
+    fn actor_kind_restartable_for_h3_server() {
+        let err = ActorError::H3Server {
+            peer_id: "client-1".into(),
+            reason: "connection reset".into(),
+        };
+        assert_eq!(err.kind(), ActorKind::Restartable);
+        let msg = err.to_string();
+        assert!(msg.contains("h3_server"));
+        assert!(msg.contains("client-1"));
     }
 
     #[tokio::test]

@@ -282,6 +282,74 @@ pub fn spawn_udp_rx(
     (cmd_tx, handle)
 }
 
+/// Spawns a server-side UDP recv loop that accepts all sources.
+///
+/// Unlike [`spawn_udp_rx`], this variant has no IP filter and tags each batch
+/// with its source `SocketAddr` so the caller can route by QUIC CID and
+/// `accept` new connections with the correct remote address.
+pub fn spawn_server_udp_rx(
+    rx: BareUdpRx,
+    output: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+) -> JoinHandle<ActorExitResult> {
+    let BareUdpRx {
+        socket,
+        state,
+        max_udp_payload,
+    } = rx;
+    let local_addr = socket
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+
+    tokio::spawn(async move {
+        let gro_segments = state.gro_segments();
+        let mut buf = vec![0u8; max_udp_payload * gro_segments];
+        let mut meta = RecvMeta::default();
+
+        loop {
+            socket
+                .readable()
+                .await
+                .map_err(|e| ActorError::BareRxRecv {
+                    addr: local_addr.clone(),
+                    source: e,
+                })?;
+            loop {
+                let result = socket.try_io(Interest::READABLE, || {
+                    state.recv(
+                        UdpSockRef::from(&socket),
+                        &mut [IoSliceMut::new(&mut buf)],
+                        std::slice::from_mut(&mut meta),
+                    )
+                });
+                match result {
+                    Ok(0) => break,
+                    Ok(_) if meta.len == 0 => break,
+                    Ok(_) => {
+                        let remote = meta.addr;
+                        let stride = meta.stride.min(meta.len);
+                        let batch: Vec<PooledBuf> = buf[..meta.len]
+                            .chunks(stride)
+                            .map(alloc_packet_buf)
+                            .collect();
+                        if output.send((remote, batch)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
+                    Err(e) => {
+                        return Err(ActorError::BareRxRecv {
+                            addr: local_addr,
+                            source: e,
+                        });
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Spawns the BareUDP send loop using quinn-udp for GSO offload.
 ///
 /// The socket is unconnected; each packet is sent via `sendmsg` with explicit
