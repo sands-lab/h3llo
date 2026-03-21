@@ -297,8 +297,10 @@ docker exec <container> ip link set dev eth0 up
 The `ci-runner` Dockerfile stage provides a containerized environment for
 running integration and E2E test harnesses in CI. It contains:
 - Rust stable toolchain (from `rust:slim-trixie` base)
-- Docker CLI (for testcontainers-rs to communicate with Docker daemon)
 - Build dependencies for boring-sys (cmake, clang, perl, go)
+
+No Docker CLI is needed inside the image; test code uses bollard (Rust Docker
+API client) to communicate with the host Docker daemon via the mounted socket.
 
 Build the CI runner image:
 ```bash
@@ -307,7 +309,7 @@ docker buildx build --platform linux/amd64 --target ci-runner -t h3llo:ci-runner
 
 Run tests inside the container (DooD mode):
 ```bash
-docker run --rm \
+docker run --rm --network host \
   --user "$(id -u):$(id -g)" \
   --group-add "$(stat -c '%g' /var/run/docker.sock)" \
   -e CARGO_HOME="$PWD/.cargo" \

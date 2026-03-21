@@ -164,7 +164,7 @@ RUN apk add --no-cache iproute2 iputils-ping iperf3
 COPY --from=builder /app/out/integration-container-tun /usr/local/bin/
 COPY --from=builder /app/out/integration-container-route /usr/local/bin/
 
-# Stage 6: CI Runner - Rust toolchain + Docker CLI for running test harnesses.
+# Stage 6: CI Runner - Rust toolchain + boring-sys deps for running test harnesses.
 # Uses DooD (Docker-outside-of-Docker): mount host Docker socket at runtime.
 # Usage:
 #   docker buildx build --platform linux/amd64 --target ci-runner -t h3llo:ci-runner --load .
@@ -175,7 +175,6 @@ COPY --from=builder /app/out/integration-container-route /usr/local/bin/
 #     h3llo:ci-runner cargo test --test e2e -- --ignored --nocapture
 FROM rust:slim-trixie AS ci-runner
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    docker.io \
     pkg-config libssl-dev \
     cmake make perl golang-go git \
     clang libclang-dev \

@@ -48,6 +48,7 @@ mimalloc = { version = "0.1", features = ["debug", "override"] }
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "process"] }
 hyper = { version = "1", features = ["client"] }
 testcontainers = "0.27"
+bollard = "0.20"
 tempfile = "3"
 tracing-test = "0.2"
 rand = "0.10"
