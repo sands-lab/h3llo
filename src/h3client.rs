@@ -154,7 +154,7 @@ impl H3Engine {
 
     /// Creates the H3 connection, queuing SETTINGS on the control stream.
     ///
-    /// The caller should flush after this and before [`send_connect_request`]
+    /// The caller should flush after this and before [`Self::send_connect_request`]
     /// so that the server processes SETTINGS before the CONNECT-IP request.
     fn start_h3_session(
         conn: &mut quiche::Connection,
@@ -216,7 +216,7 @@ fn make_client_quiche_config(
 
 /// Establishes an outbound H3 client CONNECT-IP connection.
 ///
-/// Creates a UDP socket, spawns BareUDP Rx/Tx actors (on the caller's
+/// Creates a UDP socket, spawns UDP I/O actors (on the caller's
 /// runtime via `tokio::spawn`), builds the H3 client engine, and drives
 /// QUIC+H3 handshake on `crypto_rt` before entering steady-state forwarding.
 ///
