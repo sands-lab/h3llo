@@ -1,0 +1,354 @@
+//! Protocol-agnostic UDP I/O actors with shared `Arc<UdpSocket>`.
+//!
+//! Provides GRO-aware receive and GSO-aware send loops that both BareUDP
+//! and H3v2 transports share. The actors communicate via
+//! `(SocketAddr, Vec<PooledBuf>)` channels, tagging each batch with
+//! the remote address.
+
+use crate::actor::{ActorError, ActorExitResult};
+use crate::bind::UdpError;
+use crate::helpers::retry_on_transient;
+use crate::tun::alloc_packet_buf;
+use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
+use std::io;
+use std::io::IoSliceMut;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::Interest;
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_quiche::buf_factory::PooledBuf;
+
+/// Receive side of a shared UDP socket with quinn-udp GRO support.
+#[derive(Debug)]
+pub struct UdpRx {
+    socket: Arc<UdpSocket>,
+    state: UdpSocketState,
+    max_udp_payload: usize,
+}
+
+/// Send side of a shared UDP socket with quinn-udp GSO support.
+#[derive(Debug)]
+pub struct UdpTx {
+    socket: Arc<UdpSocket>,
+    state: UdpSocketState,
+    enable_offload: bool,
+}
+
+/// Creates shared UDP actor state by wrapping the socket in `Arc`.
+///
+/// Returns both RX and TX halves sharing the same underlying socket.
+/// Callers may use either or both; the unused half is cheaply dropped.
+///
+/// # Arguments
+///
+/// * `socket` - Tokio UDP socket to wrap.
+/// * `max_udp_payload` - Maximum UDP payload size for GRO buffer sizing.
+/// * `enable_offload` - Enable GSO on the TX side; `false` caps segments to 1.
+///
+/// # Errors
+///
+/// Returns `UdpError::Socket` if quinn-udp state initialization fails.
+pub fn make_udp(
+    socket: UdpSocket,
+    max_udp_payload: usize,
+    enable_offload: bool,
+) -> Result<(UdpRx, UdpTx), UdpError> {
+    let socket = Arc::new(socket);
+    let state_rx = UdpSocketState::new(UdpSockRef::from(&*socket))
+        .map_err(|e| UdpError::Socket(format!("quinn-udp rx state: {e}")))?;
+    let state_tx = UdpSocketState::new(UdpSockRef::from(&*socket))
+        .map_err(|e| UdpError::Socket(format!("quinn-udp tx state: {e}")))?;
+    Ok((
+        UdpRx {
+            socket: socket.clone(),
+            state: state_rx,
+            max_udp_payload,
+        },
+        UdpTx {
+            socket,
+            state: state_tx,
+            enable_offload,
+        },
+    ))
+}
+
+/// Spawns a UDP receive loop that tags each batch with its source address.
+///
+/// Pure I/O actor: no filtering, no metrics, no command channel.
+/// Protocol-specific logic belongs in the consuming actor.
+pub fn spawn_udp_rx(
+    rx: UdpRx,
+    output: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+) -> JoinHandle<ActorExitResult> {
+    let UdpRx {
+        socket,
+        state,
+        max_udp_payload,
+    } = rx;
+    let local_addr = socket
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+
+    tokio::spawn(async move {
+        let gro_segments = state.gro_segments();
+        let mut buf = vec![0u8; max_udp_payload * gro_segments];
+        let mut meta = RecvMeta::default();
+
+        loop {
+            socket.readable().await.map_err(|e| ActorError::UdpRxRecv {
+                addr: local_addr.clone(),
+                source: e,
+            })?;
+            loop {
+                let result = socket.try_io(Interest::READABLE, || {
+                    state.recv(
+                        UdpSockRef::from(&*socket),
+                        &mut [IoSliceMut::new(&mut buf)],
+                        std::slice::from_mut(&mut meta),
+                    )
+                });
+                match result {
+                    Ok(0) => break,
+                    Ok(_) if meta.len == 0 => break,
+                    Ok(_) => {
+                        let remote = meta.addr;
+                        let stride = meta.stride.min(meta.len);
+                        let batch: Vec<PooledBuf> = buf[..meta.len]
+                            .chunks(stride)
+                            .map(alloc_packet_buf)
+                            .collect();
+                        if output.send((remote, batch)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
+                    Err(e) => {
+                        return Err(ActorError::UdpRxRecv {
+                            addr: local_addr,
+                            source: e,
+                        });
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Spawns a UDP send loop with GSO support for destination-tagged batches.
+///
+/// Pure I/O actor: no metrics, no protocol awareness.
+/// Returns the input sender and join handle.
+pub fn spawn_udp_tx(
+    tx: UdpTx,
+    queue_depth: usize,
+) -> (
+    mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+    JoinHandle<ActorExitResult>,
+) {
+    let (input_tx, mut input_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(queue_depth);
+    let UdpTx {
+        socket,
+        state,
+        enable_offload,
+    } = tx;
+    let local_addr = socket
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+
+    let handle = tokio::spawn(async move {
+        let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
+        let max_segs = if enable_offload {
+            state.max_gso_segments()
+        } else {
+            1
+        };
+
+        while let Some((dest, packets)) = input_rx.recv().await {
+            if packets.is_empty() {
+                continue;
+            }
+            // TUN GSO guarantees all non-tail packets in a batch share
+            // the same size; segment_size from the first packet is safe.
+            let segment_size = packets[0].len();
+            debug_assert!(segment_size > 0, "GSO must not produce empty packets");
+
+            // Cap segments per sendmsg so the total payload fits in
+            // one UDP message (u16::MAX bytes).
+            let max_segs = max_segs.min(u16::MAX as usize / segment_size);
+
+            for chunk in packets.chunks(max_segs.max(1)) {
+                gso_buf.clear();
+                for pkt in chunk {
+                    gso_buf.extend_from_slice(pkt);
+                }
+
+                let transmit = Transmit {
+                    destination: dest,
+                    ecn: None,
+                    contents: &gso_buf,
+                    segment_size: Some(segment_size),
+                    src_ip: None,
+                };
+
+                retry_on_transient!(
+                    {
+                        socket
+                            .writable()
+                            .await
+                            .map_err(|err| ActorError::UdpTxSend {
+                                addr: local_addr.clone(),
+                                source: err,
+                            })?;
+                        socket.try_io(Interest::WRITABLE, || {
+                            state.try_send(UdpSockRef::from(&*socket), &transmit)
+                        })
+                    },
+                    |_dur| {
+                        // No metrics at this layer; protocol actor tracks congestion.
+                    }
+                )
+                .map_err(|err| ActorError::UdpTxSend {
+                    addr: local_addr.clone(),
+                    source: err,
+                })?;
+            }
+        }
+        Ok(())
+    });
+
+    (input_tx, handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_quiche::buf_factory::BufFactory;
+
+    #[tokio::test]
+    async fn make_udp_creates_shared_socket() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (rx, tx) = make_udp(socket, 1500, false).unwrap();
+        assert!(Arc::ptr_eq(&rx.socket, &tx.socket));
+    }
+
+    #[tokio::test]
+    async fn udp_rx_tags_source_address() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (rx, _tx) = make_udp(socket, 1500, false).unwrap();
+
+        let (output_tx, mut output_rx) = mpsc::channel(4);
+        let handle = spawn_udp_rx(rx, output_tx);
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+        sender.send_to(&[1, 2, 3], addr).await.unwrap();
+
+        let (remote, batch) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), output_rx.recv())
+                .await
+                .expect("should receive within timeout")
+                .expect("channel should carry message");
+
+        assert_eq!(remote, sender_addr);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], &[1, 2, 3]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_tx_sends_to_destination() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_rx, tx) = make_udp(sender_socket, 1500, false).unwrap();
+
+        let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
+
+        input_tx
+            .send((dest, vec![BufFactory::buf_from_slice(&[9, 8, 7])]))
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 64];
+        let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], &[9, 8, 7]);
+
+        tx_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_tx_gso_batch() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_rx, tx) = make_udp(sender_socket, 1500, false).unwrap();
+
+        let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
+
+        // Send a batch of 3 packets.
+        let batch = vec![
+            BufFactory::buf_from_slice(&[1, 2]),
+            BufFactory::buf_from_slice(&[3, 4]),
+            BufFactory::buf_from_slice(&[5, 6]),
+        ];
+        input_tx.send((dest, batch)).await.unwrap();
+
+        // With GSO disabled (max_segs=1), each packet is sent individually.
+        let mut buf = vec![0u8; 64];
+        for expected in [[1u8, 2], [3, 4], [5, 6]] {
+            let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], &expected);
+        }
+
+        tx_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_rx_exits_when_output_closed() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (rx, _tx) = make_udp(socket, 1500, false).unwrap();
+
+        let (output_tx, output_rx) = mpsc::channel(1);
+        let handle = spawn_udp_rx(rx, output_tx);
+
+        // Drop receiver so output channel is closed.
+        drop(output_rx);
+
+        // Send a packet to trigger the actor to notice the closed channel.
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&[1], addr).await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), handle).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "udp_rx should exit gracefully when output closed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_tx_exits_when_input_closed() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_rx, tx) = make_udp(socket, 1500, false).unwrap();
+
+        let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
+
+        // Drop sender to close input channel.
+        drop(input_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), tx_handle).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "udp_tx should exit gracefully when input closed, got {result:?}"
+        );
+    }
+}

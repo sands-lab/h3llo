@@ -28,7 +28,7 @@ Platform tiers and binding behavior:
 Concurrency model overview: h3llo adopts the actor model—each coroutine (actor) owns private state, communicates exclusively via MPSC message queues, and never shares mutable data with other actors. This eliminates lock contention and simplifies reasoning about concurrent correctness.
 
 Actor design principles:
-- **Isolated state**: each actor (TUN-Rx, TUN-Tx, DNS Resolver, BareUDP-Rx/Tx, Route Sync, Orchestrator, H3 connections) maintains its own state; no `Arc<Mutex<_>>` across actors.
+- **Isolated state**: each actor (TUN-Rx, TUN-Tx, DNS Resolver, UDP-Rx/Tx, BareUDP-Rx/Tx, Route Sync, Orchestrator, H3 connections) maintains its own state; no `Arc<Mutex<_>>` across actors. UDP I/O actors (`udp.rs`) provide protocol-agnostic socket access via `Arc<UdpSocket>`; BareUDP actors (`bare.rs`) layer protocol logic (source-IP filtering, destination tagging) on top without touching sockets.
 - **Actor-owned message box**: each actor creates its own channels during spawn. Control-plane command channels use `mpsc::unbounded_channel()`; data-plane packet channels use `mpsc::channel(PACKET_QUEUE_DEPTH)`. The actor owns the receiver; the caller receives the sender via tuple return (e.g., `(cmd_tx, JoinHandle)` or `(packet_tx, JoinHandle)`). This ensures clear ownership and enables graceful shutdown when all senders are dropped.
 - **Message passing**: actors communicate through typed `mpsc::channel` queues; the `Event` enum and command types define the message protocol.
 - **Async select loop**: each actor runs a `tokio::select!` loop over its input channels, I/O sources, and timers.
@@ -46,14 +46,14 @@ Each actor follows a consistent two-function initialization pattern:
    - Takes configuration parameters (structured config or resolved types)
    - Performs synchronous or fallible I/O (socket binding, parsing)
    - Returns `Result<ActorState, Error>`
-   - Example: `make_bare_rx(listen, mtu, socket_buffer_bytes) -> Result<BareUdpRx, UdpError>`
+   - Example: `udp::make_udp(socket, mtu, enable_offload) -> Result<(UdpRx, UdpTx), UdpError>`
 
 2. **`spawn_*`** - Spawns the actor task:
    - Takes the state struct and dependencies (events_tx, etc.)
    - Creates channels internally (actor owns receiver)
    - Spawns `tokio::spawn` task
    - Returns `(Sender, JoinHandle)`
-   - Example: `spawn_udp_rx(rx: BareUdpRx, ...) -> (UnboundedSender<Cmd>, JoinHandle)`
+   - Example: `spawn_bare_rx(udp_rx, accepted, ingress_tx, ...) -> (UnboundedSender<Cmd>, JoinHandle)`
 
 Both `make` and `spawn` are **bare functions** (not associated methods or impl methods). This design:
 - Follows [Alice Ryhl's Tokio actor pattern](https://ryhl.io/blog/actors-with-tokio/) recommendation for fewer lifetime issues
@@ -71,7 +71,9 @@ Actors use two channel categories with different capacity policies:
 
 **Buffer allocation strategy**: Data-plane buffers reserve 10 bytes of headroom (9 bytes DGRAM_PREFIX + 1 byte Context ID) via `alloc_uninit_packet_buf(length)`, which selects the smallest pool that fits: packets where `length + HEADROOM ≤ MAX_DGRAM_SIZE` (1500) use `BufFactory::get_max_datagram()` (1.5 KB datagram pool, 64K capacity), while larger payloads fall back to `BufFactory::get_max_buf()` (64 KB generic pool, 16K capacity). Since `get_max_datagram()` internally reserves `DGRAM_PREFIX` (9 bytes) rather than our full `HEADROOM` (10 bytes), the allocator dynamically computes and consumes the 1-byte difference via `pop_front`. This headroom serves dual purposes: (1) zero-copy H3 datagram encoding via `add_prefix(&[CONTEXT_ID_IP])`, and (2) zero-copy TUN TX via `TunBuf`, which prepends a zeroed `virtio_net_hdr` (also 10 bytes) using `add_prefix` without allocation. A compile-time assertion guards the HEADROOM >= VIRTIO_NET_HDR_LEN invariant. H3 datagram decoding uses `pop_front(1)` to strip the Context ID in-place, restoring the headroom for TUN TX. TUN RX receives directly into `TunBuf::alloc_uninit(mtu)` (same headroom allocation), then extracts the inner `PooledBuf` via `into_pooled()` — zero-copy from kernel to packet channel. H3 and BareUDP RX use `alloc_packet_buf()` (copy into pooled buffer with headroom). `alloc_packet_buf` delegates to `alloc_uninit_packet_buf` internally. Buffers without headroom (e.g., `BufFactory::buf_from_slice()` in tests) cause `TunBuf` to fall back to alloc + copy.
 
-**GSO batch sending**: BareUDP TX concatenates packets from each `Vec<PooledBuf>` batch into a contiguous buffer and sends via a single `sendmsg` with `segment_size` set (UDP GSO). Batches are chunked by `max_gso_segments()` (typically 64 on Linux). On platforms without GSO support (`max_gso_segments() == 1`), `chunks(1)` naturally degrades to per-packet sending. Per-packet metrics are preserved by iterating over chunk packets after each send.
+**GSO batch sending**: The generic UDP TX actor (`udp::spawn_udp_tx`) concatenates packets from each `(SocketAddr, Vec<PooledBuf>)` batch into a contiguous buffer and sends via a single `sendmsg` with `segment_size` set (UDP GSO). Both BareUDP and H3v2 server transports share this actor. Batches are chunked by `max_gso_segments()` (typically 64 on Linux). On platforms without GSO support (`max_gso_segments() == 1`), `chunks(1)` naturally degrades to per-packet sending.
+
+**Metrics semantic note**: BareUDP TX (`Source::BareUdp, Direction::Tx`) counts packets forwarded to the UDP TX **channel**, not packets physically sent on the wire. The observable operator effect is unchanged (dead peer → pruned).
 
 Reference: [Alice Ryhl - Actors with Tokio](https://ryhl.io/blog/actors-with-tokio/)
 

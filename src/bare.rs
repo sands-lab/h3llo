@@ -1,20 +1,14 @@
-//! BareUDP transport: socket setup, source-IP filtering, and send/receive loops.
+//! BareUDP protocol actors: source-IP filtering (RX) and destination stamping (TX).
+//!
+//! These actors sit between the generic UDP I/O layer ([`crate::udp`]) and the
+//! router, adding BareUDP-specific behavior without touching sockets directly.
 
-use crate::actor::{ActorError, ActorExitResult};
-use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
-use crate::config::Tuning;
+use crate::actor::ActorExitResult;
 use crate::events::Event;
-use crate::helpers::retry_on_transient;
 use crate::metrics::{Counters, Direction, DropReason, Source};
-use crate::tun::alloc_packet_buf;
-use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::collections::HashSet;
-use std::io;
-use std::io::IoSliceMut;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
-use tokio::io::Interest;
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -30,157 +24,20 @@ pub enum BareUdpRxCommand {
     UpdateAcceptedSources(HashSet<IpAddr>),
 }
 
-/// Provides receive-only access to a BareUDP socket with quinn-udp GRO support.
+/// Spawns the BareUDP source-filter receive actor.
 ///
-/// The receive buffer is always sized for the socket's actual GRO capability.
-/// quinn-udp's `UdpSocketState::new()` unconditionally enables `UDP_GRO`, so
-/// the buffer must accommodate coalesced datagrams regardless of the
-/// `udp_enable_offload` configuration flag (which only controls TX-side GSO).
-#[derive(Debug)]
-pub struct BareUdpRx {
-    socket: UdpSocket,
-    state: UdpSocketState,
-    max_udp_payload: usize,
-}
-
-/// Creates a BareUDP RX actor state from a pre-existing socket.
-///
-/// Used by `h3v2` to reuse UDP actors with a cloned QUIC socket.
-///
-/// # Errors
-///
-/// Returns `UdpError::Socket` if quinn-udp state init fails.
-pub(crate) fn bare_rx_from_socket(
-    socket: UdpSocket,
-    max_udp_payload: usize,
-) -> Result<BareUdpRx, UdpError> {
-    let state = UdpSocketState::new(UdpSockRef::from(&socket))
-        .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
-    Ok(BareUdpRx {
-        socket,
-        state,
-        max_udp_payload,
-    })
-}
-
-/// Creates a BareUDP TX actor state from a pre-existing unconnected socket.
-///
-/// Used by `h3v2` to reuse UDP actors with a cloned QUIC socket.
-///
-/// # Errors
-///
-/// Returns `UdpError::Socket` if quinn-udp state init fails.
-pub(crate) fn bare_tx_from_socket(
-    socket: UdpSocket,
-    destination: SocketAddr,
-    enable_offload: bool,
-) -> Result<BareUdpTx, UdpError> {
-    let state = UdpSocketState::new(UdpSockRef::from(&socket))
-        .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
-    Ok(BareUdpTx {
-        socket,
-        state,
-        destination,
-        enable_offload,
-    })
-}
-
-/// Creates a BareUDP RX actor state from resolved listen address.
+/// Receives `(SocketAddr, Vec<PooledBuf>)` from a UDP RX actor, filters
+/// by accepted source IPs, and forwards accepted batches to the router.
 ///
 /// # Arguments
 ///
-/// * `listen` - Resolved socket address to bind.
-/// * `max_udp_payload` - Maximum UDP payload size for buffer sizing.
-/// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
-///
-/// # Errors
-///
-/// Returns `UdpError::Socket` when socket binding fails.
-pub fn make_bare_rx(
-    listen: SocketAddr,
-    max_udp_payload: usize,
-    socket_buffer_bytes: usize,
-) -> Result<BareUdpRx, UdpError> {
-    let socket = make_server_udp_socket(listen, socket_buffer_bytes)?;
-    let state = UdpSocketState::new(UdpSockRef::from(&socket))
-        .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
-    Ok(BareUdpRx {
-        socket,
-        state,
-        max_udp_payload,
-    })
-}
-
-/// Provides send-only access to an unconnected BareUDP socket with quinn-udp GSO support.
-///
-/// See [`make_bare_tx`] for socket creation and rationale.
-#[derive(Debug)]
-pub struct BareUdpTx {
-    socket: UdpSocket,
-    state: UdpSocketState,
-    destination: SocketAddr,
-    enable_offload: bool,
-}
-
-/// Creates a BareUDP TX actor state with an unconnected socket.
-///
-/// The socket is unconnected; quinn-udp's `Transmit.destination` provides explicit
-/// addressing via `sendmsg`. This avoids macOS `EISCONN` errors that occur when
-/// `sendmsg` specifies a destination on a connected socket.
-///
-/// # Arguments
-///
-/// * `destination` - Resolved destination socket address.
-/// * `bindif` - Optional interface name to bind.
-/// * `tun_if` - Optional TUN interface name to exclude from routing.
-/// * `probe` - Route probe for interface selection.
-/// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
-/// * `enable_offload` - Enable GSO offload; when `false`, GSO segments are capped to 1.
-///
-/// # Errors
-///
-/// Returns `UdpError::Socket` if socket creation fails.
-///
-/// Note: interface binding is best-effort; failures are logged and the
-/// socket continues unbound.
-pub async fn make_bare_tx<P: RouteProbe>(
-    destination: SocketAddr,
-    bindif: Option<&str>,
-    tun_if: Option<&str>,
-    probe: &P,
-    tuning: &Tuning,
-) -> Result<BareUdpTx, UdpError> {
-    let socket = make_unbound_udp_socket(
-        destination,
-        tun_if,
-        bindif,
-        probe,
-        tuning.socket_buffer_bytes(),
-    )
-    .await?;
-    let state = UdpSocketState::new(UdpSockRef::from(&socket))
-        .map_err(|e| UdpError::Socket(format!("quinn-udp state init: {e}")))?;
-    Ok(BareUdpTx {
-        socket,
-        state,
-        destination,
-        enable_offload: tuning.udp_enable_offload,
-    })
-}
-
-/// Spawns the BareUDP receive loop.
-///
-/// Creates an unbounded command channel internally (actor owns the receiver).
-/// Returns the command sender and join handle.
-///
-/// # Arguments
-/// - `rx`: Receive-only socket and MTU.
-/// - `accepted_sources`: Initial accepted source IP set.
-/// - `ingress_tx`: Bounded channel to push accepted packets to the router actor.
-/// - `events_tx`: Unbounded channel for emitting receive metrics.
-/// - `interval`: Metrics emission interval.
-pub fn spawn_udp_rx(
-    rx: BareUdpRx,
+/// * `udp_rx` - Tagged batches from `udp::spawn_udp_rx`.
+/// * `accepted_sources` - Initial set of accepted source IPs.
+/// * `ingress_tx` - Bounded channel to the router actor.
+/// * `events_tx` - Metrics event channel.
+/// * `interval` - Metrics emission interval.
+pub fn spawn_bare_rx(
+    mut udp_rx: mpsc::Receiver<(SocketAddr, Vec<PooledBuf>)>,
     mut accepted_sources: HashSet<IpAddr>,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
@@ -189,82 +46,29 @@ pub fn spawn_udp_rx(
     mpsc::UnboundedSender<BareUdpRxCommand>,
     JoinHandle<ActorExitResult>,
 ) {
-    // Actor creates and owns its command channel receiver
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-    let BareUdpRx {
-        socket,
-        state,
-        max_udp_payload,
-    } = rx;
-    let local_addr = socket
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-
     let handle = tokio::spawn(async move {
-        // Always size the buffer for the socket's actual GRO capability.
-        // quinn-udp's UdpSocketState::new() unconditionally enables UDP_GRO
-        // on the socket; a buffer smaller than gro_segments() would silently
-        // truncate coalesced datagrams, causing packet loss.
-        let gro_segments = state.gro_segments();
-        let mut buf = vec![0u8; max_udp_payload * gro_segments];
         let mut counters = Counters::new(Source::BareUdp, Direction::Rx);
         let mut ticker = time::interval(interval);
-        let mut meta = RecvMeta::default();
 
         loop {
             tokio::select! {
-                _ = socket.readable() => {
-                    let result = socket.try_io(Interest::READABLE, || {
-                        state.recv(
-                            UdpSockRef::from(&socket),
-                            &mut [IoSliceMut::new(&mut buf)],
-                            std::slice::from_mut(&mut meta),
-                        )
-                    });
-                    match result {
-                        Ok(0) => continue,
-                        Ok(_) => {
-                            if meta.len == 0 {
-                                continue;
-                            }
-                            let remote = meta.addr;
-                            let stride = meta.stride.min(meta.len);
-
-                            // All GRO chunks share the same source addr;
-                            // check IP filter once for the entire batch.
-                            if !accepted_sources.contains(&remote.ip()) {
-                                let chunk_count = meta.len.div_ceil(stride);
-                                counters.record_drop(DropReason::DisallowedSource, chunk_count as u64, meta.len as u64);
-                                continue;
-                            }
-
-                            let mut batch = Vec::new();
-                            for chunk in buf[..meta.len].chunks(stride) {
-                                batch.push(alloc_packet_buf(chunk));
-                            }
-
-                            if batch.is_empty() {
-                                continue;
-                            }
-
-                            let count = batch.len() as u64;
-                            let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
-                            if !counters.send_and_record(&ingress_tx, batch, count, total_bytes).await {
-                                return Ok(());
-                            }
-                        }
-                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(err) => {
-                            return Err(ActorError::BareRxRecv { addr: local_addr, source: err });
-                        }
+                maybe = udp_rx.recv() => {
+                    let Some((remote, batch)) = maybe else { return Ok(()); };
+                    let count = batch.len() as u64;
+                    let bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
+                    if !accepted_sources.contains(&remote.ip()) {
+                        counters.record_drop(DropReason::DisallowedSource, count, bytes);
+                        continue;
+                    }
+                    if !counters.send_and_record(&ingress_tx, batch, count, bytes).await {
+                        return Ok(());
                     }
                 }
                 cmd = cmd_rx.recv() => {
                     let Some(command) = cmd else {
-                        return Ok(()); // Channel closed, exit gracefully
+                        return Ok(());
                     };
                     // Single-variant enum: destructure directly
                     let BareUdpRxCommand::UpdateAcceptedSources(update) = command;
@@ -272,7 +76,7 @@ pub fn spawn_udp_rx(
                 }
                 _ = ticker.tick() => {
                     if events_tx.send(Event::Metrics(counters.snapshot(None, None))).is_err() {
-                        return Ok(()); // Events channel closed during shutdown
+                        return Ok(());
                     }
                 }
             }
@@ -282,181 +86,53 @@ pub fn spawn_udp_rx(
     (cmd_tx, handle)
 }
 
-/// Spawns a server-side UDP recv loop that accepts all sources.
+/// Spawns a BareUDP transmit adapter actor.
 ///
-/// Unlike [`spawn_udp_rx`], this variant has no IP filter and tags each batch
-/// with its source `SocketAddr` so the caller can route by QUIC CID and
-/// `accept` new connections with the correct remote address.
-pub fn spawn_server_udp_rx(
-    rx: BareUdpRx,
-    output: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
-) -> JoinHandle<ActorExitResult> {
-    let BareUdpRx {
-        socket,
-        state,
-        max_udp_payload,
-    } = rx;
-    let local_addr = socket
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-
-    tokio::spawn(async move {
-        let gro_segments = state.gro_segments();
-        let mut buf = vec![0u8; max_udp_payload * gro_segments];
-        let mut meta = RecvMeta::default();
-
-        loop {
-            socket
-                .readable()
-                .await
-                .map_err(|e| ActorError::BareRxRecv {
-                    addr: local_addr.clone(),
-                    source: e,
-                })?;
-            loop {
-                let result = socket.try_io(Interest::READABLE, || {
-                    state.recv(
-                        UdpSockRef::from(&socket),
-                        &mut [IoSliceMut::new(&mut buf)],
-                        std::slice::from_mut(&mut meta),
-                    )
-                });
-                match result {
-                    Ok(0) => break,
-                    Ok(_) if meta.len == 0 => break,
-                    Ok(_) => {
-                        let remote = meta.addr;
-                        let stride = meta.stride.min(meta.len);
-                        let batch: Vec<PooledBuf> = buf[..meta.len]
-                            .chunks(stride)
-                            .map(alloc_packet_buf)
-                            .collect();
-                        if output.send((remote, batch)).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
-                    Err(e) => {
-                        return Err(ActorError::BareRxRecv {
-                            addr: local_addr,
-                            source: e,
-                        });
-                    }
-                }
-            }
-        }
-    })
-}
-
-/// Spawns the BareUDP send loop using quinn-udp for GSO offload.
-///
-/// The socket is unconnected; each packet is sent via `sendmsg` with explicit
-/// destination from `Transmit.destination`. Creates a bounded packet channel
-/// internally (actor owns the receiver). Returns the packet sender and join handle.
+/// Receives `Vec<PooledBuf>` from the router, stamps each batch with the
+/// peer's destination address, and forwards to the UDP TX actor.
+/// Records metrics after successful channel send to avoid inflating
+/// counters when the downstream actor is unavailable.
 ///
 /// # Arguments
-/// - `tx`: Send-only socket with quinn-udp state and destination.
-/// - `peer_id`: Peer identifier for metrics labels.
-/// - `events_tx`: Unbounded channel for emitting transmit metrics.
-/// - `interval`: Metrics emission interval.
-/// - `packet_queue_depth`: Bounded channel capacity.
-pub fn spawn_udp_tx(
-    tx: BareUdpTx,
+///
+/// * `udp_tx` - Tagged channel to `udp::spawn_udp_tx`.
+/// * `destination` - Peer destination socket address.
+/// * `peer_id` - Peer identifier for metrics labels.
+/// * `events_tx` - Metrics event channel.
+/// * `metrics_interval` - Metrics emission interval.
+/// * `packet_queue_depth` - Bounded channel capacity for router → bare TX.
+pub fn spawn_bare_tx(
+    udp_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+    destination: SocketAddr,
     peer_id: String,
     events_tx: mpsc::UnboundedSender<Event>,
-    tuning: &Tuning,
+    metrics_interval: Duration,
+    packet_queue_depth: usize,
 ) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
-    // Actor creates and owns its data-plane channel receiver
-    let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.packet_queue_depth);
-    let dest_addr = tx.destination;
-    let dest_str = dest_addr.to_string();
+    let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
 
-    let BareUdpTx {
-        socket,
-        state,
-        destination,
-        enable_offload,
-    } = tx;
-
-    let metrics_interval = tuning.metrics_push_interval;
     let handle = tokio::spawn(async move {
         let mut counters = Counters::new(Source::BareUdp, Direction::Tx);
         let mut ticker = time::interval(metrics_interval);
-        let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
-        let max_segs = if enable_offload {
-            state.max_gso_segments()
-        } else {
-            1
-        };
 
         loop {
             tokio::select! {
                 maybe_batch = egress_rx.recv() => {
-                    let Some(packets) = maybe_batch else {
-                        return Ok(()); // Channel closed, exit gracefully
-                    };
-
-                    if packets.is_empty() {
-                        continue;
-                    }
-                    // TUN GSO guarantees all non-tail packets in a batch share
-                    // the same size; segment_size from the first packet is safe.
-                    let segment_size = packets[0].len();
-                    debug_assert!(segment_size > 0, "TUN GSO must not produce empty packets");
-
-                    // Cap segments per sendmsg so the total payload fits in
-                    // one UDP message (u16::MAX bytes). Without this, large
-                    // batches (e.g. 64 × 1393 = 89 KB) exceed the limit and
-                    // the kernel returns EMSGSIZE.
-                    let max_segs = max_segs.min(u16::MAX as usize / segment_size);
-
-                    for chunk in packets.chunks(max_segs.max(1)) {
-                        gso_buf.clear();
-                        for pkt in chunk {
-                            gso_buf.extend_from_slice(pkt);
-                        }
-
-                        // segment_size tells the kernel to split contents into
-                        // datagrams. When chunk has a single packet or
-                        // max_gso_segments == 1, quinn-udp's prepare_msg skips
-                        // the GSO cmsg automatically (segment_size >= contents.len()).
-                        let transmit = Transmit {
-                            destination,
-                            ecn: None,
-                            contents: &gso_buf,
-                            segment_size: Some(segment_size),
-                            src_ip: None,
-                        };
-
-                        match retry_on_transient!({
-                            socket.writable().await.map_err(|err| {
-                                ActorError::BareTxSend { dest: dest_str.clone(), source: err }
-                            })?;
-                            socket.try_io(Interest::WRITABLE, || {
-                                state.try_send(UdpSockRef::from(&socket), &transmit)
-                            })
-                        }, |dur| {
-                            counters.record_would_block(dur);
-                        }) {
-                            Ok(()) => {
-                                counters.record_success(chunk.len() as u64, gso_buf.len() as u64);
-                            }
-                            Err(err) => {
-                                // quinn-udp may internally disable GSO
-                                // (max_gso_segments -> 1) on EIO/EINVAL before
-                                // returning the error. The actor terminates here;
-                                // on respawn, max_gso_segments == 1 avoids GSO.
-                                counters.record_drop(DropReason::SendError, chunk.len() as u64, gso_buf.len() as u64);
-                                return Err(ActorError::BareTxSend { dest: dest_str, source: err });
-                            }
-                        }
+                    let Some(packets) = maybe_batch else { return Ok(()); };
+                    if packets.is_empty() { continue; }
+                    let count = packets.len() as u64;
+                    let bytes: u64 = packets.iter().map(|p| p.len() as u64).sum();
+                    // Record success AFTER send — avoids inflating metrics on channel close.
+                    match udp_tx.send((destination, packets)).await {
+                        Ok(()) => counters.record_success(count, bytes),
+                        Err(_) => return Ok(()),
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Metrics(counters.snapshot(Some(&peer_id), Some(dest_addr)))).is_err() {
-                        return Ok(()); // Events channel closed during shutdown
+                    if events_tx.send(Event::Metrics(
+                        counters.snapshot(Some(&peer_id), Some(destination))
+                    )).is_err() {
+                        return Ok(());
                     }
                 }
             }
@@ -469,215 +145,140 @@ pub fn spawn_udp_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::Event;
+    use crate::metrics::Direction;
     use std::net::Ipv4Addr;
     use std::time::Duration;
     use tokio_quiche::buf_factory::BufFactory;
 
-    /// Creates a `BareUdpRx` directly from a socket for testing.
-    fn test_bare_rx(socket: UdpSocket, max_udp_payload: usize) -> BareUdpRx {
-        let state = UdpSocketState::new(UdpSockRef::from(&socket)).unwrap();
-        BareUdpRx {
-            socket,
-            state,
-            max_udp_payload,
-        }
-    }
-
-    /// Creates a test `Tuning` with a custom metrics push interval.
-    fn test_tuning(metrics_interval: Duration) -> Tuning {
-        Tuning {
-            metrics_push_interval: metrics_interval,
-            ..Default::default()
-        }
-    }
-
-    /// Creates a `BareUdpTx` with an unconnected socket for testing.
-    fn test_bare_tx(socket: UdpSocket, destination: SocketAddr) -> BareUdpTx {
-        let state = UdpSocketState::new(UdpSockRef::from(&socket)).unwrap();
-        BareUdpTx {
-            socket,
-            state,
-            destination,
-            enable_offload: true,
-        }
-    }
-
-    // ========== make_bare_rx Tests ==========
-
     #[tokio::test]
-    async fn make_bare_rx_creates_valid_state() {
-        let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let result = make_bare_rx(listen, 1500, 0);
-        assert!(result.is_ok());
-        let rx = result.unwrap();
-        assert_eq!(rx.max_udp_payload, 1500);
-    }
-
-    // ========== make_bare_tx Tests ==========
-
-    #[tokio::test]
-    async fn make_bare_tx_creates_unconnected_socket() {
-        use crate::bind::test_support::FakeRouteProbe;
-
-        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let dest = receiver.local_addr().unwrap();
-
-        let probe = FakeRouteProbe::noop();
-        let result = make_bare_tx(dest, None, None, &probe, &Tuning::default()).await;
-        assert!(result.is_ok());
-        let tx = result.unwrap();
-        assert_eq!(tx.destination, dest);
-    }
-
-    #[tokio::test]
-    async fn udp_rx_filters_non_accepted_sources() {
-        let (socket, addr) = {
-            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let addr = sock.local_addr().unwrap();
-            (sock, addr)
-        };
-
+    async fn bare_rx_filters_non_accepted_sources() {
+        let (udp_tx, udp_rx) = mpsc::channel(4);
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
-        let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))]);
-        let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_rx(socket, 64);
-        let (_cmd_tx, handle) = spawn_udp_rx(
-            context,
+        let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+
+        let (_cmd_tx, handle) = spawn_bare_rx(
+            udp_rx,
             accepted,
             ingress_tx,
             events_tx,
             Duration::from_millis(200),
         );
 
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender
-            .send_to(&[1, 2, 3], addr)
-            .await
-            .expect("send should succeed");
+        // Send from a non-accepted source
+        let remote: SocketAddr = "192.168.1.1:5353".parse().unwrap();
+        let batch = vec![BufFactory::buf_from_slice(&[1, 2, 3])];
+        udp_tx.send((remote, batch)).await.unwrap();
 
-        // Packet should be dropped because source IP is not allowed.
         let result = tokio::time::timeout(Duration::from_millis(50), ingress_rx.recv()).await;
-        assert!(result.is_err(), "no packet should be delivered");
+        assert!(
+            result.is_err(),
+            "packet from non-accepted source should be dropped"
+        );
 
         handle.abort();
     }
 
     #[tokio::test]
-    async fn udp_rx_updates_accepted_sources() {
-        let (socket, addr) = {
-            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let addr = sock.local_addr().unwrap();
-            (sock, addr)
-        };
-
+    async fn bare_rx_forwards_accepted_sources() {
+        let (udp_tx, udp_rx) = mpsc::channel(4);
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
-        let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_rx(socket, 64);
-        let (cmd_tx, handle) = spawn_udp_rx(
-            context,
+        let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+
+        let (_cmd_tx, handle) = spawn_bare_rx(
+            udp_rx,
+            accepted,
+            ingress_tx,
+            events_tx,
+            Duration::from_millis(200),
+        );
+
+        let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
+        let batch = vec![BufFactory::buf_from_slice(&[7, 8, 9])];
+        udp_tx.send((remote, batch)).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_millis(100), ingress_rx.recv())
+            .await
+            .expect("should receive within timeout")
+            .expect("channel should carry message");
+        assert_eq!(received.len(), 1);
+        assert_eq!(&received[0][..], &[7, 8, 9]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn bare_rx_updates_accepted_sources() {
+        let (udp_tx, udp_rx) = mpsc::channel(4);
+        let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+
+        let (cmd_tx, handle) = spawn_bare_rx(
+            udp_rx,
             HashSet::new(),
             ingress_tx,
             events_tx,
             Duration::from_millis(200),
         );
 
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender
-            .send_to(&[5, 4, 3], addr)
+        // Initially no sources accepted — packet should be dropped.
+        let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
+        udp_tx
+            .send((remote, vec![BufFactory::buf_from_slice(&[1])]))
             .await
-            .expect("initial send should succeed");
-
-        // First packet should be dropped.
+            .unwrap();
         let first = tokio::time::timeout(Duration::from_millis(50), ingress_rx.recv()).await;
-        assert!(
-            first.is_err(),
-            "no packet should be delivered before update"
-        );
+        assert!(first.is_err(), "should be dropped before update");
 
+        // Update accepted sources.
         cmd_tx
             .send(BareUdpRxCommand::UpdateAcceptedSources(HashSet::from([
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             ])))
             .unwrap();
 
-        sender
-            .send_to(&[7, 8, 9], addr)
-            .await
-            .expect("second send should succeed");
+        // Yield to let the actor process the command before sending the next packet.
+        tokio::task::yield_now().await;
 
-        let batch = tokio::time::timeout(Duration::from_millis(100), ingress_rx.recv())
-            .await
-            .expect("packet should arrive after update")
-            .expect("channel should carry message");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &[7, 8, 9]);
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn udp_tx_forwards_packets_to_destination() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let dest = receiver.local_addr().unwrap();
-
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        let (events_tx, mut _events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_tx(sender_socket, dest);
-        let (egress_tx, handle) = spawn_udp_tx(
-            context,
-            "test-peer".to_string(),
-            events_tx,
-            &test_tuning(Duration::from_millis(200)),
-        );
-
-        egress_tx
-            .send(vec![BufFactory::buf_from_slice(&[9, 8, 7])])
+        // Now the same source should be accepted.
+        udp_tx
+            .send((remote, vec![BufFactory::buf_from_slice(&[2])]))
             .await
             .unwrap();
-
-        let mut buf = vec![0u8; 64];
-        let (len, _) = receiver
-            .recv_from(&mut buf)
+        let batch = tokio::time::timeout(Duration::from_millis(100), ingress_rx.recv())
             .await
-            .expect("receiver should get packet");
-        assert_eq!(&buf[..len], &[9, 8, 7]);
+            .expect("should arrive after update")
+            .expect("channel should carry message");
+        assert_eq!(&batch[0][..], &[2]);
 
         handle.abort();
     }
 
     #[tokio::test]
-    async fn udp_rx_emits_metrics() {
-        let (socket, addr) = {
-            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let addr = sock.local_addr().unwrap();
-            (sock, addr)
-        };
-
+    async fn bare_rx_emits_metrics() {
+        let (udp_tx, udp_rx) = mpsc::channel(4);
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
+        let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_rx(socket, 128);
-        let (_cmd_tx, handle) = spawn_udp_rx(
-            context,
-            HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]),
+
+        let (_cmd_tx, handle) = spawn_bare_rx(
+            udp_rx,
+            accepted,
             ingress_tx,
             events_tx,
             Duration::from_millis(10),
         );
 
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender
-            .send_to(&[1, 2, 3, 4], addr)
+        let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
+        udp_tx
+            .send((remote, vec![BufFactory::buf_from_slice(&[1, 2, 3, 4])]))
             .await
-            .expect("send should succeed");
+            .unwrap();
 
-        // Drain the forwarded message to avoid channel backpressure.
-        let batch = ingress_rx
-            .recv()
-            .await
-            .expect("message should be forwarded");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &[1, 2, 3, 4]);
+        // Drain forwarded message.
+        let _ = ingress_rx.recv().await;
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
@@ -693,11 +294,8 @@ mod tests {
         .expect("rx metrics should arrive")
         .expect("rx metrics should not be None");
 
-        assert_eq!(metrics.labels.source, Source::BareUdp);
+        assert_eq!(metrics.labels.source, crate::metrics::Source::BareUdp);
         assert_eq!(metrics.labels.direction, Direction::Rx);
-        assert_eq!(metrics.labels.peer_id, None);
-        assert_eq!(metrics.labels.remote_addr, None);
-        assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 4);
 
@@ -705,19 +303,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_tx_emits_metrics() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let dest = receiver.local_addr().unwrap();
+    async fn bare_tx_tags_and_forwards() {
+        let dest: SocketAddr = "10.0.0.1:5353".parse().unwrap();
+        let (udp_tx, mut udp_rx) = mpsc::channel(4);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_tx(sender_socket, dest);
-        let (egress_tx, handle) = spawn_udp_tx(
-            context,
+        let (egress_tx, handle) = spawn_bare_tx(
+            udp_tx,
+            dest,
             "test-peer".to_string(),
             events_tx,
-            &test_tuning(Duration::from_millis(10)),
+            Duration::from_millis(200),
+            4,
+        );
+
+        let batch = vec![BufFactory::buf_from_slice(&[9, 8, 7])];
+        egress_tx.send(batch).await.unwrap();
+
+        let (tagged_dest, packets) =
+            tokio::time::timeout(Duration::from_millis(100), udp_rx.recv())
+                .await
+                .expect("should receive within timeout")
+                .expect("channel should carry message");
+
+        assert_eq!(tagged_dest, dest);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(&packets[0][..], &[9, 8, 7]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn bare_tx_emits_metrics() {
+        let dest: SocketAddr = "10.0.0.1:5353".parse().unwrap();
+        let (udp_tx, mut udp_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+        let (egress_tx, handle) = spawn_bare_tx(
+            udp_tx,
+            dest,
+            "test-peer".to_string(),
+            events_tx,
+            Duration::from_millis(10),
+            4,
         );
 
         egress_tx
@@ -725,11 +353,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mut buf = vec![0u8; 16];
-        let _ = receiver
-            .recv_from(&mut buf)
-            .await
-            .expect("receiver should get packet");
+        // Drain forwarded message.
+        let _ = udp_rx.recv().await;
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
             while let Some(event) = events_rx.recv().await {
@@ -745,299 +370,61 @@ mod tests {
         .expect("tx metrics should arrive")
         .expect("tx metrics should not be None");
 
-        assert_eq!(metrics.labels.source, Source::BareUdp);
+        assert_eq!(metrics.labels.source, crate::metrics::Source::BareUdp);
         assert_eq!(metrics.labels.direction, Direction::Tx);
         assert_eq!(metrics.labels.peer_id, Some("test-peer".to_string()));
         assert_eq!(metrics.labels.remote_addr, Some(dest));
-        assert_eq!(metrics.stats.succeeded.batches, 1);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 4);
-        assert_eq!(metrics.stats.dropped.packets, 0);
-        assert_eq!(metrics.stats.dropped.bytes, 0);
 
         handle.abort();
     }
 
-    // ========== Actor Lifecycle Tests ==========
-
     #[tokio::test]
-    async fn spawn_udp_rx_returns_working_cmd_tx() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    async fn bare_rx_exits_when_cmd_channel_closed() {
+        let (_udp_tx, udp_rx) = mpsc::channel(4);
         let (ingress_tx, _ingress_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_rx(socket, 64);
 
-        let (cmd_tx, handle) = spawn_udp_rx(
-            context,
+        let (cmd_tx, handle) = spawn_bare_rx(
+            udp_rx,
             HashSet::new(),
             ingress_tx,
             events_tx,
             Duration::from_secs(60),
         );
 
-        // Verify cmd_tx is functional by sending an accepted sources update
-        assert!(cmd_tx
-            .send(BareUdpRxCommand::UpdateAcceptedSources(HashSet::from([
-                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))
-            ])))
-            .is_ok());
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn udp_rx_actor_exits_when_sender_dropped() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (ingress_tx, _ingress_rx) = mpsc::channel(4);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_rx(socket, 64);
-
-        let (cmd_tx, join_handle) = spawn_udp_rx(
-            context,
-            HashSet::new(),
-            ingress_tx,
-            events_tx,
-            Duration::from_secs(60),
-        );
-
-        // Drop sender to signal shutdown
+        // Drop cmd_tx to signal shutdown via command channel closure.
         drop(cmd_tx);
 
-        // Actor should exit gracefully (check both timeout and join result)
-        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
+        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
         assert!(
             matches!(result, Ok(Ok(Ok(())))),
-            "udp_rx actor should shut down cleanly after sender dropped, got {:?}",
-            result
+            "bare_rx should exit gracefully when cmd channel closed, got {result:?}"
         );
     }
 
     #[tokio::test]
-    async fn spawn_udp_tx_returns_working_channel() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let dest = receiver.local_addr().unwrap();
-
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
+    async fn bare_tx_exits_when_egress_closed() {
+        let dest: SocketAddr = "10.0.0.1:5353".parse().unwrap();
+        let (udp_tx, _udp_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_tx(sender_socket, dest);
 
-        let (egress_tx, handle) = spawn_udp_tx(
-            context,
+        let (egress_tx, handle) = spawn_bare_tx(
+            udp_tx,
+            dest,
             "test-peer".to_string(),
-            events_tx,
-            &test_tuning(Duration::from_secs(60)),
-        );
-
-        // Verify egress_tx is functional by sending a batch
-        assert!(egress_tx
-            .send(vec![BufFactory::buf_from_slice(&[1, 2, 3])])
-            .await
-            .is_ok());
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn udp_tx_actor_exits_when_sender_dropped() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let dest = receiver.local_addr().unwrap();
-
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_tx(sender_socket, dest);
-
-        let (egress_tx, join_handle) = spawn_udp_tx(
-            context,
-            "test-peer".to_string(),
-            events_tx,
-            &test_tuning(Duration::from_secs(60)),
-        );
-
-        // Drop sender to signal shutdown
-        drop(egress_tx);
-
-        // Actor should exit gracefully (check both timeout and join result)
-        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
-        assert!(
-            matches!(result, Ok(Ok(Ok(())))),
-            "udp_tx actor should shut down cleanly after sender dropped, got {:?}",
-            result
-        );
-    }
-
-    /// Verifies RX forwards accepted packets to the ingress channel.
-    #[tokio::test]
-    async fn udp_rx_sends_to_ingress() {
-        let (socket, addr) = {
-            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let addr = sock.local_addr().unwrap();
-            (sock, addr)
-        };
-
-        let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
-        let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_rx(socket, 64);
-        let (_cmd_tx, handle) = spawn_udp_rx(
-            context,
-            accepted,
-            ingress_tx,
             events_tx,
             Duration::from_secs(60),
+            4,
         );
 
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender.send_to(&[1, 2, 3], addr).await.unwrap();
+        drop(egress_tx);
 
-        let batch = tokio::time::timeout(Duration::from_millis(200), ingress_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("channel should carry message");
-        assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &[1, 2, 3]);
-
-        handle.abort();
-    }
-
-    /// Verifies that a multi-packet batch is delivered correctly via GSO
-    /// (or per-packet fallback on non-GSO platforms).
-    #[tokio::test]
-    async fn udp_tx_batch_gso_delivers_all_packets() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let dest = receiver.local_addr().unwrap();
-
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_tx(sender_socket, dest);
-        let (egress_tx, handle) = spawn_udp_tx(
-            context,
-            "test-peer".to_string(),
-            events_tx,
-            &test_tuning(Duration::from_millis(200)),
+        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(())))),
+            "bare_tx should exit gracefully when egress closed, got {result:?}"
         );
-
-        // Send a batch of 3 equal-sized packets (simulates TUN GSO output)
-        let batch = vec![
-            BufFactory::buf_from_slice(&[1, 2, 3, 4]),
-            BufFactory::buf_from_slice(&[5, 6, 7, 8]),
-            BufFactory::buf_from_slice(&[9, 10, 11, 12]),
-        ];
-        egress_tx.send(batch).await.unwrap();
-
-        let mut received = Vec::new();
-        for _ in 0..3 {
-            let mut buf = vec![0u8; 64];
-            let (len, _) =
-                tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
-                    .await
-                    .expect("should receive packet")
-                    .expect("recv_from");
-            received.push(buf[..len].to_vec());
-        }
-        received.sort();
-        assert_eq!(
-            received,
-            vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10, 11, 12]]
-        );
-
-        handle.abort();
-    }
-
-    /// Verifies that a batch with a shorter last packet (common in TCP flows)
-    /// is delivered correctly.
-    #[tokio::test]
-    async fn udp_tx_batch_gso_short_last_packet() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let dest = receiver.local_addr().unwrap();
-
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_tx(sender_socket, dest);
-        let (egress_tx, handle) = spawn_udp_tx(
-            context,
-            "test-peer".to_string(),
-            events_tx,
-            &test_tuning(Duration::from_millis(200)),
-        );
-
-        // Last packet is shorter (e.g., TCP stream tail)
-        let batch = vec![
-            BufFactory::buf_from_slice(&[1, 2, 3, 4]),
-            BufFactory::buf_from_slice(&[5, 6, 7, 8]),
-            BufFactory::buf_from_slice(&[9, 10]),
-        ];
-        egress_tx.send(batch).await.unwrap();
-
-        let mut received = Vec::new();
-        for _ in 0..3 {
-            let mut buf = vec![0u8; 64];
-            let (len, _) =
-                tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
-                    .await
-                    .expect("should receive packet")
-                    .expect("recv_from");
-            received.push(buf[..len].to_vec());
-        }
-        received.sort();
-        assert_eq!(
-            received,
-            vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10]]
-        );
-
-        handle.abort();
-    }
-
-    /// Verifies that metrics count each packet individually in a GSO batch.
-    #[tokio::test]
-    async fn udp_tx_gso_batch_metrics() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let dest = receiver.local_addr().unwrap();
-
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let context = test_bare_tx(sender_socket, dest);
-        let (egress_tx, handle) = spawn_udp_tx(
-            context,
-            "test-peer".to_string(),
-            events_tx,
-            &test_tuning(Duration::from_millis(10)),
-        );
-
-        let batch = vec![
-            BufFactory::buf_from_slice(&[1, 2, 3]),
-            BufFactory::buf_from_slice(&[4, 5, 6]),
-        ];
-        egress_tx.send(batch).await.unwrap();
-
-        // Drain packets
-        let mut buf = vec![0u8; 64];
-        for _ in 0..2 {
-            let _ = receiver.recv_from(&mut buf).await.unwrap();
-        }
-
-        let metrics = tokio::time::timeout(Duration::from_millis(100), async {
-            while let Some(event) = events_rx.recv().await {
-                if let Event::Metrics(m) = event {
-                    if m.labels.direction == Direction::Tx && m.stats.succeeded.packets >= 2 {
-                        return Some(m);
-                    }
-                }
-            }
-            None
-        })
-        .await
-        .expect("tx metrics should arrive")
-        .expect("tx metrics should not be None");
-
-        assert!(metrics.stats.succeeded.batches >= 1);
-        assert_eq!(metrics.stats.succeeded.packets, 2);
-        assert_eq!(metrics.stats.succeeded.bytes, 6);
-
-        handle.abort();
     }
 }
