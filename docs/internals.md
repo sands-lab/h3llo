@@ -73,6 +73,8 @@ Actors use two channel categories with different capacity policies:
 
 **GSO batch sending**: The generic UDP TX actor (`udp::spawn_udp_tx`) concatenates packets from each `(SocketAddr, Vec<PooledBuf>)` batch into a contiguous buffer and sends via a single `sendmsg` with `segment_size` set (UDP GSO). Both BareUDP and H3v2 server transports share this actor. Batches are chunked by `max_gso_segments()` (typically 64 on Linux). On platforms without GSO support (`max_gso_segments() == 1`), `chunks(1)` naturally degrades to per-packet sending.
 
+**H3 session event handling**: `H3Session::poll_h3_events` is the unified H3 event loop shared by client handshake (`h3dialer`), server handshake (`h3listener`), and steady-state forwarding (`h3engine`). It accepts a generic `FnMut` callback for role-specific header processing—client checks `:status`, server validates CONNECT-IP headers + auth and sends 200 OK, steady-state ignores all headers. The callback returns a `HeaderAction` enum (`Accept` / `Ignore`) that tells the session what bookkeeping to perform. This design uses static dispatch (monomorphized at each call site) and keeps authentication logic in `h3listener.rs` without leaking it into the session module.
+
 **Metrics semantic note**: BareUDP TX (`Source::BareUdp, Direction::Tx`) counts packets forwarded to the UDP TX **channel**, not packets physically sent on the wire. The observable operator effect is unchanged (dead peer → pruned).
 
 Reference: [Alice Ryhl - Actors with Tokio](https://ryhl.io/blog/actors-with-tokio/)

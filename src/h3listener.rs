@@ -18,7 +18,7 @@ use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, EngineRole,
     H3Engine, RunState,
 };
-use crate::h3session::{H3Session, MAX_TIMEOUT};
+use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
 use crate::udp;
 use quiche::h3::NameValue;
 use rand::Rng;
@@ -118,86 +118,6 @@ fn validate_server_auth(
         .map(|h| String::from_utf8_lossy(h.value()).to_string());
     let peer_iter = tokens.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     validate_connect_auth(auth_value.as_deref(), peer_iter).map_err(|reason| reason.to_string())
-}
-
-// ========== Server-Side H3Session Extension ==========
-
-/// Result of advancing the server-side CONNECT-IP handshake.
-enum ServerConnectProgress {
-    /// Server is still waiting for more H3 state.
-    Pending,
-    /// CONNECT-IP is fully established and authenticated.
-    Ready(String),
-}
-
-impl H3Session {
-    /// Polls server-side H3 events until the inbound CONNECT-IP request advances.
-    fn poll_connect_request(
-        &mut self,
-        conn: &mut quiche::Connection,
-        pending_peer_id: &mut Option<String>,
-        peer_tokens: &HashMap<String, String>,
-    ) -> Result<ServerConnectProgress, ServerError> {
-        loop {
-            match self.h3_conn.poll(conn) {
-                Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                    if pending_peer_id.is_some() || self.connect_accepted {
-                        return Err(ServerError::Accept("duplicate CONNECT-IP request".into()));
-                    }
-
-                    validate_server_connect_headers(&list).map_err(ServerError::Accept)?;
-                    let peer_id = validate_server_auth(&list, peer_tokens)
-                        .map_err(|e| ServerError::Accept(format!("auth: {e}")))?;
-
-                    let response = [
-                        quiche::h3::Header::new(b":status", b"200"),
-                        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-                    ];
-                    self.h3_conn
-                        .send_response(conn, stream_id, &response, false)
-                        .map_err(|e| ServerError::Accept(format!("send 200: {e}")))?;
-
-                    self.bind_connect_stream(stream_id);
-                    self.mark_connect_accepted();
-
-                    if self.connect_ready(conn) {
-                        return Ok(ServerConnectProgress::Ready(peer_id));
-                    }
-
-                    *pending_peer_id = Some(peer_id);
-                }
-
-                Ok((sid, quiche::h3::Event::Finished)) if sid == self.connect_stream_id => {
-                    return Err(ServerError::Accept("CONNECT-IP stream finished".into()));
-                }
-
-                Ok((sid, quiche::h3::Event::Reset(code))) if sid == self.connect_stream_id => {
-                    return Err(ServerError::Accept(format!(
-                        "CONNECT-IP stream reset: {code}"
-                    )));
-                }
-
-                Ok((_sid, quiche::h3::Event::GoAway)) => {
-                    return Err(ServerError::Accept("GOAWAY during handshake".into()));
-                }
-
-                Ok((_sid, _)) => {}
-
-                Err(quiche::h3::Error::Done) => {
-                    if self.connect_ready(conn) {
-                        if let Some(peer_id) = pending_peer_id.take() {
-                            return Ok(ServerConnectProgress::Ready(peer_id));
-                        }
-                    }
-                    return Ok(ServerConnectProgress::Pending);
-                }
-
-                Err(e) => {
-                    return Err(ServerError::Accept(format!("h3 poll: {e}")));
-                }
-            }
-        }
-    }
 }
 
 // ========== Configuration Helpers ==========
@@ -315,12 +235,32 @@ impl H3Engine {
         timeout: Duration,
     ) -> Result<Self, ServerError> {
         let recv_info = self.meta.recv_info();
-        let mut pending_peer_id: Option<String> = None;
 
         let deadline = time::sleep(timeout);
         tokio::pin!(deadline);
         let timer = time::sleep(self.conn.timeout().unwrap_or(MAX_TIMEOUT));
         tokio::pin!(timer);
+
+        let mut server_handler = |h3: &mut quiche::h3::Connection,
+                                  conn: &mut quiche::Connection,
+                                  stream_id: u64,
+                                  headers: &[quiche::h3::Header]| {
+            validate_server_connect_headers(headers).map_err(ConnectFailure::Closed)?;
+            let pid = validate_server_auth(headers, peer_tokens)
+                .map_err(|e| ConnectFailure::Closed(format!("auth: {e}")))?;
+
+            let response = [
+                quiche::h3::Header::new(b":status", b"200"),
+                quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+            ];
+            h3.send_response(conn, stream_id, &response, false)
+                .map_err(|e| ConnectFailure::Closed(format!("send 200: {e}")))?;
+
+            Ok(HeaderAction::Accept {
+                stream_id,
+                peer_id: Some(pid),
+            })
+        };
 
         loop {
             tokio::select! {
@@ -346,17 +286,24 @@ impl H3Engine {
                     }
 
                     if let Some(session) = self.session.as_mut() {
-                        match session.poll_connect_request(
-                            &mut self.conn,
-                            &mut pending_peer_id,
-                            peer_tokens,
-                        )? {
-                            ServerConnectProgress::Ready(peer_id) => {
+                        match session
+                            .poll_h3_events(
+                                &mut self.conn,
+                                &self.meta.peer_id,
+                                &mut server_handler,
+                            )
+                            .map_err(|e| ServerError::Accept(e.into_actor_reason()))?
+                        {
+                            ConnectProgress::Ready => {
+                                let peer_id = session
+                                    .accepted_peer_id
+                                    .take()
+                                    .expect("peer_id set by server handler");
                                 self.flush_send();
                                 self.meta.peer_id = peer_id;
                                 return Ok(self);
                             }
-                            ServerConnectProgress::Pending => {}
+                            ConnectProgress::Pending => {}
                         }
                     }
                 }

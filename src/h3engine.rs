@@ -10,7 +10,9 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::Tuning;
 use crate::events::Event;
-use crate::h3session::{ConnectIpDatagramCodec, ConnectProgress, H3Session, MAX_TIMEOUT};
+use crate::h3session::{
+    ConnectIpDatagramCodec, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT,
+};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::tun::alloc_uninit_packet_buf;
 use std::net::SocketAddr;
@@ -513,7 +515,11 @@ impl H3Engine {
                     // stream close/reset/goaway. The header-parsing branch is
                     // unreachable after establishment (server never sees :status;
                     // client's connect_ready() is already true).
-                    match session.poll_h3_events(&mut conn, &meta.peer_id) {
+                    match session.poll_h3_events(
+                        &mut conn,
+                        &meta.peer_id,
+                        &mut |_, _, _, _| Ok(HeaderAction::Ignore),
+                    ) {
                         Ok(ConnectProgress::Pending | ConnectProgress::Ready) => {}
                         Err(err) => break LoopExit::Err {
                             close_reason: err.close_reason(),
