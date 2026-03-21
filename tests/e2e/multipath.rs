@@ -91,7 +91,7 @@ tuning:
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_multipath_dual_subnet_mixed_transport() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new().await;
 
     let name_a = ctx.container_name("node-a-mp");
     let name_b = ctx.container_name("node-b-mp");

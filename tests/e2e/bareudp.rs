@@ -19,7 +19,7 @@ use super::common::{assert_ping, bareudp_config, start_bareudp_node, BareUdpPeer
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_two_node_bareudp_tunnel() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new().await;
 
     let name_a = ctx.container_name("node-a");
     let name_b = ctx.container_name("node-b");
@@ -63,7 +63,7 @@ async fn test_two_node_bareudp_tunnel() {
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_source_ip_filtering() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new().await;
 
     let name_a = ctx.container_name("node-a-filter");
     let fqdn_a = ctx.fqdn("node-a-filter");
@@ -128,7 +128,7 @@ async fn test_source_ip_filtering() {
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_mtu_boundary_drop() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new().await;
 
     let name_a = ctx.container_name("node-a-mtu");
     let name_b = ctx.container_name("node-b-mtu");

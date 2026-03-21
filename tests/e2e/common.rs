@@ -15,12 +15,7 @@ pub const TEST_IMAGE: &str = "h3llo";
 /// Default test image tag.
 pub const TEST_TAG: &str = "test";
 
-/// Runs a future on the current tokio runtime from a synchronous context.
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
-}
-
-/// Returns a shared bollard Docker client.
+/// Returns a bollard Docker client.
 fn docker() -> bollard::Docker {
     bollard::Docker::connect_with_local_defaults().expect("connect to Docker daemon")
 }
@@ -35,7 +30,7 @@ fn docker() -> bollard::Docker {
 /// # Examples
 ///
 /// ```ignore
-/// let ctx = TestContext::new();
+/// let ctx = TestContext::new().await;
 /// let name_a = ctx.container_name("node-a");  // e.g. "node-a-a1b2c3d4"
 /// let fqdn_a = ctx.fqdn("node-a");            // e.g. "node-a-a1b2c3d4.h3llo-e2e-a1b2c3d4"
 /// ```
@@ -51,11 +46,11 @@ impl TestContext {
     /// # Panics
     ///
     /// Panics if the Docker test image is not found or the network cannot be created.
-    pub fn new() -> Self {
+    pub async fn new() -> Self {
         let docker = docker();
         let image = format!("{TEST_IMAGE}:{TEST_TAG}");
 
-        if block_on(docker.inspect_image(&image)).is_err() {
+        if docker.inspect_image(&image).await.is_err() {
             eprintln!("Docker image {image} not found. Build with:");
             eprintln!("  docker buildx build --target test -t {image} --load .");
             panic!("Missing Docker image");
@@ -64,11 +59,13 @@ impl TestContext {
         let suffix = format!("{:08x}", rand::random::<u32>());
         let network = format!("h3llo-e2e-{suffix}");
 
-        block_on(docker.create_network(NetworkCreateRequest {
-            name: network.clone(),
-            ..Default::default()
-        }))
-        .unwrap_or_else(|e| panic!("Failed to create network {network}: {e}"));
+        docker
+            .create_network(NetworkCreateRequest {
+                name: network.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create network {network}: {e}"));
 
         Self { suffix, network }
     }
@@ -94,7 +91,15 @@ impl TestContext {
 
 impl Drop for TestContext {
     fn drop(&mut self) {
-        let _ = block_on(docker().remove_network(&self.network));
+        // Drop cannot be async; spawn a background thread to clean up.
+        let network = self.network.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(docker().remove_network(&network))
+        });
     }
 }
 

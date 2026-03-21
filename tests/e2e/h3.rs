@@ -98,7 +98,7 @@ tuning:
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image with H3 support"]
 async fn test_two_node_h3_tunnel() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new().await;
 
     let name_a = ctx.container_name("node-a-h3");
     let name_b = ctx.container_name("node-b-h3");

@@ -86,7 +86,7 @@ async fn run_iperf3_throughput(
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_bareudp_tcp_throughput() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new().await;
 
     let name_a = ctx.container_name("node-a-tp");
     let name_b = ctx.container_name("node-b-tp");
@@ -129,7 +129,7 @@ async fn test_bareudp_tcp_throughput() {
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image with H3 support"]
 async fn test_h3_tcp_throughput() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new().await;
 
     let name_a = ctx.container_name("node-a-tp-h3");
     let name_b = ctx.container_name("node-b-tp-h3");

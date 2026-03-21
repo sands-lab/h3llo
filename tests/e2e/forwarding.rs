@@ -16,7 +16,7 @@ use super::common::{assert_ping, bareudp_config, start_bareudp_node, BareUdpPeer
 #[tokio::test]
 #[ignore = "requires Docker and pre-built image"]
 async fn test_three_node_bareudp_forwarding() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new().await;
 
     let name_a = ctx.container_name("node-a-fwd");
     let fqdn_a = ctx.fqdn("node-a-fwd");
