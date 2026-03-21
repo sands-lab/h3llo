@@ -1021,6 +1021,7 @@ impl Orchestrator {
             Event::H3Connected(event) => {
                 self.handle_h3_connection(event).await;
             }
+            // TODO: Wire H3v2Connected into routing (register bound, rebuild routes).
             Event::H3v2Connected(event) => {
                 debug!(
                     peer_id = %event.peer_id,

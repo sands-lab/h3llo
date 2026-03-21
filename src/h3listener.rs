@@ -1156,6 +1156,10 @@ mod tests {
             dial_new_client(server.bound_addr, token, peer_id).await;
         let event = await_h3v2_connection(&mut server.events_rx).await;
 
+        // Verify event fields carry correct connection metadata.
+        assert_eq!(event.peer_id, peer_id);
+        assert_eq!(event.direction, ConnectionDirection::Inbound);
+
         // Send test packet from server.
         let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
         let pkt = alloc_packet_buf(&test_packet);
