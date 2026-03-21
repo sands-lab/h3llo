@@ -1022,6 +1022,9 @@ impl Orchestrator {
                 self.handle_h3_connection(event).await;
             }
             // TODO: Wire H3v2Connected into routing (register bound, rebuild routes).
+            // Currently event.tx is dropped here, which closes the per-connection
+            // egress channel and causes the H3Engine to shut down. This will be
+            // fixed when routing integration lands.
             Event::H3v2Connected(event) => {
                 debug!(
                     peer_id = %event.peer_id,
