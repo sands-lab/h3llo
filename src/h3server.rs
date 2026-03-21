@@ -12,7 +12,8 @@ use crate::config::Tuning;
 use crate::events::Event;
 use crate::h3::CONNECT_IP_OVERHEAD;
 use crate::h3v2::{
-    apply_transport_config, collect_router_ingress, handle_udp_recv, H3Session, MAX_TIMEOUT,
+    apply_transport_config, collect_router_ingress, handle_udp_recv, H3Session, PendingBatch,
+    MAX_TIMEOUT,
 };
 use crate::metrics::{Counters, Direction, Source};
 use quiche::h3::NameValue;
@@ -395,24 +396,17 @@ impl ServerConn {
         }
     }
 
-    fn forward_ingress(
-        &mut self,
-        max_udp_payload: usize,
-        ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
-    ) {
+    fn collect_ingress(&mut self, max_udp_payload: usize) -> Vec<PooledBuf> {
         let Some(session) = self.session.as_ref() else {
-            return;
+            return Vec::new();
         };
 
-        let dgrams = collect_router_ingress(
+        collect_router_ingress(
             &mut self.conn,
             max_udp_payload,
             &mut self.rx_counters,
             &session.datagram_codec,
-        );
-        if !dgrams.is_empty() {
-            let _ = ingress_tx.try_send(dgrams);
-        }
+        )
     }
 
     fn close(&mut self, reason: &'static [u8]) {
@@ -488,7 +482,6 @@ struct ServerRuntime {
     handshake_timeout: Duration,
     send_socket: UdpSocket,
     send_buf: Vec<u8>,
-    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     cid_table: HashMap<Vec<u8>, usize>,
     connections: HashMap<usize, ServerConn>,
@@ -502,7 +495,6 @@ impl ServerRuntime {
         max_udp_payload: usize,
         handshake_timeout: Duration,
         send_socket: UdpSocket,
-        ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
         events_tx: mpsc::UnboundedSender<Event>,
     ) -> Self {
         Self {
@@ -512,7 +504,6 @@ impl ServerRuntime {
             handshake_timeout,
             send_socket,
             send_buf: vec![0u8; max_udp_payload],
-            ingress_tx,
             events_tx,
             cid_table: HashMap::new(),
             connections: HashMap::new(),
@@ -525,6 +516,7 @@ impl ServerRuntime {
         mut udp_recv_rx: mpsc::Receiver<(SocketAddr, Vec<PooledBuf>)>,
         mut cmd_rx: mpsc::UnboundedReceiver<H3v2ListenerCommand>,
         mut peer_tokens: HashMap<String, String>,
+        ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
         metrics_interval: Duration,
         keepalive_interval: Duration,
     ) -> ActorExitResult {
@@ -535,11 +527,15 @@ impl ServerRuntime {
         let timer = time::sleep(MAX_TIMEOUT);
         tokio::pin!(timer);
 
+        let mut pending_ingress: Option<PendingBatch> = None;
+
         info!(bound_addr = %self.bound_addr, "h3v2 listener started");
 
         loop {
+            let ingress_pending = pending_ingress.is_some();
+
             tokio::select! {
-                maybe_pkt = udp_recv_rx.recv() => {
+                maybe_pkt = udp_recv_rx.recv(), if !ingress_pending => {
                     let Some((remote, batch)) = maybe_pkt else {
                         return Err(ActorError::BareRxRecv {
                             addr: self.bound_addr.to_string(),
@@ -547,7 +543,20 @@ impl ServerRuntime {
                         });
                     };
 
-                    self.handle_udp_batch(remote, batch, &peer_tokens);
+                    let dgrams = self.handle_udp_batch(remote, batch, &peer_tokens);
+                    pending_ingress = match PendingBatch::enqueue(&ingress_tx, dgrams) {
+                        Ok(pending) => pending,
+                        Err(()) => return Ok(()),
+                    };
+                }
+
+                permit_res = ingress_tx.reserve(), if ingress_pending => {
+                    if PendingBatch::resume(
+                        &mut pending_ingress, permit_res,
+                        |waited| debug!(waited_ms = waited.as_millis(), "server ingress backpressure"),
+                    ).is_err() {
+                        return Ok(());
+                    }
                 }
 
                 _ = &mut timer => {
@@ -582,17 +591,17 @@ impl ServerRuntime {
         remote: SocketAddr,
         mut batch: Vec<PooledBuf>,
         peer_tokens: &HashMap<String, String>,
-    ) {
+    ) -> Vec<PooledBuf> {
         let Some(header) = ServerPacketHeader::parse(&mut batch) else {
-            return;
+            return Vec::new();
         };
 
         if let Some(&conn_id) = self.cid_table.get(&header.dcid) {
-            self.handle_existing_connection(conn_id, batch, peer_tokens);
-            return;
+            return self.handle_existing_connection(conn_id, batch, peer_tokens);
         }
 
         self.accept_new_connection(remote, batch, header);
+        Vec::new()
     }
 
     fn handle_existing_connection(
@@ -600,25 +609,25 @@ impl ServerRuntime {
         conn_id: usize,
         batch: Vec<PooledBuf>,
         peer_tokens: &HashMap<String, String>,
-    ) {
+    ) -> Vec<PooledBuf> {
         let bound_addr = self.bound_addr;
         let max_udp_payload = self.max_udp_payload;
-        let ingress_tx = &self.ingress_tx;
         let send_socket = &self.send_socket;
         let send_buf = &mut self.send_buf;
 
         let Some(sc) = self.connections.get_mut(&conn_id) else {
-            return;
+            return Vec::new();
         };
 
         let recv_info = sc.recv_info(bound_addr);
         handle_udp_recv(&mut sc.conn, batch, recv_info);
 
-        if sc.is_established() {
+        let ingress = if sc.is_established() {
             if !sc.drain_control() {
                 sc.close(b"h3 control closed");
+                Vec::new()
             } else {
-                sc.forward_ingress(max_udp_payload, ingress_tx);
+                sc.collect_ingress(max_udp_payload)
             }
         } else {
             match sc.advance_handshake(peer_tokens) {
@@ -631,9 +640,11 @@ impl ServerRuntime {
                     sc.close(b"handshake failed");
                 }
             }
-        }
+            Vec::new()
+        };
 
         sc.flush_send(send_socket, send_buf);
+        ingress
     }
 
     fn accept_new_connection(
@@ -855,7 +866,6 @@ pub fn spawn_h3v2_listener(
             max_udp_payload,
             handshake_timeout,
             send_socket,
-            ingress_tx,
             events_tx,
         );
 
@@ -864,6 +874,7 @@ pub fn spawn_h3v2_listener(
                 udp_recv_rx,
                 cmd_rx,
                 peer_tokens,
+                ingress_tx,
                 tuning.metrics_push_interval,
                 tuning.h3_keepalive_interval,
             )

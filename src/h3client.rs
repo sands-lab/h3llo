@@ -12,14 +12,14 @@ use crate::events::Event;
 use crate::h3::CONNECT_IP_OVERHEAD;
 use crate::h3v2::{
     apply_transport_config, collect_router_ingress, handle_udp_recv, ConnectFailure,
-    ConnectProgress, H3Session, MAX_TIMEOUT,
+    ConnectProgress, H3Session, PendingBatch, MAX_TIMEOUT,
 };
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::tun::alloc_uninit_packet_buf;
 use rand::Rng;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
@@ -149,56 +149,6 @@ impl EngineMeta {
         match role {
             EngineRole::Client => ActorError::H3Client { peer_id, reason },
             EngineRole::Server => ActorError::H3Server { peer_id, reason },
-        }
-    }
-}
-
-/// Packet batch waiting for downstream capacity, with congestion timing.
-struct PendingBatch {
-    batch: Vec<PooledBuf>,
-    /// When the batch first became pending (for congestion duration tracking).
-    since: Instant,
-}
-
-impl PendingBatch {
-    fn new(batch: Vec<PooledBuf>) -> Self {
-        Self {
-            batch,
-            since: Instant::now(),
-        }
-    }
-
-    fn enqueue(
-        tx: &mpsc::Sender<Vec<PooledBuf>>,
-        batch: Vec<PooledBuf>,
-    ) -> Result<Option<Self>, ()> {
-        if batch.is_empty() {
-            return Ok(None);
-        }
-
-        match tx.try_send(batch) {
-            Ok(()) => Ok(None),
-            Err(mpsc::error::TrySendError::Full(batch)) => Ok(Some(Self::new(batch))),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
-        }
-    }
-
-    fn resume<F>(
-        slot: &mut Option<Self>,
-        permit_res: Result<mpsc::Permit<'_, Vec<PooledBuf>>, mpsc::error::SendError<()>>,
-        on_waited: F,
-    ) -> Result<(), ()>
-    where
-        F: FnOnce(Duration),
-    {
-        match permit_res {
-            Ok(permit) => {
-                let pending = slot.take().expect("pending batch present");
-                on_waited(pending.since.elapsed());
-                permit.send(pending.batch);
-                Ok(())
-            }
-            Err(_closed) => Err(()),
         }
     }
 }
@@ -965,44 +915,6 @@ mod tests {
             if peer_id == "peer-x" && reason == "QUIC connection closed"
         ));
         assert_eq!(err.kind(), ActorKind::Restartable);
-    }
-
-    // ========== PendingBatch Tests ==========
-
-    #[test]
-    fn pending_batch_enqueue_empty_returns_none() {
-        let (tx, _rx) = mpsc::channel::<Vec<PooledBuf>>(1);
-        let result = PendingBatch::enqueue(&tx, vec![]);
-        assert!(matches!(result, Ok(None)));
-    }
-
-    #[test]
-    fn pending_batch_enqueue_success() {
-        let (tx, mut rx) = mpsc::channel::<Vec<PooledBuf>>(1);
-        let batch = vec![alloc_packet_buf(b"pkt1")];
-        let result = PendingBatch::enqueue(&tx, batch);
-        assert!(matches!(result, Ok(None)));
-        // Verify the batch was actually sent.
-        assert!(rx.try_recv().is_ok());
-    }
-
-    #[test]
-    fn pending_batch_enqueue_full_returns_pending() {
-        let (tx, _rx) = mpsc::channel::<Vec<PooledBuf>>(1);
-        // Fill the channel directly, not via the function under test.
-        let _ = tx.try_send(vec![alloc_packet_buf(b"fill")]);
-        let batch = vec![alloc_packet_buf(b"overflow")];
-        let result = PendingBatch::enqueue(&tx, batch);
-        assert!(matches!(result, Ok(Some(_))));
-    }
-
-    #[test]
-    fn pending_batch_enqueue_closed_returns_err() {
-        let (tx, rx) = mpsc::channel::<Vec<PooledBuf>>(1);
-        drop(rx);
-        let batch = vec![alloc_packet_buf(b"orphan")];
-        let result = PendingBatch::enqueue(&tx, batch);
-        assert!(matches!(result, Err(())));
     }
 
     // ========== EngineMeta Tests ==========
