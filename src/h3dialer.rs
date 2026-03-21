@@ -9,10 +9,11 @@ use crate::bind::{make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::Event;
 use crate::h3::CONNECT_IP_OVERHEAD;
-use crate::h3v2::{
-    apply_transport_config, handle_udp_recv, reset_timer, ConnectFailure, ConnectProgress,
-    EngineIo, EngineMeta, EngineRole, H3Engine, H3Session, RunState, MAX_TIMEOUT,
+use crate::h3engine::{
+    apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, EngineRole,
+    H3Engine, RunState,
 };
+use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, MAX_TIMEOUT};
 use crate::udp;
 use rand::Rng;
 use std::net::SocketAddr;
@@ -376,7 +377,7 @@ mod tests {
     use crate::events::{ConnectionDirection, Event};
     use crate::h3::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::h3::{make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx};
-    use crate::h3v2::ConnectFailure;
+    use crate::h3session::ConnectFailure;
     use crate::tun::alloc_packet_buf;
     use std::collections::HashMap;
 

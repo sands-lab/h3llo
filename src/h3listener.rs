@@ -14,10 +14,11 @@ use crate::bind::make_server_udp_socket;
 use crate::config::Tuning;
 use crate::events::Event;
 use crate::h3::CONNECT_IP_OVERHEAD;
-use crate::h3v2::{
+use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, EngineRole,
-    H3Engine, H3Session, RunState, MAX_TIMEOUT,
+    H3Engine, RunState,
 };
+use crate::h3session::{H3Session, MAX_TIMEOUT};
 use crate::udp;
 use quiche::h3::NameValue;
 use rand::Rng;
