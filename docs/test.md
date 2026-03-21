@@ -289,6 +289,7 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Unit: `src/config.rs` tests for defaults, H3/API config validation, peer transport exclusivity.
 - Unit: `src/h3.rs` tests for datagram encoding, error display, CONNECT-IP header validation, and listener spawn/shutdown.
 - Unit: `src/h3v2.rs` tests for QSI encode/decode, quiche config creation, DialError display, ConnectIpDatagramCodec framing (prepend/strip/undo roundtrip, rejection paths), ConnectFailure/LoopExit exit mapping, PendingBatch channel backpressure, EngineMeta data constructors, and RunState initialization. Integration tests for h3v2 client against h3.rs server (handshake, auth rejection, bidirectional datagrams, shutdown).
+- Unit: `src/h3listener.rs` tests for ServerError display, server header/auth validation, and make_h3v2_listener cert rejection. Integration tests for h3v2 server against h3.rs client (handshake, auth rejection, C2S/S2C/bidirectional datagrams) and h3dialer.rs client (handshake, auth rejection, C2S/S2C/bidirectional datagrams, client shutdown, listener shutdown).
 - Unit: `src/auth.rs` tests for Bearer Token generation and validation.
 - Unit: `src/dns.rs` real-network DNS resolver tests.
 - Unit: `src/bare.rs` real-network BareUDP tests.

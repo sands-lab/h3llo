@@ -53,7 +53,8 @@ pub(crate) struct H3Session {
 impl H3Session {
     /// Creates a new H3 session bound to `conn`, before CONNECT-IP stream setup.
     pub(crate) fn with_transport(conn: &mut quiche::Connection) -> Result<Self, String> {
-        let h3_config = quiche::h3::Config::new().map_err(|e| format!("h3 config: {e}"))?;
+        let mut h3_config = quiche::h3::Config::new().map_err(|e| format!("h3 config: {e}"))?;
+        h3_config.enable_extended_connect(true);
         let h3_conn = quiche::h3::Connection::with_transport(conn, &h3_config)
             .map_err(|e| format!("h3 connection: {e}"))?;
 
@@ -78,10 +79,16 @@ impl H3Session {
     }
 
     /// Returns `true` when the CONNECT-IP session is fully ready for datagram forwarding.
+    ///
+    /// Only checks `connect_accepted` (CONNECT-IP 200 OK exchanged) and
+    /// `dgram_enabled_by_peer` (QUIC DATAGRAM transport parameter). The
+    /// `extended_connect_enabled_by_peer()` check is intentionally omitted:
+    /// per RFC 9220 only *servers* advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL`,
+    /// so the peer check fails on the server side where the client never sends it.
+    /// Post-acceptance the check is also redundant — a successful CONNECT-IP
+    /// exchange already proves extended CONNECT works.
     pub(crate) fn connect_ready(&self, conn: &quiche::Connection) -> bool {
-        self.connect_accepted
-            && self.h3_conn.dgram_enabled_by_peer(conn)
-            && self.h3_conn.extended_connect_enabled_by_peer()
+        self.connect_accepted && self.h3_conn.dgram_enabled_by_peer(conn)
     }
 
     /// Polls H3 events with a caller-supplied header handler.

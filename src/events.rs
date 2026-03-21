@@ -34,12 +34,40 @@ pub enum ConnectionDirection {
     Outbound,
 }
 
+/// HTTP/3 engine-based server connection established event.
+///
+/// Emitted by the h3v2 listener dispatcher when a client completes the
+/// QUIC + CONNECT-IP handshake via the H3Engine-based listener. Carries
+/// the per-connection egress channel for orchestrator routing integration.
+pub struct H3v2ConnectedEvent {
+    /// Authenticated peer identifier (from Bearer token validation).
+    pub peer_id: String,
+    /// Remote client socket address.
+    pub remote_addr: SocketAddr,
+    /// Channel for sending IP packets to the connected client.
+    pub tx: mpsc::Sender<Vec<PooledBuf>>,
+    /// Always `Inbound` for listener-accepted connections.
+    pub direction: ConnectionDirection,
+}
+
+impl std::fmt::Debug for H3v2ConnectedEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("H3v2ConnectedEvent")
+            .field("peer_id", &self.peer_id)
+            .field("remote_addr", &self.remote_addr)
+            .field("direction", &self.direction)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Carries high-level events emitted by modules to the orchestrator.
 pub enum Event {
     /// Cumulative metrics snapshot from any source.
     Metrics(Metrics),
     /// HTTP/3 connection established, ready for actor spawning.
     H3Connected(H3ConnectedEvent),
+    /// HTTP/3 engine-based server connection established.
+    H3v2Connected(H3v2ConnectedEvent),
     /// BareUDP TX connection established, ready for bound registration.
     BareConnected(BareConnectedEvent),
     /// A dial attempt failed; orchestrator should clear in-flight state and update backoff.
@@ -55,6 +83,7 @@ impl std::fmt::Debug for Event {
         match self {
             Self::Metrics(m) => f.debug_tuple("Metrics").field(m).finish(),
             Self::H3Connected(e) => f.debug_tuple("H3Connected").field(e).finish(),
+            Self::H3v2Connected(e) => f.debug_tuple("H3v2Connected").field(e).finish(),
             Self::BareConnected(e) => f.debug_tuple("BareConnected").field(e).finish(),
             Self::DialFailed(e) => f.debug_tuple("DialFailed").field(e).finish(),
             Self::Dns(e) => f.debug_tuple("Dns").field(e).finish(),

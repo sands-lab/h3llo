@@ -12,7 +12,7 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::validate_connect_auth;
 use crate::bind::make_server_udp_socket;
 use crate::config::Tuning;
-use crate::events::Event;
+use crate::events::{ConnectionDirection, Event, H3v2ConnectedEvent};
 use crate::h3::CONNECT_IP_OVERHEAD;
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, EngineRole,
@@ -48,29 +48,6 @@ pub enum ServerError {
     /// Connection acceptance or CONNECT-IP handshake failed.
     #[error("accept: {0}")]
     Accept(String),
-}
-
-// ========== Server Connection Handle ==========
-
-/// Established H3 server CONNECT-IP connection (one per client).
-///
-/// Returned to the orchestrator (via events channel) when a client completes
-/// the QUIC + CONNECT-IP handshake. Connection lifetime is managed by the
-/// multiplexed listener, not by per-connection actor handles.
-pub struct H3ServerConn {
-    /// Authenticated peer identifier (from Bearer token validation).
-    pub peer_id: String,
-    /// Remote client socket address.
-    pub remote_addr: SocketAddr,
-}
-
-impl std::fmt::Debug for H3ServerConn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("H3ServerConn")
-            .field("peer_id", &self.peer_id)
-            .field("remote_addr", &self.remote_addr)
-            .finish_non_exhaustive()
-    }
 }
 
 // ========== Server Validation Helpers ==========
@@ -245,9 +222,27 @@ impl H3Engine {
                                   conn: &mut quiche::Connection,
                                   stream_id: u64,
                                   headers: &[quiche::h3::Header]| {
-            validate_server_connect_headers(headers).map_err(ConnectFailure::Closed)?;
-            let pid = validate_server_auth(headers, peer_tokens)
-                .map_err(|e| ConnectFailure::Closed(format!("auth: {e}")))?;
+            if let Err(reason) = validate_server_connect_headers(headers) {
+                let _ = h3.send_response(
+                    conn,
+                    stream_id,
+                    &[quiche::h3::Header::new(b":status", b"400")],
+                    true,
+                );
+                return Err(ConnectFailure::Closed(reason));
+            }
+            let pid = match validate_server_auth(headers, peer_tokens) {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = h3.send_response(
+                        conn,
+                        stream_id,
+                        &[quiche::h3::Header::new(b":status", b"401")],
+                        true,
+                    );
+                    return Err(ConnectFailure::Closed(format!("auth: {e}")));
+                }
+            };
 
             let response = [
                 quiche::h3::Header::new(b":status", b"200"),
@@ -286,15 +281,12 @@ impl H3Engine {
                     }
 
                     if let Some(session) = self.session.as_mut() {
-                        match session
-                            .poll_h3_events(
-                                &mut self.conn,
-                                &self.meta.peer_id,
-                                &mut server_handler,
-                            )
-                            .map_err(|e| ServerError::Accept(e.into_actor_reason()))?
-                        {
-                            ConnectProgress::Ready => {
+                        match session.poll_h3_events(
+                            &mut self.conn,
+                            &self.meta.peer_id,
+                            &mut server_handler,
+                        ) {
+                            Ok(ConnectProgress::Ready) => {
                                 let peer_id = session
                                     .accepted_peer_id
                                     .take()
@@ -303,7 +295,11 @@ impl H3Engine {
                                 self.meta.peer_id = peer_id;
                                 return Ok(self);
                             }
-                            ConnectProgress::Pending => {}
+                            Ok(ConnectProgress::Pending) => {}
+                            Err(e) => {
+                                self.flush_send();
+                                return Err(ServerError::Accept(e.into_actor_reason()));
+                            }
                         }
                     }
                 }
@@ -552,9 +548,15 @@ impl H3Dispatcher {
                 "server: CONNECT-IP established"
             );
 
-            // TODO: Emit H3ServerConn { peer_id, remote_addr, tx: egress_tx }
-            // to the orchestrator for routing integration.
-            let _ = &egress_tx; // suppress unused warning for now
+            let _ = engine
+                .io
+                .events_tx
+                .send(Event::H3v2Connected(H3v2ConnectedEvent {
+                    peer_id: engine.meta.peer_id.clone(),
+                    remote_addr: remote,
+                    tx: egress_tx,
+                    direction: ConnectionDirection::Inbound,
+                }));
 
             engine.run().await
         });
@@ -693,6 +695,31 @@ pub fn spawn_h3v2_listener(
     (cmd_tx, handle, bound_addr)
 }
 
+/// Shared test utilities for H3v2 listener integration tests across modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::events::{Event, H3v2ConnectedEvent};
+
+    /// Waits for an `H3v2ConnectedEvent` on the events channel, with timeout.
+    ///
+    /// Skips non-H3v2Connected events (e.g. metrics). Panics on timeout or if
+    /// the channel closes before an H3v2Connected event arrives.
+    pub async fn await_h3v2_connection(
+        events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ) -> H3v2ConnectedEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = events_rx.recv().await {
+                if let Event::H3v2Connected(connected) = event {
+                    return connected;
+                }
+            }
+            panic!("events channel closed without H3v2Connected");
+        })
+        .await
+        .expect("timeout waiting for H3v2Connected event")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,19 +734,6 @@ mod tests {
         assert!(err.to_string().contains("config"));
         let err = ServerError::Accept("auth failed".into());
         assert!(err.to_string().contains("accept"));
-    }
-
-    // ========== H3ServerConn Tests ==========
-
-    #[test]
-    fn h3_server_conn_debug_format() {
-        let conn = H3ServerConn {
-            peer_id: "client-1".into(),
-            remote_addr: "10.0.0.2:54321".parse().unwrap(),
-        };
-        let dbg = format!("{conn:?}");
-        assert!(dbg.contains("client-1"));
-        assert!(dbg.contains("10.0.0.2:54321"));
     }
 
     // ========== Validation Helper Tests ==========
@@ -793,5 +807,539 @@ mod tests {
             &tuning,
         );
         assert!(result.is_err());
+    }
+
+    // ========== Integration Test Imports ==========
+
+    use crate::bind::test_support::FakeRouteProbe;
+    use crate::config::default_mtu;
+    use crate::h3::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
+    use crate::h3::{dial_h3, spawn_h3_rx, spawn_h3_tx, DialError as OldDialError};
+    use crate::h3dialer::{dial_h3_client, DialError as NewDialError};
+    use crate::helpers::test_packets::make_ipv4_packet;
+    use crate::tun::alloc_packet_buf;
+    use std::net::Ipv4Addr;
+    use test_support::await_h3v2_connection;
+    use tokio_quiche::buf_factory::PooledBuf;
+
+    // ========== Test Harness ==========
+
+    /// Test server wrapping h3v2 listener with cert and handle lifecycle management.
+    struct TestH3v2Server {
+        cmd_tx: mpsc::UnboundedSender<H3v2ListenerCommand>,
+        events_rx: mpsc::UnboundedReceiver<Event>,
+        ingress_rx: mpsc::Receiver<Vec<PooledBuf>>,
+        bound_addr: SocketAddr,
+        _certs: TestCertBundle,
+        _handle: JoinHandle<crate::actor::ActorExitResult>,
+    }
+
+    impl TestH3v2Server {
+        async fn start(peer_tokens: HashMap<String, String>) -> Self {
+            let certs = TestCertBundle::generate();
+            let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let tuning = crate::config::Tuning::default();
+
+            let listener = make_h3v2_listener(
+                listen_addr,
+                certs.cert_path(),
+                certs.key_path(),
+                default_mtu(),
+                &tuning,
+            )
+            .expect("make_h3v2_listener");
+
+            let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+            let (events_tx, events_rx) = mpsc::unbounded_channel();
+            let (cmd_tx, handle, bound_addr) = spawn_h3v2_listener(
+                listener,
+                peer_tokens,
+                &tuning,
+                &tokio::runtime::Handle::current(),
+                ingress_tx,
+                events_tx,
+            );
+
+            // Give listener time to start accepting.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            Self {
+                cmd_tx,
+                events_rx,
+                ingress_rx,
+                bound_addr,
+                _certs: certs,
+                _handle: handle,
+            }
+        }
+    }
+
+    // ========== Integration Test Helpers ==========
+
+    /// Dials the h3v2 server with the OLD client (h3.rs tokio-quiche).
+    async fn dial_old_client(
+        bound_addr: SocketAddr,
+        token: &str,
+        peer_id: &str,
+    ) -> crate::h3::H3Connection {
+        let peer_h3 = test_peer_h3(bound_addr, token);
+        let probe = FakeRouteProbe::noop();
+        let tuning = insecure_tuning();
+
+        dial_h3(
+            &peer_h3,
+            bound_addr,
+            peer_id,
+            None,
+            default_mtu(),
+            &probe,
+            &tuning,
+        )
+        .await
+        .expect("dial_h3 failed")
+    }
+
+    /// Dials the h3v2 server with the NEW client (h3dialer.rs raw quiche).
+    async fn dial_new_client(
+        bound_addr: SocketAddr,
+        token: &str,
+        peer_id: &str,
+    ) -> (
+        crate::h3dialer::H3ClientConn,
+        mpsc::Receiver<Vec<PooledBuf>>,
+        mpsc::UnboundedReceiver<Event>,
+    ) {
+        let peer_h3 = test_peer_h3(bound_addr, token);
+        let probe = FakeRouteProbe::noop();
+        let tuning = insecure_tuning();
+
+        let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+
+        let conn = dial_h3_client(
+            &peer_h3,
+            bound_addr,
+            peer_id,
+            None,
+            default_mtu(),
+            &probe,
+            &tuning,
+            &tokio::runtime::Handle::current(),
+            ingress_tx,
+            events_tx,
+        )
+        .await
+        .expect("dial_h3_client failed");
+
+        (conn, ingress_rx, events_rx)
+    }
+
+    // ========== Old Client (h3.rs) → H3v2 Listener Tests ==========
+
+    #[tokio::test]
+    async fn h3v2_listener_handshake_old_client() {
+        let peer_id = "old-cli-hs-peer";
+        let token = "old-cli-hs-tk-12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let server = TestH3v2Server::start(peer_tokens).await;
+        let conn = dial_old_client(server.bound_addr, token, peer_id).await;
+
+        assert_eq!(conn.peer_id, peer_id);
+        assert_eq!(conn.remote_addr, server.bound_addr);
+
+        drop(server.cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn h3v2_listener_auth_reject_old_client() {
+        let peer_id = "old-cli-rj-peer";
+        let correct_token = "correct-token-12";
+        let wrong_token = "wrong-token-12ch";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), correct_token.to_string())]);
+
+        let server = TestH3v2Server::start(peer_tokens).await;
+
+        let peer_h3 = test_peer_h3(server.bound_addr, wrong_token);
+        let probe = FakeRouteProbe::noop();
+        let tuning = insecure_tuning();
+
+        let result = dial_h3(
+            &peer_h3,
+            server.bound_addr,
+            peer_id,
+            None,
+            default_mtu(),
+            &probe,
+            &tuning,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(OldDialError::Auth(_))),
+            "expected Auth error, got {:?}",
+            result,
+        );
+
+        drop(server.cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn h3v2_listener_datagram_c2s_old_client() {
+        let peer_id = "old-cli-c2s-peer";
+        let token = "old-cli-c2s-tk12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let mut server = TestH3v2Server::start(peer_tokens).await;
+        let conn = dial_old_client(server.bound_addr, token, peer_id).await;
+
+        // Set up old client TX actor.
+        let (_client_rx, client_tx) = conn.into_actors();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (client_send_tx, _tx_handle) = spawn_h3_tx(
+            client_tx,
+            events_tx,
+            Duration::from_secs(60),
+            256,
+            Duration::from_secs(20),
+        );
+
+        // Send test packet.
+        let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
+        let pkt = alloc_packet_buf(&test_packet);
+        client_send_tx.send(vec![pkt]).await.expect("send failed");
+
+        // Verify server received the packet via ingress_rx.
+        let batch = tokio::time::timeout(Duration::from_secs(5), server.ingress_rx.recv())
+            .await
+            .expect("timeout waiting for datagram")
+            .expect("channel closed");
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], &test_packet[..]);
+
+        drop(server.cmd_tx);
+    }
+
+    // ========== New Client (h3dialer.rs) → H3v2 Listener Tests ==========
+
+    #[tokio::test]
+    async fn h3v2_listener_handshake_new_client() {
+        let peer_id = "new-cli-hs-peer";
+        let token = "new-cli-hs-tk-12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let server = TestH3v2Server::start(peer_tokens).await;
+        let (conn, _ingress_rx, _cli_events_rx) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
+
+        assert_eq!(conn.peer_id, peer_id);
+        assert_eq!(conn.remote_addr, server.bound_addr);
+
+        drop(server.cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn h3v2_listener_auth_reject_new_client() {
+        let peer_id = "new-cli-rj-peer";
+        let correct_token = "correct-token-12";
+        let wrong_token = "wrong-token-12ch";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), correct_token.to_string())]);
+
+        let server = TestH3v2Server::start(peer_tokens).await;
+
+        let peer_h3 = test_peer_h3(server.bound_addr, wrong_token);
+        let probe = FakeRouteProbe::noop();
+        let tuning = insecure_tuning();
+
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+
+        let result = dial_h3_client(
+            &peer_h3,
+            server.bound_addr,
+            peer_id,
+            None,
+            default_mtu(),
+            &probe,
+            &tuning,
+            &tokio::runtime::Handle::current(),
+            ingress_tx,
+            events_tx,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(NewDialError::Rejected(_))),
+            "expected Rejected, got {:?}",
+            result,
+        );
+
+        drop(server.cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn h3v2_listener_datagram_c2s_new_client() {
+        let peer_id = "new-cli-c2s-peer";
+        let token = "new-cli-c2s-tk12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let mut server = TestH3v2Server::start(peer_tokens).await;
+        let (conn, _ingress_rx, _cli_events_rx) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
+
+        // Send test packet via new client.
+        let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
+        let pkt = alloc_packet_buf(&test_packet);
+        conn.tx.send(vec![pkt]).await.expect("send failed");
+
+        // Verify server received the packet.
+        let batch = tokio::time::timeout(Duration::from_secs(5), server.ingress_rx.recv())
+            .await
+            .expect("timeout waiting for datagram")
+            .expect("channel closed");
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], &test_packet[..]);
+
+        drop(server.cmd_tx);
+    }
+
+    // ========== Server→Client Tests ==========
+
+    #[tokio::test]
+    async fn h3v2_listener_datagram_s2c_old_client() {
+        let peer_id = "old-cli-s2c-peer";
+        let token = "old-cli-s2c-tk12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let mut server = TestH3v2Server::start(peer_tokens).await;
+        let conn = dial_old_client(server.bound_addr, token, peer_id).await;
+        let event = await_h3v2_connection(&mut server.events_rx).await;
+
+        // Set up old client RX actor.
+        let (client_rx, _client_tx) = conn.into_actors();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (client_ingress_tx, mut client_ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let _rx_handle = spawn_h3_rx(
+            client_rx,
+            client_ingress_tx,
+            events_tx,
+            Duration::from_secs(60),
+        );
+
+        // Send test packet from server.
+        let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
+        let pkt = alloc_packet_buf(&test_packet);
+        event.tx.send(vec![pkt]).await.expect("send failed");
+
+        // Verify client received the packet.
+        let batch = tokio::time::timeout(Duration::from_secs(5), client_ingress_rx.recv())
+            .await
+            .expect("timeout waiting for datagram")
+            .expect("channel closed");
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], &test_packet[..]);
+
+        drop(server.cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn h3v2_listener_datagram_s2c_new_client() {
+        let peer_id = "new-cli-s2c-peer";
+        let token = "new-cli-s2c-tk12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let mut server = TestH3v2Server::start(peer_tokens).await;
+        let (_conn, mut ingress_rx, _cli_events_rx) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
+        let event = await_h3v2_connection(&mut server.events_rx).await;
+
+        // Verify event fields carry correct connection metadata.
+        assert_eq!(event.peer_id, peer_id);
+        assert_eq!(event.direction, ConnectionDirection::Inbound);
+
+        // Send test packet from server.
+        let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
+        let pkt = alloc_packet_buf(&test_packet);
+        event.tx.send(vec![pkt]).await.expect("send failed");
+
+        // Verify client received the packet via ingress_rx.
+        let batch = tokio::time::timeout(Duration::from_secs(5), ingress_rx.recv())
+            .await
+            .expect("timeout waiting for datagram")
+            .expect("channel closed");
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(&batch[0][..], &test_packet[..]);
+
+        drop(server.cmd_tx);
+    }
+
+    // ========== Bidirectional Tests ==========
+
+    #[tokio::test]
+    async fn h3v2_listener_bidirectional_old_client() {
+        let peer_id = "old-cli-bi-peer";
+        let token = "old-cli-bi-tk-12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let mut server = TestH3v2Server::start(peer_tokens).await;
+        let conn = dial_old_client(server.bound_addr, token, peer_id).await;
+        let event = await_h3v2_connection(&mut server.events_rx).await;
+
+        let (client_rx, client_tx) = conn.into_actors();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (client_send_tx, _tx_handle) = spawn_h3_tx(
+            client_tx,
+            events_tx.clone(),
+            Duration::from_secs(60),
+            256,
+            Duration::from_secs(20),
+        );
+        let (client_ingress_tx, mut client_ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let _rx_handle = spawn_h3_rx(
+            client_rx,
+            client_ingress_tx,
+            events_tx,
+            Duration::from_secs(60),
+        );
+
+        // Client → Server
+        let packet_c2s = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
+        client_send_tx
+            .send(vec![alloc_packet_buf(&packet_c2s)])
+            .await
+            .expect("c2s failed");
+        let batch = tokio::time::timeout(Duration::from_secs(5), server.ingress_rx.recv())
+            .await
+            .expect("timeout c2s")
+            .expect("closed");
+        assert_eq!(&batch[0][..], &packet_c2s[..]);
+
+        // Server → Client
+        let packet_s2c = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
+        event
+            .tx
+            .send(vec![alloc_packet_buf(&packet_s2c)])
+            .await
+            .expect("s2c failed");
+        let batch = tokio::time::timeout(Duration::from_secs(5), client_ingress_rx.recv())
+            .await
+            .expect("timeout s2c")
+            .expect("closed");
+        assert_eq!(&batch[0][..], &packet_s2c[..]);
+
+        drop(server.cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn h3v2_listener_bidirectional_new_client() {
+        let peer_id = "new-cli-bi-peer";
+        let token = "new-cli-bi-tk-12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let mut server = TestH3v2Server::start(peer_tokens).await;
+        let (conn, mut ingress_rx, _cli_events_rx) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
+        let event = await_h3v2_connection(&mut server.events_rx).await;
+
+        // Client → Server
+        let packet_c2s = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
+        conn.tx
+            .send(vec![alloc_packet_buf(&packet_c2s)])
+            .await
+            .expect("c2s failed");
+        let batch = tokio::time::timeout(Duration::from_secs(5), server.ingress_rx.recv())
+            .await
+            .expect("timeout c2s")
+            .expect("closed");
+        assert_eq!(&batch[0][..], &packet_c2s[..]);
+
+        // Server → Client
+        let packet_s2c = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
+        event
+            .tx
+            .send(vec![alloc_packet_buf(&packet_s2c)])
+            .await
+            .expect("s2c failed");
+        let batch = tokio::time::timeout(Duration::from_secs(5), ingress_rx.recv())
+            .await
+            .expect("timeout s2c")
+            .expect("closed");
+        assert_eq!(&batch[0][..], &packet_s2c[..]);
+
+        drop(server.cmd_tx);
+    }
+
+    // ========== Lifecycle Tests ==========
+
+    #[tokio::test]
+    async fn h3v2_listener_shutdown() {
+        let peer_id = "sd-listener-peer";
+        let token = "sd-listener-tk12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let server = TestH3v2Server::start(peer_tokens).await;
+
+        // Verify a client can connect.
+        let (conn, _ingress_rx, _cli_events_rx) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
+        assert_eq!(conn.peer_id, peer_id);
+
+        // Drop command sender to trigger listener shutdown.
+        let handle = server._handle;
+        drop(server.cmd_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("listener did not terminate in time")
+            .expect("listener task panicked");
+        assert!(
+            result.is_ok(),
+            "listener should shut down gracefully: {:?}",
+            result,
+        );
+    }
+
+    #[tokio::test]
+    async fn h3v2_listener_client_shutdown() {
+        let peer_id = "sd-client-peer-1";
+        let token = "sd-client-tk-1-12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let mut server = TestH3v2Server::start(peer_tokens).await;
+        let (conn, _ingress_rx, _cli_events_rx) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
+
+        let _event = await_h3v2_connection(&mut server.events_rx).await;
+
+        // Drop the egress sender to trigger client shutdown.
+        let crate::h3dialer::H3ClientConn {
+            engine_handle,
+            udp_rx_handle,
+            udp_tx_handle,
+            tx,
+            ..
+        } = conn;
+        drop(tx);
+
+        // Engine handle should terminate cleanly within a reasonable timeout.
+        let engine_result = tokio::time::timeout(Duration::from_secs(5), engine_handle)
+            .await
+            .expect("engine_handle did not terminate in time")
+            .expect("engine task panicked");
+        assert!(
+            engine_result.is_ok(),
+            "engine exited with error: {:?}",
+            engine_result,
+        );
+
+        // UDP actors may be aborted by the engine or complete on their own.
+        let _ = tokio::time::timeout(Duration::from_secs(2), udp_rx_handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), udp_tx_handle).await;
+
+        drop(server.cmd_tx);
     }
 }
