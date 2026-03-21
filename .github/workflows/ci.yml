@@ -81,7 +81,8 @@ jobs:
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --group-add "$(stat -c '%g' /var/run/docker.sock)" \
-            -e CARGO_HOME=${{ github.workspace }}/.cargo \
+            -e CARGO_HOME=/tmp/ci-cargo-home \
+            -v /tmp/ci-cargo-home:/tmp/ci-cargo-home \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${{ github.workspace }}:${{ github.workspace }}" \
             -w "${{ github.workspace }}" \
@@ -92,7 +93,8 @@ jobs:
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --group-add "$(stat -c '%g' /var/run/docker.sock)" \
-            -e CARGO_HOME=${{ github.workspace }}/.cargo \
+            -e CARGO_HOME=/tmp/ci-cargo-home \
+            -v /tmp/ci-cargo-home:/tmp/ci-cargo-home \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${{ github.workspace }}:${{ github.workspace }}" \
             -w "${{ github.workspace }}" \

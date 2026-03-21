@@ -312,7 +312,8 @@ Run tests inside the container (DooD mode):
 docker run --rm \
   --user "$(id -u):$(id -g)" \
   --group-add "$(stat -c '%g' /var/run/docker.sock)" \
-  -e CARGO_HOME="$PWD/.cargo" \
+  -e CARGO_HOME=/tmp/ci-cargo-home \
+  -v /tmp/ci-cargo-home:/tmp/ci-cargo-home \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$PWD:$PWD" -w "$PWD" \
   h3llo:ci-runner \
@@ -320,10 +321,9 @@ docker run --rm \
 ```
 
 The `--user` flag ensures build artifacts retain the host user's ownership.
-`CARGO_HOME` is redirected into the workspace so the registry/index cache
-also persists across runs. Both `target/` and `.cargo/` live on the host
-filesystem via volume mount, so only the first-ever run downloads and
-compiles from scratch.
+`CARGO_HOME` is mounted from outside the workspace so the registry/index
+cache survives `git clean` between CI runs. Only the first-ever run
+downloads and compiles from scratch.
 
 ## SSL/TLS Certificates
 

@@ -1,6 +1,5 @@
 .vscode
 /target
-/.cargo
 **/*.rs.bk
 .tmp/
 .milestones/
