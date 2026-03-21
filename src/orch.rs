@@ -1021,6 +1021,13 @@ impl Orchestrator {
             Event::H3Connected(event) => {
                 self.handle_h3_connection(event).await;
             }
+            Event::H3v2Connected(event) => {
+                debug!(
+                    peer_id = %event.peer_id,
+                    remote = %event.remote_addr,
+                    "h3v2 connected (routing not yet wired)"
+                );
+            }
             Event::BareConnected(event) => {
                 self.handle_bare_connection(event);
             }
