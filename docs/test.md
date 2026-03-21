@@ -309,7 +309,7 @@ docker buildx build --platform linux/amd64 --target ci-runner -t h3llo:ci-runner
 
 Run tests inside the container (DooD mode):
 ```bash
-docker run --rm --network host \
+docker run --rm \
   --user "$(id -u):$(id -g)" \
   --group-add "$(stat -c '%g' /var/run/docker.sock)" \
   -e CARGO_HOME="$PWD/.cargo" \

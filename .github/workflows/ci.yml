@@ -78,7 +78,7 @@ jobs:
           load: true
       - name: Run integration tests in container
         run: |
-          docker run --rm --network host \
+          docker run --rm \
             --user "$(id -u):$(id -g)" \
             --group-add "$(stat -c '%g' /var/run/docker.sock)" \
             -e CARGO_HOME=${{ github.workspace }}/.cargo \
@@ -89,7 +89,7 @@ jobs:
             cargo test --test integration --features test-utils -- --ignored --nocapture
       - name: Run E2E tests in container
         run: |
-          docker run --rm --network host \
+          docker run --rm \
             --user "$(id -u):$(id -g)" \
             --group-add "$(stat -c '%g' /var/run/docker.sock)" \
             -e CARGO_HOME=${{ github.workspace }}/.cargo \

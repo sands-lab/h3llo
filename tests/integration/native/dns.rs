@@ -49,8 +49,11 @@ multi   3600 IN AAAA 2001:db8::2
 ipv6only 3600 IN AAAA 2001:db8::1
 "#;
 
-/// Spawns a CoreDNS container with zone file and returns the mapped host port.
-async fn start_coredns() -> (ContainerAsync<GenericImage>, u16) {
+/// Spawns a CoreDNS container and returns the reachable server address.
+///
+/// Uses `get_host()` to resolve the correct address, which handles DooD
+/// (Docker-outside-of-Docker) transparently.
+async fn start_coredns() -> (ContainerAsync<GenericImage>, SocketAddr) {
     let container = GenericImage::new("coredns/coredns", "1.12.0")
         .with_wait_for(WaitFor::message_on_stdout("CoreDNS-"))
         .with_exposed_port(ContainerPort::Udp(53))
@@ -64,11 +67,13 @@ async fn start_coredns() -> (ContainerAsync<GenericImage>, u16) {
         .await
         .expect("failed to start CoreDNS container");
 
+    let host = container.get_host().await.unwrap();
     let port = container
         .get_host_port_ipv4(ContainerPort::Udp(53))
         .await
         .unwrap();
-    (container, port)
+    let server: SocketAddr = format!("{host}:{port}").parse().unwrap();
+    (container, server)
 }
 
 /// Spawns a DNS resolver targeting the given server address.
@@ -142,8 +147,7 @@ fn hosts(names: &[&str]) -> HashSet<String> {
 #[tokio::test]
 #[ignore] // Requires Docker
 async fn dns_resolve_single_a_record() {
-    let (_container, port) = start_coredns().await;
-    let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (_container, server) = start_coredns().await;
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
@@ -173,8 +177,7 @@ async fn dns_resolve_single_a_record() {
 #[tokio::test]
 #[ignore]
 async fn dns_resolve_multiple_records() {
-    let (_container, port) = start_coredns().await;
-    let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (_container, server) = start_coredns().await;
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
@@ -208,8 +211,7 @@ async fn dns_resolve_multiple_records() {
 #[tokio::test]
 #[ignore]
 async fn dns_resolve_aaaa_only() {
-    let (_container, port) = start_coredns().await;
-    let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (_container, server) = start_coredns().await;
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
@@ -236,8 +238,7 @@ async fn dns_resolve_aaaa_only() {
 #[tokio::test]
 #[ignore]
 async fn dns_resolve_nxdomain_emits_no_events() {
-    let (_container, port) = start_coredns().await;
-    let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (_container, server) = start_coredns().await;
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
@@ -265,8 +266,7 @@ async fn dns_resolve_nxdomain_emits_no_events() {
 #[tokio::test]
 #[ignore]
 async fn dns_resolve_multiple_hostnames() {
-    let (_container, port) = start_coredns().await;
-    let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let (_container, server) = start_coredns().await;
     let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     // Register multiple hostnames at once
