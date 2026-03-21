@@ -4,9 +4,11 @@
 //! helpers shared by the client ([`crate::h3client`]) and server
 //! ([`crate::h3server`]) modules.
 
+use crate::actor::{ActorError, ActorExitResult};
 use crate::config::Tuning;
+use crate::events::Event;
 use crate::h3::CONTEXT_ID_IP;
-use crate::metrics::{Counters, DropReason};
+use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::tun::alloc_uninit_packet_buf;
 use octets::{varint_len, varint_parse_len, Octets, OctetsMut};
 use quiche::h3::NameValue;
@@ -70,7 +72,11 @@ impl H3Session {
     }
 
     /// Polls H3 events for the CONNECT-IP control stream.
-    pub(crate) fn poll_connect_response(
+    ///
+    /// Used during both client handshake (establish) and steady-state forwarding
+    /// (run loop). Post-establishment, the header-parsing branch is unreachable
+    /// (server never sees `:status`; client's `connect_ready()` is already true).
+    pub(crate) fn poll_h3_events(
         &mut self,
         conn: &mut quiche::Connection,
         peer_id: &str,
@@ -119,6 +125,7 @@ impl H3Session {
 
                 Ok((_sid, quiche::h3::Event::GoAway)) => {
                     tracing::info!(%peer_id, "received H3 GOAWAY");
+                    return Err(ConnectFailure::Closed("received GOAWAY".into()));
                 }
 
                 Ok((_sid, quiche::h3::Event::PriorityUpdate)) => {}
@@ -415,12 +422,9 @@ impl PendingBatch {
 
 /// Collects pending QUIC output packets into a batch.
 ///
-/// Pure function with no channel dependency — the caller is responsible for
-/// sending the batch via `try_send` + `pending_send` pattern.
-pub(crate) fn collect_udp_send(
-    conn: &mut quiche::Connection,
-    max_udp_payload: usize,
-) -> Vec<PooledBuf> {
+/// Called by [`flush_udp_send`] to gather all queued QUIC output before
+/// sending via the tagged UDP TX channel.
+fn collect_udp_send(conn: &mut quiche::Connection, max_udp_payload: usize) -> Vec<PooledBuf> {
     let mut batch = Vec::new();
     loop {
         let mut buf = alloc_uninit_packet_buf(max_udp_payload);
@@ -525,6 +529,342 @@ pub(crate) fn handle_router_egress(
 /// Uses `MAX_TIMEOUT` as sentinel when quiche returns `None` (no pending timers).
 pub(crate) fn reset_timer(timer: std::pin::Pin<&mut time::Sleep>, conn: &quiche::Connection) {
     timer.reset(time::Instant::now() + conn.timeout().unwrap_or(MAX_TIMEOUT));
+}
+
+// ========== H3 Engine (unified client/server) ==========
+
+/// Discriminates client vs. server engine for error reporting.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum EngineRole {
+    Client,
+    Server,
+}
+
+/// Channels owned by the engine actor.
+pub(crate) struct EngineIo {
+    pub(crate) udp_recv_rx: mpsc::Receiver<(SocketAddr, Vec<PooledBuf>)>,
+    pub(crate) udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+    pub(crate) egress_rx: mpsc::Receiver<Vec<PooledBuf>>,
+    pub(crate) ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+    pub(crate) events_tx: mpsc::UnboundedSender<Event>,
+}
+
+/// Connection metadata shared across startup and established phases.
+pub(crate) struct EngineMeta {
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) remote_addr: SocketAddr,
+    pub(crate) peer_id: String,
+    pub(crate) max_udp_payload: usize,
+}
+
+impl EngineMeta {
+    // TODO: For QUIC path migration / NAT rebinding, recv_info should be
+    // constructed per-batch from the actual source address instead of using
+    // a fixed remote_addr. Currently all callers (establish, accept, run)
+    // ignore the per-batch remote and use this fixed value.
+    pub(crate) fn recv_info(&self) -> quiche::RecvInfo {
+        quiche::RecvInfo {
+            from: self.remote_addr,
+            to: self.local_addr,
+        }
+    }
+
+    pub(crate) fn actor_error(&self, role: EngineRole, reason: impl Into<String>) -> ActorError {
+        let peer_id = self.peer_id.clone();
+        let reason = reason.into();
+        match role {
+            EngineRole::Client => ActorError::H3Client { peer_id, reason },
+            EngineRole::Server => ActorError::H3Server { peer_id, reason },
+        }
+    }
+}
+
+/// Exit reason for the established-phase event loop.
+///
+/// Carried out of the loop via `break` so that QUIC close + UDP flush
+/// happen exactly once, after the loop.
+pub(crate) enum LoopExit {
+    Ok(&'static [u8]),
+    Err {
+        close_reason: &'static [u8],
+        reason: String,
+    },
+}
+
+impl LoopExit {
+    pub(crate) fn close_reason(&self) -> &'static [u8] {
+        match self {
+            Self::Ok(r) => r,
+            Self::Err { close_reason, .. } => close_reason,
+        }
+    }
+
+    pub(crate) fn into_result(self, meta: &EngineMeta, role: EngineRole) -> ActorExitResult {
+        match self {
+            Self::Ok(_) => Ok(()),
+            Self::Err { reason, .. } => Err(meta.actor_error(role, reason)),
+        }
+    }
+}
+
+/// Established-phase mutable state that does not own transport resources.
+pub(crate) struct RunState {
+    pub(crate) rx_counters: Counters,
+    pub(crate) tx_counters: Counters,
+    pub(crate) pending_ingress: Option<PendingBatch>,
+    pub(crate) pending_egress: Option<PendingBatch>,
+    pub(crate) pending_send: Option<PendingBatch>,
+}
+
+impl RunState {
+    pub(crate) fn new() -> Self {
+        Self {
+            rx_counters: Counters::new(Source::Http3, Direction::Rx),
+            tx_counters: Counters::new(Source::Http3, Direction::Tx),
+            pending_ingress: None,
+            pending_egress: None,
+            pending_send: None,
+        }
+    }
+
+    pub(crate) fn flush_and_retry(
+        &mut self,
+        conn: &mut quiche::Connection,
+        session: &H3Session,
+        meta: &EngineMeta,
+        udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+    ) -> Result<(), ()> {
+        if self.pending_send.is_none() {
+            self.pending_send =
+                flush_udp_send(conn, meta.max_udp_payload, meta.remote_addr, udp_send_tx)?;
+        }
+
+        if let Some(pending) = self.pending_egress.take() {
+            self.tx_counters.record_queue_full(pending.since.elapsed());
+            if let Some(remaining) = handle_router_egress(
+                conn,
+                pending.batch,
+                &session.datagram_codec,
+                &mut self.tx_counters,
+            ) {
+                self.pending_egress = Some(PendingBatch::new(remaining));
+            }
+        }
+
+        if self.pending_send.is_none() {
+            self.pending_send =
+                flush_udp_send(conn, meta.max_udp_payload, meta.remote_addr, udp_send_tx)?;
+        }
+
+        Ok(())
+    }
+
+    fn emit_metrics(&self, meta: &EngineMeta, events_tx: &mpsc::UnboundedSender<Event>) {
+        let rx = self
+            .rx_counters
+            .snapshot(Some(&meta.peer_id), Some(meta.remote_addr));
+        let tx = self
+            .tx_counters
+            .snapshot(Some(&meta.peer_id), Some(meta.remote_addr));
+        let _ = events_tx.send(Event::Metrics(rx));
+        let _ = events_tx.send(Event::Metrics(tx));
+    }
+}
+
+/// Unified H3 engine actor for both client and server connections.
+///
+/// Owns the QUIC connection and all I/O channels. Client connections use
+/// [`establish`](Self::establish) (in `h3client`) for handshake; server
+/// connections use [`accept`](Self::accept) (in `h3server`). Both then call
+/// [`run`](Self::run) for steady-state datagram forwarding.
+pub(crate) struct H3Engine {
+    pub(crate) conn: quiche::Connection,
+    pub(crate) session: Option<H3Session>,
+
+    pub(crate) io: EngineIo,
+    pub(crate) meta: EngineMeta,
+    pub(crate) run_state: RunState,
+
+    pub(crate) metrics_interval: Duration,
+    pub(crate) keepalive_interval: Duration,
+    pub(crate) role: EngineRole,
+}
+
+impl H3Engine {
+    /// Best-effort flush of QUIC output to the UDP send channel.
+    ///
+    /// Used during handshake and close, where pending-send tracking is
+    /// unnecessary. Drops on channel backpressure — acceptable because quiche
+    /// retransmits during handshake and CONNECTION_CLOSE is best-effort.
+    pub(crate) fn flush_send(&mut self) {
+        let _ = flush_udp_send(
+            &mut self.conn,
+            self.meta.max_udp_payload,
+            self.meta.remote_addr,
+            &self.io.udp_send_tx,
+        );
+    }
+
+    /// Established phase: steady-state datagram forwarding.
+    ///
+    /// Uses three pending slots for zero-drop backpressure:
+    /// - `pending_ingress`: IP packets from dgram_recv waiting for `ingress_tx` capacity.
+    /// - `pending_egress`: IP packets from TUN waiting for `conn.dgram_send()` capacity.
+    /// - `pending_send`: encrypted QUIC packets waiting for `udp_send_tx` capacity.
+    pub(crate) async fn run(self) -> ActorExitResult {
+        let recv_info = self.meta.recv_info();
+
+        let H3Engine {
+            mut conn,
+            session,
+            io:
+                EngineIo {
+                    mut udp_recv_rx,
+                    udp_send_tx,
+                    mut egress_rx,
+                    ingress_tx,
+                    events_tx,
+                },
+            meta,
+            mut run_state,
+            metrics_interval,
+            keepalive_interval,
+            role,
+        } = self;
+        let mut session = session.expect("session present after establish/accept");
+
+        let mut ticker = time::interval(metrics_interval);
+        let mut keepalive = time::interval(keepalive_interval);
+        keepalive.tick().await;
+
+        let timer = time::sleep(conn.timeout().unwrap_or(MAX_TIMEOUT));
+        tokio::pin!(timer);
+
+        let exit: LoopExit = loop {
+            let ingress_pending = run_state.pending_ingress.is_some();
+            let egress_pending = run_state.pending_egress.is_some();
+            let send_pending = run_state.pending_send.is_some();
+
+            tokio::select! {
+                maybe_batch = udp_recv_rx.recv(),
+                    if !ingress_pending =>
+                {
+                    let Some((_remote, packets)) = maybe_batch else {
+                        break LoopExit::Ok(b"udp rx closed");
+                    };
+
+                    handle_udp_recv(&mut conn, packets, recv_info);
+
+                    // Drain H3 control events. Post-establishment, this detects
+                    // stream close/reset/goaway. The header-parsing branch is
+                    // unreachable after establishment (server never sees :status;
+                    // client's connect_ready() is already true).
+                    match session.poll_h3_events(&mut conn, &meta.peer_id) {
+                        Ok(ConnectProgress::Pending | ConnectProgress::Ready) => {}
+                        Err(err) => break LoopExit::Err {
+                            close_reason: err.close_reason(),
+                            reason: err.into_actor_reason(),
+                        },
+                    }
+
+                    run_state.pending_ingress = match PendingBatch::enqueue(
+                        &ingress_tx,
+                        collect_router_ingress(
+                            &mut conn,
+                            meta.max_udp_payload,
+                            &mut run_state.rx_counters,
+                            &session.datagram_codec,
+                        ),
+                    ) {
+                        Ok(pending) => pending,
+                        Err(()) => break LoopExit::Ok(b"shutdown"),
+                    };
+                }
+
+                permit_res = ingress_tx.reserve(),
+                    if ingress_pending =>
+                {
+                    if PendingBatch::resume(
+                        &mut run_state.pending_ingress, permit_res,
+                        |waited| run_state.rx_counters.record_queue_full(waited),
+                    ).is_err() {
+                        break LoopExit::Ok(b"shutdown");
+                    }
+                }
+
+                maybe_batch = egress_rx.recv(),
+                    if !egress_pending =>
+                {
+                    let Some(packets) = maybe_batch else {
+                        break LoopExit::Ok(b"shutdown");
+                    };
+
+                    if let Some(remaining) = handle_router_egress(
+                        &mut conn,
+                        packets,
+                        &session.datagram_codec,
+                        &mut run_state.tx_counters,
+                    ) {
+                        run_state.pending_egress = Some(PendingBatch::new(remaining));
+                    }
+                }
+
+                permit_res = udp_send_tx.reserve(),
+                    if send_pending =>
+                {
+                    match permit_res {
+                        Ok(permit) => {
+                            let pending = run_state.pending_send.take()
+                                .expect("pending send present");
+                            run_state.tx_counters.record_queue_full(pending.since.elapsed());
+                            permit.send((meta.remote_addr, pending.batch));
+                        }
+                        Err(_) => break LoopExit::Ok(b"udp tx closed"),
+                    }
+                }
+
+                _ = &mut timer => {
+                    conn.on_timeout();
+                }
+
+                _ = keepalive.tick() => {
+                    conn.send_ack_eliciting().ok();
+                }
+
+                _ = ticker.tick() => {
+                    run_state.emit_metrics(&meta, &events_tx);
+                }
+            }
+
+            if run_state
+                .flush_and_retry(&mut conn, &session, &meta, &udp_send_tx)
+                .is_err()
+            {
+                break LoopExit::Err {
+                    close_reason: b"udp tx closed",
+                    reason: "UDP TX channel closed".into(),
+                };
+            }
+            reset_timer(timer.as_mut(), &conn);
+
+            if conn.is_closed() {
+                break LoopExit::Err {
+                    close_reason: b"conn closed",
+                    reason: "QUIC connection closed".into(),
+                };
+            }
+        };
+
+        // Single cleanup point: close QUIC and flush remaining packets.
+        conn.close(true, 0, exit.close_reason()).ok();
+        let _ = flush_udp_send(
+            &mut conn,
+            meta.max_udp_payload,
+            meta.remote_addr,
+            &udp_send_tx,
+        );
+        exit.into_result(&meta, role)
+    }
 }
 
 #[cfg(test)]
@@ -765,5 +1105,102 @@ mod tests {
         let batch = vec![alloc_packet_buf(b"orphan")];
         let result = PendingBatch::enqueue(&tx, batch);
         assert!(matches!(result, Err(())));
+    }
+
+    // ========== Engine Type Tests ==========
+
+    use crate::actor::ActorKind;
+
+    #[test]
+    fn loop_exit_close_reason() {
+        let ok = LoopExit::Ok(b"shutdown");
+        assert_eq!(ok.close_reason(), b"shutdown");
+
+        let err = LoopExit::Err {
+            close_reason: b"conn closed",
+            reason: "QUIC closed".into(),
+        };
+        assert_eq!(err.close_reason(), b"conn closed");
+    }
+
+    fn test_meta() -> EngineMeta {
+        EngineMeta {
+            local_addr: "127.0.0.1:5000".parse().unwrap(),
+            remote_addr: "10.0.0.1:443".parse().unwrap(),
+            peer_id: "peer-x".into(),
+            max_udp_payload: 1400,
+        }
+    }
+
+    #[test]
+    fn loop_exit_into_result_ok() {
+        let exit = LoopExit::Ok(b"graceful");
+        assert!(exit.into_result(&test_meta(), EngineRole::Client).is_ok());
+    }
+
+    #[test]
+    fn loop_exit_into_result_err_client() {
+        let exit = LoopExit::Err {
+            close_reason: b"conn closed",
+            reason: "QUIC connection closed".into(),
+        };
+        let err = exit
+            .into_result(&test_meta(), EngineRole::Client)
+            .unwrap_err();
+        assert!(matches!(&err, ActorError::H3Client { peer_id, reason }
+            if peer_id == "peer-x" && reason == "QUIC connection closed"
+        ));
+        assert_eq!(err.kind(), ActorKind::Restartable);
+    }
+
+    #[test]
+    fn loop_exit_into_result_err_server() {
+        let exit = LoopExit::Err {
+            close_reason: b"conn closed",
+            reason: "auth failed".into(),
+        };
+        let err = exit
+            .into_result(&test_meta(), EngineRole::Server)
+            .unwrap_err();
+        assert!(matches!(&err, ActorError::H3Server { peer_id, reason }
+            if peer_id == "peer-x" && reason == "auth failed"
+        ));
+        assert_eq!(err.kind(), ActorKind::Restartable);
+    }
+
+    #[test]
+    fn engine_meta_recv_info() {
+        let meta = test_meta();
+        let info = meta.recv_info();
+        assert_eq!(info.from, meta.remote_addr);
+        assert_eq!(info.to, meta.local_addr);
+    }
+
+    #[test]
+    fn engine_meta_actor_error_client() {
+        let meta = test_meta();
+        let err = meta.actor_error(EngineRole::Client, "connection reset");
+        assert!(matches!(&err, ActorError::H3Client { peer_id, reason }
+            if peer_id == "peer-x" && reason == "connection reset"
+        ));
+        assert_eq!(err.kind(), ActorKind::Restartable);
+    }
+
+    #[test]
+    fn engine_meta_actor_error_server() {
+        let meta = test_meta();
+        let err = meta.actor_error(EngineRole::Server, "auth failed");
+        assert!(matches!(&err, ActorError::H3Server { peer_id, reason }
+            if peer_id == "peer-x" && reason == "auth failed"
+        ));
+        assert_eq!(err.kind(), ActorKind::Restartable);
+    }
+
+    #[test]
+    fn run_state_new_has_no_pending() {
+        let state = RunState::new();
+        assert!(state.pending_ingress.is_none());
+        assert!(state.pending_egress.is_none());
+        assert!(state.pending_send.is_none());
     }
 }
