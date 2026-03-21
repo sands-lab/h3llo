@@ -287,7 +287,6 @@ impl H3Engine {
                             &mut server_handler,
                         ) {
                             Ok(ConnectProgress::Ready) => {
-                                eprintln!("[diag] READY!");
                                 let peer_id = session
                                     .accepted_peer_id
                                     .take()
