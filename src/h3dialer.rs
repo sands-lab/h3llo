@@ -246,9 +246,9 @@ fn make_client_quiche_config(
 
 /// Establishes an outbound H3 client CONNECT-IP connection.
 ///
-/// Creates a UDP socket, spawns UDP I/O actors (on the caller's
-/// runtime via `tokio::spawn`), builds the H3 client engine, and drives
-/// QUIC+H3 handshake on `crypto_rt` before entering steady-state forwarding.
+/// Creates a UDP socket and spawns UDP I/O actors on `udp_rt`, builds the
+/// H3 client engine, and drives QUIC+H3 handshake on `crypto_rt` before
+/// entering steady-state forwarding.
 ///
 /// # Arguments
 ///
