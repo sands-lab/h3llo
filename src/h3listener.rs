@@ -13,11 +13,11 @@ use crate::auth::validate_connect_auth;
 use crate::bind::make_server_udp_socket;
 use crate::config::Tuning;
 use crate::events::{ConnectionDirection, Event, H3v2ConnectedEvent};
-use crate::h3::CONNECT_IP_OVERHEAD;
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, EngineRole,
     H3Engine, RunState,
 };
+use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
 use crate::udp;
 use quiche::h3::NameValue;
@@ -556,6 +556,7 @@ impl H3Dispatcher {
                     remote_addr: remote,
                     tx: egress_tx,
                     direction: ConnectionDirection::Inbound,
+                    handles: Vec::new(),
                 }));
 
             engine.run().await
@@ -606,8 +607,8 @@ fn spawn_listener_start_error(
 
 /// Spawns the H3v2 listener with separated I/O and crypto:
 ///
-/// - **Recv actor** (I/O thread): quinn-udp GRO-aware recv.
-/// - **TX actor** (I/O thread): shared send actor for all connections.
+/// - **Recv actor** (`udp_rt`): quinn-udp GRO-aware recv.
+/// - **TX actor** (`udp_rt`): shared send actor for all connections.
 /// - **Dispatcher** (`crypto_rt`): CID routing, connection acceptance.
 /// - **Per-connection actors** (`crypto_rt`): QUIC crypto, H3 session,
 ///   datagram forwarding with backpressure.
@@ -618,6 +619,7 @@ pub fn spawn_h3v2_listener(
     listener: H3v2Listener,
     peer_tokens: HashMap<String, String>,
     tuning: &Tuning,
+    udp_rt: &RuntimeHandle,
     crypto_rt: &RuntimeHandle,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
@@ -638,8 +640,12 @@ pub fn spawn_h3v2_listener(
 
     let tuning = tuning.clone();
 
-    // Convert std socket to tokio and create shared UDP actors.
-    let socket = match UdpSocket::from_std(std_socket) {
+    // Convert std socket to tokio on the UDP runtime's reactor.
+    let socket_result = {
+        let _guard = udp_rt.enter();
+        UdpSocket::from_std(std_socket)
+    };
+    let socket = match socket_result {
         Ok(s) => s,
         Err(e) => {
             let handle = spawn_listener_start_error(crypto_rt, bound_addr, e);
@@ -658,13 +664,23 @@ pub fn spawn_h3v2_listener(
         }
     };
 
-    // RX actor on I/O thread.
+    // TODO: Return UDP actor JoinHandles for orchestrator supervision.
+    // Currently dropped — if a UDP actor exits unexpectedly the dispatcher
+    // keeps running without visibility, silently breaking the listener.
+
+    // RX actor on UDP runtime.
     let (udp_recv_tx, udp_recv_rx) =
         mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
-    let _recv_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx);
+    let _recv_handle = {
+        let _guard = udp_rt.enter();
+        udp::spawn_udp_rx(udp_rx, udp_recv_tx)
+    };
 
-    // TX actor on I/O thread (GSO-aware, replaces per-packet try_send_to).
-    let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth);
+    // TX actor on UDP runtime (GSO-aware, replaces per-packet try_send_to).
+    let (udp_send_tx, _tx_handle) = {
+        let _guard = udp_rt.enter();
+        udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth)
+    };
 
     // Dispatcher on crypto_rt.
     let handle = crypto_rt.spawn(async move {
@@ -813,9 +829,9 @@ mod tests {
 
     use crate::bind::test_support::FakeRouteProbe;
     use crate::config::default_mtu;
-    use crate::h3::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::h3::{dial_h3, spawn_h3_rx, spawn_h3_tx, DialError as OldDialError};
     use crate::h3dialer::{dial_h3_client, DialError as NewDialError};
+    use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::helpers::test_packets::make_ipv4_packet;
     use crate::tun::alloc_packet_buf;
     use std::net::Ipv4Addr;
@@ -855,6 +871,7 @@ mod tests {
                 listener,
                 peer_tokens,
                 &tuning,
+                &tokio::runtime::Handle::current(),
                 &tokio::runtime::Handle::current(),
                 ingress_tx,
                 events_tx,
@@ -924,6 +941,7 @@ mod tests {
             default_mtu(),
             &probe,
             &tuning,
+            &tokio::runtime::Handle::current(),
             &tokio::runtime::Handle::current(),
             ingress_tx,
             events_tx,
@@ -1063,6 +1081,7 @@ mod tests {
             default_mtu(),
             &probe,
             &tuning,
+            &tokio::runtime::Handle::current(),
             &tokio::runtime::Handle::current(),
             ingress_tx,
             events_tx,

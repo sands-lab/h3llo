@@ -7,11 +7,10 @@ use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
     ApiEvent, BareConnectedEvent, ConnectionDirection, DialFailedEvent, DnsEvent, Endpoint, Event,
-    H3ConnectedEvent,
+    H3v2ConnectedEvent,
 };
-use crate::h3::{
-    dial_h3, make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
-};
+use crate::h3dialer::dial_h3_client;
+use crate::h3listener::{make_h3v2_listener, spawn_h3v2_listener, H3v2ListenerCommand};
 use crate::metrics::{log_quic_metrics, log_transport_metrics, Direction, Labels, Metrics};
 use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::router::{spawn_router, RouterCommand, RoutingTable};
@@ -177,13 +176,16 @@ impl PeerEntry {
     ///
     /// Per-IP rate-limited: skips IPs with an in-flight dial or whose backoff
     /// `next_allowed_at` has not yet elapsed. Does nothing if `resolved_ips` is empty.
+    #[allow(clippy::too_many_arguments)]
     fn try_connect(
         &mut self,
         events_tx: &mpsc::UnboundedSender<Event>,
         tun_if: &str,
         mtu: usize,
         tuning: &Tuning,
-        bare_handle: &Handle,
+        udp_handle: &Handle,
+        crypto_handle: &Handle,
+        ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
     ) {
         if self.resolved_ips.is_empty() {
             return;
@@ -235,9 +237,9 @@ impl PeerEntry {
                 let bindif = bare.bindif.clone();
                 let endpoint = Endpoint::Udp(bare.endpoint.clone());
 
-                // Enter BareUDP runtime so tokio::spawn targets the BareUDP
+                // Enter UDP runtime so tokio::spawn targets the UDP
                 // scheduler. Guard drops after spawn returns (sync call site).
-                let _guard = bare_handle.enter();
+                let _guard = udp_handle.enter();
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
                     match make_unbound_udp_socket(
@@ -295,10 +297,16 @@ impl PeerEntry {
                 let destination = SocketAddr::new(dial_ip, h3_endpoint.port);
                 let tun_mtu = mtu as u16;
                 let peer_h3 = h3.clone();
+                let ingress_tx = ingress_tx.clone();
+                let udp_handle = udp_handle.clone();
+                let crypto_handle = crypto_handle.clone();
 
+                // H3 dial runs on the orchestrator's main runtime (lightweight
+                // coordinator); dial_h3_client internally places UDP actors on
+                // udp_rt and engine on crypto_rt.
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
-                    match dial_h3(
+                    match dial_h3_client(
                         &peer_h3,
                         destination,
                         &peer_id,
@@ -306,14 +314,25 @@ impl PeerEntry {
                         tun_mtu,
                         &probe,
                         &tuning,
+                        &udp_handle,
+                        &crypto_handle,
+                        ingress_tx,
+                        events_tx.clone(),
                     )
                     .await
                     {
-                        Ok(conn) => {
-                            info!(peer = %peer_id, addr = %destination, "H3 connection established");
-                            let _ = events_tx.send(Event::H3Connected(H3ConnectedEvent {
-                                connection: conn,
+                        Ok(client_conn) => {
+                            info!(peer = %client_conn.peer_id, addr = %client_conn.remote_addr, "H3 connected");
+                            let _ = events_tx.send(Event::H3v2Connected(H3v2ConnectedEvent {
+                                peer_id: client_conn.peer_id,
+                                remote_addr: client_conn.remote_addr,
+                                tx: client_conn.tx,
                                 direction: ConnectionDirection::Outbound,
+                                handles: vec![
+                                    client_conn.engine_handle,
+                                    client_conn.udp_rx_handle,
+                                    client_conn.udp_tx_handle,
+                                ],
                             }));
                         }
                         Err(e) => {
@@ -386,7 +405,7 @@ pub enum OrchestratorError {
 ///
 /// Manages child actors with selective supervision:
 /// - Critical actors (TUN, BareUDP-Rx, H3-Listener): failure causes immediate exit
-/// - Peer actors (BareUDP-Tx, H3-Tx/Rx): failure triggers maintenance cycle (prune + reconnect)
+/// - Peer actors (BareUDP-Tx, H3-Engine): failure triggers maintenance cycle (prune + reconnect)
 pub struct Orchestrator {
     events_rx: mpsc::UnboundedReceiver<Event>,
     events_tx: mpsc::UnboundedSender<Event>,
@@ -402,8 +421,8 @@ pub struct Orchestrator {
     router_cmd_tx: mpsc::UnboundedSender<RouterCommand>,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
-    /// H3 listener command sender (if listening).
-    h3_listener_cmd_tx: Option<mpsc::UnboundedSender<H3ListenerCommand>>,
+    /// H3v2 listener command sender (if listening).
+    h3_listener_cmd_tx: Option<mpsc::UnboundedSender<H3v2ListenerCommand>>,
 
     /// DNS resolver command sender for SetHostnames.
     dns_cmd_tx: mpsc::UnboundedSender<DnsCommand>,
@@ -424,12 +443,10 @@ pub struct Orchestrator {
     ///
     /// Not read after init — kept alive for its `Drop` impl (RAII shutdown).
     _tun_rt: DedicatedRuntime,
-    /// Dedicated runtime for Router actor (thread: `h3llo-router`).
-    ///
-    /// Not read after init — kept alive for its `Drop` impl (RAII shutdown).
-    _router_rt: DedicatedRuntime,
-    /// Dedicated runtime for BareUDP Tx/Rx actors (thread: `h3llo-bare`).
-    bare_rt: DedicatedRuntime,
+    /// Router + H3 Engine actors (thread: `h3llo-crypto`).
+    crypto_rt: DedicatedRuntime,
+    /// All UDP I/O actors: BareUDP + H3 (thread: `h3llo-udp`).
+    udp_rt: DedicatedRuntime,
 }
 
 impl Orchestrator {
@@ -468,7 +485,7 @@ impl Orchestrator {
                 })
                 .collect::<HashMap<_, _>>();
 
-            if let Err(e) = cmd_tx.send(H3ListenerCommand::UpdatePeerTokens(tokens)) {
+            if let Err(e) = cmd_tx.send(H3v2ListenerCommand::UpdatePeerTokens(tokens)) {
                 warn!(error = %e, "failed to send peer tokens update to h3_listener actor");
             }
         }
@@ -548,8 +565,8 @@ impl Orchestrator {
             })
         };
         let tun_rt = make_runtime("h3llo-tun")?;
-        let router_rt = make_runtime("h3llo-router")?;
-        let bare_rt = make_runtime("h3llo-bare")?;
+        let crypto_rt = make_runtime("h3llo-crypto")?;
+        let udp_rt = make_runtime("h3llo-udp")?;
 
         // Setup TUN — enter guard ensures AsyncFd registers with the TUN
         // runtime's I/O reactor. make_tun is async in signature but has no
@@ -590,9 +607,9 @@ impl Orchestrator {
             )
         };
 
-        // Router on Router runtime (sync fn — enter guard is safe, no .await).
+        // Router on crypto runtime (sync fn — enter guard is safe, no .await).
         let (output_tx, ingress_tx, router_cmd_tx, router_handle) = {
-            let _guard = router_rt.handle().enter();
+            let _guard = crypto_rt.handle().enter();
             spawn_router(
                 routing,
                 input_tx.clone(),
@@ -621,9 +638,9 @@ impl Orchestrator {
         let bare_rx_cmd_tx = if let Some(ref local_bare) = config.local.bare {
             let listen_addr = resolve_listen_addr(&local_bare.listen.host, local_bare.listen.port)?;
 
-            // Create listen socket and generic UDP RX actor on BareUDP runtime.
+            // Create listen socket and generic UDP RX actor on UDP runtime.
             let udp_rx = {
-                let _guard = bare_rt.handle().enter();
+                let _guard = udp_rt.handle().enter();
                 let socket = make_server_udp_socket(listen_addr, tuning.socket_buffer_bytes())
                     .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
                 let (udp_rx, _udp_tx) = udp::make_udp(socket, mtu, tuning.udp_enable_offload)
@@ -636,12 +653,12 @@ impl Orchestrator {
                 mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
 
             let udp_rx_handle = {
-                let _guard = bare_rt.handle().enter();
+                let _guard = udp_rt.handle().enter();
                 udp::spawn_udp_rx(udp_rx, udp_output_tx)
             };
 
             let (cmd_tx, bare_rx_handle) = {
-                let _guard = bare_rt.handle().enter();
+                let _guard = udp_rt.handle().enter();
                 spawn_bare_rx(
                     udp_output_rx,
                     HashSet::new(),
@@ -658,30 +675,27 @@ impl Orchestrator {
             None
         };
 
-        // Initialize H3 listener if configured (H3 stays on orchestrator runtime)
+        // Initialize H3v2 listener if configured (dispatcher on crypto_rt, UDP I/O on udp_rt)
         let h3_listener_cmd_tx = if let Some(ref h3_cfg) = config.local.h3 {
             let listen_addr = resolve_listen_addr(&h3_cfg.listen.host, h3_cfg.listen.port)?;
             let cert_path = Path::new(&h3_cfg.cert);
             let key_path = Path::new(&h3_cfg.key);
 
             // make: fallible I/O (socket bind, TLS config)
-            let listener = make_h3_listener(
-                listen_addr,
-                cert_path,
-                key_path,
-                tuning.socket_buffer_bytes(),
-            )
-            .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
+            let listener = make_h3v2_listener(listen_addr, cert_path, key_path, mtu as u16, tuning)
+                .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
 
             // spawn: infallible task creation; listener sends events through events_tx
             // Initial peer tokens are empty; sync_peers_to_actors() populates them
             // immediately after construction.
-            let (cmd_tx, listener_handle, _bound_addr) = spawn_h3_listener(
+            let (cmd_tx, listener_handle, _bound_addr) = spawn_h3v2_listener(
                 listener,
                 HashMap::new(),
-                config.local.tun.mtu,
-                events_tx.clone(),
                 tuning,
+                udp_rt.handle(),
+                crypto_rt.handle(),
+                ingress_tx.clone(),
+                events_tx.clone(),
             );
 
             join_set.spawn(listener_handle);
@@ -766,8 +780,8 @@ impl Orchestrator {
             local: config.local,
             non_peer_metrics: HashMap::new(),
             _tun_rt: tun_rt,
-            _router_rt: router_rt,
-            bare_rt,
+            crypto_rt,
+            udp_rt,
         };
         orch.sync_peers_to_actors();
         Ok(orch)
@@ -789,7 +803,7 @@ impl Orchestrator {
         loop {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {
-                    self.handle_event(event).await;
+                    self.handle_event(event);
                 }
                 _ = reconcile_ticker.tick() => {
                     self.reconcile();
@@ -866,7 +880,8 @@ impl Orchestrator {
 
     /// Periodic reconciliation: prune stale bounds and attempt reconnection.
     fn reconcile(&mut self) {
-        let bare_handle = self.bare_rt.handle().clone();
+        let udp_handle = self.udp_rt.handle().clone();
+        let crypto_handle = self.crypto_rt.handle().clone();
         let mut routing_changed = false;
         for entry in self.peers.values_mut() {
             routing_changed |= entry.prune();
@@ -875,7 +890,9 @@ impl Orchestrator {
                 &self.tun_if,
                 self.mtu,
                 &self.tuning,
-                &bare_handle,
+                &udp_handle,
+                &crypto_handle,
+                &self.ingress_tx,
             );
         }
         if routing_changed {
@@ -979,7 +996,7 @@ impl Orchestrator {
     }
 
     /// Handles an event from a child actor.
-    async fn handle_event(&mut self, event: Event) {
+    fn handle_event(&mut self, event: Event) {
         match event {
             Event::Dns(dns_event) => {
                 self.handle_dns_snapshot(dns_event);
@@ -1019,18 +1036,15 @@ impl Orchestrator {
                 }
             }
             Event::H3Connected(event) => {
-                self.handle_h3_connection(event).await;
-            }
-            // TODO: Wire H3v2Connected into routing (register bound, rebuild routes).
-            // Currently event.tx is dropped here, which closes the per-connection
-            // egress channel and causes the H3Engine to shut down. This will be
-            // fixed when routing integration lands.
-            Event::H3v2Connected(event) => {
-                debug!(
-                    peer_id = %event.peer_id,
-                    remote = %event.remote_addr,
-                    "h3v2 connected (routing not yet wired)"
+                // Deprecated: old h3.rs path no longer used in production.
+                // Kept for compilation compatibility while h3.rs exists.
+                warn!(
+                    direction = ?event.direction,
+                    "received old-style H3Connected event (h3.rs path); ignoring"
                 );
+            }
+            Event::H3v2Connected(event) => {
+                self.handle_h3v2_connected(event);
             }
             Event::BareConnected(event) => {
                 self.handle_bare_connection(event);
@@ -1048,7 +1062,8 @@ impl Orchestrator {
     /// after DNS changes or peer mutations (add/remove via API).
     fn handle_dns_snapshot(&mut self, dns_event: DnsEvent) {
         let dns_state = dns_event.state;
-        let bare_handle = self.bare_rt.handle().clone();
+        let udp_handle = self.udp_rt.handle().clone();
+        let crypto_handle = self.crypto_rt.handle().clone();
 
         for entry in self.peers.values_mut() {
             let hostname = peer_dns_hostname(&entry.config);
@@ -1063,7 +1078,9 @@ impl Orchestrator {
                 &self.tun_if,
                 self.mtu,
                 &self.tuning,
-                &bare_handle,
+                &udp_handle,
+                &crypto_handle,
+                &self.ingress_tx,
             );
         }
 
@@ -1154,30 +1171,24 @@ impl Orchestrator {
         }
     }
 
-    /// Handles an H3 connection event (inbound or outbound).
+    /// Handles an H3v2 engine-based connection event (inbound or outbound).
     ///
-    /// Unified handler for both listener and dialer connections.
-    /// Spawns RX/TX actors and updates routing via [`update_bound`].
-    async fn handle_h3_connection(&mut self, event: H3ConnectedEvent) {
-        let H3ConnectedEvent {
-            connection: conn,
+    /// H3Engine handles RX/TX internally — no separate actor spawning needed.
+    /// Registers the TX bound and adds actor join handles to JoinSet.
+    fn handle_h3v2_connected(&mut self, event: H3v2ConnectedEvent) {
+        let H3v2ConnectedEvent {
+            peer_id,
+            remote_addr,
+            tx,
             direction,
+            handles,
         } = event;
-        let peer_id = conn.peer_id.clone();
-        let remote_addr = conn.remote_addr;
 
-        // Pre-check before destructive conn.into_actors(): peer must exist
         let Some(entry) = self.peers.get(&peer_id) else {
-            warn!(
-                peer = %peer_id,
-                addr = %remote_addr,
-                direction = ?direction,
-                "H3 connection from unknown peer"
-            );
+            warn!(peer = %peer_id, addr = %remote_addr, direction = ?direction, "H3v2 connection from unknown peer");
             return;
         };
 
-        // Extract endpoint for outbound connections; inbound has None (listener-originated).
         let endpoint = match direction {
             ConnectionDirection::Outbound => entry
                 .config
@@ -1188,29 +1199,11 @@ impl Orchestrator {
             ConnectionDirection::Inbound => None,
         };
 
-        // Split connection into actor states
-        let (rx_state, tx_state) = conn.into_actors();
+        for handle in handles {
+            self.join_set.spawn(handle);
+        }
 
-        // Spawn RX actor
-        let rx_handle = spawn_h3_rx(
-            rx_state,
-            self.ingress_tx.clone(),
-            self.events_tx.clone(),
-            self.tuning.metrics_push_interval,
-        );
-
-        // Spawn TX actor
-        let (egress_tx, tx_handle) = spawn_h3_tx(
-            tx_state,
-            self.events_tx.clone(),
-            self.tuning.metrics_push_interval,
-            self.tuning.packet_queue_depth,
-            self.tuning.h3_keepalive_interval,
-        );
-
-        self.join_set.spawn(rx_handle);
-        self.join_set.spawn(tx_handle);
-        self.update_bound(&peer_id, endpoint, remote_addr, egress_tx);
+        self.update_bound(&peer_id, endpoint, remote_addr, tx);
     }
 }
 
@@ -1306,7 +1299,7 @@ mod test_support {
         pub bare_rx_cmd_rx: mpsc::UnboundedReceiver<BareUdpRxCommand>,
         pub dns_cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
         pub route_cmd_rx: mpsc::UnboundedReceiver<RouteCommand>,
-        pub h3_listener_cmd_rx: mpsc::UnboundedReceiver<H3ListenerCommand>,
+        pub h3_listener_cmd_rx: mpsc::UnboundedReceiver<H3v2ListenerCommand>,
     }
 
     impl TestableOrchestratorBuilder {
@@ -1402,8 +1395,8 @@ mod test_support {
                 local,
                 non_peer_metrics: HashMap::new(),
                 _tun_rt: DedicatedRuntime::new("test-tun").expect("test runtime"),
-                _router_rt: DedicatedRuntime::new("test-router").expect("test runtime"),
-                bare_rt: DedicatedRuntime::new("test-bare").expect("test runtime"),
+                crypto_rt: DedicatedRuntime::new("test-crypto").expect("test runtime"),
+                udp_rt: DedicatedRuntime::new("test-udp").expect("test runtime"),
             };
 
             (
@@ -1617,7 +1610,7 @@ mod tests {
             .with_peer_tx("peer1", dest, peer_tx)
             .build();
 
-        orch.handle_event(make_metrics_event()).await;
+        orch.handle_event(make_metrics_event());
 
         // State preserved: existing entries not modified
         assert_eq!(orch.peers.len(), 1);
@@ -1633,14 +1626,14 @@ mod tests {
     async fn handle_metrics_event_stores_snapshot() {
         let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
         assert!(orch.non_peer_metrics.is_empty());
-        orch.handle_event(make_metrics_event()).await;
+        orch.handle_event(make_metrics_event());
         assert_eq!(orch.non_peer_metrics.len(), 1);
     }
 
     #[tokio::test]
     async fn handle_metrics_event_replaces_on_same_labels() {
         let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
-        orch.handle_event(make_metrics_event()).await;
+        orch.handle_event(make_metrics_event());
         assert_eq!(orch.non_peer_metrics.len(), 1);
 
         // Push again with different values but same labels
@@ -1659,7 +1652,7 @@ mod tests {
                 ..Default::default()
             },
         });
-        orch.handle_event(event).await;
+        orch.handle_event(event);
         assert_eq!(orch.non_peer_metrics.len(), 1);
         let stored = orch.non_peer_metrics.values().next().unwrap();
         assert_eq!(stored.stats.succeeded.packets, 42);
@@ -1703,9 +1696,8 @@ mod tests {
             .build();
 
         // Add both non-peer and peer-scoped metrics
-        orch.handle_event(make_metrics_event()).await;
-        orch.handle_event(make_peer_metrics_event("peer1", dest, Direction::Tx, 10))
-            .await;
+        orch.handle_event(make_metrics_event());
+        orch.handle_event(make_peer_metrics_event("peer1", dest, Direction::Tx, 10));
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         orch.handle_api_event(ApiEvent::GetMetricsSnapshot { reply_tx });
@@ -1742,7 +1734,7 @@ mod tests {
             .build();
 
         let event = make_peer_metrics_event("peer1", dest, Direction::Tx, 100);
-        orch.handle_event(event).await;
+        orch.handle_event(event);
 
         let bound = &orch.peers.get("peer1").unwrap().bounds[0];
         assert!(bound.tx_metrics.is_some());
@@ -1753,7 +1745,7 @@ mod tests {
         assert!(bound.rx_metrics.is_none());
 
         let event = make_peer_metrics_event("peer1", dest, Direction::Rx, 50);
-        orch.handle_event(event).await;
+        orch.handle_event(event);
 
         let bound = &orch.peers.get("peer1").unwrap().bounds[0];
         assert!(bound.rx_metrics.is_some());
@@ -1779,7 +1771,7 @@ mod tests {
             .build();
 
         let event = make_peer_metrics_event("peer1", dest, Direction::Tx, 100);
-        orch.handle_event(event).await;
+        orch.handle_event(event);
 
         let snapshot = orch.collect_metrics_snapshot();
         assert!(snapshot.values().any(|m| m.stats.succeeded.packets == 100));
@@ -1804,9 +1796,8 @@ mod tests {
             .with_resolved_ips("peer1", HashSet::from([ip]))
             .build();
 
-        orch.handle_event(make_metrics_event()).await;
-        orch.handle_event(make_peer_metrics_event("peer1", dest, Direction::Tx, 200))
-            .await;
+        orch.handle_event(make_metrics_event());
+        orch.handle_event(make_peer_metrics_event("peer1", dest, Direction::Tx, 200));
 
         let snapshot = orch.collect_metrics_snapshot();
         assert_eq!(snapshot.len(), 2);
@@ -1822,7 +1813,7 @@ mod tests {
             Direction::Tx,
             42,
         );
-        orch.handle_event(event).await;
+        orch.handle_event(event);
 
         assert!(orch.non_peer_metrics.is_empty());
         assert!(orch.collect_metrics_snapshot().is_empty());
@@ -1848,7 +1839,7 @@ mod tests {
             HashSet::from(["1.2.3.4".parse().unwrap()]),
         );
         let event = make_dns_snapshot_event(state);
-        orch.handle_event(event).await;
+        orch.handle_event(event);
 
         // No bound created (hostname doesn't match)
         assert!(orch.peers.get("peer1").unwrap().bounds.is_empty());
@@ -1880,7 +1871,7 @@ mod tests {
             HashSet::from(["1.2.3.4".parse().unwrap()]),
         );
         let event = make_dns_snapshot_event(state);
-        orch.handle_event(event).await;
+        orch.handle_event(event);
 
         // Both peers should be processed (iteration covers all matching)
         // Note: actual socket binding may fail in test environment,
@@ -1901,7 +1892,7 @@ mod tests {
             HashSet::from(["1.2.3.4".parse().unwrap()]),
         );
         let event = make_dns_snapshot_event(state);
-        orch.handle_event(event).await;
+        orch.handle_event(event);
 
         // Accepted sources always updated (unconditionally), but empty since no hostname matched
         let cmd = handles
@@ -1935,7 +1926,7 @@ mod tests {
         let mut state = HashMap::new();
         state.insert("example.com".to_string(), HashSet::new());
         let event = make_dns_snapshot_event(state);
-        orch.handle_event(event).await;
+        orch.handle_event(event);
 
         // Bound should be removed
         assert!(orch.peers.get("peer1").unwrap().bounds.is_empty());
@@ -1971,7 +1962,7 @@ mod tests {
         state.insert("alpha.example.com".to_string(), HashSet::new());
         state.insert("beta.example.com".to_string(), HashSet::from([shared_ip]));
         let event = make_dns_snapshot_event(state);
-        orch.handle_event(event).await;
+        orch.handle_event(event);
 
         // Only peer-a should be disconnected (endpoint matches, IP no longer in resolved_ips)
         assert!(orch.peers.get("peer-a").unwrap().bounds.is_empty());
@@ -2010,7 +2001,7 @@ mod tests {
         let mut state = HashMap::new();
         state.insert("example.com".to_string(), HashSet::new());
         let event = make_dns_snapshot_event(state);
-        orch.handle_event(event).await;
+        orch.handle_event(event);
 
         // Bound should remain (endpoint is None, so never pruned by DNS/endpoint checks)
         assert!(!orch.peers.get("peer1").unwrap().bounds.is_empty());
@@ -2110,7 +2101,7 @@ mod tests {
         // The key assertion: handle_dns_snapshot should return immediately
         // (within milliseconds), not block for 30 seconds waiting for dial timeout
         let start = Instant::now();
-        orch.handle_event(event).await;
+        orch.handle_event(event);
         let elapsed = start.elapsed();
 
         // If dial was blocking, this would take ~30 seconds (H3_HANDSHAKE_TIMEOUT)
@@ -2222,7 +2213,7 @@ mod tests {
             HashSet::from(["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()]),
         );
         let event = make_dns_snapshot_event(state);
-        orch.handle_event(event).await;
+        orch.handle_event(event);
 
         // Accepted sources SHOULD be updated (unconditionally, from resolved_ips)
         let BareUdpRxCommand::UpdateAcceptedSources(ips) = handles
@@ -2259,7 +2250,7 @@ mod tests {
         let event = make_dns_snapshot_event(state);
 
         let start = Instant::now();
-        orch.handle_event(event).await;
+        orch.handle_event(event);
         let elapsed = start.elapsed();
 
         assert!(
@@ -2551,24 +2542,30 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         // First call should mark IP as in-flight
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(1);
         entry.try_connect(
             &events_tx,
             "test0",
             1393,
             &Tuning::default(),
             &Handle::current(),
+            &Handle::current(),
+            &ingress_tx,
         );
         assert!(entry.dials.contains_key(&ip));
         assert!(entry.dials[&ip].in_flight);
 
         // Second immediate call should skip (in-flight)
         let attempt_before = entry.dials[&ip].attempt;
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(1);
         entry.try_connect(
             &events_tx,
             "test0",
             1393,
             &Tuning::default(),
             &Handle::current(),
+            &Handle::current(),
+            &ingress_tx,
         );
         assert_eq!(entry.dials[&ip].attempt, attempt_before);
     }
@@ -2590,12 +2587,15 @@ mod tests {
         );
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(1);
         entry.try_connect(
             &events_tx,
             "test0",
             1393,
             &Tuning::default(),
             &Handle::current(),
+            &Handle::current(),
+            &ingress_tx,
         );
 
         assert!(!entry.dials[&ip].in_flight);
@@ -2619,12 +2619,15 @@ mod tests {
         );
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(1);
         entry.try_connect(
             &events_tx,
             "test0",
             1393,
             &Tuning::default(),
             &Handle::current(),
+            &Handle::current(),
+            &ingress_tx,
         );
 
         // Should have re-triggered: in_flight set, attempt preserved
@@ -2936,7 +2939,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("H3 listener should receive UpdatePeerTokens");
-        let H3ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        let H3v2ListenerCommand::UpdatePeerTokens(tokens) = cmd;
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens.get("h3-peer").unwrap(), "secure-token-12ch");
     }
@@ -2966,7 +2969,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("H3 listener should receive UpdatePeerTokens after delete");
-        let H3ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        let H3v2ListenerCommand::UpdatePeerTokens(tokens) = cmd;
         assert!(
             tokens.is_empty(),
             "tokens should be empty after removing the only H3 peer"
@@ -3028,7 +3031,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("should receive UpdatePeerTokens");
-        let H3ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        let H3v2ListenerCommand::UpdatePeerTokens(tokens) = cmd;
         assert_eq!(tokens.len(), 1, "only H3 peers should be included");
         assert!(tokens.contains_key("h3-peer"));
         assert!(!tokens.contains_key("bare-peer"));

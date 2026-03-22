@@ -181,7 +181,13 @@ flowchart TB
     cr-orch -- emit(filter-update) --> cr-bare
 ```
 
-h3llo uses a thread-per-core architecture with multiple Tokio `current_thread` runtimes. Each data-plane actor group (TUN Tx/Rx, Router, BareUDP Tx/Rx) runs on a dedicated OS thread with its own runtime, eliminating cross-thread task migrations and cache pollution on hot paths. The orchestrator and control-plane actors (DNS, Route Sync, API, H3) share the main thread's `current_thread` runtime. Cross-runtime communication uses Tokio MPSC channels, which are runtime-agnostic. `Handle::enter()` is used during initialization to register I/O resources with the correct runtime's reactor; `JoinHandle`s from foreign runtimes are monitored by the orchestrator's `JoinSet`.
+h3llo uses a thread-per-core architecture with multiple Tokio `current_thread` runtimes. Each data-plane actor group runs on a dedicated OS thread:
+
+- **tun_rt** (`h3llo-tun`): TUN Rx/Tx actors.
+- **crypto_rt** (`h3llo-crypto`): Router actor and H3 engine actors (QUIC crypto, H3 session, datagram forwarding). Co-locating H3 engines with the Router eliminates cross-thread hops for routed packets.
+- **udp_rt** (`h3llo-udp`): All UDP I/O actors (BareUDP Rx/Tx and H3 transport UDP Rx/Tx).
+
+The orchestrator and control-plane actors (DNS, Route Sync, API) share the main thread's `current_thread` runtime. Cross-runtime communication uses Tokio MPSC channels, which are runtime-agnostic. `Handle::enter()` is used during initialization to register I/O resources with the correct runtime's reactor; `JoinHandle`s from foreign runtimes are monitored by the orchestrator's `JoinSet`.
 
 Orchestrator responsibilities and invariants:
 - Maintain the latest configuration snapshot and H3 connection pool; receive commands from other actors through its MPSC queue.
