@@ -34,11 +34,11 @@ pub enum ConnectionDirection {
     Outbound,
 }
 
-/// HTTP/3 engine-based server connection established event.
+/// HTTP/3 engine-based connection established event.
 ///
-/// Emitted by the h3v2 listener dispatcher when a client completes the
-/// QUIC + CONNECT-IP handshake via the H3Engine-based listener. Carries
-/// the per-connection egress channel for orchestrator routing integration.
+/// Emitted by the H3v2 listener dispatcher (inbound) or dial task (outbound)
+/// when QUIC + CONNECT-IP handshake completes. Carries the per-connection
+/// egress channel and optional join handles for orchestrator registration.
 pub struct H3v2ConnectedEvent {
     /// Authenticated peer identifier (from Bearer token validation).
     pub peer_id: String,
@@ -46,8 +46,14 @@ pub struct H3v2ConnectedEvent {
     pub remote_addr: SocketAddr,
     /// Channel for sending IP packets to the connected client.
     pub tx: mpsc::Sender<Vec<PooledBuf>>,
-    /// Always `Inbound` for listener-accepted connections.
+    /// Inbound (listener-accepted) or Outbound (dialer-established).
     pub direction: ConnectionDirection,
+    /// Actor join handles for lifecycle tracking.
+    ///
+    /// Outbound connections carry engine + UDP actor handles for JoinSet
+    /// registration. Inbound connections are managed by the dispatcher
+    /// and carry no handles (empty Vec).
+    pub handles: Vec<JoinHandle<ActorExitResult>>,
 }
 
 impl std::fmt::Debug for H3v2ConnectedEvent {

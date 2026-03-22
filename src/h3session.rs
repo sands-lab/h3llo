@@ -5,11 +5,20 @@
 //! progress/failure types shared by [`crate::h3dialer`] and
 //! [`crate::h3listener`].
 
-use crate::h3::CONTEXT_ID_IP;
 use octets::{varint_len, varint_parse_len, Octets, OctetsMut};
 use std::time::Duration;
 use tokio_quiche::buf_factory::PooledBuf;
 use tracing::debug;
+
+/// Context ID for IP payloads per RFC 9484 (always 0 for CONNECT-IP).
+pub(crate) const CONTEXT_ID_IP: u8 = 0x00;
+
+/// Conservative CONNECT-IP encapsulation overhead in bytes per
+/// [RFC 9484 Section 7.2](https://datatracker.ietf.org/doc/html/rfc9484#section-7.2).
+///
+/// 51B base (QUIC v1 worst-case) + 8B optional DATAGRAM Length = 59B.
+/// QUIC `max_send/recv_udp_payload_size` = `TUN_MTU + CONNECT_IP_OVERHEAD`.
+pub(crate) const CONNECT_IP_OVERHEAD: usize = 59;
 
 /// Duration used as "infinite" timeout when quiche returns None.
 pub(crate) const MAX_TIMEOUT: Duration = Duration::from_secs(86400);
@@ -294,10 +303,84 @@ fn decode_qsi(buf: &[u8]) -> Option<(u64, usize)> {
     Some((qsi, qsi_len))
 }
 
+/// Shared test utilities for H3 integration tests across modules.
+///
+/// Provides certificate generation, insecure TLS config, and peer config
+/// builders used by h3dialer and h3listener integration tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::config::{H3Endpoint, PeerH3, Tuning};
+    use std::net::SocketAddr;
+
+    /// Test certificate bundle with temporary files.
+    pub struct TestCertBundle {
+        cert_file: tempfile::NamedTempFile,
+        key_file: tempfile::NamedTempFile,
+    }
+
+    impl TestCertBundle {
+        /// Generates a self-signed certificate for localhost using rcgen.
+        pub fn generate() -> Self {
+            use rcgen::{generate_simple_self_signed, CertifiedKey};
+            use std::io::Write;
+
+            let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+            let CertifiedKey { cert, signing_key } =
+                generate_simple_self_signed(subject_alt_names).expect("cert generation");
+
+            let mut cert_file = tempfile::NamedTempFile::new().expect("create cert temp file");
+            cert_file
+                .write_all(cert.pem().as_bytes())
+                .expect("write cert");
+
+            let mut key_file = tempfile::NamedTempFile::new().expect("create key temp file");
+            key_file
+                .write_all(signing_key.serialize_pem().as_bytes())
+                .expect("write key");
+
+            Self {
+                cert_file,
+                key_file,
+            }
+        }
+
+        /// Returns the path to the certificate PEM file.
+        pub fn cert_path(&self) -> &std::path::Path {
+            self.cert_file.path()
+        }
+
+        /// Returns the path to the private key PEM file.
+        pub fn key_path(&self) -> &std::path::Path {
+            self.key_file.path()
+        }
+    }
+
+    /// Returns `Tuning` with `h3_insecure_skip_verify: true` for tests.
+    pub fn insecure_tuning() -> Tuning {
+        Tuning {
+            h3_insecure_skip_verify: true,
+            ..Default::default()
+        }
+    }
+
+    /// Creates a test `PeerH3` config pointing at the given server address.
+    pub fn test_peer_h3(bound_addr: SocketAddr, token: &str) -> PeerH3 {
+        PeerH3 {
+            endpoint: Some(H3Endpoint {
+                host: "localhost".to_string(),
+                port: bound_addr.port(),
+                path: "/.well-known/masque/udp/*/*/".to_string(),
+            }),
+            token: token.to_string(),
+            bindif: None,
+            sni: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::h3::{CONNECT_IP_OVERHEAD, CONTEXT_ID_IP};
     use crate::tun::alloc_packet_buf;
     use tokio_quiche::buf_factory::BufFactory;
 

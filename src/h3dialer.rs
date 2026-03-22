@@ -8,17 +8,18 @@ use crate::auth::generate_bearer_auth;
 use crate::bind::{make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::Event;
-use crate::h3::CONNECT_IP_OVERHEAD;
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, EngineRole,
     H3Engine, RunState,
 };
+use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
 use crate::udp;
 use quiche::h3::NameValue;
 use rand::Rng;
 use std::net::SocketAddr;
 use std::time::Duration;
+use tokio::net::UdpSocket;
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -258,6 +259,7 @@ fn make_client_quiche_config(
 /// * `tun_mtu` - TUN MTU in bytes, used for QUIC payload sizing.
 /// * `probe` - Route probe for interface selection.
 /// * `tuning` - Tuning parameters (timeouts, buffers, congestion control).
+/// * `udp_rt` - Runtime handle for UDP I/O actors (socket + Rx/Tx).
 /// * `crypto_rt` - Runtime handle for the H3 engine (handshake + forwarding).
 /// * `ingress_tx` - Channel to forward decrypted IP packets toward the TUN.
 /// * `events_tx` - Channel for emitting metrics events.
@@ -274,6 +276,7 @@ pub async fn dial_h3_client<P: RouteProbe>(
     tun_mtu: u16,
     probe: &P,
     tuning: &Tuning,
+    udp_rt: &RuntimeHandle,
     crypto_rt: &RuntimeHandle,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
@@ -294,8 +297,8 @@ pub async fn dial_h3_client<P: RouteProbe>(
     let connect_path = endpoint.path.clone();
     let auth_header = generate_bearer_auth(&peer_h3.token);
 
-    // Create unconnected UDP socket (BareUDP needs sendmsg with explicit dest).
-    let socket = make_unbound_udp_socket(
+    // Create unconnected UDP socket, then re-register on the UDP runtime's reactor.
+    let std_socket = make_unbound_udp_socket(
         remote_addr,
         tun_if,
         peer_h3.bindif.as_deref(),
@@ -303,7 +306,13 @@ pub async fn dial_h3_client<P: RouteProbe>(
         tuning.socket_buffer_bytes(),
     )
     .await
-    .map_err(|e| DialError::Socket(e.to_string()))?;
+    .map_err(|e| DialError::Socket(e.to_string()))?
+    .into_std()
+    .map_err(|e| DialError::Socket(format!("into_std: {e}")))?;
+    let socket = {
+        let _guard = udp_rt.enter();
+        UdpSocket::from_std(std_socket).map_err(|e| DialError::Socket(format!("from_std: {e}")))?
+    };
 
     let local_addr = socket
         .local_addr()
@@ -313,11 +322,17 @@ pub async fn dial_h3_client<P: RouteProbe>(
     let (udp_rx, udp_tx) = udp::make_udp(socket, max_udp_payload, tuning.udp_enable_offload)
         .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
 
-    // Spawn generic UDP actors.
+    // Spawn generic UDP actors on the UDP runtime.
     let (udp_recv_tx, udp_recv_rx) =
         mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
-    let udp_rx_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx);
-    let (udp_send_tx, udp_tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth);
+    let udp_rx_handle = {
+        let _guard = udp_rt.enter();
+        udp::spawn_udp_rx(udp_rx, udp_recv_tx)
+    };
+    let (udp_send_tx, udp_tx_handle) = {
+        let _guard = udp_rt.enter();
+        udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth)
+    };
 
     // Create quiche config and connection.
     let mut config = make_client_quiche_config(tuning, max_udp_payload)?;
@@ -403,8 +418,8 @@ mod tests {
     use crate::bind::test_support::FakeRouteProbe;
     use crate::config::default_mtu;
     use crate::events::{ConnectionDirection, Event};
-    use crate::h3::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::h3::{make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx};
+    use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::h3session::ConnectFailure;
     use crate::tun::alloc_packet_buf;
     use std::collections::HashMap;
@@ -524,6 +539,7 @@ mod tests {
             &probe,
             &tuning,
             &tokio::runtime::Handle::current(),
+            &tokio::runtime::Handle::current(),
             ingress_tx,
             events_tx,
         )
@@ -581,6 +597,7 @@ mod tests {
             default_mtu(),
             &probe,
             &tuning,
+            &tokio::runtime::Handle::current(),
             &tokio::runtime::Handle::current(),
             ingress_tx,
             events_tx,
