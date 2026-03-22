@@ -266,7 +266,7 @@ impl H3Engine {
                         ));
                     };
 
-                    handle_udp_recv(&mut self.conn, batch, recv_info);
+                    handle_udp_recv(&mut self.conn, batch, recv_info, None);
 
                     // Lazily create H3 session once QUIC is established.
                     if self.session.is_none() && self.conn.is_established() {
@@ -394,7 +394,7 @@ impl H3Dispatcher {
                         });
                     };
 
-                    self.handle_udp_batch(remote, batch, &peer_tokens);
+                    self.handle_udp_batch(remote, batch, &peer_tokens).await;
                 }
 
                 _ = cleanup_ticker.tick() => {
@@ -414,7 +414,7 @@ impl H3Dispatcher {
         }
     }
 
-    fn handle_udp_batch(
+    async fn handle_udp_batch(
         &mut self,
         remote: SocketAddr,
         mut batch: Vec<PooledBuf>,
@@ -426,13 +426,10 @@ impl H3Dispatcher {
 
         if let Some(&conn_id) = self.cid_table.get(&header.dcid) {
             // Forward to existing per-connection actor.
+            // Await channel capacity so we never silently drop QUIC packets;
+            // on a single-thread runtime this yields to the engine task.
             if let Some(actor) = self.actors.get(&conn_id) {
-                if actor.packet_tx.try_send((remote, batch)).is_err() {
-                    debug!(
-                        conn_id,
-                        "actor packet channel full or closed; dropping batch"
-                    );
-                }
+                let _ = actor.packet_tx.send((remote, batch)).await;
             }
             return;
         }
@@ -486,6 +483,7 @@ impl H3Dispatcher {
                 from: remote,
                 to: self.bound_addr,
             },
+            None,
         );
 
         // Register CIDs before spawning actor so subsequent packets route correctly.

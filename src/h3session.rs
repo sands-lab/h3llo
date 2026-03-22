@@ -243,10 +243,6 @@ impl ConnectIpDatagramCodec {
         }
     }
 
-    fn prefix_len(&self) -> usize {
-        self.qsi_bytes.len() + 1
-    }
-
     pub(crate) fn prepend(&self, packet: &mut PooledBuf) -> bool {
         packet.add_prefix(&[CONTEXT_ID_IP]) && packet.add_prefix(&self.qsi_bytes)
     }
@@ -269,10 +265,6 @@ impl ConnectIpDatagramCodec {
 
         packet.pop_front(prefix_len);
         true
-    }
-
-    pub(crate) fn undo_prefix(&self, packet: &mut PooledBuf) {
-        packet.pop_front(self.prefix_len());
     }
 }
 
@@ -445,7 +437,7 @@ mod tests {
             let codec = ConnectIpDatagramCodec::new(stream_id);
             assert_eq!(codec.expected_qsi, expect_qsi, "sid={stream_id}");
             assert_eq!(codec.qsi_bytes, encode_qsi(expect_qsi), "sid={stream_id}");
-            assert_eq!(codec.prefix_len(), expect_prefix, "sid={stream_id}");
+            assert_eq!(codec.qsi_bytes.len() + 1, expect_prefix, "sid={stream_id}");
         }
     }
 
@@ -530,15 +522,6 @@ mod tests {
             );
             assert_eq!(&recv_buf[..], payload);
         }
-    }
-
-    #[test]
-    fn codec_undo_prefix_restores_payload() {
-        let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = alloc_packet_buf(b"undo test");
-        assert!(codec.prepend(&mut buf));
-        codec.undo_prefix(&mut buf);
-        assert_eq!(&buf[..], b"undo test");
     }
 
     // ========== ConnectFailure Tests ==========

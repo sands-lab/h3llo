@@ -113,7 +113,7 @@ impl H3Engine {
                         return Err(DialError::Handshake("UDP Rx closed during startup".into()));
                     };
 
-                    handle_udp_recv(&mut self.conn, packets, recv_info);
+                    handle_udp_recv(&mut self.conn, packets, recv_info, None);
 
                     if self.session.is_none() && self.conn.is_established() {
                         debug!(%self.meta.peer_id, "QUIC established; starting H3 CONNECT-IP");
