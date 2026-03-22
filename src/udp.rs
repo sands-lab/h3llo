@@ -172,19 +172,32 @@ pub fn spawn_udp_tx(
             if packets.is_empty() {
                 continue;
             }
-            // TUN GSO guarantees all non-tail packets in a batch share
-            // the same size; segment_size from the first packet is safe.
-            let segment_size = packets[0].len();
-            debug_assert!(segment_size > 0, "GSO must not produce empty packets");
+            // Split batch into consecutive runs of same-sized packets.
+            // GSO requires uniform segment_size per sendmsg; QUIC batches
+            // may mix sizes (e.g. 1393 vs 1394, data vs ACK).
+            // Max UDP payload per sendmsg: IPv4 Total Length (16-bit)
+            // includes the IP header, IPv6 Payload Length does not.
+            let max_udp_payload: usize = if dest.is_ipv4() {
+                65535 - 20 - 8 // 65507
+            } else {
+                65535 - 8 // 65527
+            };
+            let mut pos = 0;
 
-            // Cap segments per sendmsg so the total payload fits in
-            // one UDP message (u16::MAX bytes).
-            let max_segs = max_segs.min(u16::MAX as usize / segment_size);
+            while pos < packets.len() {
+                let segment_size = packets[pos].len();
+                debug_assert!(segment_size > 0, "GSO must not produce empty packets");
+                let max_segs_run = max_segs.min(max_udp_payload / segment_size).max(1);
 
-            for chunk in packets.chunks(max_segs.max(1)) {
                 gso_buf.clear();
-                for pkt in chunk {
-                    gso_buf.extend_from_slice(pkt);
+
+                // Accumulate consecutive same-sized packets up to max_segs.
+                while pos < packets.len()
+                    && packets[pos].len() == segment_size
+                    && gso_buf.len() / segment_size < max_segs_run
+                {
+                    gso_buf.extend_from_slice(&packets[pos]);
+                    pos += 1;
                 }
 
                 let transmit = Transmit {
@@ -307,6 +320,34 @@ mod tests {
         for expected in [[1u8, 2], [3, 4], [5, 6]] {
             let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
             assert_eq!(&buf[..len], &expected);
+        }
+
+        tx_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_tx_mixed_size_batch() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+
+        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_rx, tx) = make_udp(sender_socket, 1500, false).unwrap();
+
+        let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
+
+        // Mixed sizes: run of 2-byte, then 3-byte, then back to 2-byte.
+        let batch = vec![
+            BufFactory::buf_from_slice(&[1, 2]),
+            BufFactory::buf_from_slice(&[3, 4]),
+            BufFactory::buf_from_slice(&[5, 6, 7]),
+            BufFactory::buf_from_slice(&[8, 9]),
+        ];
+        input_tx.send((dest, batch)).await.unwrap();
+
+        let mut buf = vec![0u8; 64];
+        for expected in [&[1u8, 2] as &[u8], &[3, 4], &[5, 6, 7], &[8, 9]] {
+            let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], expected);
         }
 
         tx_handle.abort();
