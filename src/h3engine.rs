@@ -170,15 +170,6 @@ fn collect_udp_send(conn: &mut quiche::Connection, max_udp_payload: usize) -> Ve
     batch
 }
 
-/// Collects QUIC output and tries to send it to the tagged UDP TX channel.
-///
-/// The destination address is tagged onto each batch for the generic UDP TX actor.
-/// On channel-full, the returned `PendingBatch` stores only the batch (without dest);
-/// the caller re-supplies `dest` at resume time.
-///
-/// Returns `Ok(Some(batch))` when the channel is full (store as `pending_send`),
-/// `Ok(None)` on success or empty, `Err(())` when the channel is closed.
-
 // ========== Router Egress ==========
 
 /// Encodes egress IP packets as QUIC DATAGRAMs with QSI varint + Context ID prefix.
