@@ -664,6 +664,10 @@ pub fn spawn_h3v2_listener(
         }
     };
 
+    // TODO: Return UDP actor JoinHandles for orchestrator supervision.
+    // Currently dropped — if a UDP actor exits unexpectedly the dispatcher
+    // keeps running without visibility, silently breaking the listener.
+
     // RX actor on UDP runtime.
     let (udp_recv_tx, udp_recv_rx) =
         mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
