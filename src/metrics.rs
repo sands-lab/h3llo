@@ -59,6 +59,8 @@ pub enum DropReason {
     NoPeerChannel,
     /// PooledBuf lacked headroom for datagram prefix insertion.
     NoHeadroom,
+    /// QUIC dgram_send queue is full.
+    QueueFull,
     /// Packet's TTL/hop limit reached zero (forwarded to TUN for ICMP generation).
     TtlExpired,
 }

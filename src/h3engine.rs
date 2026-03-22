@@ -63,8 +63,16 @@ pub(crate) fn handle_udp_recv(
     conn: &mut quiche::Connection,
     batch: Vec<PooledBuf>,
     info: quiche::RecvInfo,
+    mut rx_counters: Option<&mut Counters>,
 ) {
     for mut pkt in batch {
+        // quiche silently drops the oldest datagram when the recv queue is
+        // full (pop-oldest-then-push). Record so metrics can surface it.
+        if conn.is_dgram_recv_queue_full() {
+            if let Some(c) = rx_counters.as_deref_mut() {
+                c.record_drop(DropReason::QueueFull, 1, 0);
+            }
+        }
         match conn.recv(&mut pkt, info) {
             Ok(_) | Err(quiche::Error::Done) => {}
             Err(e) => debug!(error = ?e, "quiche recv (non-fatal)"),
@@ -129,47 +137,10 @@ pub(crate) struct PendingBatch {
 }
 
 impl PendingBatch {
-    /// Creates a new pending batch, recording the current instant.
     pub(crate) fn new(batch: Vec<PooledBuf>) -> Self {
         Self {
             batch,
             since: Instant::now(),
-        }
-    }
-
-    /// Attempts `try_send` on `tx`; returns `Some(Self)` on channel-full, `Err` on closed.
-    pub(crate) fn enqueue(
-        tx: &mpsc::Sender<Vec<PooledBuf>>,
-        batch: Vec<PooledBuf>,
-    ) -> Result<Option<Self>, ()> {
-        if batch.is_empty() {
-            return Ok(None);
-        }
-
-        match tx.try_send(batch) {
-            Ok(()) => Ok(None),
-            Err(mpsc::error::TrySendError::Full(batch)) => Ok(Some(Self::new(batch))),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
-        }
-    }
-
-    /// Drains the pending slot via a pre-acquired permit, reporting wait duration.
-    pub(crate) fn resume<F>(
-        slot: &mut Option<Self>,
-        permit_res: Result<mpsc::Permit<'_, Vec<PooledBuf>>, mpsc::error::SendError<()>>,
-        on_waited: F,
-    ) -> Result<(), ()>
-    where
-        F: FnOnce(Duration),
-    {
-        match permit_res {
-            Ok(permit) => {
-                let pending = slot.take().expect("pending batch present");
-                on_waited(pending.since.elapsed());
-                permit.send(pending.batch);
-                Ok(())
-            }
-            Err(_closed) => Err(()),
         }
     }
 }
@@ -207,40 +178,23 @@ fn collect_udp_send(conn: &mut quiche::Connection, max_udp_payload: usize) -> Ve
 ///
 /// Returns `Ok(Some(batch))` when the channel is full (store as `pending_send`),
 /// `Ok(None)` on success or empty, `Err(())` when the channel is closed.
-pub(crate) fn flush_udp_send(
-    conn: &mut quiche::Connection,
-    max_udp_payload: usize,
-    dest: SocketAddr,
-    udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
-) -> Result<Option<PendingBatch>, ()> {
-    let batch = collect_udp_send(conn, max_udp_payload);
-    if batch.is_empty() {
-        return Ok(None);
-    }
-    match udp_send_tx.try_send((dest, batch)) {
-        Ok(()) => Ok(None),
-        Err(mpsc::error::TrySendError::Full((_, batch))) => Ok(Some(PendingBatch::new(batch))),
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
-    }
-}
 
 // ========== Router Egress ==========
 
 /// Encodes egress IP packets as QUIC DATAGRAMs with QSI varint + Context ID prefix.
 ///
-/// Returns unsent packets (with framing stripped) when the dgram queue is full,
-/// so the caller can store them as `pending_egress` for retry after `flush_send`.
+/// Drops packets when the dgram queue is full (counted via `DropReason::QueueFull`).
+/// With cc=none the queue rarely fills; accepting the drop avoids retry complexity.
 pub(crate) fn handle_router_egress(
     conn: &mut quiche::Connection,
     packets: Vec<PooledBuf>,
     codec: &ConnectIpDatagramCodec,
     counters: &mut Counters,
-) -> Option<Vec<PooledBuf>> {
+) {
     let mut ok_pkts: u64 = 0;
     let mut ok_bytes: u64 = 0;
-    let mut iter = packets.into_iter();
 
-    while let Some(mut pkt) = iter.next() {
+    for mut pkt in packets {
         let pkt_len = pkt.len() as u64;
         if !codec.prepend(&mut pkt) {
             counters.record_drop(DropReason::NoHeadroom, 1, pkt_len);
@@ -252,22 +206,9 @@ pub(crate) fn handle_router_egress(
                 ok_bytes += pkt_len;
             }
             Err(quiche::Error::Done) => {
-                // Queue full: undo framing and collect remaining for retry.
-                debug!(
-                    "dgram_send queue full; {} pkts pending",
-                    1 + iter.size_hint().0
-                );
-                codec.undo_prefix(&mut pkt);
-                let mut remaining = vec![pkt];
-                remaining.extend(iter);
-                if ok_pkts > 0 {
-                    counters.record_success(ok_pkts, ok_bytes);
-                }
-                return Some(remaining);
+                counters.record_drop(DropReason::QueueFull, 1, pkt_len);
             }
             Err(e) => {
-                // Non-queue-full error (e.g. BufferTooShort, InvalidState):
-                // drop to prevent infinite retry.
                 debug!(error = ?e, "dgram_send failed; dropping packet");
                 counters.record_drop(DropReason::SendError, 1, pkt_len);
             }
@@ -277,7 +218,6 @@ pub(crate) fn handle_router_egress(
     if ok_pkts > 0 {
         counters.record_success(ok_pkts, ok_bytes);
     }
-    None
 }
 
 /// Resets the pinned timer to the next quiche timeout deadline.
@@ -368,7 +308,6 @@ pub(crate) struct RunState {
     pub(crate) rx_counters: Counters,
     pub(crate) tx_counters: Counters,
     pub(crate) pending_ingress: Option<PendingBatch>,
-    pub(crate) pending_egress: Option<PendingBatch>,
     pub(crate) pending_send: Option<PendingBatch>,
 }
 
@@ -378,41 +317,8 @@ impl RunState {
             rx_counters: Counters::new(Source::Http3, Direction::Rx),
             tx_counters: Counters::new(Source::Http3, Direction::Tx),
             pending_ingress: None,
-            pending_egress: None,
             pending_send: None,
         }
-    }
-
-    pub(crate) fn flush_and_retry(
-        &mut self,
-        conn: &mut quiche::Connection,
-        session: &H3Session,
-        meta: &EngineMeta,
-        udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
-    ) -> Result<(), ()> {
-        if self.pending_send.is_none() {
-            self.pending_send =
-                flush_udp_send(conn, meta.max_udp_payload, meta.remote_addr, udp_send_tx)?;
-        }
-
-        if let Some(pending) = self.pending_egress.take() {
-            self.tx_counters.record_queue_full(pending.since.elapsed());
-            if let Some(remaining) = handle_router_egress(
-                conn,
-                pending.batch,
-                &session.datagram_codec,
-                &mut self.tx_counters,
-            ) {
-                self.pending_egress = Some(PendingBatch::new(remaining));
-            }
-        }
-
-        if self.pending_send.is_none() {
-            self.pending_send =
-                flush_udp_send(conn, meta.max_udp_payload, meta.remote_addr, udp_send_tx)?;
-        }
-
-        Ok(())
     }
 
     fn emit_metrics(&self, meta: &EngineMeta, events_tx: &mpsc::UnboundedSender<Event>) {
@@ -449,23 +355,19 @@ pub(crate) struct H3Engine {
 impl H3Engine {
     /// Best-effort flush of QUIC output to the UDP send channel.
     ///
-    /// Used during handshake and close, where pending-send tracking is
-    /// unnecessary. Drops on channel backpressure — acceptable because quiche
-    /// retransmits during handshake and CONNECTION_CLOSE is best-effort.
+    /// Used during handshake where pending-send tracking is unnecessary.
+    /// Drops on channel backpressure — acceptable because quiche retransmits.
     pub(crate) fn flush_send(&mut self) {
-        let _ = flush_udp_send(
-            &mut self.conn,
-            self.meta.max_udp_payload,
-            self.meta.remote_addr,
-            &self.io.udp_send_tx,
-        );
+        let batch = collect_udp_send(&mut self.conn, self.meta.max_udp_payload);
+        if !batch.is_empty() {
+            let _ = self.io.udp_send_tx.try_send((self.meta.remote_addr, batch));
+        }
     }
 
     /// Established phase: steady-state datagram forwarding.
     ///
-    /// Uses three pending slots for zero-drop backpressure:
+    /// Uses two pending slots for backpressure:
     /// - `pending_ingress`: IP packets from dgram_recv waiting for `ingress_tx` capacity.
-    /// - `pending_egress`: IP packets from TUN waiting for `conn.dgram_send()` capacity.
     /// - `pending_send`: encrypted QUIC packets waiting for `udp_send_tx` capacity.
     pub(crate) async fn run(self) -> ActorExitResult {
         let recv_info = self.meta.recv_info();
@@ -498,7 +400,6 @@ impl H3Engine {
 
         let exit: LoopExit = loop {
             let ingress_pending = run_state.pending_ingress.is_some();
-            let egress_pending = run_state.pending_egress.is_some();
             let send_pending = run_state.pending_send.is_some();
 
             tokio::select! {
@@ -509,7 +410,7 @@ impl H3Engine {
                         break LoopExit::Ok(b"udp rx closed");
                     };
 
-                    handle_udp_recv(&mut conn, packets, recv_info);
+                    handle_udp_recv(&mut conn, packets, recv_info, Some(&mut run_state.rx_counters));
 
                     // Drain H3 control events. Post-establishment, this detects
                     // stream close/reset/goaway. The header-parsing branch is
@@ -527,46 +428,45 @@ impl H3Engine {
                         },
                     }
 
-                    run_state.pending_ingress = match PendingBatch::enqueue(
-                        &ingress_tx,
-                        collect_router_ingress(
-                            &mut conn,
-                            meta.max_udp_payload,
-                            &mut run_state.rx_counters,
-                            &session.datagram_codec,
-                        ),
-                    ) {
-                        Ok(pending) => pending,
-                        Err(()) => break LoopExit::Ok(b"shutdown"),
-                    };
+                    let batch = collect_router_ingress(
+                        &mut conn,
+                        meta.max_udp_payload,
+                        &mut run_state.rx_counters,
+                        &session.datagram_codec,
+                    );
+                    if !batch.is_empty() {
+                        run_state.pending_ingress = match ingress_tx.try_send(batch) {
+                            Ok(()) => None,
+                            Err(mpsc::error::TrySendError::Full(b)) => Some(PendingBatch::new(b)),
+                            Err(mpsc::error::TrySendError::Closed(_)) => break LoopExit::Ok(b"shutdown"),
+                        };
+                    }
                 }
 
                 permit_res = ingress_tx.reserve(),
                     if ingress_pending =>
                 {
-                    if PendingBatch::resume(
-                        &mut run_state.pending_ingress, permit_res,
-                        |waited| run_state.rx_counters.record_queue_full(waited),
-                    ).is_err() {
-                        break LoopExit::Ok(b"shutdown");
+                    match permit_res {
+                        Ok(permit) => {
+                            let pending = run_state.pending_ingress.take().expect("pending ingress present");
+                            run_state.rx_counters.record_queue_full(pending.since.elapsed());
+                            permit.send(pending.batch);
+                        }
+                        Err(_) => break LoopExit::Ok(b"shutdown"),
                     }
                 }
 
-                maybe_batch = egress_rx.recv(),
-                    if !egress_pending =>
-                {
+                maybe_batch = egress_rx.recv() => {
                     let Some(packets) = maybe_batch else {
                         break LoopExit::Ok(b"shutdown");
                     };
 
-                    if let Some(remaining) = handle_router_egress(
+                    handle_router_egress(
                         &mut conn,
                         packets,
                         &session.datagram_codec,
                         &mut run_state.tx_counters,
-                    ) {
-                        run_state.pending_egress = Some(PendingBatch::new(remaining));
-                    }
+                    );
                 }
 
                 permit_res = udp_send_tx.reserve(),
@@ -596,14 +496,22 @@ impl H3Engine {
                 }
             }
 
-            if run_state
-                .flush_and_retry(&mut conn, &session, &meta, &udp_send_tx)
-                .is_err()
-            {
-                break LoopExit::Err {
-                    close_reason: b"udp tx closed",
-                    reason: "UDP TX channel closed".into(),
-                };
+            if run_state.pending_send.is_none() {
+                let batch = collect_udp_send(&mut conn, meta.max_udp_payload);
+                if !batch.is_empty() {
+                    match udp_send_tx.try_send((meta.remote_addr, batch)) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full((_, b))) => {
+                            run_state.pending_send = Some(PendingBatch::new(b));
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            break LoopExit::Err {
+                                close_reason: b"udp tx closed",
+                                reason: "UDP TX channel closed".into(),
+                            }
+                        }
+                    }
+                }
             }
             reset_timer(timer.as_mut(), &conn);
 
@@ -617,12 +525,10 @@ impl H3Engine {
 
         // Single cleanup point: close QUIC and flush remaining packets.
         conn.close(true, 0, exit.close_reason()).ok();
-        let _ = flush_udp_send(
-            &mut conn,
-            meta.max_udp_payload,
-            meta.remote_addr,
-            &udp_send_tx,
-        );
+        let batch = collect_udp_send(&mut conn, meta.max_udp_payload);
+        if !batch.is_empty() {
+            let _ = udp_send_tx.send((meta.remote_addr, batch)).await;
+        }
         exit.into_result(&meta, role)
     }
 }
@@ -631,7 +537,6 @@ impl H3Engine {
 mod tests {
     use super::*;
     use crate::actor::ActorKind;
-    use crate::tun::alloc_packet_buf;
 
     #[test]
     fn apply_transport_config_valid() {
@@ -648,42 +553,6 @@ mod tests {
         };
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         assert!(apply_transport_config(&mut config, &tuning, 1350).is_err());
-    }
-
-    // ========== PendingBatch Tests ==========
-
-    #[test]
-    fn pending_batch_enqueue_empty_returns_none() {
-        let (tx, _rx) = mpsc::channel::<Vec<PooledBuf>>(1);
-        let result = PendingBatch::enqueue(&tx, vec![]);
-        assert!(matches!(result, Ok(None)));
-    }
-
-    #[test]
-    fn pending_batch_enqueue_success() {
-        let (tx, mut rx) = mpsc::channel::<Vec<PooledBuf>>(1);
-        let batch = vec![alloc_packet_buf(b"pkt1")];
-        let result = PendingBatch::enqueue(&tx, batch);
-        assert!(matches!(result, Ok(None)));
-        assert!(rx.try_recv().is_ok());
-    }
-
-    #[test]
-    fn pending_batch_enqueue_full_returns_pending() {
-        let (tx, _rx) = mpsc::channel::<Vec<PooledBuf>>(1);
-        let _ = tx.try_send(vec![alloc_packet_buf(b"fill")]);
-        let batch = vec![alloc_packet_buf(b"overflow")];
-        let result = PendingBatch::enqueue(&tx, batch);
-        assert!(matches!(result, Ok(Some(_))));
-    }
-
-    #[test]
-    fn pending_batch_enqueue_closed_returns_err() {
-        let (tx, rx) = mpsc::channel::<Vec<PooledBuf>>(1);
-        drop(rx);
-        let batch = vec![alloc_packet_buf(b"orphan")];
-        let result = PendingBatch::enqueue(&tx, batch);
-        assert!(matches!(result, Err(())));
     }
 
     // ========== Engine Type Tests ==========
@@ -777,7 +646,6 @@ mod tests {
     fn run_state_new_has_no_pending() {
         let state = RunState::new();
         assert!(state.pending_ingress.is_none());
-        assert!(state.pending_egress.is_none());
         assert!(state.pending_send.is_none());
     }
 }

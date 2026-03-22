@@ -340,6 +340,7 @@ impl EncodeLabelValue for DropReasonLabel {
             DropReason::NoRoute => "no_route",
             DropReason::NoPeerChannel => "no_peer_channel",
             DropReason::NoHeadroom => "no_headroom",
+            DropReason::QueueFull => "queue_full",
             DropReason::TtlExpired => "ttl_expired",
         };
         EncodeLabelValue::encode(&s, encoder)
