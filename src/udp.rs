@@ -172,19 +172,27 @@ pub fn spawn_udp_tx(
             if packets.is_empty() {
                 continue;
             }
-            // TUN GSO guarantees all non-tail packets in a batch share
-            // the same size; segment_size from the first packet is safe.
-            let segment_size = packets[0].len();
-            debug_assert!(segment_size > 0, "GSO must not produce empty packets");
+            // Split batch into consecutive runs of same-sized packets.
+            // GSO requires uniform segment_size per sendmsg; QUIC batches
+            // may mix sizes (e.g. 1393 vs 1394, data vs ACK).
+            let ip_udp_overhead: usize = if dest.is_ipv4() { 28 } else { 48 };
+            let max_udp_payload = u16::MAX as usize - ip_udp_overhead;
+            let mut pos = 0;
 
-            // Cap segments per sendmsg so the total payload fits in
-            // one UDP message (u16::MAX bytes).
-            let max_segs = max_segs.min(u16::MAX as usize / segment_size);
+            while pos < packets.len() {
+                let segment_size = packets[pos].len();
+                debug_assert!(segment_size > 0, "GSO must not produce empty packets");
+                let max_segs_run = max_segs.min(max_udp_payload / segment_size).max(1);
 
-            for chunk in packets.chunks(max_segs.max(1)) {
                 gso_buf.clear();
-                for pkt in chunk {
-                    gso_buf.extend_from_slice(pkt);
+
+                // Accumulate consecutive same-sized packets up to max_segs.
+                while pos < packets.len()
+                    && packets[pos].len() == segment_size
+                    && gso_buf.len() / segment_size < max_segs_run
+                {
+                    gso_buf.extend_from_slice(&packets[pos]);
+                    pos += 1;
                 }
 
                 let transmit = Transmit {
