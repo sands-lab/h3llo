@@ -607,8 +607,8 @@ fn spawn_listener_start_error(
 
 /// Spawns the H3v2 listener with separated I/O and crypto:
 ///
-/// - **Recv actor** (I/O thread): quinn-udp GRO-aware recv.
-/// - **TX actor** (I/O thread): shared send actor for all connections.
+/// - **Recv actor** (`udp_rt`): quinn-udp GRO-aware recv.
+/// - **TX actor** (`udp_rt`): shared send actor for all connections.
 /// - **Dispatcher** (`crypto_rt`): CID routing, connection acceptance.
 /// - **Per-connection actors** (`crypto_rt`): QUIC crypto, H3 session,
 ///   datagram forwarding with backpressure.

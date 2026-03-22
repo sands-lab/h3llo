@@ -72,7 +72,7 @@ pub enum Event {
     Metrics(Metrics),
     /// HTTP/3 connection established, ready for actor spawning.
     H3Connected(H3ConnectedEvent),
-    /// HTTP/3 engine-based server connection established.
+    /// HTTP/3 engine-based connection established (inbound or outbound).
     H3v2Connected(H3v2ConnectedEvent),
     /// BareUDP TX connection established, ready for bound registration.
     BareConnected(BareConnectedEvent),

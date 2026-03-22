@@ -301,6 +301,9 @@ impl PeerEntry {
                 let udp_handle = udp_handle.clone();
                 let crypto_handle = crypto_handle.clone();
 
+                // H3 dial runs on the orchestrator's main runtime (lightweight
+                // coordinator); dial_h3_client internally places UDP actors on
+                // udp_rt and engine on crypto_rt.
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
                     match dial_h3_client(
@@ -402,7 +405,7 @@ pub enum OrchestratorError {
 ///
 /// Manages child actors with selective supervision:
 /// - Critical actors (TUN, BareUDP-Rx, H3-Listener): failure causes immediate exit
-/// - Peer actors (BareUDP-Tx, H3-Tx/Rx): failure triggers maintenance cycle (prune + reconnect)
+/// - Peer actors (BareUDP-Tx, H3-Engine): failure triggers maintenance cycle (prune + reconnect)
 pub struct Orchestrator {
     events_rx: mpsc::UnboundedReceiver<Event>,
     events_tx: mpsc::UnboundedSender<Event>,
