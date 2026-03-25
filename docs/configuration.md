@@ -20,7 +20,7 @@ local:
     ifname: h3llo0 # optional, default: h3llo0
     addrs: # required (CIDR notation with prefix length)
       - 192.168.180.2/24 # required; supports subnets (e.g., /24) or host addresses (/32, /128)
-    mtu: 1350 # optional, default: 1350 (tokio-quiche default DATAGRAM upper limit)
+    mtu: 1291 # optional, default: 1291 (tokio-quiche default max_udp_payload 1350 − 59 CONNECT-IP overhead)
 tuning: # optional, all fields have defaults
   packet_queue_depth: 256 # optional, default: 256
   socket_buffer_size: 16 # optional, default: 16 (MiB; 0 to use system default)
@@ -72,7 +72,7 @@ peers: # optional, default: []
 - `local.bare.listen`: BareUDP listen address when using the plaintext fast path; required to start BareUDP and optional alongside `local.h3`.
 - `local.tun.ifname` (default `h3llo0`): Name of the TUN interface created by h3llo.
 - `local.tun.addrs` (required): IP prefixes in CIDR notation (e.g., `192.168.180.1/24`, `2001:db8::1/64`) for the TUN interface. Supports IPv4, IPv6, dual-stack, and multiple prefixes. Extra system routes come from `peers[].tun.allowed_ips` when `local.table=true`.
-- `local.tun.mtu` (default `1350`): MTU for the TUN interface, capped to tokio-quiche's default maximum DATAGRAM size (the limit is configurable in quiche). See [docs/protocol.md](protocol.md) for sizing guidance. When H3 peers are configured and MTU exceeds 1413, a warning is emitted because IPv4 CONNECT-IP payloads may exceed the QUIC DATAGRAM writable size.
+- `local.tun.mtu` (default `1291`): MTU for the TUN interface, derived from tokio-quiche's default `max_udp_payload_size` (1350) minus CONNECT-IP overhead (59). The limit is configurable in quiche. See [docs/protocol.md](protocol.md) for sizing guidance. When H3 peers are configured and MTU exceeds 1413, a warning is emitted because IPv4 CONNECT-IP payloads may exceed the QUIC DATAGRAM writable size.
 - `tuning` (optional): All fields have defaults; omit the entire section to use defaults.
 - `tuning.packet_queue_depth` (default `256`): Bounded channel capacity for data-plane packet queues between actors. Counts batch messages, not individual packets; each batch carries one device I/O operation's worth of packets.
 - `tuning.socket_buffer_size` (default `16`): Socket buffer size in megabytes, applied to all UDP sockets via SO_RCVBUF and SO_SNDBUF. Set to `0` to skip buffer configuration and use system defaults. On Linux, the effective buffer size may be clamped by `net.core.rmem_max` / `net.core.wmem_max`; setting failures are logged as warnings without aborting.

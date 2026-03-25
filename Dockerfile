@@ -91,6 +91,7 @@ WORKDIR /app
 FROM --platform=$BUILDPLATFORM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY benches ./benches
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 3: Builder - Build dependencies then application
@@ -110,6 +111,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=registry-$TARGETARCH 
 # extraction breaks when stale artifacts accumulate in cache mounts.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY benches ./benches
 COPY tests ./tests
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=registry-$TARGETARCH \
     --mount=type=cache,target=/usr/local/cargo/git,id=git-$TARGETARCH \

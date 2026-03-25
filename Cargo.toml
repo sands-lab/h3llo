@@ -42,7 +42,7 @@ rand = "0.10"
 # Use mimalloc for musl targets to avoid musl's slow default allocator.
 # Purge tuning is done via MIMALLOC_PURGE_DELAY=0 env var in the Dockerfile.
 [target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = { version = "0.1", features = ["debug", "override"] }
+mimalloc = { version = "0.1", features = ["override"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "process"] }
@@ -87,13 +87,17 @@ name = "integration-container-route"
 path = "tests/integration/container/route.rs"
 harness = false
 
+[[bench]]
+name = "dgram_throughput"
+harness = false
+
 # Patch quiche monorepo for:
 # - datagram-socket: musl compatibility (msghdr private padding fields)
 #   See: https://github.com/rust-lang/libc/issues/2344
 # - quiche: "none" congestion control algorithm
 # - tokio-quiche: must match patched quiche API
 [patch.crates-io]
-datagram-socket = { git = "https://github.com/Tonny-Gu/quiche" }
-octets = { git = "https://github.com/Tonny-Gu/quiche" }
-quiche = { git = "https://github.com/Tonny-Gu/quiche" }
-tokio-quiche = { git = "https://github.com/Tonny-Gu/quiche" }
+datagram-socket = { git = "https://github.com/Tonny-Gu/quiche", branch = "remove-pooled-buf-metrics" }
+octets = { git = "https://github.com/Tonny-Gu/quiche", branch = "remove-pooled-buf-metrics" }
+quiche = { git = "https://github.com/Tonny-Gu/quiche", branch = "remove-pooled-buf-metrics" }
+tokio-quiche = { git = "https://github.com/Tonny-Gu/quiche", branch = "remove-pooled-buf-metrics" }

@@ -236,6 +236,7 @@ impl PeerEntry {
                 let destination = SocketAddr::new(dial_ip, bare.endpoint.port);
                 let bindif = bare.bindif.clone();
                 let endpoint = Endpoint::Udp(bare.endpoint.clone());
+                let crypto_handle_inner = crypto_handle.clone();
 
                 // Enter UDP runtime so tokio::spawn targets the UDP
                 // scheduler. Guard drops after spawn returns (sync call site).
@@ -255,14 +256,17 @@ impl PeerEntry {
                             Ok((_rx, tx)) => {
                                 let (udp_send_tx, udp_tx_handle) =
                                     udp::spawn_udp_tx(tx, tuning.packet_queue_depth);
-                                let (egress_tx, bare_tx_handle) = spawn_bare_tx(
-                                    udp_send_tx,
-                                    destination,
-                                    peer_id.clone(),
-                                    events_tx.clone(),
-                                    tuning.metrics_push_interval,
-                                    tuning.packet_queue_depth,
-                                );
+                                let (egress_tx, bare_tx_handle) = {
+                                    let _guard = crypto_handle_inner.enter();
+                                    spawn_bare_tx(
+                                        udp_send_tx,
+                                        destination,
+                                        peer_id.clone(),
+                                        events_tx.clone(),
+                                        tuning.metrics_push_interval,
+                                        tuning.packet_queue_depth,
+                                    )
+                                };
                                 let _ = events_tx.send(Event::BareConnected(BareConnectedEvent {
                                     peer_id,
                                     endpoint,
@@ -658,7 +662,7 @@ impl Orchestrator {
             };
 
             let (cmd_tx, bare_rx_handle) = {
-                let _guard = udp_rt.handle().enter();
+                let _guard = crypto_rt.handle().enter();
                 spawn_bare_rx(
                     udp_output_rx,
                     HashSet::new(),

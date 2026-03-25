@@ -601,7 +601,7 @@ mod tests {
         LocalTun {
             ifname: "test0".to_string(),
             addrs: vec![],
-            mtu: 1350,
+            mtu: 1291,
         }
     }
 
@@ -665,7 +665,7 @@ mod tests {
         let local_tun = LocalTun {
             ifname: "test0".to_string(),
             addrs: vec!["10.0.0.1/24".parse().unwrap()],
-            mtu: 1350,
+            mtu: 1291,
         };
         let table = RoutingTable::make(&peers, &peer_txs, &local_tun, &input_tx)
             .expect("table should build");
