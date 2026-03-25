@@ -114,7 +114,7 @@ BareUDP sends the inner IP packet directly as the UDP payload; there is no QUIC 
 
 #### MTU Guidance
 
-MTU summary: pick the lowest MTU across transports using IPv4/IPv6 figures per endpoint's resolved family; default `1350` is capped to tokio-quiche's default maximum DATAGRAM size (the limit is configurable in quiche), IPv4-only CONNECT-IP can go higher (up to 1413), BareUDP-only can go higher still, and mixed H3/BareUDP should stick to the H3 lower bound.
+MTU summary: pick the lowest MTU across transports using IPv4/IPv6 figures per endpoint's resolved family; default `1291` is derived from tokio-quiche's default `max_udp_payload_size` (1350) minus CONNECT-IP overhead (59). The limit is configurable in quiche. IPv4-only CONNECT-IP can go higher (up to 1413), BareUDP-only can go higher still, and mixed H3/BareUDP should stick to the H3 lower bound.
 
 - CONNECT-IP overhead per [RFC 9484 Section 7.2](https://datatracker.ietf.org/doc/html/rfc9484#section-7.2): the QUIC-internal encapsulation overhead is conservatively 59 bytes (51 base + 8 optional DATAGRAM Length field).
     - Base breakdown (51B): 1B QUIC Short Header type + 20B max Destination Connection ID + 4B max packet number + 1B DATAGRAM frame type + 8B max Quarter Stream ID + 1B Context ID (0x00) + 16B AEAD authentication tag.

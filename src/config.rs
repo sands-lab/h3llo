@@ -92,7 +92,7 @@ pub struct LocalTun {
     /// TUN addresses with CIDR prefixes (IPv4/IPv6, required).
     /// Example: `192.168.180.1/24`, `2001:db8::1/64`
     pub addrs: Vec<IpNet>,
-    /// TUN MTU (default: 1350).
+    /// TUN MTU (default: 1291).
     #[serde(default = "default_mtu")]
     pub mtu: u16,
 }
@@ -717,11 +717,12 @@ fn default_ifname() -> String {
     "h3llo0".to_string()
 }
 
-/// Default TUN MTU: capped to tokio-quiche's default maximum DATAGRAM size.
-/// tokio-quiche limits QUIC DATAGRAM payloads to 1350 bytes by default,
-/// but the limit is configurable in quiche. 1350 is a safe conservative default.
+/// Default TUN MTU derived from tokio-quiche's default `max_udp_payload_size` (1350).
+///
+/// `max_udp_payload_size` (1350) − CONNECT-IP overhead (59) = 1291.
+/// The limit is configurable in quiche.
 pub fn default_mtu() -> u16 {
-    1350
+    1291
 }
 
 /// Maximum safe TUN MTU for HTTP/3 CONNECT-IP over a 1500-byte IPv4 WAN path.
@@ -979,7 +980,7 @@ mod tests {
                 tun: LocalTun {
                     ifname: "h3llo0".to_string(),
                     addrs: vec!["192.168.180.1/32".parse().unwrap()],
-                    mtu: 1350,
+                    mtu: 1291,
                 },
             },
             tuning: Tuning::default(),
@@ -1300,7 +1301,7 @@ peers:
         );
         assert_eq!(cfg.local.dns.bindif, None);
         assert_eq!(cfg.local.tun.ifname, "h3llo0");
-        assert_eq!(cfg.local.tun.mtu, 1350);
+        assert_eq!(cfg.local.tun.mtu, 1291);
         assert!(cfg.peers[0].h3.is_some());
         if let Some(h3) = cfg.peers[0].h3.as_ref() {
             assert!(h3.endpoint.is_none());
