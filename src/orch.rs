@@ -251,7 +251,10 @@ impl PeerEntry {
                         tuning.socket_buffer_bytes(),
                     )
                     .await
-                    {
+                    .and_then(|s| {
+                        tokio::net::UdpSocket::from_std(s)
+                            .map_err(|e| crate::bind::UdpError::Socket(e.to_string()))
+                    }) {
                         Ok(socket) => match udp::make_udp(socket, mtu, tuning.udp_enable_offload) {
                             Ok((_rx, tx)) => {
                                 let (udp_send_tx, udp_tx_handle) =
@@ -646,6 +649,8 @@ impl Orchestrator {
             let udp_rx = {
                 let _guard = udp_rt.handle().enter();
                 let socket = make_server_udp_socket(listen_addr, tuning.socket_buffer_bytes())
+                    .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
+                let socket = tokio::net::UdpSocket::from_std(socket)
                     .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
                 let (udp_rx, _udp_tx) = udp::make_udp(socket, mtu, tuning.udp_enable_offload)
                     .map_err(|err| OrchestratorError::Udp(err.to_string()))?;

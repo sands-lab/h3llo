@@ -163,13 +163,10 @@ pub fn make_h3v2_listener(
         .map_err(|e| ServerError::Socket(format!("local_addr: {e}")))?;
     let max_udp_payload = tun_mtu as usize + CONNECT_IP_OVERHEAD;
     let config = make_server_quiche_config(tuning, max_udp_payload, cert_path, key_path)?;
-    let std_socket = socket
-        .into_std()
-        .map_err(|e| ServerError::Socket(format!("into_std: {e}")))?;
 
     info!(%listen_addr, %bound_addr, "h3v2 listener created");
     Ok(H3v2Listener {
-        socket: std_socket,
+        socket,
         bound_addr,
         config,
         max_udp_payload,
@@ -638,46 +635,38 @@ pub fn spawn_h3v2_listener(
 
     let tuning = tuning.clone();
 
-    // Convert std socket to tokio on the UDP runtime's reactor.
-    let socket_result = {
+    // Register socket and spawn UDP actors on udp_rt.
+    let (udp_recv_rx, udp_send_tx, _recv_handle, _tx_handle) = {
         let _guard = udp_rt.enter();
-        UdpSocket::from_std(std_socket)
-    };
-    let socket = match socket_result {
-        Ok(s) => s,
-        Err(e) => {
-            let handle = spawn_listener_start_error(crypto_rt, bound_addr, e);
-            return (cmd_tx, handle, bound_addr);
-        }
-    };
-    let (udp_rx, udp_tx) = match udp::make_udp(socket, max_udp_payload, tuning.udp_enable_offload) {
-        Ok(pair) => pair,
-        Err(e) => {
-            let handle = spawn_listener_start_error(
-                crypto_rt,
-                bound_addr,
-                std::io::Error::other(e.to_string()),
-            );
-            return (cmd_tx, handle, bound_addr);
-        }
-    };
+        let socket = match UdpSocket::from_std(std_socket) {
+            Ok(s) => s,
+            Err(e) => {
+                let handle = spawn_listener_start_error(crypto_rt, bound_addr, e);
+                return (cmd_tx, handle, bound_addr);
+            }
+        };
+        let (udp_rx, udp_tx) =
+            match udp::make_udp(socket, max_udp_payload, tuning.udp_enable_offload) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let handle = spawn_listener_start_error(
+                        crypto_rt,
+                        bound_addr,
+                        std::io::Error::other(e.to_string()),
+                    );
+                    return (cmd_tx, handle, bound_addr);
+                }
+            };
 
-    // TODO: Return UDP actor JoinHandles for orchestrator supervision.
-    // Currently dropped — if a UDP actor exits unexpectedly the dispatcher
-    // keeps running without visibility, silently breaking the listener.
+        // TODO: Return UDP actor JoinHandles for orchestrator supervision.
+        // Currently dropped — if a UDP actor exits unexpectedly the dispatcher
+        // keeps running without visibility, silently breaking the listener.
 
-    // RX actor on UDP runtime.
-    let (udp_recv_tx, udp_recv_rx) =
-        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
-    let _recv_handle = {
-        let _guard = udp_rt.enter();
-        udp::spawn_udp_rx(udp_rx, udp_recv_tx)
-    };
-
-    // TX actor on UDP runtime (GSO-aware, replaces per-packet try_send_to).
-    let (udp_send_tx, _tx_handle) = {
-        let _guard = udp_rt.enter();
-        udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth)
+        let (udp_recv_tx, udp_recv_rx) =
+            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
+        let _recv_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx);
+        let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth);
+        (udp_recv_rx, udp_send_tx, _recv_handle, _tx_handle)
     };
 
     // Dispatcher on crypto_rt.

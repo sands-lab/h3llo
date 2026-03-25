@@ -525,6 +525,8 @@ pub async fn dial_h3<P: RouteProbe>(
     let quic_cmd_tx = controller.cmd_sender();
 
     // Establish QUIC connection with H3 driver
+    let socket = tokio::net::UdpSocket::from_std(socket)
+        .map_err(|e| DialError::Socket(format!("from_std: {e}")))?;
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut socket: tokio_quiche::socket::Socket<_, _> = socket
         .try_into()
@@ -1044,9 +1046,7 @@ pub fn make_h3_listener(
 ) -> Result<H3Listener, ListenerError> {
     // Bind socket via unified path (applies SO_RCVBUF/SO_SNDBUF)
     let socket = make_server_udp_socket(listen_addr, socket_buffer_bytes)
-        .map_err(|e| ListenerError::Bind(e.to_string()))?
-        .into_std()
-        .map_err(|e| ListenerError::Bind(format!("tokio-to-std conversion: {e}")))?;
+        .map_err(|e| ListenerError::Bind(e.to_string()))?;
 
     let bound_addr = socket
         .local_addr()

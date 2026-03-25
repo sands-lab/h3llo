@@ -297,7 +297,7 @@ pub async fn dial_h3_client<P: RouteProbe>(
     let connect_path = endpoint.path.clone();
     let auth_header = generate_bearer_auth(&peer_h3.token);
 
-    // Create unconnected UDP socket, then re-register on the UDP runtime's reactor.
+    // Create unconnected UDP socket, then register and spawn actors on udp_rt.
     let std_socket = make_unbound_udp_socket(
         remote_addr,
         tun_if,
@@ -306,32 +306,30 @@ pub async fn dial_h3_client<P: RouteProbe>(
         tuning.socket_buffer_bytes(),
     )
     .await
-    .map_err(|e| DialError::Socket(e.to_string()))?
-    .into_std()
-    .map_err(|e| DialError::Socket(format!("into_std: {e}")))?;
-    let socket = {
-        let _guard = udp_rt.enter();
-        UdpSocket::from_std(std_socket).map_err(|e| DialError::Socket(format!("from_std: {e}")))?
-    };
+    .map_err(|e| DialError::Socket(e.to_string()))?;
 
-    let local_addr = socket
-        .local_addr()
-        .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
-
-    let max_udp_payload = tun_mtu as usize + CONNECT_IP_OVERHEAD;
-    let (udp_rx, udp_tx) = udp::make_udp(socket, max_udp_payload, tuning.udp_enable_offload)
-        .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
-
-    // Spawn generic UDP actors on the UDP runtime.
-    let (udp_recv_tx, udp_recv_rx) =
-        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
-    let udp_rx_handle = {
+    let (local_addr, max_udp_payload, udp_recv_rx, udp_rx_handle, udp_send_tx, udp_tx_handle) = {
         let _guard = udp_rt.enter();
-        udp::spawn_udp_rx(udp_rx, udp_recv_tx)
-    };
-    let (udp_send_tx, udp_tx_handle) = {
-        let _guard = udp_rt.enter();
-        udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth)
+        let socket = UdpSocket::from_std(std_socket)
+            .map_err(|e| DialError::Socket(format!("from_std: {e}")))?;
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
+        let max_udp_payload = tun_mtu as usize + CONNECT_IP_OVERHEAD;
+        let (udp_rx, udp_tx) = udp::make_udp(socket, max_udp_payload, tuning.udp_enable_offload)
+            .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
+        let (udp_recv_tx, udp_recv_rx) =
+            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
+        let udp_rx_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx);
+        let (udp_send_tx, udp_tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth);
+        (
+            local_addr,
+            max_udp_payload,
+            udp_recv_rx,
+            udp_rx_handle,
+            udp_send_tx,
+            udp_tx_handle,
+        )
     };
 
     // Create quiche config and connection.

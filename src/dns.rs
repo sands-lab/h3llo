@@ -238,6 +238,8 @@ pub async fn make_dns<P: RouteProbe>(
     )
     .await
     .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
+    let socket =
+        UdpSocket::from_std(socket).map_err(|e| ResolveInitError::Socket(e.to_string()))?;
 
     Ok(DnsActor {
         server,
