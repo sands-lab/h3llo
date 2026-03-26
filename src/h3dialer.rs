@@ -366,10 +366,14 @@ pub async fn dial_h3_client<P: RouteProbe>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::ActorExitResult;
     use crate::bind::test_support::FakeRouteProbe;
     use crate::config::default_mtu;
     use crate::events::{ConnectionDirection, Event, H3v2ConnectedEvent};
-    use crate::h3::{make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx};
+    use crate::h3::test_support::await_server_connection;
+    use crate::h3::{
+        make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
+    };
     use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::h3session::ConnectFailure;
     use crate::tun::alloc_packet_buf;
@@ -403,15 +407,13 @@ mod tests {
 
     // ========== Integration Test Helpers ==========
 
-    use crate::h3::test_support::await_server_connection;
-
     /// Test server wrapping h3.rs listener with cert and handle lifecycle management.
     struct TestServer {
-        cmd_tx: mpsc::UnboundedSender<crate::h3::H3ListenerCommand>,
+        cmd_tx: mpsc::UnboundedSender<H3ListenerCommand>,
         events_rx: mpsc::UnboundedReceiver<Event>,
         bound_addr: SocketAddr,
         _certs: TestCertBundle,
-        _handle: tokio::task::JoinHandle<crate::actor::ActorExitResult>,
+        _handle: tokio::task::JoinHandle<ActorExitResult>,
     }
 
     impl TestServer {
@@ -457,7 +459,7 @@ mod tests {
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = crate::events::DialContext {
+        let ctx = DialContext {
             peer_id: peer_id.to_string(),
             tun_if: String::new(),
             tun_mtu: default_mtu().into(),
@@ -513,7 +515,7 @@ mod tests {
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let ctx = crate::events::DialContext {
+        let ctx = DialContext {
             peer_id: peer_id.to_string(),
             tun_if: String::new(),
             tun_mtu: default_mtu().into(),

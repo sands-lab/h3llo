@@ -4,11 +4,15 @@
 //! router, adding BareUDP-specific behavior without touching sockets directly.
 
 use crate::actor::ActorExitResult;
-use crate::events::Event;
+use crate::bind::{make_unbound_udp_socket, RouteProbe, UdpError};
+use crate::config::UdpEndpoint;
+use crate::events::{BareConnectedEvent, DialContext, Endpoint, Event};
 use crate::metrics::{Counters, Direction, DropReason, Source};
+use crate::udp;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -99,14 +103,14 @@ pub fn spawn_bare_rx(
 ///
 /// `ctx.udp_rt` is used for socket registration and the UDP TX actor;
 /// `ctx.crypto_rt` is used for the bare TX adapter actor.
-pub async fn dial_bare_tx<P: crate::bind::RouteProbe>(
-    endpoint: crate::config::UdpEndpoint,
+pub async fn dial_bare_tx<P: RouteProbe>(
+    endpoint: UdpEndpoint,
     destination: SocketAddr,
-    ctx: &crate::events::DialContext,
+    ctx: &DialContext,
     probe: &P,
     bindif: Option<&str>,
-) -> Result<crate::events::BareConnectedEvent, crate::bind::UdpError> {
-    let std_socket = crate::bind::make_unbound_udp_socket(
+) -> Result<BareConnectedEvent, UdpError> {
+    let std_socket = make_unbound_udp_socket(
         destination,
         Some(ctx.tun_if.as_str()),
         bindif,
@@ -117,10 +121,10 @@ pub async fn dial_bare_tx<P: crate::bind::RouteProbe>(
 
     let (udp_send_tx, udp_tx_handle) = {
         let _guard = ctx.udp_rt.enter();
-        let socket = tokio::net::UdpSocket::from_std(std_socket)
-            .map_err(|e| crate::bind::UdpError::Socket(e.to_string()))?;
-        let (_rx, tx) = crate::udp::make_udp(socket, ctx.tun_mtu, ctx.tuning.udp_enable_offload)?;
-        crate::udp::spawn_udp_tx(tx, ctx.tuning.packet_queue_depth)
+        let socket =
+            UdpSocket::from_std(std_socket).map_err(|e| UdpError::Socket(e.to_string()))?;
+        let (_rx, tx) = udp::make_udp(socket, ctx.tun_mtu, ctx.tuning.udp_enable_offload)?;
+        udp::spawn_udp_tx(tx, ctx.tuning.packet_queue_depth)
     };
     let (egress_tx, bare_tx_handle) = {
         let _guard = ctx.crypto_rt.enter();
@@ -134,9 +138,9 @@ pub async fn dial_bare_tx<P: crate::bind::RouteProbe>(
         )
     };
 
-    Ok(crate::events::BareConnectedEvent {
+    Ok(BareConnectedEvent {
         peer_id: ctx.peer_id.clone(),
-        endpoint: crate::events::Endpoint::Udp(endpoint),
+        endpoint: Endpoint::Udp(endpoint),
         dest: destination,
         tx: egress_tx,
         tx_handle: bare_tx_handle,
@@ -348,7 +352,7 @@ mod tests {
         .expect("rx metrics should arrive")
         .expect("rx metrics should not be None");
 
-        assert_eq!(metrics.labels.source, crate::metrics::Source::BareUdp);
+        assert_eq!(metrics.labels.source, Source::BareUdp);
         assert_eq!(metrics.labels.direction, Direction::Rx);
         assert_eq!(metrics.stats.succeeded.packets, 1);
         assert_eq!(metrics.stats.succeeded.bytes, 4);
@@ -424,7 +428,7 @@ mod tests {
         .expect("tx metrics should arrive")
         .expect("tx metrics should not be None");
 
-        assert_eq!(metrics.labels.source, crate::metrics::Source::BareUdp);
+        assert_eq!(metrics.labels.source, Source::BareUdp);
         assert_eq!(metrics.labels.direction, Direction::Tx);
         assert_eq!(metrics.labels.peer_id, Some("test-peer".to_string()));
         assert_eq!(metrics.labels.remote_addr, Some(dest));

@@ -1,6 +1,7 @@
 //! Runtime orchestration for BareUDP and HTTP/3 transports.
 
 use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
+use crate::api;
 use crate::bare::{dial_bare_tx, spawn_bare_rx, BareUdpRxCommand};
 use crate::bind::{make_server_udp_socket, DefaultRouteProbe};
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
@@ -689,10 +690,10 @@ impl Orchestrator {
         if let Some(ref local_api) = config.local.api {
             let api_listen_addr =
                 resolve_listen_addr(&local_api.listen.host, local_api.listen.port)?;
-            let api_listener = crate::api::make_api(api_listen_addr)
+            let api_listener = api::make_api(api_listen_addr)
                 .await
                 .map_err(|e| OrchestratorError::ApiInit(e.to_string()))?;
-            let api_handle = crate::api::spawn_api(
+            let api_handle = api::spawn_api(
                 api_listener,
                 local_api.listen.path.clone(),
                 events_tx.clone(),
@@ -1206,6 +1207,7 @@ fn collect_hostnames(peers: &[Peer]) -> HashSet<String> {
 #[cfg(test)]
 mod test_support {
     use super::*;
+    use crate::config::{default_mtu, LocalDns, LocalTun};
 
     /// Test-only builder for creating an Orchestrator with injected dependencies.
     ///
@@ -1215,14 +1217,14 @@ mod test_support {
         tun_if: String,
         tun_mtu: usize,
         peers: HashMap<String, PeerEntry>,
-        local: Option<crate::config::Local>,
+        local: Option<Local>,
     }
 
     impl Default for TestableOrchestratorBuilder {
         fn default() -> Self {
             Self {
                 tun_if: "test0".to_string(),
-                tun_mtu: crate::config::default_mtu() as usize,
+                tun_mtu: default_mtu() as usize,
                 peers: HashMap::new(),
                 local: None,
             }
@@ -1281,17 +1283,17 @@ mod test_support {
             self
         }
 
-        fn default_local() -> crate::config::Local {
-            crate::config::Local {
+        fn default_local() -> Local {
+            Local {
                 table: false,
-                dns: crate::config::LocalDns {
+                dns: LocalDns {
                     server: "1.1.1.1:53".parse().unwrap(),
                     bindif: None,
                 },
                 h3: None,
                 bare: None,
                 api: None,
-                tun: crate::config::LocalTun {
+                tun: LocalTun {
                     ifname: "test0".to_string(),
                     addrs: vec!["192.168.180.1/32".parse().unwrap()],
                     mtu: 1393,
@@ -1356,15 +1358,14 @@ mod test_support {
 mod tests {
     use super::test_support::TestableOrchestratorBuilder;
     use super::*;
-    use crate::config::{PeerBare, PeerTun};
+    use crate::config::{PeerBare, PeerH3, PeerTun, UdpEndpoint};
     use crate::events::DnsEvent;
-    use crate::metrics::{Direction, Labels, Metrics, Source, Stats};
+    use crate::metrics::{Direction, Labels, Metrics, PktCounters, Source, Stats};
 
     // ========== PeerEntry unit tests ==========
 
     /// Helper to create test peers with BareUDP configuration.
     fn bare_peer(id: &str, allowed: &[&str]) -> Peer {
-        use crate::config::UdpEndpoint;
         Peer {
             id: id.to_string(),
 
@@ -1384,7 +1385,6 @@ mod tests {
 
     /// Helper to create test peers with BareUDP configuration at a specific hostname.
     fn bare_peer_at_host(id: &str, hostname: &str, port: u16, allowed: &[&str]) -> Peer {
-        use crate::config::UdpEndpoint;
         Peer {
             id: id.to_string(),
 
@@ -1417,7 +1417,6 @@ mod tests {
     #[test]
     fn orchestrator_error_includes_actor_context() {
         // Verify that OrchestratorError::ActorError includes actor context
-        use crate::actor::ActorError;
         use std::io;
 
         let actor_err = ActorError::TunRxRecv {
@@ -1583,7 +1582,7 @@ mod tests {
                 remote_addr: None,
             },
             stats: Stats {
-                succeeded: crate::metrics::PktCounters {
+                succeeded: PktCounters {
                     packets: 42,
                     ..Default::default()
                 },
@@ -1611,7 +1610,7 @@ mod tests {
                 remote_addr: Some(remote_addr),
             },
             stats: Stats {
-                succeeded: crate::metrics::PktCounters {
+                succeeded: PktCounters {
                     packets,
                     ..Default::default()
                 },
@@ -1642,7 +1641,7 @@ mod tests {
 
         let snapshot = reply_rx.await.expect("should receive metrics snapshot");
         assert_eq!(snapshot.len(), 2);
-        let text = crate::api::encode_metrics_snapshot(snapshot);
+        let text = api::encode_metrics_snapshot(snapshot);
         assert!(
             text.contains("h3llo_transport_packets_total"),
             "missing packets metric: {text}"
@@ -1997,7 +1996,7 @@ mod tests {
 
     /// Helper to create test peers with H3 configuration at a specific host.
     fn h3_peer_at_host(id: &str, host: &str, port: u16, allowed: &[&str]) -> Peer {
-        use crate::config::{H3Endpoint, PeerH3};
+        use crate::config::H3Endpoint;
         Peer {
             id: id.to_string(),
 
@@ -2200,7 +2199,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_bare_connection_rejects_unknown_peer() {
-        use crate::config::UdpEndpoint;
         let (mut orch, _handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![])
             .build();
@@ -2227,7 +2225,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_bare_connection_appends_second_bound() {
-        use crate::config::UdpEndpoint;
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
         let (existing_tx, _existing_rx) = mpsc::channel(1);
 
@@ -2268,7 +2265,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_bare_connection_sets_bound_and_updates_routing() {
-        use crate::config::UdpEndpoint;
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
 
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
@@ -2666,7 +2662,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         orch.update_bound(
             "peer1",
-            Some(Endpoint::Udp(crate::config::UdpEndpoint {
+            Some(Endpoint::Udp(UdpEndpoint {
                 host: "example.com".to_string(),
                 port: 5353,
             })),
@@ -2706,7 +2702,7 @@ mod tests {
     async fn api_get_config_returns_snapshot() {
         let peer = Peer {
             id: "peer-1".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
@@ -2738,7 +2734,7 @@ mod tests {
 
         let new_peer = Peer {
             id: "new-peer".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
@@ -2792,7 +2788,7 @@ mod tests {
     async fn api_delete_config_removes_peer() {
         let peer = Peer {
             id: "peer-1".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
@@ -2824,7 +2820,7 @@ mod tests {
     async fn api_delete_config_ignores_unknown_ids() {
         let peer = Peer {
             id: "keeper".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
@@ -2859,7 +2855,7 @@ mod tests {
 
         let peer = Peer {
             id: "h3-peer".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "secure-token-12ch".to_string(),
                 bindif: None,
@@ -2886,7 +2882,7 @@ mod tests {
     async fn api_delete_config_sends_h3_token_update() {
         let peer = Peer {
             id: "h3-peer".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "secure-token-12ch".to_string(),
                 bindif: None,
@@ -2918,7 +2914,7 @@ mod tests {
     async fn api_delete_config_no_h3_update_when_unchanged() {
         let peer = Peer {
             id: "keeper".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch1".to_string(),
                 bindif: None,
@@ -2946,7 +2942,7 @@ mod tests {
     async fn api_post_config_h3_tokens_exclude_bare_peers() {
         let h3_peer = Peer {
             id: "h3-peer".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "h3-token-12chars1".to_string(),
                 bindif: None,

@@ -19,6 +19,7 @@ use crate::h3engine::{
 };
 use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
+use crate::tun::alloc_uninit_packet_buf;
 use crate::udp;
 use quiche::h3::NameValue;
 use rand::Rng;
@@ -452,7 +453,7 @@ impl H3Dispatcher {
                 &quiche::ConnectionId::from_ref(&header.dcid),
                 &mut self.neg_buf,
             ) {
-                let mut pkt = crate::tun::alloc_uninit_packet_buf(len);
+                let mut pkt = alloc_uninit_packet_buf(len);
                 pkt[..len].copy_from_slice(&self.neg_buf[..len]);
                 pkt.truncate(len);
                 let _ = self.io.udp_send_tx.try_send((remote, vec![pkt]));
@@ -819,8 +820,9 @@ mod tests {
 
     use crate::bind::test_support::FakeRouteProbe;
     use crate::config::default_mtu;
-    use crate::h3::{dial_h3, spawn_h3_rx, spawn_h3_tx, DialError as OldDialError};
-    use crate::h3dialer::dial_h3_client;
+    use crate::events::DialContext;
+    use crate::h3::{dial_h3, spawn_h3_rx, spawn_h3_tx, DialError as OldDialError, H3Connection};
+    use crate::h3dialer::{dial_h3_client, DialError};
     use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::helpers::test_packets::make_ipv4_packet;
     use crate::tun::alloc_packet_buf;
@@ -837,14 +839,14 @@ mod tests {
         ingress_rx: mpsc::Receiver<Vec<PooledBuf>>,
         bound_addr: SocketAddr,
         _certs: TestCertBundle,
-        _handle: JoinHandle<crate::actor::ActorExitResult>,
+        _handle: JoinHandle<ActorExitResult>,
     }
 
     impl TestH3v2Server {
         async fn start(peer_tokens: HashMap<String, String>) -> Self {
             let certs = TestCertBundle::generate();
             let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let tuning = crate::config::Tuning::default();
+            let tuning = Tuning::default();
 
             let listener = make_h3v2_listener(
                 listen_addr,
@@ -884,11 +886,7 @@ mod tests {
     // ========== Integration Test Helpers ==========
 
     /// Dials the h3v2 server with the OLD client (h3.rs tokio-quiche).
-    async fn dial_old_client(
-        bound_addr: SocketAddr,
-        token: &str,
-        peer_id: &str,
-    ) -> crate::h3::H3Connection {
+    async fn dial_old_client(bound_addr: SocketAddr, token: &str, peer_id: &str) -> H3Connection {
         let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
         let tuning = insecure_tuning();
@@ -918,7 +916,7 @@ mod tests {
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = crate::events::DialContext {
+        let ctx = DialContext {
             peer_id: peer_id.to_string(),
             tun_if: String::new(),
             tun_mtu: default_mtu().into(),
@@ -1055,7 +1053,7 @@ mod tests {
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let ctx = crate::events::DialContext {
+        let ctx = DialContext {
             peer_id: peer_id.to_string(),
             tun_if: String::new(),
             tun_mtu: default_mtu().into(),
@@ -1068,7 +1066,7 @@ mod tests {
         let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
 
         assert!(
-            matches!(result, Err(crate::h3dialer::DialError::Rejected(_))),
+            matches!(result, Err(DialError::Rejected(_))),
             "expected Rejected, got {result:?}",
         );
 

@@ -17,7 +17,7 @@ use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::{ConnectionDirection, Event, H3ConnectedEvent};
 use crate::helpers::{send_with_backpressure, SendEvent};
-use crate::metrics::{Counters, Direction, Source};
+use crate::metrics::{Counters, Direction, DropReason, Source};
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -795,11 +795,7 @@ fn handle_inbound_frame(
     match inbound_frame {
         InboundFrame::Datagram(mut dgram) => {
             if dgram.is_empty() || dgram[0] != CONTEXT_ID_IP {
-                counters.record_drop(
-                    crate::metrics::DropReason::InvalidFraming,
-                    1,
-                    dgram.len() as u64,
-                );
+                counters.record_drop(DropReason::InvalidFraming, 1, dgram.len() as u64);
                 return;
             }
             dgram.pop_front(1);
@@ -814,11 +810,7 @@ fn handle_inbound_frame(
                 len = pooled_buf.len(),
                 "received unexpected Body frame on CONNECT-IP stream"
             );
-            counters.record_drop(
-                crate::metrics::DropReason::InvalidFraming,
-                1,
-                pooled_buf.len() as u64,
-            );
+            counters.record_drop(DropReason::InvalidFraming, 1, pooled_buf.len() as u64);
         }
     }
 }
@@ -933,7 +925,7 @@ pub fn spawn_h3_tx(
                         let len = packet.len();
                         // Zero-copy: prepend Context ID using reserved headroom.
                         if !packet.add_prefix(&[CONTEXT_ID_IP]) {
-                            counters.record_drop(crate::metrics::DropReason::NoHeadroom, 1, len as u64);
+                            counters.record_drop(DropReason::NoHeadroom, 1, len as u64);
                             continue;
                         }
                         let frame = OutboundFrame::Datagram(packet, flow_id);
@@ -961,7 +953,7 @@ pub fn spawn_h3_tx(
                         .await
                         .map_err(|_| {
                             counters.record_drop(
-                                crate::metrics::DropReason::SendError, 1, len as u64,
+                                DropReason::SendError, 1, len as u64,
                             );
                             ActorError::H3TxSend {
                                 peer_id: peer.clone(),
@@ -1191,6 +1183,7 @@ pub fn spawn_h3_listener(
 /// adds h3.rs-specific helpers (`await_server_connection`).
 #[cfg(test)]
 pub(crate) mod test_support {
+    use crate::events::{Event, H3ConnectedEvent};
     pub use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
 
     /// Waits for an `H3ConnectedEvent` on the events channel, with timeout.
@@ -1198,11 +1191,11 @@ pub(crate) mod test_support {
     /// Skips non-H3Connected events (e.g. metrics). Panics on timeout or if
     /// the channel closes before an H3Connected event arrives.
     pub async fn await_server_connection(
-        events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::events::Event>,
-    ) -> crate::events::H3ConnectedEvent {
+        events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ) -> H3ConnectedEvent {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
-                if let crate::events::Event::H3Connected(connected) = event {
+                if let Event::H3Connected(connected) = event {
                     return connected;
                 }
             }
@@ -1216,14 +1209,16 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::generate_bearer_auth;
     use crate::bind::test_support::FakeRouteProbe;
+    use crate::config::default_mtu;
     use test_support::{await_server_connection, insecure_tuning, test_peer_h3, TestCertBundle};
 
     // ========== Auth Helper Tests ==========
 
     #[test]
     fn extract_and_validate_auth_accepts_valid() {
-        let auth_header = crate::auth::generate_bearer_auth("token-for-peer1");
+        let auth_header = generate_bearer_auth("token-for-peer1");
         let headers = vec![
             Header::new(b":method", b"CONNECT"),
             Header::new(b"authorization", auth_header.as_bytes()),
@@ -1251,7 +1246,7 @@ mod tests {
 
     #[test]
     fn extract_and_validate_auth_rejects_wrong_token() {
-        let auth_header = crate::auth::generate_bearer_auth("wrong-token");
+        let auth_header = generate_bearer_auth("wrong-token");
         let headers = vec![Header::new(b"authorization", auth_header.as_bytes())];
         let tokens: HashMap<String, String> = [("peer1".to_string(), "correct-token".to_string())]
             .into_iter()
@@ -1321,7 +1316,7 @@ mod tests {
             ..Tuning::default()
         };
 
-        let settings = make_quic_settings(&tuning, crate::config::default_mtu());
+        let settings = make_quic_settings(&tuning, default_mtu());
 
         assert_eq!(settings.handshake_timeout, Some(Duration::from_secs(7)));
     }
@@ -1471,7 +1466,7 @@ mod tests {
             "127.0.0.1:443".parse().unwrap(),
             "peer_id",
             None,
-            crate::config::default_mtu(),
+            default_mtu(),
             &probe,
             &Tuning::default(),
         )
@@ -1506,7 +1501,7 @@ mod tests {
         let (cmd_tx, handle, bound_addr) = spawn_h3_listener(
             listener,
             HashMap::new(),
-            crate::config::default_mtu(),
+            default_mtu(),
             events_tx,
             &Tuning::default(),
         );
@@ -1539,7 +1534,7 @@ mod tests {
         let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(
             listener,
             peer_tokens,
-            crate::config::default_mtu(),
+            default_mtu(),
             events_tx,
             &Tuning::default(),
         );
@@ -1581,7 +1576,7 @@ mod tests {
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
             peer_tokens,
-            crate::config::default_mtu(),
+            default_mtu(),
             events_tx,
             &Tuning::default(),
         );
@@ -1596,7 +1591,7 @@ mod tests {
             bound_addr,
             peer_id,
             None,
-            crate::config::default_mtu(),
+            default_mtu(),
             &probe,
             &insecure_tuning(),
         )
@@ -1637,7 +1632,7 @@ mod tests {
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
             peer_tokens,
-            crate::config::default_mtu(),
+            default_mtu(),
             events_tx,
             &Tuning::default(),
         );
@@ -1654,7 +1649,7 @@ mod tests {
             bound_addr,
             peer_id,
             None,
-            crate::config::default_mtu(),
+            default_mtu(),
             &probe,
             &insecure_tuning(),
         )
@@ -1694,7 +1689,7 @@ mod tests {
         let (cmd_tx, _handle, bound_addr) = spawn_h3_listener(
             listener,
             peer_tokens,
-            crate::config::default_mtu(),
+            default_mtu(),
             events_tx,
             &Tuning::default(),
         );
@@ -1708,7 +1703,7 @@ mod tests {
             bound_addr,
             peer_id,
             None,
-            crate::config::default_mtu(),
+            default_mtu(),
             &probe,
             &insecure_tuning(),
         )
@@ -1742,7 +1737,7 @@ mod tests {
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
             peer_tokens,
-            crate::config::default_mtu(),
+            default_mtu(),
             events_tx,
             &Tuning::default(),
         );
@@ -1757,7 +1752,7 @@ mod tests {
             bound_addr,
             "test-client",
             None,
-            crate::config::default_mtu(),
+            default_mtu(),
             &probe,
             &insecure_tuning(),
         )
@@ -1802,7 +1797,7 @@ mod tests {
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
             peer_tokens,
-            crate::config::default_mtu(),
+            default_mtu(),
             events_tx,
             &Tuning::default(),
         );
@@ -1816,7 +1811,7 @@ mod tests {
             bound_addr,
             "unknown-peer",
             None,
-            crate::config::default_mtu(),
+            default_mtu(),
             &probe,
             &insecure_tuning(),
         )
@@ -1849,7 +1844,7 @@ mod tests {
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
             peer_tokens,
-            crate::config::default_mtu(),
+            default_mtu(),
             listener_events_tx,
             &Tuning::default(),
         );
@@ -1863,7 +1858,7 @@ mod tests {
             bound_addr,
             peer_id,
             None,
-            crate::config::default_mtu(),
+            default_mtu(),
             &probe,
             &insecure_tuning(),
         )
@@ -1932,7 +1927,7 @@ mod tests {
         let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
             listener,
             peer_tokens,
-            crate::config::default_mtu(),
+            default_mtu(),
             listener_events_tx,
             &Tuning::default(),
         );
@@ -1946,7 +1941,7 @@ mod tests {
             bound_addr,
             peer_id,
             None,
-            crate::config::default_mtu(),
+            default_mtu(),
             &probe,
             &insecure_tuning(),
         )
@@ -2042,7 +2037,7 @@ mod tests {
         let (cmd_tx, listener_handle, bound_addr) = spawn_h3_listener(
             listener,
             peer_tokens,
-            crate::config::default_mtu(),
+            default_mtu(),
             events_tx,
             &Tuning::default(),
         );
@@ -2056,7 +2051,7 @@ mod tests {
             bound_addr,
             peer_id,
             None,
-            crate::config::default_mtu(),
+            default_mtu(),
             &probe,
             &insecure_tuning(),
         )
@@ -2079,7 +2074,7 @@ mod tests {
     #[test]
     fn default_mtu_fits_ipv6_ethernet() {
         // Verify: default TUN MTU + CONNECT-IP overhead + IPv6/UDP headers <= 1500
-        let default_mtu: usize = crate::config::default_mtu() as usize;
+        let default_mtu: usize = default_mtu() as usize;
         let total = default_mtu + CONNECT_IP_OVERHEAD + 48;
         assert!(
             total <= 1500,
