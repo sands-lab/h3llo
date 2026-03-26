@@ -19,6 +19,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_quiche::buf_factory::PooledBuf;
+use tokio_util::sync::CancellationToken;
 
 /// Receive side of a shared UDP socket with quinn-udp GRO support.
 #[derive(Debug)]
@@ -78,9 +79,15 @@ pub fn make_udp(
 ///
 /// Pure I/O actor: no filtering, no metrics, no command channel.
 /// Protocol-specific logic belongs in the consuming actor.
+///
+/// The optional `cancel` token allows the owner to signal shutdown.
+/// Without it, the actor only exits when the output channel closes
+/// **and** a packet arrives — which may never happen after the consumer
+/// is gone, leaking the task.
 pub fn spawn_udp_rx(
     rx: UdpRx,
     output: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+    cancel: CancellationToken,
 ) -> JoinHandle<ActorExitResult> {
     let UdpRx {
         socket,
@@ -98,10 +105,15 @@ pub fn spawn_udp_rx(
         let mut meta = RecvMeta::default();
 
         loop {
-            socket.readable().await.map_err(|e| ActorError::UdpRxRecv {
-                addr: local_addr.clone(),
-                source: e,
-            })?;
+            tokio::select! {
+                result = socket.readable() => {
+                    result.map_err(|e| ActorError::UdpRxRecv {
+                        addr: local_addr.clone(),
+                        source: e,
+                    })?;
+                }
+                _ = cancel.cancelled() => return Ok(()),
+            }
             loop {
                 let result = socket.try_io(Interest::READABLE, || {
                     state.recv(
@@ -142,6 +154,11 @@ pub fn spawn_udp_rx(
 ///
 /// Pure I/O actor: no metrics, no protocol awareness.
 /// Returns the input sender and join handle.
+///
+/// Exits when the input channel closes, draining all remaining batches
+/// first. This guarantees that final packets (e.g. QUIC CONNECTION_CLOSE)
+/// are sent before the actor stops. No `CancellationToken` is needed —
+/// the caller controls shutdown by dropping the returned sender.
 pub fn spawn_udp_tx(
     tx: UdpTx,
     queue_depth: usize,
@@ -241,6 +258,7 @@ pub fn spawn_udp_tx(
 mod tests {
     use super::*;
     use tokio_quiche::buf_factory::BufFactory;
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn make_udp_creates_shared_socket() {
@@ -256,7 +274,7 @@ mod tests {
         let (rx, _tx) = make_udp(socket, 1500, false).unwrap();
 
         let (output_tx, mut output_rx) = mpsc::channel(4);
-        let handle = spawn_udp_rx(rx, output_tx);
+        let handle = spawn_udp_rx(rx, output_tx, CancellationToken::new());
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sender_addr = sender.local_addr().unwrap();
@@ -360,7 +378,7 @@ mod tests {
         let (rx, _tx) = make_udp(socket, 1500, false).unwrap();
 
         let (output_tx, output_rx) = mpsc::channel(1);
-        let handle = spawn_udp_rx(rx, output_tx);
+        let handle = spawn_udp_rx(rx, output_tx, CancellationToken::new());
 
         // Drop receiver so output channel is closed.
         drop(output_rx);

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 // ========== Configuration Helpers ==========
@@ -341,6 +342,12 @@ pub(crate) struct H3Engine {
     pub(crate) metrics_interval: Duration,
     pub(crate) keepalive_interval: Duration,
     pub(crate) role: EngineRole,
+
+    /// Cancels associated UDP actors when the engine finishes.
+    ///
+    /// `None` for server-side engines where UDP actors are shared
+    /// across all connections by the dispatcher.
+    pub(crate) udp_cancel: Option<CancellationToken>,
 }
 
 impl H3Engine {
@@ -379,6 +386,7 @@ impl H3Engine {
             metrics_interval,
             keepalive_interval,
             role,
+            udp_cancel: _udp_cancel,
         } = self;
         let mut session = session.expect("session present after establish/accept");
 
@@ -519,6 +527,12 @@ impl H3Engine {
         let batch = collect_udp_send(&mut conn, meta.max_udp_payload);
         if !batch.is_empty() {
             let _ = udp_send_tx.send((meta.remote_addr, batch)).await;
+        }
+        // Cancel the RX actor, which blocks on socket.readable().
+        // TX actor exits naturally when udp_send_tx is dropped at
+        // function return, draining any remaining batches first.
+        if let Some(token) = _udp_cancel {
+            token.cancel();
         }
         exit.into_result(&meta, role)
     }

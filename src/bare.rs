@@ -26,26 +26,30 @@ pub enum BareUdpRxCommand {
 
 /// Spawns the BareUDP source-filter receive actor.
 ///
-/// Receives `(SocketAddr, Vec<PooledBuf>)` from a UDP RX actor, filters
-/// by accepted source IPs, and forwards accepted batches to the router.
+/// Creates its own input channel and returns the `Sender` for upstream
+/// (e.g. `udp::spawn_udp_rx`) to send tagged batches into. Filters by
+/// accepted source IPs and forwards accepted batches to the router.
 ///
 /// # Arguments
 ///
-/// * `udp_rx` - Tagged batches from `udp::spawn_udp_rx`.
 /// * `accepted_sources` - Initial set of accepted source IPs.
 /// * `ingress_tx` - Bounded channel to the router actor.
 /// * `events_tx` - Metrics event channel.
 /// * `interval` - Metrics emission interval.
+/// * `packet_queue_depth` - Bounded input channel capacity.
+#[allow(clippy::type_complexity)]
 pub fn spawn_bare_rx(
-    mut udp_rx: mpsc::Receiver<(SocketAddr, Vec<PooledBuf>)>,
     mut accepted_sources: HashSet<IpAddr>,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
+    packet_queue_depth: usize,
 ) -> (
+    mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     mpsc::UnboundedSender<BareUdpRxCommand>,
     JoinHandle<ActorExitResult>,
 ) {
+    let (input_tx, mut udp_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(packet_queue_depth);
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
     let handle = tokio::spawn(async move {
@@ -83,7 +87,7 @@ pub fn spawn_bare_rx(
         }
     });
 
-    (cmd_tx, handle)
+    (input_tx, cmd_tx, handle)
 }
 
 /// Spawns a BareUDP transmit adapter actor.
@@ -153,17 +157,16 @@ mod tests {
 
     #[tokio::test]
     async fn bare_rx_filters_non_accepted_sources() {
-        let (udp_tx, udp_rx) = mpsc::channel(4);
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
         let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (_cmd_tx, handle) = spawn_bare_rx(
-            udp_rx,
+        let (udp_tx, _cmd_tx, handle) = spawn_bare_rx(
             accepted,
             ingress_tx,
             events_tx,
             Duration::from_millis(200),
+            4,
         );
 
         // Send from a non-accepted source
@@ -182,17 +185,16 @@ mod tests {
 
     #[tokio::test]
     async fn bare_rx_forwards_accepted_sources() {
-        let (udp_tx, udp_rx) = mpsc::channel(4);
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
         let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (_cmd_tx, handle) = spawn_bare_rx(
-            udp_rx,
+        let (udp_tx, _cmd_tx, handle) = spawn_bare_rx(
             accepted,
             ingress_tx,
             events_tx,
             Duration::from_millis(200),
+            4,
         );
 
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
@@ -211,16 +213,15 @@ mod tests {
 
     #[tokio::test]
     async fn bare_rx_updates_accepted_sources() {
-        let (udp_tx, udp_rx) = mpsc::channel(4);
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (cmd_tx, handle) = spawn_bare_rx(
-            udp_rx,
+        let (udp_tx, cmd_tx, handle) = spawn_bare_rx(
             HashSet::new(),
             ingress_tx,
             events_tx,
             Duration::from_millis(200),
+            4,
         );
 
         // Initially no sources accepted — packet should be dropped.
@@ -258,17 +259,16 @@ mod tests {
 
     #[tokio::test]
     async fn bare_rx_emits_metrics() {
-        let (udp_tx, udp_rx) = mpsc::channel(4);
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
         let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
-        let (_cmd_tx, handle) = spawn_bare_rx(
-            udp_rx,
+        let (udp_tx, _cmd_tx, handle) = spawn_bare_rx(
             accepted,
             ingress_tx,
             events_tx,
             Duration::from_millis(10),
+            4,
         );
 
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
@@ -382,16 +382,15 @@ mod tests {
 
     #[tokio::test]
     async fn bare_rx_exits_when_cmd_channel_closed() {
-        let (_udp_tx, udp_rx) = mpsc::channel(4);
         let (ingress_tx, _ingress_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (cmd_tx, handle) = spawn_bare_rx(
-            udp_rx,
+        let (_udp_tx, cmd_tx, handle) = spawn_bare_rx(
             HashSet::new(),
             ingress_tx,
             events_tx,
             Duration::from_secs(60),
+            4,
         );
 
         // Drop cmd_tx to signal shutdown via command channel closure.

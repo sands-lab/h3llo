@@ -28,6 +28,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_quiche::buf_factory::PooledBuf;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// A single active connection bound to a peer.
@@ -328,19 +329,9 @@ impl PeerEntry {
                     )
                     .await
                     {
-                        Ok(client_conn) => {
-                            info!(peer = %client_conn.peer_id, addr = %client_conn.remote_addr, "H3 connected");
-                            let _ = events_tx.send(Event::H3v2Connected(H3v2ConnectedEvent {
-                                peer_id: client_conn.peer_id,
-                                remote_addr: client_conn.remote_addr,
-                                tx: client_conn.tx,
-                                direction: ConnectionDirection::Outbound,
-                                handles: vec![
-                                    client_conn.engine_handle,
-                                    client_conn.udp_rx_handle,
-                                    client_conn.udp_tx_handle,
-                                ],
-                            }));
+                        Ok(event) => {
+                            info!(peer = %event.peer_id, addr = %event.remote_addr, "H3 connected");
+                            let _ = events_tx.send(Event::H3v2Connected(event));
                         }
                         Err(e) => {
                             warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
@@ -658,23 +649,20 @@ impl Orchestrator {
                 udp_rx
             };
 
-            let (udp_output_tx, udp_output_rx) =
-                mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
-
-            let udp_rx_handle = {
-                let _guard = udp_rt.handle().enter();
-                udp::spawn_udp_rx(udp_rx, udp_output_tx)
-            };
-
-            let (cmd_tx, bare_rx_handle) = {
+            let (udp_output_tx, cmd_tx, bare_rx_handle) = {
                 let _guard = crypto_rt.handle().enter();
                 spawn_bare_rx(
-                    udp_output_rx,
                     HashSet::new(),
                     ingress_tx.clone(),
                     events_tx.clone(),
                     tuning.metrics_push_interval,
+                    tuning.packet_queue_depth,
                 )
+            };
+
+            let udp_rx_handle = {
+                let _guard = udp_rt.handle().enter();
+                udp::spawn_udp_rx(udp_rx, udp_output_tx, CancellationToken::new())
             };
 
             join_set.spawn(udp_rx_handle);
