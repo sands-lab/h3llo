@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use crate::actor::ActorExitResult;
-use crate::config::{Config, H3Endpoint, Peer, UdpEndpoint};
+use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
 use crate::h3::H3Connection;
 use crate::metrics::{Labels, Metrics};
+use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_quiche::buf_factory::PooledBuf;
@@ -23,15 +24,45 @@ pub enum Endpoint {
     H3(H3Endpoint),
 }
 
-/// Indicates connection establishment direction.
+/// Common parameters for outbound dial operations.
+///
+/// Shared by [`crate::h3dialer::dial_h3_client`] and
+/// [`crate::bare::dial_bare_tx`] to avoid parameter duplication.
+pub struct DialContext {
+    /// Peer identifier from configuration.
+    pub peer_id: String,
+    /// TUN interface name (for route-probe exclusion).
+    pub tun_if: String,
+    /// TUN MTU in bytes.
+    pub tun_mtu: usize,
+    /// Tuning parameters (timeouts, buffers, congestion control).
+    pub tuning: Tuning,
+    /// Runtime handle for UDP I/O actors.
+    pub udp_rt: RuntimeHandle,
+    /// Runtime handle for crypto / protocol actors.
+    pub crypto_rt: RuntimeHandle,
+    /// Channel for emitting events back to the orchestrator.
+    pub events_tx: mpsc::UnboundedSender<Event>,
+}
+
+/// Which side created a connection: `Client` (we dialed) or `Server` (we accepted).
 ///
 /// Distinct from `Direction` (Rx/Tx) which describes data flow for metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionDirection {
-    /// Connection accepted by listener (server-side).
-    Inbound,
-    /// Connection established by dialer (client-side).
-    Outbound,
+pub enum ConnOrigin {
+    /// We acted as client and dialed this connection.
+    Client,
+    /// We acted as server and accepted this connection.
+    Server,
+}
+
+impl std::fmt::Display for ConnOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client => f.write_str("client"),
+            Self::Server => f.write_str("server"),
+        }
+    }
 }
 
 /// HTTP/3 engine-based connection established event.
@@ -46,8 +77,8 @@ pub struct H3v2ConnectedEvent {
     pub remote_addr: SocketAddr,
     /// Channel for sending IP packets to the connected client.
     pub tx: mpsc::Sender<Vec<PooledBuf>>,
-    /// Inbound (listener-accepted) or Outbound (dialer-established).
-    pub direction: ConnectionDirection,
+    /// Server (listener-accepted) or Client (dialer-established).
+    pub origin: ConnOrigin,
     /// Actor join handles for lifecycle tracking.
     ///
     /// Outbound connections carry engine + UDP actor handles for JoinSet
@@ -61,7 +92,7 @@ impl std::fmt::Debug for H3v2ConnectedEvent {
         f.debug_struct("H3v2ConnectedEvent")
             .field("peer_id", &self.peer_id)
             .field("remote_addr", &self.remote_addr)
-            .field("direction", &self.direction)
+            .field("origin", &self.origin)
             .finish_non_exhaustive()
     }
 }
@@ -195,8 +226,8 @@ impl std::fmt::Debug for BareConnectedEvent {
 pub struct H3ConnectedEvent {
     /// The established connection.
     pub connection: H3Connection,
-    /// Whether this is an inbound or outbound connection.
-    pub direction: ConnectionDirection,
+    /// Whether we acted as client or server for this connection.
+    pub origin: ConnOrigin,
 }
 
 /// DNS resolution state change notification.

@@ -1,21 +1,21 @@
 //! Runtime orchestration for BareUDP and HTTP/3 transports.
 
 use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
-use crate::bare::{spawn_bare_rx, spawn_bare_tx, BareUdpRxCommand};
-use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, DefaultRouteProbe};
+use crate::api;
+use crate::bare::{dial_bare_tx, make_bare_rx, spawn_bare_rx, BareUdpRxCommand};
+use crate::bind::DefaultRouteProbe;
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
-    ApiEvent, BareConnectedEvent, ConnectionDirection, DialFailedEvent, DnsEvent, Endpoint, Event,
-    H3v2ConnectedEvent,
+    ApiEvent, BareConnectedEvent, ConnOrigin, DialContext, DialFailedEvent, DnsEvent, Endpoint,
+    Event, H3v2ConnectedEvent,
 };
 use crate::h3dialer::dial_h3_client;
-use crate::h3listener::{make_h3v2_listener, spawn_h3v2_listener, H3v2ListenerCommand};
+use crate::h3listener::{make_h3_dispatcher, spawn_h3_dispatcher, DispatcherCommand};
 use crate::metrics::{log_quic_metrics, log_transport_metrics, Direction, Labels, Metrics};
 use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::router::{spawn_router, RouterCommand, RoutingTable};
 use crate::tun;
-use crate::udp;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -181,7 +181,7 @@ impl PeerEntry {
         &mut self,
         events_tx: &mpsc::UnboundedSender<Event>,
         tun_if: &str,
-        mtu: usize,
+        tun_mtu: usize,
         tuning: &Tuning,
         udp_handle: &Handle,
         crypto_handle: &Handle,
@@ -225,69 +225,32 @@ impl PeerEntry {
                 .or_insert_with(DialState::new_in_flight);
             info!(peer = %self.config.id, ip = %ip, attempt, "dialing peer");
 
-            // Common bindings for the spawned task (only one branch runs).
-            let events_tx = events_tx.clone();
-            let tun_if = tun_if.to_string();
-            let peer_id = peer_id.clone();
-            let tuning = tuning.clone();
             let dial_ip = *ip;
+            let ctx = DialContext {
+                peer_id: peer_id.clone(),
+                tun_if: tun_if.to_string(),
+                tun_mtu,
+                tuning: tuning.clone(),
+                udp_rt: udp_handle.clone(),
+                crypto_rt: crypto_handle.clone(),
+                events_tx: events_tx.clone(),
+            };
 
             if let Some(bare) = self.config.bare.as_ref() {
                 let destination = SocketAddr::new(dial_ip, bare.endpoint.port);
                 let bindif = bare.bindif.clone();
-                let endpoint = Endpoint::Udp(bare.endpoint.clone());
-                let crypto_handle_inner = crypto_handle.clone();
-
-                // Enter UDP runtime so tokio::spawn targets the UDP
-                // scheduler. Guard drops after spawn returns (sync call site).
-                let _guard = udp_handle.enter();
+                let endpoint = bare.endpoint.clone();
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
-                    match make_unbound_udp_socket(
-                        destination,
-                        Some(&tun_if),
-                        bindif.as_deref(),
-                        &probe,
-                        tuning.socket_buffer_bytes(),
-                    )
-                    .await
+                    match dial_bare_tx(endpoint, destination, &ctx, &probe, bindif.as_deref()).await
                     {
-                        Ok(socket) => match udp::make_udp(socket, mtu, tuning.udp_enable_offload) {
-                            Ok((_rx, tx)) => {
-                                let (udp_send_tx, udp_tx_handle) =
-                                    udp::spawn_udp_tx(tx, tuning.packet_queue_depth);
-                                let (egress_tx, bare_tx_handle) = {
-                                    let _guard = crypto_handle_inner.enter();
-                                    spawn_bare_tx(
-                                        udp_send_tx,
-                                        destination,
-                                        peer_id.clone(),
-                                        events_tx.clone(),
-                                        tuning.metrics_push_interval,
-                                        tuning.packet_queue_depth,
-                                    )
-                                };
-                                let _ = events_tx.send(Event::BareConnected(BareConnectedEvent {
-                                    peer_id,
-                                    endpoint,
-                                    dest: destination,
-                                    tx: egress_tx,
-                                    tx_handle: bare_tx_handle,
-                                    udp_tx_handle,
-                                }));
-                            }
-                            Err(err) => {
-                                warn!(peer = %peer_id, addr = %destination, error = %err, "make_udp failed");
-                                let _ = events_tx.send(Event::DialFailed(DialFailedEvent {
-                                    peer_id,
-                                    ip: dial_ip,
-                                }));
-                            }
-                        },
+                        Ok(event) => {
+                            let _ = ctx.events_tx.send(Event::BareConnected(event));
+                        }
                         Err(err) => {
-                            warn!(peer = %peer_id, addr = %destination, error = %err, "bare tx socket setup failed");
-                            let _ = events_tx.send(Event::DialFailed(DialFailedEvent {
-                                peer_id,
+                            warn!(peer = %ctx.peer_id, addr = %destination, error = %err, "bare dial failed");
+                            let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
+                                peer_id: ctx.peer_id,
                                 ip: dial_ip,
                             }));
                         }
@@ -299,50 +262,20 @@ impl PeerEntry {
                     continue;
                 };
                 let destination = SocketAddr::new(dial_ip, h3_endpoint.port);
-                let tun_mtu = mtu as u16;
                 let peer_h3 = h3.clone();
                 let ingress_tx = ingress_tx.clone();
-                let udp_handle = udp_handle.clone();
-                let crypto_handle = crypto_handle.clone();
 
-                // H3 dial runs on the orchestrator's main runtime (lightweight
-                // coordinator); dial_h3_client internally places UDP actors on
-                // udp_rt and engine on crypto_rt.
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
-                    match dial_h3_client(
-                        &peer_h3,
-                        destination,
-                        &peer_id,
-                        Some(&tun_if),
-                        tun_mtu,
-                        &probe,
-                        &tuning,
-                        &udp_handle,
-                        &crypto_handle,
-                        ingress_tx,
-                        events_tx.clone(),
-                    )
-                    .await
-                    {
-                        Ok(client_conn) => {
-                            info!(peer = %client_conn.peer_id, addr = %client_conn.remote_addr, "H3 connected");
-                            let _ = events_tx.send(Event::H3v2Connected(H3v2ConnectedEvent {
-                                peer_id: client_conn.peer_id,
-                                remote_addr: client_conn.remote_addr,
-                                tx: client_conn.tx,
-                                direction: ConnectionDirection::Outbound,
-                                handles: vec![
-                                    client_conn.engine_handle,
-                                    client_conn.udp_rx_handle,
-                                    client_conn.udp_tx_handle,
-                                ],
-                            }));
+                    match dial_h3_client(&peer_h3, destination, &ctx, &probe, ingress_tx).await {
+                        Ok(event) => {
+                            info!(peer = %event.peer_id, addr = %event.remote_addr, "H3 connected");
+                            let _ = ctx.events_tx.send(Event::H3v2Connected(event));
                         }
                         Err(e) => {
-                            warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
-                            let _ = events_tx.send(Event::DialFailed(DialFailedEvent {
-                                peer_id,
+                            warn!(peer = %ctx.peer_id, addr = %destination, error = %e, "H3 dial failed");
+                            let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
+                                peer_id: ctx.peer_id,
                                 ip: dial_ip,
                             }));
                         }
@@ -417,7 +350,7 @@ pub struct Orchestrator {
 
     // Runtime state
     tun_if: String,
-    mtu: usize,
+    tun_mtu: usize,
     /// Tuning parameters from config.
     tuning: Tuning,
     /// Unified peer state: config + active bound.
@@ -426,7 +359,7 @@ pub struct Orchestrator {
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
     /// H3v2 listener command sender (if listening).
-    h3_listener_cmd_tx: Option<mpsc::UnboundedSender<H3v2ListenerCommand>>,
+    h3_listener_cmd_tx: Option<mpsc::UnboundedSender<DispatcherCommand>>,
 
     /// DNS resolver command sender for SetHostnames.
     dns_cmd_tx: mpsc::UnboundedSender<DnsCommand>,
@@ -489,7 +422,7 @@ impl Orchestrator {
                 })
                 .collect::<HashMap<_, _>>();
 
-            if let Err(e) = cmd_tx.send(H3v2ListenerCommand::UpdatePeerTokens(tokens)) {
+            if let Err(e) = cmd_tx.send(DispatcherCommand::UpdatePeerTokens(tokens)) {
                 warn!(error = %e, "failed to send peer tokens update to h3_listener actor");
             }
         }
@@ -556,7 +489,7 @@ impl Orchestrator {
     pub async fn new(config: Config) -> Result<Self, OrchestratorError> {
         let tuning = &config.tuning;
         let tun_if = config.local.tun.ifname.clone();
-        let mtu = config.local.tun.mtu as usize;
+        let tun_mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
 
         // Create dedicated current_thread runtimes for data-plane actors.
@@ -642,35 +575,18 @@ impl Orchestrator {
         let bare_rx_cmd_tx = if let Some(ref local_bare) = config.local.bare {
             let listen_addr = resolve_listen_addr(&local_bare.listen.host, local_bare.listen.port)?;
 
-            // Create listen socket and generic UDP RX actor on UDP runtime.
-            let udp_rx = {
-                let _guard = udp_rt.handle().enter();
-                let socket = make_server_udp_socket(listen_addr, tuning.socket_buffer_bytes())
-                    .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
-                let (udp_rx, _udp_tx) = udp::make_udp(socket, mtu, tuning.udp_enable_offload)
-                    .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
-                // _udp_tx dropped: per-peer TX sockets created in try_connect.
-                udp_rx
-            };
+            let udp_rx = make_bare_rx(listen_addr, tun_mtu, tuning, udp_rt.handle())
+                .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
 
-            let (udp_output_tx, udp_output_rx) =
-                mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
-
-            let udp_rx_handle = {
-                let _guard = udp_rt.handle().enter();
-                udp::spawn_udp_rx(udp_rx, udp_output_tx)
-            };
-
-            let (cmd_tx, bare_rx_handle) = {
-                let _guard = crypto_rt.handle().enter();
-                spawn_bare_rx(
-                    udp_output_rx,
-                    HashSet::new(),
-                    ingress_tx.clone(),
-                    events_tx.clone(),
-                    tuning.metrics_push_interval,
-                )
-            };
+            let (cmd_tx, bare_rx_handle, udp_rx_handle) = spawn_bare_rx(
+                udp_rx,
+                HashSet::new(),
+                ingress_tx.clone(),
+                events_tx.clone(),
+                tuning,
+                udp_rt.handle(),
+                crypto_rt.handle(),
+            );
 
             join_set.spawn(udp_rx_handle);
             join_set.spawn(bare_rx_handle);
@@ -679,30 +595,36 @@ impl Orchestrator {
             None
         };
 
-        // Initialize H3v2 listener if configured (dispatcher on crypto_rt, UDP I/O on udp_rt)
+        // Initialize H3 dispatcher if configured (dispatcher on crypto_rt, UDP I/O on udp_rt)
         let h3_listener_cmd_tx = if let Some(ref h3_cfg) = config.local.h3 {
             let listen_addr = resolve_listen_addr(&h3_cfg.listen.host, h3_cfg.listen.port)?;
             let cert_path = Path::new(&h3_cfg.cert);
             let key_path = Path::new(&h3_cfg.key);
 
-            // make: fallible I/O (socket bind, TLS config)
-            let listener = make_h3v2_listener(listen_addr, cert_path, key_path, mtu as u16, tuning)
-                .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
-
-            // spawn: infallible task creation; listener sends events through events_tx
-            // Initial peer tokens are empty; sync_peers_to_actors() populates them
-            // immediately after construction.
-            let (cmd_tx, listener_handle, _bound_addr) = spawn_h3v2_listener(
-                listener,
-                HashMap::new(),
+            // make: fallible I/O (socket bind, TLS config, UDP actor setup)
+            let (dispatcher, _bound_addr) = make_h3_dispatcher(
+                listen_addr,
+                cert_path,
+                key_path,
+                tun_mtu as u16,
                 tuning,
                 udp_rt.handle(),
-                crypto_rt.handle(),
                 ingress_tx.clone(),
                 events_tx.clone(),
+            )
+            .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
+
+            // spawn: infallible task creation
+            // Initial peer tokens are empty; sync_peers_to_actors() populates them
+            // immediately after construction.
+            let (cmd_tx, dispatcher_handle, _) = spawn_h3_dispatcher(
+                dispatcher,
+                HashMap::new(),
+                udp_rt.handle(),
+                crypto_rt.handle(),
             );
 
-            join_set.spawn(listener_handle);
+            join_set.spawn(dispatcher_handle);
             Some(cmd_tx)
         } else {
             None
@@ -755,10 +677,10 @@ impl Orchestrator {
         if let Some(ref local_api) = config.local.api {
             let api_listen_addr =
                 resolve_listen_addr(&local_api.listen.host, local_api.listen.port)?;
-            let api_listener = crate::api::make_api(api_listen_addr)
+            let api_listener = api::make_api(api_listen_addr)
                 .await
                 .map_err(|e| OrchestratorError::ApiInit(e.to_string()))?;
-            let api_handle = crate::api::spawn_api(
+            let api_handle = api::spawn_api(
                 api_listener,
                 local_api.listen.path.clone(),
                 events_tx.clone(),
@@ -771,7 +693,7 @@ impl Orchestrator {
             events_tx,
             join_set,
             tun_if,
-            mtu,
+            tun_mtu,
             tuning: config.tuning,
             peers,
             router_cmd_tx,
@@ -892,7 +814,7 @@ impl Orchestrator {
             entry.try_connect(
                 &self.events_tx,
                 &self.tun_if,
-                self.mtu,
+                self.tun_mtu,
                 &self.tuning,
                 &udp_handle,
                 &crypto_handle,
@@ -1043,7 +965,7 @@ impl Orchestrator {
                 // Deprecated: old h3.rs path no longer used in production.
                 // Kept for compilation compatibility while h3.rs exists.
                 warn!(
-                    direction = ?event.direction,
+                    origin = ?event.origin,
                     "received old-style H3Connected event (h3.rs path); ignoring"
                 );
             }
@@ -1080,7 +1002,7 @@ impl Orchestrator {
             entry.try_connect(
                 &self.events_tx,
                 &self.tun_if,
-                self.mtu,
+                self.tun_mtu,
                 &self.tuning,
                 &udp_handle,
                 &crypto_handle,
@@ -1184,23 +1106,23 @@ impl Orchestrator {
             peer_id,
             remote_addr,
             tx,
-            direction,
+            origin,
             handles,
         } = event;
 
         let Some(entry) = self.peers.get(&peer_id) else {
-            warn!(peer = %peer_id, addr = %remote_addr, direction = ?direction, "H3v2 connection from unknown peer");
+            warn!(peer = %peer_id, addr = %remote_addr, origin = ?origin, "H3v2 connection from unknown peer");
             return;
         };
 
-        let endpoint = match direction {
-            ConnectionDirection::Outbound => entry
+        let endpoint = match origin {
+            ConnOrigin::Client => entry
                 .config
                 .h3
                 .as_ref()
                 .and_then(|h3| h3.endpoint.as_ref())
                 .map(|ep| Endpoint::H3(ep.clone())),
-            ConnectionDirection::Inbound => None,
+            ConnOrigin::Server => None,
         };
 
         for handle in handles {
@@ -1272,6 +1194,7 @@ fn collect_hostnames(peers: &[Peer]) -> HashSet<String> {
 #[cfg(test)]
 mod test_support {
     use super::*;
+    use crate::config::{default_mtu, LocalDns, LocalTun};
 
     /// Test-only builder for creating an Orchestrator with injected dependencies.
     ///
@@ -1279,16 +1202,16 @@ mod test_support {
     /// to enable isolated unit testing of event handling logic.
     pub struct TestableOrchestratorBuilder {
         tun_if: String,
-        mtu: usize,
+        tun_mtu: usize,
         peers: HashMap<String, PeerEntry>,
-        local: Option<crate::config::Local>,
+        local: Option<Local>,
     }
 
     impl Default for TestableOrchestratorBuilder {
         fn default() -> Self {
             Self {
                 tun_if: "test0".to_string(),
-                mtu: crate::config::default_mtu() as usize,
+                tun_mtu: default_mtu() as usize,
                 peers: HashMap::new(),
                 local: None,
             }
@@ -1303,7 +1226,7 @@ mod test_support {
         pub bare_rx_cmd_rx: mpsc::UnboundedReceiver<BareUdpRxCommand>,
         pub dns_cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
         pub route_cmd_rx: mpsc::UnboundedReceiver<RouteCommand>,
-        pub h3_listener_cmd_rx: mpsc::UnboundedReceiver<H3v2ListenerCommand>,
+        pub h3_listener_cmd_rx: mpsc::UnboundedReceiver<DispatcherCommand>,
     }
 
     impl TestableOrchestratorBuilder {
@@ -1347,17 +1270,17 @@ mod test_support {
             self
         }
 
-        fn default_local() -> crate::config::Local {
-            crate::config::Local {
+        fn default_local() -> Local {
+            Local {
                 table: false,
-                dns: crate::config::LocalDns {
+                dns: LocalDns {
                     server: "1.1.1.1:53".parse().unwrap(),
                     bindif: None,
                 },
                 h3: None,
                 bare: None,
                 api: None,
-                tun: crate::config::LocalTun {
+                tun: LocalTun {
                     ifname: "test0".to_string(),
                     addrs: vec!["192.168.180.1/32".parse().unwrap()],
                     mtu: 1393,
@@ -1386,7 +1309,7 @@ mod test_support {
                 events_tx: events_tx.clone(),
                 join_set: JoinSet::new(),
                 tun_if: self.tun_if,
-                mtu: self.mtu,
+                tun_mtu: self.tun_mtu,
                 tuning: Tuning::default(),
                 peers: self.peers,
                 router_cmd_tx,
@@ -1422,15 +1345,14 @@ mod test_support {
 mod tests {
     use super::test_support::TestableOrchestratorBuilder;
     use super::*;
-    use crate::config::{PeerBare, PeerTun};
+    use crate::config::{PeerBare, PeerH3, PeerTun, UdpEndpoint};
     use crate::events::DnsEvent;
-    use crate::metrics::{Direction, Labels, Metrics, Source, Stats};
+    use crate::metrics::{Direction, Labels, Metrics, PktCounters, Source, Stats};
 
     // ========== PeerEntry unit tests ==========
 
     /// Helper to create test peers with BareUDP configuration.
     fn bare_peer(id: &str, allowed: &[&str]) -> Peer {
-        use crate::config::UdpEndpoint;
         Peer {
             id: id.to_string(),
 
@@ -1450,7 +1372,6 @@ mod tests {
 
     /// Helper to create test peers with BareUDP configuration at a specific hostname.
     fn bare_peer_at_host(id: &str, hostname: &str, port: u16, allowed: &[&str]) -> Peer {
-        use crate::config::UdpEndpoint;
         Peer {
             id: id.to_string(),
 
@@ -1483,7 +1404,6 @@ mod tests {
     #[test]
     fn orchestrator_error_includes_actor_context() {
         // Verify that OrchestratorError::ActorError includes actor context
-        use crate::actor::ActorError;
         use std::io;
 
         let actor_err = ActorError::TunRxRecv {
@@ -1649,7 +1569,7 @@ mod tests {
                 remote_addr: None,
             },
             stats: Stats {
-                succeeded: crate::metrics::PktCounters {
+                succeeded: PktCounters {
                     packets: 42,
                     ..Default::default()
                 },
@@ -1677,7 +1597,7 @@ mod tests {
                 remote_addr: Some(remote_addr),
             },
             stats: Stats {
-                succeeded: crate::metrics::PktCounters {
+                succeeded: PktCounters {
                     packets,
                     ..Default::default()
                 },
@@ -1708,7 +1628,7 @@ mod tests {
 
         let snapshot = reply_rx.await.expect("should receive metrics snapshot");
         assert_eq!(snapshot.len(), 2);
-        let text = crate::api::encode_metrics_snapshot(snapshot);
+        let text = api::encode_metrics_snapshot(snapshot);
         assert!(
             text.contains("h3llo_transport_packets_total"),
             "missing packets metric: {text}"
@@ -2063,7 +1983,7 @@ mod tests {
 
     /// Helper to create test peers with H3 configuration at a specific host.
     fn h3_peer_at_host(id: &str, host: &str, port: u16, allowed: &[&str]) -> Peer {
-        use crate::config::{H3Endpoint, PeerH3};
+        use crate::config::H3Endpoint;
         Peer {
             id: id.to_string(),
 
@@ -2266,7 +2186,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_bare_connection_rejects_unknown_peer() {
-        use crate::config::UdpEndpoint;
         let (mut orch, _handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![])
             .build();
@@ -2293,7 +2212,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_bare_connection_appends_second_bound() {
-        use crate::config::UdpEndpoint;
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
         let (existing_tx, _existing_rx) = mpsc::channel(1);
 
@@ -2334,7 +2252,6 @@ mod tests {
 
     #[tokio::test]
     async fn handle_bare_connection_sets_bound_and_updates_routing() {
-        use crate::config::UdpEndpoint;
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
 
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
@@ -2732,7 +2649,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         orch.update_bound(
             "peer1",
-            Some(Endpoint::Udp(crate::config::UdpEndpoint {
+            Some(Endpoint::Udp(UdpEndpoint {
                 host: "example.com".to_string(),
                 port: 5353,
             })),
@@ -2772,7 +2689,7 @@ mod tests {
     async fn api_get_config_returns_snapshot() {
         let peer = Peer {
             id: "peer-1".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
@@ -2804,7 +2721,7 @@ mod tests {
 
         let new_peer = Peer {
             id: "new-peer".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
@@ -2858,7 +2775,7 @@ mod tests {
     async fn api_delete_config_removes_peer() {
         let peer = Peer {
             id: "peer-1".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
@@ -2890,7 +2807,7 @@ mod tests {
     async fn api_delete_config_ignores_unknown_ids() {
         let peer = Peer {
             id: "keeper".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
@@ -2925,7 +2842,7 @@ mod tests {
 
         let peer = Peer {
             id: "h3-peer".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "secure-token-12ch".to_string(),
                 bindif: None,
@@ -2943,7 +2860,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("H3 listener should receive UpdatePeerTokens");
-        let H3v2ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens.get("h3-peer").unwrap(), "secure-token-12ch");
     }
@@ -2952,7 +2869,7 @@ mod tests {
     async fn api_delete_config_sends_h3_token_update() {
         let peer = Peer {
             id: "h3-peer".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "secure-token-12ch".to_string(),
                 bindif: None,
@@ -2973,7 +2890,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("H3 listener should receive UpdatePeerTokens after delete");
-        let H3v2ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
         assert!(
             tokens.is_empty(),
             "tokens should be empty after removing the only H3 peer"
@@ -2984,7 +2901,7 @@ mod tests {
     async fn api_delete_config_no_h3_update_when_unchanged() {
         let peer = Peer {
             id: "keeper".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch1".to_string(),
                 bindif: None,
@@ -3012,7 +2929,7 @@ mod tests {
     async fn api_post_config_h3_tokens_exclude_bare_peers() {
         let h3_peer = Peer {
             id: "h3-peer".to_string(),
-            h3: Some(crate::config::PeerH3 {
+            h3: Some(PeerH3 {
                 endpoint: None,
                 token: "h3-token-12chars1".to_string(),
                 bindif: None,
@@ -3035,7 +2952,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("should receive UpdatePeerTokens");
-        let H3v2ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
         assert_eq!(tokens.len(), 1, "only H3 peers should be included");
         assert!(tokens.contains_key("h3-peer"));
         assert!(!tokens.contains_key("bare-peer"));

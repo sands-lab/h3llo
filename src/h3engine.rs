@@ -9,7 +9,7 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::Tuning;
-use crate::events::Event;
+use crate::events::{ConnOrigin, Event};
 use crate::h3session::{
     ConnectIpDatagramCodec, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT,
 };
@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 // ========== Configuration Helpers ==========
@@ -220,13 +221,6 @@ pub(crate) fn reset_timer(timer: std::pin::Pin<&mut time::Sleep>, conn: &quiche:
 
 // ========== H3 Engine (unified client/server) ==========
 
-/// Discriminates client vs. server engine for error reporting.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum EngineRole {
-    Client,
-    Server,
-}
-
 /// Channels owned by the engine actor.
 pub(crate) struct EngineIo {
     pub(crate) udp_recv_rx: mpsc::Receiver<(SocketAddr, Vec<PooledBuf>)>,
@@ -255,15 +249,6 @@ impl EngineMeta {
             to: self.local_addr,
         }
     }
-
-    pub(crate) fn actor_error(&self, role: EngineRole, reason: impl Into<String>) -> ActorError {
-        let peer_id = self.peer_id.clone();
-        let reason = reason.into();
-        match role {
-            EngineRole::Client => ActorError::H3Client { peer_id, reason },
-            EngineRole::Server => ActorError::H3Server { peer_id, reason },
-        }
-    }
 }
 
 /// Exit reason for the established-phase event loop.
@@ -286,10 +271,14 @@ impl LoopExit {
         }
     }
 
-    pub(crate) fn into_result(self, meta: &EngineMeta, role: EngineRole) -> ActorExitResult {
+    pub(crate) fn into_result(self, meta: &EngineMeta, origin: ConnOrigin) -> ActorExitResult {
         match self {
             Self::Ok(_) => Ok(()),
-            Self::Err { reason, .. } => Err(meta.actor_error(role, reason)),
+            Self::Err { reason, .. } => Err(ActorError::H3Engine {
+                origin,
+                peer_id: meta.peer_id.clone(),
+                reason,
+            }),
         }
     }
 }
@@ -340,7 +329,13 @@ pub(crate) struct H3Engine {
 
     pub(crate) metrics_interval: Duration,
     pub(crate) keepalive_interval: Duration,
-    pub(crate) role: EngineRole,
+    pub(crate) origin: ConnOrigin,
+
+    /// Cancels associated UDP actors when the engine finishes.
+    ///
+    /// `None` for server-side engines where UDP actors are shared
+    /// across all connections by the dispatcher.
+    pub(crate) udp_cancel: Option<CancellationToken>,
 }
 
 impl H3Engine {
@@ -378,7 +373,8 @@ impl H3Engine {
             mut run_state,
             metrics_interval,
             keepalive_interval,
-            role,
+            origin,
+            udp_cancel: _udp_cancel,
         } = self;
         let mut session = session.expect("session present after establish/accept");
 
@@ -520,7 +516,13 @@ impl H3Engine {
         if !batch.is_empty() {
             let _ = udp_send_tx.send((meta.remote_addr, batch)).await;
         }
-        exit.into_result(&meta, role)
+        // Cancel the RX actor, which blocks on socket.readable().
+        // TX actor exits naturally when udp_send_tx is dropped at
+        // function return, draining any remaining batches first.
+        if let Some(token) = _udp_cancel {
+            token.cancel();
+        }
+        exit.into_result(&meta, origin)
     }
 }
 
@@ -572,7 +574,7 @@ mod tests {
     #[test]
     fn loop_exit_into_result_ok() {
         let exit = LoopExit::Ok(b"graceful");
-        assert!(exit.into_result(&test_meta(), EngineRole::Client).is_ok());
+        assert!(exit.into_result(&test_meta(), ConnOrigin::Client).is_ok());
     }
 
     #[test]
@@ -582,11 +584,13 @@ mod tests {
             reason: "QUIC connection closed".into(),
         };
         let err = exit
-            .into_result(&test_meta(), EngineRole::Client)
+            .into_result(&test_meta(), ConnOrigin::Client)
             .unwrap_err();
-        assert!(matches!(&err, ActorError::H3Client { peer_id, reason }
-            if peer_id == "peer-x" && reason == "QUIC connection closed"
-        ));
+        assert!(
+            matches!(&err, ActorError::H3Engine { origin: ConnOrigin::Client, peer_id, reason }
+                if peer_id == "peer-x" && reason == "QUIC connection closed"
+            )
+        );
         assert_eq!(err.kind(), ActorKind::Restartable);
     }
 
@@ -597,11 +601,13 @@ mod tests {
             reason: "auth failed".into(),
         };
         let err = exit
-            .into_result(&test_meta(), EngineRole::Server)
+            .into_result(&test_meta(), ConnOrigin::Server)
             .unwrap_err();
-        assert!(matches!(&err, ActorError::H3Server { peer_id, reason }
-            if peer_id == "peer-x" && reason == "auth failed"
-        ));
+        assert!(
+            matches!(&err, ActorError::H3Engine { origin: ConnOrigin::Server, peer_id, reason }
+                if peer_id == "peer-x" && reason == "auth failed"
+            )
+        );
         assert_eq!(err.kind(), ActorKind::Restartable);
     }
 
@@ -611,26 +617,6 @@ mod tests {
         let info = meta.recv_info();
         assert_eq!(info.from, meta.remote_addr);
         assert_eq!(info.to, meta.local_addr);
-    }
-
-    #[test]
-    fn engine_meta_actor_error_client() {
-        let meta = test_meta();
-        let err = meta.actor_error(EngineRole::Client, "connection reset");
-        assert!(matches!(&err, ActorError::H3Client { peer_id, reason }
-            if peer_id == "peer-x" && reason == "connection reset"
-        ));
-        assert_eq!(err.kind(), ActorKind::Restartable);
-    }
-
-    #[test]
-    fn engine_meta_actor_error_server() {
-        let meta = test_meta();
-        let err = meta.actor_error(EngineRole::Server, "auth failed");
-        assert!(matches!(&err, ActorError::H3Server { peer_id, reason }
-            if peer_id == "peer-x" && reason == "auth failed"
-        ));
-        assert_eq!(err.kind(), ActorKind::Restartable);
     }
 
     #[test]

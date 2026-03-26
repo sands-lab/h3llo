@@ -6,8 +6,7 @@ use tracing::warn;
 
 use std::collections::HashSet;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
-use tokio::net::UdpSocket;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 
 #[cfg(target_os = "windows")]
 use std::ffi::CStr;
@@ -89,8 +88,7 @@ pub fn make_udp_socket_raw(
         socket.bind(&addr.into())?;
     }
 
-    let udp = UdpSocket::from_std(socket.into())?;
-    Ok(udp)
+    Ok(socket.into())
 }
 
 /// Creates a UDP socket for receiving packets on a listen address.
@@ -200,7 +198,6 @@ pub async fn make_client_udp_socket<P: RouteProbe>(
 
     socket
         .connect(target)
-        .await
         .map_err(|e| UdpError::Socket(format!("connect to {}: {}", target, e)))?;
 
     Ok(socket)
@@ -818,11 +815,9 @@ mod tests {
     }
 
     // ========== make_udp_socket_raw Tests ==========
-    // Note: These tests use #[tokio::test] even though they don't call async functions.
-    // This is because `UdpSocket::from_std()` requires a tokio runtime to be present.
 
-    #[tokio::test]
-    async fn make_udp_socket_raw_with_none_bind_addr() {
+    #[test]
+    fn make_udp_socket_raw_with_none_bind_addr() {
         let socket = make_udp_socket_raw(Domain::IPV4, None, None, 0);
         assert!(
             socket.is_ok(),
@@ -830,8 +825,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn make_udp_socket_raw_with_ipv4_domain() {
+    #[test]
+    fn make_udp_socket_raw_with_ipv4_domain() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let socket = make_udp_socket_raw(Domain::IPV4, Some(addr), None, 0);
         assert!(
@@ -844,8 +839,8 @@ mod tests {
         assert!(local.is_ipv4());
     }
 
-    #[tokio::test]
-    async fn make_udp_socket_raw_with_ipv6_domain() {
+    #[test]
+    fn make_udp_socket_raw_with_ipv6_domain() {
         let addr: SocketAddr = "[::]:0".parse().unwrap();
         let result = make_udp_socket_raw(Domain::IPV6, Some(addr), None, 0);
         // May fail on systems without IPv6, which is acceptable
@@ -855,11 +850,9 @@ mod tests {
     }
 
     // ========== make_server_udp_socket Tests ==========
-    // Note: These tests use #[tokio::test] even though they don't call async functions.
-    // This is because `UdpSocket::from_std()` requires a tokio runtime to be present.
 
-    #[tokio::test]
-    async fn make_server_udp_socket_binds_to_address() {
+    #[test]
+    fn make_server_udp_socket_binds_to_address() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let socket = make_server_udp_socket(addr, 0);
         assert!(socket.is_ok(), "make_server_udp_socket should succeed");
@@ -870,8 +863,8 @@ mod tests {
         assert_ne!(local.port(), 0, "port should be assigned");
     }
 
-    #[tokio::test]
-    async fn make_server_udp_socket_ipv6() {
+    #[test]
+    fn make_server_udp_socket_ipv6() {
         // This test may pass without assertions on systems without IPv6.
         // The important behavior is that it doesn't panic.
         let addr: SocketAddr = "[::]:0".parse().unwrap();
