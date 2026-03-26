@@ -6,7 +6,7 @@
 use crate::auth::generate_bearer_auth;
 use crate::bind::{make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
-use crate::events::{ConnectionDirection, Event, H3v2ConnectedEvent};
+use crate::events::{ConnectionDirection, DialContext, H3v2ConnectedEvent};
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, EngineRole,
     H3Engine, RunState,
@@ -19,7 +19,6 @@ use rand::Rng;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
@@ -225,20 +224,22 @@ fn make_client_quiche_config(
 ///
 /// On success, returns [`H3v2ConnectedEvent`] with direction `Outbound`.
 /// The caller is responsible for sending the event and handling errors.
-#[allow(clippy::too_many_arguments)]
 pub async fn dial_h3_client<P: RouteProbe>(
     peer_h3: &PeerH3,
     remote_addr: SocketAddr,
-    peer_id: &str,
-    tun_if: Option<&str>,
-    tun_mtu: u16,
+    ctx: &DialContext,
     probe: &P,
-    tuning: &Tuning,
-    udp_rt: &RuntimeHandle,
-    crypto_rt: &RuntimeHandle,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-    events_tx: mpsc::UnboundedSender<Event>,
 ) -> Result<H3v2ConnectedEvent, DialError> {
+    let DialContext {
+        peer_id,
+        tun_if,
+        tun_mtu,
+        tuning,
+        udp_rt,
+        crypto_rt,
+        events_tx,
+    } = ctx;
     let endpoint = peer_h3
         .endpoint
         .as_ref()
@@ -258,7 +259,7 @@ pub async fn dial_h3_client<P: RouteProbe>(
     // Create unconnected UDP socket, then register and spawn actors on udp_rt.
     let std_socket = make_unbound_udp_socket(
         remote_addr,
-        tun_if,
+        Some(tun_if.as_str()),
         peer_h3.bindif.as_deref(),
         probe,
         tuning.socket_buffer_bytes(),
@@ -276,7 +277,7 @@ pub async fn dial_h3_client<P: RouteProbe>(
         let local_addr = socket
             .local_addr()
             .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
-        let max_udp_payload = tun_mtu as usize + CONNECT_IP_OVERHEAD;
+        let max_udp_payload = *tun_mtu + CONNECT_IP_OVERHEAD;
         let (udp_rx, udp_tx) = udp::make_udp(socket, max_udp_payload, tuning.udp_enable_offload)
             .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
         let (udp_recv_tx, udp_recv_rx) =
@@ -425,7 +426,7 @@ mod tests {
             let (cmd_tx, handle, bound_addr) = spawn_h3_listener(
                 listener,
                 peer_tokens,
-                default_mtu(),
+                default_mtu().into(),
                 events_tx,
                 &Tuning::default(),
             );
@@ -456,22 +457,19 @@ mod tests {
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-
-        let event = dial_h3_client(
-            &peer_h3,
-            bound_addr,
-            peer_id,
-            None,
-            default_mtu(),
-            &probe,
-            &tuning,
-            &tokio::runtime::Handle::current(),
-            &tokio::runtime::Handle::current(),
-            ingress_tx,
+        let ctx = crate::events::DialContext {
+            peer_id: peer_id.to_string(),
+            tun_if: String::new(),
+            tun_mtu: default_mtu().into(),
+            tuning,
+            udp_rt: tokio::runtime::Handle::current(),
+            crypto_rt: tokio::runtime::Handle::current(),
             events_tx,
-        )
-        .await
-        .expect("dial_h3_client failed");
+        };
+
+        let event = dial_h3_client(&peer_h3, bound_addr, &ctx, &probe, ingress_tx)
+            .await
+            .expect("dial_h3_client failed");
 
         (event, ingress_rx)
     }
@@ -515,20 +513,17 @@ mod tests {
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let result = dial_h3_client(
-            &peer_h3,
-            server.bound_addr,
-            peer_id,
-            None,
-            default_mtu(),
-            &probe,
-            &tuning,
-            &tokio::runtime::Handle::current(),
-            &tokio::runtime::Handle::current(),
-            ingress_tx,
+        let ctx = crate::events::DialContext {
+            peer_id: peer_id.to_string(),
+            tun_if: String::new(),
+            tun_mtu: default_mtu().into(),
+            tuning,
+            udp_rt: tokio::runtime::Handle::current(),
+            crypto_rt: tokio::runtime::Handle::current(),
             events_tx,
-        )
-        .await;
+        };
+
+        let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
 
         assert!(
             matches!(result, Err(DialError::Rejected(_))),

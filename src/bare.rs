@@ -92,6 +92,60 @@ pub fn spawn_bare_rx(
 
 /// Spawns a BareUDP transmit adapter actor.
 ///
+/// Creates a BareUDP outbound TX path: socket → UDP TX actor → bare TX actor.
+///
+/// Returns a [`BareConnectedEvent`] on success. The caller is responsible
+/// for sending the event and handling errors.
+///
+/// `ctx.udp_rt` is used for socket registration and the UDP TX actor;
+/// `ctx.crypto_rt` is used for the bare TX adapter actor.
+pub async fn dial_bare_tx<P: crate::bind::RouteProbe>(
+    endpoint: crate::config::UdpEndpoint,
+    destination: SocketAddr,
+    ctx: &crate::events::DialContext,
+    probe: &P,
+    bindif: Option<&str>,
+) -> Result<crate::events::BareConnectedEvent, crate::bind::UdpError> {
+    let std_socket = crate::bind::make_unbound_udp_socket(
+        destination,
+        Some(ctx.tun_if.as_str()),
+        bindif,
+        probe,
+        ctx.tuning.socket_buffer_bytes(),
+    )
+    .await?;
+
+    let (udp_send_tx, udp_tx_handle) = {
+        let _guard = ctx.udp_rt.enter();
+        let socket = tokio::net::UdpSocket::from_std(std_socket)
+            .map_err(|e| crate::bind::UdpError::Socket(e.to_string()))?;
+        let (_rx, tx) = crate::udp::make_udp(socket, ctx.tun_mtu, ctx.tuning.udp_enable_offload)?;
+        crate::udp::spawn_udp_tx(tx, ctx.tuning.packet_queue_depth)
+    };
+    let (egress_tx, bare_tx_handle) = {
+        let _guard = ctx.crypto_rt.enter();
+        spawn_bare_tx(
+            udp_send_tx,
+            destination,
+            ctx.peer_id.clone(),
+            ctx.events_tx.clone(),
+            ctx.tuning.metrics_push_interval,
+            ctx.tuning.packet_queue_depth,
+        )
+    };
+
+    Ok(crate::events::BareConnectedEvent {
+        peer_id: ctx.peer_id.clone(),
+        endpoint: crate::events::Endpoint::Udp(endpoint),
+        dest: destination,
+        tx: egress_tx,
+        tx_handle: bare_tx_handle,
+        udp_tx_handle,
+    })
+}
+
+/// Spawns the BareUDP destination-stamping transmit actor.
+///
 /// Receives `Vec<PooledBuf>` from the router, stamps each batch with the
 /// peer's destination address, and forwards to the UDP TX actor.
 /// Records metrics after successful channel send to avoid inflating

@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use crate::actor::ActorExitResult;
-use crate::config::{Config, H3Endpoint, Peer, UdpEndpoint};
+use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
 use crate::h3::H3Connection;
 use crate::metrics::{Labels, Metrics};
+use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_quiche::buf_factory::PooledBuf;
@@ -21,6 +22,27 @@ pub enum Endpoint {
     Udp(UdpEndpoint),
     /// HTTP/3 endpoint (host:port/path).
     H3(H3Endpoint),
+}
+
+/// Common parameters for outbound dial operations.
+///
+/// Shared by [`crate::h3dialer::dial_h3_client`] and
+/// [`crate::bare::dial_bare_tx`] to avoid parameter duplication.
+pub struct DialContext {
+    /// Peer identifier from configuration.
+    pub peer_id: String,
+    /// TUN interface name (for route-probe exclusion).
+    pub tun_if: String,
+    /// TUN MTU in bytes.
+    pub tun_mtu: usize,
+    /// Tuning parameters (timeouts, buffers, congestion control).
+    pub tuning: Tuning,
+    /// Runtime handle for UDP I/O actors.
+    pub udp_rt: RuntimeHandle,
+    /// Runtime handle for crypto / protocol actors.
+    pub crypto_rt: RuntimeHandle,
+    /// Channel for emitting events back to the orchestrator.
+    pub events_tx: mpsc::UnboundedSender<Event>,
 }
 
 /// Indicates connection establishment direction.

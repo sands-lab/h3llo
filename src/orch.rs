@@ -1,13 +1,13 @@
 //! Runtime orchestration for BareUDP and HTTP/3 transports.
 
 use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
-use crate::bare::{spawn_bare_rx, spawn_bare_tx, BareUdpRxCommand};
-use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, DefaultRouteProbe};
+use crate::bare::{dial_bare_tx, spawn_bare_rx, BareUdpRxCommand};
+use crate::bind::{make_server_udp_socket, DefaultRouteProbe};
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
-    ApiEvent, BareConnectedEvent, ConnectionDirection, DialFailedEvent, DnsEvent, Endpoint, Event,
-    H3v2ConnectedEvent,
+    ApiEvent, BareConnectedEvent, ConnectionDirection, DialContext, DialFailedEvent, DnsEvent,
+    Endpoint, Event, H3v2ConnectedEvent,
 };
 use crate::h3dialer::dial_h3_client;
 use crate::h3listener::{make_h3v2_listener, spawn_h3v2_listener, H3v2ListenerCommand};
@@ -182,7 +182,7 @@ impl PeerEntry {
         &mut self,
         events_tx: &mpsc::UnboundedSender<Event>,
         tun_if: &str,
-        mtu: usize,
+        tun_mtu: usize,
         tuning: &Tuning,
         udp_handle: &Handle,
         crypto_handle: &Handle,
@@ -226,72 +226,32 @@ impl PeerEntry {
                 .or_insert_with(DialState::new_in_flight);
             info!(peer = %self.config.id, ip = %ip, attempt, "dialing peer");
 
-            // Common bindings for the spawned task (only one branch runs).
-            let events_tx = events_tx.clone();
-            let tun_if = tun_if.to_string();
-            let peer_id = peer_id.clone();
-            let tuning = tuning.clone();
             let dial_ip = *ip;
+            let ctx = DialContext {
+                peer_id: peer_id.clone(),
+                tun_if: tun_if.to_string(),
+                tun_mtu,
+                tuning: tuning.clone(),
+                udp_rt: udp_handle.clone(),
+                crypto_rt: crypto_handle.clone(),
+                events_tx: events_tx.clone(),
+            };
 
             if let Some(bare) = self.config.bare.as_ref() {
                 let destination = SocketAddr::new(dial_ip, bare.endpoint.port);
                 let bindif = bare.bindif.clone();
-                let endpoint = Endpoint::Udp(bare.endpoint.clone());
-                let crypto_handle_inner = crypto_handle.clone();
-
-                // Enter UDP runtime so tokio::spawn targets the UDP
-                // scheduler. Guard drops after spawn returns (sync call site).
-                let _guard = udp_handle.enter();
+                let endpoint = bare.endpoint.clone();
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
-                    match make_unbound_udp_socket(
-                        destination,
-                        Some(&tun_if),
-                        bindif.as_deref(),
-                        &probe,
-                        tuning.socket_buffer_bytes(),
-                    )
-                    .await
-                    .and_then(|s| {
-                        tokio::net::UdpSocket::from_std(s)
-                            .map_err(|e| crate::bind::UdpError::Socket(e.to_string()))
-                    }) {
-                        Ok(socket) => match udp::make_udp(socket, mtu, tuning.udp_enable_offload) {
-                            Ok((_rx, tx)) => {
-                                let (udp_send_tx, udp_tx_handle) =
-                                    udp::spawn_udp_tx(tx, tuning.packet_queue_depth);
-                                let (egress_tx, bare_tx_handle) = {
-                                    let _guard = crypto_handle_inner.enter();
-                                    spawn_bare_tx(
-                                        udp_send_tx,
-                                        destination,
-                                        peer_id.clone(),
-                                        events_tx.clone(),
-                                        tuning.metrics_push_interval,
-                                        tuning.packet_queue_depth,
-                                    )
-                                };
-                                let _ = events_tx.send(Event::BareConnected(BareConnectedEvent {
-                                    peer_id,
-                                    endpoint,
-                                    dest: destination,
-                                    tx: egress_tx,
-                                    tx_handle: bare_tx_handle,
-                                    udp_tx_handle,
-                                }));
-                            }
-                            Err(err) => {
-                                warn!(peer = %peer_id, addr = %destination, error = %err, "make_udp failed");
-                                let _ = events_tx.send(Event::DialFailed(DialFailedEvent {
-                                    peer_id,
-                                    ip: dial_ip,
-                                }));
-                            }
-                        },
+                    match dial_bare_tx(endpoint, destination, &ctx, &probe, bindif.as_deref()).await
+                    {
+                        Ok(event) => {
+                            let _ = ctx.events_tx.send(Event::BareConnected(event));
+                        }
                         Err(err) => {
-                            warn!(peer = %peer_id, addr = %destination, error = %err, "bare tx socket setup failed");
-                            let _ = events_tx.send(Event::DialFailed(DialFailedEvent {
-                                peer_id,
+                            warn!(peer = %ctx.peer_id, addr = %destination, error = %err, "bare dial failed");
+                            let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
+                                peer_id: ctx.peer_id,
                                 ip: dial_ip,
                             }));
                         }
@@ -303,40 +263,20 @@ impl PeerEntry {
                     continue;
                 };
                 let destination = SocketAddr::new(dial_ip, h3_endpoint.port);
-                let tun_mtu = mtu as u16;
                 let peer_h3 = h3.clone();
                 let ingress_tx = ingress_tx.clone();
-                let udp_handle = udp_handle.clone();
-                let crypto_handle = crypto_handle.clone();
 
-                // H3 dial runs on the orchestrator's main runtime (lightweight
-                // coordinator); dial_h3_client internally places UDP actors on
-                // udp_rt and engine on crypto_rt.
                 tokio::spawn(async move {
                     let probe = DefaultRouteProbe;
-                    match dial_h3_client(
-                        &peer_h3,
-                        destination,
-                        &peer_id,
-                        Some(&tun_if),
-                        tun_mtu,
-                        &probe,
-                        &tuning,
-                        &udp_handle,
-                        &crypto_handle,
-                        ingress_tx,
-                        events_tx.clone(),
-                    )
-                    .await
-                    {
+                    match dial_h3_client(&peer_h3, destination, &ctx, &probe, ingress_tx).await {
                         Ok(event) => {
                             info!(peer = %event.peer_id, addr = %event.remote_addr, "H3 connected");
-                            let _ = events_tx.send(Event::H3v2Connected(event));
+                            let _ = ctx.events_tx.send(Event::H3v2Connected(event));
                         }
                         Err(e) => {
-                            warn!(peer = %peer_id, addr = %destination, error = %e, "H3 dial failed");
-                            let _ = events_tx.send(Event::DialFailed(DialFailedEvent {
-                                peer_id,
+                            warn!(peer = %ctx.peer_id, addr = %destination, error = %e, "H3 dial failed");
+                            let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
+                                peer_id: ctx.peer_id,
                                 ip: dial_ip,
                             }));
                         }
@@ -411,7 +351,7 @@ pub struct Orchestrator {
 
     // Runtime state
     tun_if: String,
-    mtu: usize,
+    tun_mtu: usize,
     /// Tuning parameters from config.
     tuning: Tuning,
     /// Unified peer state: config + active bound.
@@ -550,7 +490,7 @@ impl Orchestrator {
     pub async fn new(config: Config) -> Result<Self, OrchestratorError> {
         let tuning = &config.tuning;
         let tun_if = config.local.tun.ifname.clone();
-        let mtu = config.local.tun.mtu as usize;
+        let tun_mtu = config.local.tun.mtu as usize;
         let manage_routes = config.local.table;
 
         // Create dedicated current_thread runtimes for data-plane actors.
@@ -643,7 +583,7 @@ impl Orchestrator {
                     .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
                 let socket = tokio::net::UdpSocket::from_std(socket)
                     .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
-                let (udp_rx, _udp_tx) = udp::make_udp(socket, mtu, tuning.udp_enable_offload)
+                let (udp_rx, _udp_tx) = udp::make_udp(socket, tun_mtu, tuning.udp_enable_offload)
                     .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
                 // _udp_tx dropped: per-peer TX sockets created in try_connect.
                 udp_rx
@@ -679,8 +619,9 @@ impl Orchestrator {
             let key_path = Path::new(&h3_cfg.key);
 
             // make: fallible I/O (socket bind, TLS config)
-            let listener = make_h3v2_listener(listen_addr, cert_path, key_path, mtu as u16, tuning)
-                .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
+            let listener =
+                make_h3v2_listener(listen_addr, cert_path, key_path, tun_mtu as u16, tuning)
+                    .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
 
             // spawn: infallible task creation; listener sends events through events_tx
             // Initial peer tokens are empty; sync_peers_to_actors() populates them
@@ -764,7 +705,7 @@ impl Orchestrator {
             events_tx,
             join_set,
             tun_if,
-            mtu,
+            tun_mtu,
             tuning: config.tuning,
             peers,
             router_cmd_tx,
@@ -885,7 +826,7 @@ impl Orchestrator {
             entry.try_connect(
                 &self.events_tx,
                 &self.tun_if,
-                self.mtu,
+                self.tun_mtu,
                 &self.tuning,
                 &udp_handle,
                 &crypto_handle,
@@ -1073,7 +1014,7 @@ impl Orchestrator {
             entry.try_connect(
                 &self.events_tx,
                 &self.tun_if,
-                self.mtu,
+                self.tun_mtu,
                 &self.tuning,
                 &udp_handle,
                 &crypto_handle,
@@ -1272,7 +1213,7 @@ mod test_support {
     /// to enable isolated unit testing of event handling logic.
     pub struct TestableOrchestratorBuilder {
         tun_if: String,
-        mtu: usize,
+        tun_mtu: usize,
         peers: HashMap<String, PeerEntry>,
         local: Option<crate::config::Local>,
     }
@@ -1281,7 +1222,7 @@ mod test_support {
         fn default() -> Self {
             Self {
                 tun_if: "test0".to_string(),
-                mtu: crate::config::default_mtu() as usize,
+                tun_mtu: crate::config::default_mtu() as usize,
                 peers: HashMap::new(),
                 local: None,
             }
@@ -1379,7 +1320,7 @@ mod test_support {
                 events_tx: events_tx.clone(),
                 join_set: JoinSet::new(),
                 tun_if: self.tun_if,
-                mtu: self.mtu,
+                tun_mtu: self.tun_mtu,
                 tuning: Tuning::default(),
                 peers: self.peers,
                 router_cmd_tx,
