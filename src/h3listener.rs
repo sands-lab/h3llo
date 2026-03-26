@@ -12,10 +12,9 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::validate_connect_auth;
 use crate::bind::make_server_udp_socket;
 use crate::config::Tuning;
-use crate::events::{ConnectionDirection, Event, H3v2ConnectedEvent};
+use crate::events::{ConnOrigin, Event, H3v2ConnectedEvent};
 use crate::h3engine::{
-    apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, EngineRole,
-    H3Engine, RunState,
+    apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, H3Engine, RunState,
 };
 use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
@@ -522,7 +521,7 @@ impl H3Dispatcher {
             run_state: RunState::new(),
             metrics_interval: self.conn_params.metrics_interval,
             keepalive_interval: self.conn_params.keepalive_interval,
-            role: EngineRole::Server,
+            origin: ConnOrigin::Server,
             udp_cancel: None,
         };
 
@@ -553,7 +552,7 @@ impl H3Dispatcher {
                     peer_id: engine.meta.peer_id.clone(),
                     remote_addr: remote,
                     tx: egress_tx,
-                    direction: ConnectionDirection::Inbound,
+                    origin: ConnOrigin::Server,
                     handles: Vec::new(),
                 }));
 
@@ -1151,7 +1150,7 @@ mod tests {
 
         // Verify event fields carry correct connection metadata.
         assert_eq!(event.peer_id, peer_id);
-        assert_eq!(event.direction, ConnectionDirection::Inbound);
+        assert_eq!(event.origin, ConnOrigin::Server);
 
         // Send test packet from server.
         let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));

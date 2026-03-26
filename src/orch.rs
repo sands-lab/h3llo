@@ -7,8 +7,8 @@ use crate::bind::{make_server_udp_socket, DefaultRouteProbe};
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
-    ApiEvent, BareConnectedEvent, ConnectionDirection, DialContext, DialFailedEvent, DnsEvent,
-    Endpoint, Event, H3v2ConnectedEvent,
+    ApiEvent, BareConnectedEvent, ConnOrigin, DialContext, DialFailedEvent, DnsEvent, Endpoint,
+    Event, H3v2ConnectedEvent,
 };
 use crate::h3dialer::dial_h3_client;
 use crate::h3listener::{make_h3v2_listener, spawn_h3v2_listener, H3v2ListenerCommand};
@@ -978,7 +978,7 @@ impl Orchestrator {
                 // Deprecated: old h3.rs path no longer used in production.
                 // Kept for compilation compatibility while h3.rs exists.
                 warn!(
-                    direction = ?event.direction,
+                    origin = ?event.origin,
                     "received old-style H3Connected event (h3.rs path); ignoring"
                 );
             }
@@ -1119,23 +1119,23 @@ impl Orchestrator {
             peer_id,
             remote_addr,
             tx,
-            direction,
+            origin,
             handles,
         } = event;
 
         let Some(entry) = self.peers.get(&peer_id) else {
-            warn!(peer = %peer_id, addr = %remote_addr, direction = ?direction, "H3v2 connection from unknown peer");
+            warn!(peer = %peer_id, addr = %remote_addr, origin = ?origin, "H3v2 connection from unknown peer");
             return;
         };
 
-        let endpoint = match direction {
-            ConnectionDirection::Outbound => entry
+        let endpoint = match origin {
+            ConnOrigin::Client => entry
                 .config
                 .h3
                 .as_ref()
                 .and_then(|h3| h3.endpoint.as_ref())
                 .map(|ep| Endpoint::H3(ep.clone())),
-            ConnectionDirection::Inbound => None,
+            ConnOrigin::Server => None,
         };
 
         for handle in handles {

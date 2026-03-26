@@ -5,10 +5,13 @@
 //! [`DedicatedRuntime`] for thread-per-core actor scheduling.
 
 use std::io;
+
 use thiserror::Error;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot;
 use tracing::error;
+
+use crate::events::ConnOrigin;
 
 /// Classifies actors by their supervision policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,15 +82,6 @@ pub enum ActorError {
         source: io::Error,
     },
 
-    /// HTTP/3 receive loop exited with error.
-    #[error("h3_rx[{peer_id}]: recv failed: {reason}")]
-    H3RxRecv {
-        /// Peer identifier.
-        peer_id: String,
-        /// Failure reason.
-        reason: String,
-    },
-
     /// HTTP/3 transmit failed.
     #[error("h3_tx[{peer_id}]: send failed: {reason}")]
     H3TxSend {
@@ -97,19 +91,12 @@ pub enum ActorError {
         reason: String,
     },
 
-    /// H3 client actor exited with error.
-    #[error("h3_client[{peer_id}]: {reason}")]
-    H3Client {
+    /// H3 engine (client or server) actor exited with error.
+    #[error("h3_{origin}[{peer_id}]: {reason}")]
+    H3Engine {
+        /// Which side created the connection.
+        origin: ConnOrigin,
         /// Peer identifier.
-        peer_id: String,
-        /// Failure reason.
-        reason: String,
-    },
-
-    /// H3 server engine actor exited with error.
-    #[error("h3_server[{peer_id}]: {reason}")]
-    H3Server {
-        /// Peer identifier (remote addr until auth completes).
         peer_id: String,
         /// Failure reason.
         reason: String,
@@ -145,10 +132,8 @@ impl ActorError {
             ActorError::RouterFailed { .. } => ActorKind::Critical,
             // Restartable actors - could be reconnected (future work)
             ActorError::UdpTxSend { .. } => ActorKind::Restartable,
-            ActorError::H3RxRecv { .. } => ActorKind::Restartable,
             ActorError::H3TxSend { .. } => ActorKind::Restartable,
-            ActorError::H3Client { .. } => ActorKind::Restartable,
-            ActorError::H3Server { .. } => ActorKind::Restartable,
+            ActorError::H3Engine { .. } => ActorKind::Restartable,
         }
     }
 }
@@ -276,10 +261,6 @@ mod tests {
                 addr: "1.2.3.4:5353".into(),
                 source: io::Error::other("test"),
             },
-            ActorError::H3RxRecv {
-                peer_id: "peer-1".into(),
-                reason: "connection reset".into(),
-            },
             ActorError::H3TxSend {
                 peer_id: "peer-1".into(),
                 reason: "flow control".into(),
@@ -331,18 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn actor_error_h3_rx_includes_peer() {
-        let err = ActorError::H3RxRecv {
-            peer_id: "node-2".to_string(),
-            reason: "connection reset".to_string(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("h3_rx"));
-        assert!(msg.contains("node-2"));
-        assert!(msg.contains("connection reset"));
-    }
-
-    #[test]
     fn actor_error_h3_tx_includes_peer() {
         let err = ActorError::H3TxSend {
             peer_id: "node-3".to_string(),
@@ -355,8 +324,9 @@ mod tests {
     }
 
     #[test]
-    fn actor_kind_restartable_for_h3_server() {
-        let err = ActorError::H3Server {
+    fn actor_kind_restartable_for_h3_engine() {
+        let err = ActorError::H3Engine {
+            origin: ConnOrigin::Server,
             peer_id: "client-1".into(),
             reason: "connection reset".into(),
         };
