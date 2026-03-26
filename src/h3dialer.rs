@@ -425,7 +425,7 @@ mod tests {
             let (cmd_tx, handle, bound_addr) = spawn_h3_listener(
                 listener,
                 peer_tokens,
-                default_mtu().into(),
+                default_mtu(),
                 events_tx,
                 &Tuning::default(),
             );

@@ -52,8 +52,8 @@ Each actor follows a consistent two-function initialization pattern:
    - Takes the state struct and dependencies (events_tx, etc.)
    - Creates channels internally (actor owns receiver)
    - Spawns `tokio::spawn` task
-   - Returns `(Sender, JoinHandle)`
-   - Example: `spawn_bare_rx(accepted, ingress_tx, ..., depth) -> (Sender<Input>, UnboundedSender<Cmd>, JoinHandle)`
+   - Returns `(Sender, JoinHandle)` or similar tuple
+   - Example: `spawn_bare_rx(udp_rx, accepted, ingress_tx, ..., tuning, udp_rt, crypto_rt) -> (UnboundedSender<Cmd>, JoinHandle, JoinHandle)`
 
 Both `make` and `spawn` are **bare functions** (not associated methods or impl methods). This design:
 - Follows [Alice Ryhl's Tokio actor pattern](https://ryhl.io/blog/actors-with-tokio/) recommendation for fewer lifetime issues

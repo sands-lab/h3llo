@@ -45,7 +45,7 @@ pub struct UdpTx {
 ///
 /// # Arguments
 ///
-/// * `socket` - Standard library UDP socket (must be bound).
+/// * `socket` - Standard library UDP socket (must be non-blocking).
 /// * `max_udp_payload` - Maximum UDP payload size for GRO buffer sizing.
 /// * `enable_offload` - Enable GSO on the TX side; `false` caps segments to 1.
 ///
@@ -84,8 +84,9 @@ pub fn make_udp(
 /// Pure I/O actor: no filtering, no metrics, no command channel.
 /// Protocol-specific logic belongs in the consuming actor.
 ///
-/// The optional `cancel` token allows the owner to signal shutdown.
-/// Without it, the actor only exits when the output channel closes
+/// The `cancel` token allows the owner to signal immediate shutdown.
+/// The caller must retain a clone and cancel it when done; without
+/// cancellation the actor only exits when the output channel closes
 /// **and** a packet arrives — which may never happen after the consumer
 /// is gone, leaking the task.
 pub fn spawn_udp_rx(

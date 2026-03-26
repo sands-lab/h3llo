@@ -840,7 +840,7 @@ mod tests {
                 listen_addr,
                 certs.cert_path(),
                 certs.key_path(),
-                default_mtu().into(),
+                default_mtu(),
                 &tuning,
                 &rt,
                 ingress_tx,
@@ -877,7 +877,7 @@ mod tests {
             bound_addr,
             peer_id,
             None,
-            default_mtu().into(),
+            default_mtu(),
             &probe,
             &tuning,
         )
@@ -949,7 +949,7 @@ mod tests {
             server.bound_addr,
             peer_id,
             None,
-            default_mtu().into(),
+            default_mtu(),
             &probe,
             &tuning,
         )
