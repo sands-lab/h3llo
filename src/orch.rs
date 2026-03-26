@@ -2,8 +2,8 @@
 
 use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
 use crate::api;
-use crate::bare::{dial_bare_tx, spawn_bare_rx, BareUdpRxCommand};
-use crate::bind::{make_server_udp_socket, DefaultRouteProbe};
+use crate::bare::{dial_bare_tx, make_bare_rx, spawn_bare_rx, BareUdpRxCommand};
+use crate::bind::DefaultRouteProbe;
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
@@ -11,12 +11,11 @@ use crate::events::{
     Event, H3v2ConnectedEvent,
 };
 use crate::h3dialer::dial_h3_client;
-use crate::h3listener::{make_h3v2_listener, spawn_h3v2_listener, H3v2ListenerCommand};
+use crate::h3listener::{make_h3_dispatcher, spawn_h3_dispatcher, DispatcherCommand};
 use crate::metrics::{log_quic_metrics, log_transport_metrics, Direction, Labels, Metrics};
 use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::router::{spawn_router, RouterCommand, RoutingTable};
 use crate::tun;
-use crate::udp;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -29,7 +28,6 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_quiche::buf_factory::PooledBuf;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// A single active connection bound to a peer.
@@ -361,7 +359,7 @@ pub struct Orchestrator {
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     bare_rx_cmd_tx: Option<mpsc::UnboundedSender<BareUdpRxCommand>>,
     /// H3v2 listener command sender (if listening).
-    h3_listener_cmd_tx: Option<mpsc::UnboundedSender<H3v2ListenerCommand>>,
+    h3_listener_cmd_tx: Option<mpsc::UnboundedSender<DispatcherCommand>>,
 
     /// DNS resolver command sender for SetHostnames.
     dns_cmd_tx: mpsc::UnboundedSender<DnsCommand>,
@@ -424,7 +422,7 @@ impl Orchestrator {
                 })
                 .collect::<HashMap<_, _>>();
 
-            if let Err(e) = cmd_tx.send(H3v2ListenerCommand::UpdatePeerTokens(tokens)) {
+            if let Err(e) = cmd_tx.send(DispatcherCommand::UpdatePeerTokens(tokens)) {
                 warn!(error = %e, "failed to send peer tokens update to h3_listener actor");
             }
         }
@@ -577,34 +575,18 @@ impl Orchestrator {
         let bare_rx_cmd_tx = if let Some(ref local_bare) = config.local.bare {
             let listen_addr = resolve_listen_addr(&local_bare.listen.host, local_bare.listen.port)?;
 
-            // Create listen socket and generic UDP RX actor on UDP runtime.
-            let udp_rx = {
-                let _guard = udp_rt.handle().enter();
-                let socket = make_server_udp_socket(listen_addr, tuning.socket_buffer_bytes())
-                    .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
-                let socket = tokio::net::UdpSocket::from_std(socket)
-                    .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
-                let (udp_rx, _udp_tx) = udp::make_udp(socket, tun_mtu, tuning.udp_enable_offload)
-                    .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
-                // _udp_tx dropped: per-peer TX sockets created in try_connect.
-                udp_rx
-            };
+            let udp_rx = make_bare_rx(listen_addr, tun_mtu, tuning, udp_rt.handle())
+                .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
 
-            let (udp_output_tx, cmd_tx, bare_rx_handle) = {
-                let _guard = crypto_rt.handle().enter();
-                spawn_bare_rx(
-                    HashSet::new(),
-                    ingress_tx.clone(),
-                    events_tx.clone(),
-                    tuning.metrics_push_interval,
-                    tuning.packet_queue_depth,
-                )
-            };
-
-            let udp_rx_handle = {
-                let _guard = udp_rt.handle().enter();
-                udp::spawn_udp_rx(udp_rx, udp_output_tx, CancellationToken::new())
-            };
+            let (cmd_tx, bare_rx_handle, udp_rx_handle) = spawn_bare_rx(
+                udp_rx,
+                HashSet::new(),
+                ingress_tx.clone(),
+                events_tx.clone(),
+                tuning,
+                udp_rt.handle(),
+                crypto_rt.handle(),
+            );
 
             join_set.spawn(udp_rx_handle);
             join_set.spawn(bare_rx_handle);
@@ -613,31 +595,36 @@ impl Orchestrator {
             None
         };
 
-        // Initialize H3v2 listener if configured (dispatcher on crypto_rt, UDP I/O on udp_rt)
+        // Initialize H3 dispatcher if configured (dispatcher on crypto_rt, UDP I/O on udp_rt)
         let h3_listener_cmd_tx = if let Some(ref h3_cfg) = config.local.h3 {
             let listen_addr = resolve_listen_addr(&h3_cfg.listen.host, h3_cfg.listen.port)?;
             let cert_path = Path::new(&h3_cfg.cert);
             let key_path = Path::new(&h3_cfg.key);
 
-            // make: fallible I/O (socket bind, TLS config)
-            let listener =
-                make_h3v2_listener(listen_addr, cert_path, key_path, tun_mtu as u16, tuning)
-                    .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
-
-            // spawn: infallible task creation; listener sends events through events_tx
-            // Initial peer tokens are empty; sync_peers_to_actors() populates them
-            // immediately after construction.
-            let (cmd_tx, listener_handle, _bound_addr) = spawn_h3v2_listener(
-                listener,
-                HashMap::new(),
+            // make: fallible I/O (socket bind, TLS config, UDP actor setup)
+            let (dispatcher, _bound_addr) = make_h3_dispatcher(
+                listen_addr,
+                cert_path,
+                key_path,
+                tun_mtu as u16,
                 tuning,
                 udp_rt.handle(),
-                crypto_rt.handle(),
                 ingress_tx.clone(),
                 events_tx.clone(),
+            )
+            .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
+
+            // spawn: infallible task creation
+            // Initial peer tokens are empty; sync_peers_to_actors() populates them
+            // immediately after construction.
+            let (cmd_tx, dispatcher_handle, _) = spawn_h3_dispatcher(
+                dispatcher,
+                HashMap::new(),
+                udp_rt.handle(),
+                crypto_rt.handle(),
             );
 
-            join_set.spawn(listener_handle);
+            join_set.spawn(dispatcher_handle);
             Some(cmd_tx)
         } else {
             None
@@ -1239,7 +1226,7 @@ mod test_support {
         pub bare_rx_cmd_rx: mpsc::UnboundedReceiver<BareUdpRxCommand>,
         pub dns_cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
         pub route_cmd_rx: mpsc::UnboundedReceiver<RouteCommand>,
-        pub h3_listener_cmd_rx: mpsc::UnboundedReceiver<H3v2ListenerCommand>,
+        pub h3_listener_cmd_rx: mpsc::UnboundedReceiver<DispatcherCommand>,
     }
 
     impl TestableOrchestratorBuilder {
@@ -2873,7 +2860,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("H3 listener should receive UpdatePeerTokens");
-        let H3v2ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens.get("h3-peer").unwrap(), "secure-token-12ch");
     }
@@ -2903,7 +2890,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("H3 listener should receive UpdatePeerTokens after delete");
-        let H3v2ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
         assert!(
             tokens.is_empty(),
             "tokens should be empty after removing the only H3 peer"
@@ -2965,7 +2952,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("should receive UpdatePeerTokens");
-        let H3v2ListenerCommand::UpdatePeerTokens(tokens) = cmd;
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
         assert_eq!(tokens.len(), 1, "only H3 peers should be included");
         assert!(tokens.contains_key("h3-peer"));
         assert!(!tokens.contains_key("bare-peer"));

@@ -17,7 +17,6 @@ use quiche::h3::NameValue;
 use rand::Rng;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
@@ -271,14 +270,13 @@ pub async fn dial_h3_client<P: RouteProbe>(
 
     let (local_addr, max_udp_payload, udp_recv_rx, udp_rx_handle, udp_send_tx, udp_tx_handle) = {
         let _guard = udp_rt.enter();
-        let socket = UdpSocket::from_std(std_socket)
-            .map_err(|e| DialError::Socket(format!("from_std: {e}")))?;
-        let local_addr = socket
+        let local_addr = std_socket
             .local_addr()
             .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
         let max_udp_payload = *tun_mtu + CONNECT_IP_OVERHEAD;
-        let (udp_rx, udp_tx) = udp::make_udp(socket, max_udp_payload, tuning.udp_enable_offload)
-            .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
+        let (udp_rx, udp_tx) =
+            udp::make_udp(std_socket, max_udp_payload, tuning.udp_enable_offload)
+                .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
         let (udp_recv_tx, udp_recv_rx) =
             mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
         let udp_rx_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx, udp_cancel.clone());

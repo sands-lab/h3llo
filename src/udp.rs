@@ -37,25 +37,29 @@ pub struct UdpTx {
     enable_offload: bool,
 }
 
-/// Creates shared UDP actor state by wrapping the socket in `Arc`.
+/// Creates shared UDP actor state from a standard library socket.
 ///
-/// Returns both RX and TX halves sharing the same underlying socket.
+/// Converts the `std::net::UdpSocket` to a tokio socket, wraps it in `Arc`,
+/// and returns both RX and TX halves sharing the same underlying socket.
 /// Callers may use either or both; the unused half is cheaply dropped.
 ///
 /// # Arguments
 ///
-/// * `socket` - Tokio UDP socket to wrap.
+/// * `socket` - Standard library UDP socket (must be bound).
 /// * `max_udp_payload` - Maximum UDP payload size for GRO buffer sizing.
 /// * `enable_offload` - Enable GSO on the TX side; `false` caps segments to 1.
 ///
 /// # Errors
 ///
-/// Returns `UdpError::Socket` if quinn-udp state initialization fails.
+/// Returns `UdpError::Socket` if tokio conversion or quinn-udp state
+/// initialization fails.
 pub fn make_udp(
-    socket: UdpSocket,
+    socket: std::net::UdpSocket,
     max_udp_payload: usize,
     enable_offload: bool,
 ) -> Result<(UdpRx, UdpTx), UdpError> {
+    let socket = UdpSocket::from_std(socket)
+        .map_err(|e| UdpError::Socket(format!("tokio from_std: {e}")))?;
     let socket = Arc::new(socket);
     let state_rx = UdpSocketState::new(UdpSockRef::from(&*socket))
         .map_err(|e| UdpError::Socket(format!("quinn-udp rx state: {e}")))?;
@@ -260,18 +264,23 @@ mod tests {
     use tokio_quiche::buf_factory::BufFactory;
     use tokio_util::sync::CancellationToken;
 
+    fn bind_std() -> std::net::UdpSocket {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_nonblocking(true).unwrap();
+        s
+    }
+
     #[tokio::test]
     async fn make_udp_creates_shared_socket() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (rx, tx) = make_udp(socket, 1500, false).unwrap();
+        let (rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
         assert!(Arc::ptr_eq(&rx.socket, &tx.socket));
     }
 
     #[tokio::test]
     async fn udp_rx_tags_source_address() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        let (rx, _tx) = make_udp(socket, 1500, false).unwrap();
+        let std_socket = bind_std();
+        let addr = std_socket.local_addr().unwrap();
+        let (rx, _tx) = make_udp(std_socket, 1500, false).unwrap();
 
         let (output_tx, mut output_rx) = mpsc::channel(4);
         let handle = spawn_udp_rx(rx, output_tx, CancellationToken::new());
@@ -298,8 +307,7 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (_rx, tx) = make_udp(sender_socket, 1500, false).unwrap();
+        let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
         let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
 
@@ -320,8 +328,7 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (_rx, tx) = make_udp(sender_socket, 1500, false).unwrap();
+        let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
         let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
 
@@ -348,8 +355,7 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
-        let sender_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (_rx, tx) = make_udp(sender_socket, 1500, false).unwrap();
+        let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
         let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
 
@@ -373,9 +379,9 @@ mod tests {
 
     #[tokio::test]
     async fn udp_rx_exits_when_output_closed() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        let (rx, _tx) = make_udp(socket, 1500, false).unwrap();
+        let std_socket = bind_std();
+        let addr = std_socket.local_addr().unwrap();
+        let (rx, _tx) = make_udp(std_socket, 1500, false).unwrap();
 
         let (output_tx, output_rx) = mpsc::channel(1);
         let handle = spawn_udp_rx(rx, output_tx, CancellationToken::new());
@@ -396,8 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_tx_exits_when_input_closed() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (_rx, tx) = make_udp(socket, 1500, false).unwrap();
+        let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
         let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
 
