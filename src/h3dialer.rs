@@ -64,8 +64,6 @@ impl H3Engine {
         auth_header: String,
         timeout: Duration,
     ) -> Result<Self, DialError> {
-        let recv_info = self.meta.recv_info();
-
         // Send initial QUIC packets (e.g. ClientHello).
         self.flush_send();
 
@@ -77,11 +75,11 @@ impl H3Engine {
         loop {
             tokio::select! {
                 maybe_batch = self.io.udp_recv_rx.recv() => {
-                    let Some((_remote, packets)) = maybe_batch else {
+                    let Some((remote, packets)) = maybe_batch else {
                         return Err(DialError::Handshake("UDP Rx closed during startup".into()));
                     };
 
-                    handle_udp_recv(&mut self.conn, packets, recv_info, None);
+                    handle_udp_recv(&mut self.conn, packets, self.meta.recv_info(remote), None);
 
                     if self.session.is_none() && self.conn.is_established() {
                         debug!(%self.meta.peer_id, "QUIC established; starting H3 CONNECT-IP");

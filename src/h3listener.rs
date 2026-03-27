@@ -221,8 +221,6 @@ impl H3Engine {
         peer_tokens: &HashMap<String, String>,
         timeout: Duration,
     ) -> Result<Self, ServerError> {
-        let recv_info = self.meta.recv_info();
-
         let deadline = time::sleep(timeout);
         tokio::pin!(deadline);
         let timer = time::sleep(self.conn.timeout().unwrap_or(MAX_TIMEOUT));
@@ -270,13 +268,13 @@ impl H3Engine {
         loop {
             tokio::select! {
                 maybe_batch = self.io.udp_recv_rx.recv() => {
-                    let Some((_remote, batch)) = maybe_batch else {
+                    let Some((remote, batch)) = maybe_batch else {
                         return Err(ServerError::Accept(
                             "udp rx closed during handshake".into(),
                         ));
                     };
 
-                    handle_udp_recv(&mut self.conn, batch, recv_info, None);
+                    handle_udp_recv(&mut self.conn, batch, self.meta.recv_info(remote), None);
 
                     // Lazily create H3 session once QUIC is established.
                     if self.session.is_none() && self.conn.is_established() {
