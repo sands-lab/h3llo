@@ -150,16 +150,26 @@ impl PendingBatch {
 
 /// Collects pending QUIC output packets into a batch.
 ///
-/// Called by [`flush_udp_send`] to gather all queued QUIC output before
-/// sending via the tagged UDP TX channel.
-fn collect_udp_send(conn: &mut quiche::Connection, max_udp_payload: usize) -> Vec<PooledBuf> {
+/// Returns `None` when there is nothing to send, or `Some((dest, batch))`
+/// where `dest` comes from the last [`quiche::SendInfo`] (the peer address
+/// quiche wants the packets delivered to — tracks NAT rebinding).
+fn collect_udp_send(
+    conn: &mut quiche::Connection,
+    max_udp_payload: usize,
+) -> Option<(SocketAddr, Vec<PooledBuf>)> {
     let mut batch = Vec::new();
+    let mut dest = None;
     loop {
         let mut buf = alloc_uninit_packet_buf(max_udp_payload);
         match conn.send(&mut buf) {
-            Ok((len, _send_info)) => {
+            Ok((len, send_info)) => {
                 buf.truncate(len);
                 batch.push(buf);
+                debug_assert!(
+                    dest.is_none_or(|d| d == send_info.to),
+                    "quiche returned mixed destinations in one send loop"
+                );
+                dest = Some(send_info.to);
             }
             Err(quiche::Error::Done) => break,
             Err(e) => {
@@ -168,7 +178,7 @@ fn collect_udp_send(conn: &mut quiche::Connection, max_udp_payload: usize) -> Ve
             }
         }
     }
-    batch
+    dest.map(|d| (d, batch))
 }
 
 // ========== Router Egress ==========
@@ -239,13 +249,10 @@ pub(crate) struct EngineMeta {
 }
 
 impl EngineMeta {
-    // TODO: For QUIC path migration / NAT rebinding, recv_info should be
-    // constructed per-batch from the actual source address instead of using
-    // a fixed remote_addr. Currently all callers (establish, accept, run)
-    // ignore the per-batch remote and use this fixed value.
-    pub(crate) fn recv_info(&self) -> quiche::RecvInfo {
+    /// Builds a [`quiche::RecvInfo`] for a packet received from `remote`.
+    pub(crate) fn recv_info(&self, remote: SocketAddr) -> quiche::RecvInfo {
         quiche::RecvInfo {
-            from: self.remote_addr,
+            from: remote,
             to: self.local_addr,
         }
     }
@@ -288,7 +295,7 @@ pub(crate) struct RunState {
     pub(crate) rx_counters: Counters,
     pub(crate) tx_counters: Counters,
     pub(crate) pending_ingress: Option<PendingBatch>,
-    pub(crate) pending_send: Option<PendingBatch>,
+    pub(crate) pending_send: Option<(SocketAddr, PendingBatch)>,
 }
 
 impl RunState {
@@ -344,9 +351,8 @@ impl H3Engine {
     /// Used during handshake where pending-send tracking is unnecessary.
     /// Drops on channel backpressure — acceptable because quiche retransmits.
     pub(crate) fn flush_send(&mut self) {
-        let batch = collect_udp_send(&mut self.conn, self.meta.max_udp_payload);
-        if !batch.is_empty() {
-            let _ = self.io.udp_send_tx.try_send((self.meta.remote_addr, batch));
+        if let Some(send) = collect_udp_send(&mut self.conn, self.meta.max_udp_payload) {
+            let _ = self.io.udp_send_tx.try_send(send);
         }
     }
 
@@ -356,8 +362,6 @@ impl H3Engine {
     /// - `pending_ingress`: IP packets from dgram_recv waiting for `ingress_tx` capacity.
     /// - `pending_send`: encrypted QUIC packets waiting for `udp_send_tx` capacity.
     pub(crate) async fn run(self) -> ActorExitResult {
-        let recv_info = self.meta.recv_info();
-
         let H3Engine {
             mut conn,
             session,
@@ -374,7 +378,7 @@ impl H3Engine {
             metrics_interval,
             keepalive_interval,
             origin,
-            udp_cancel: _udp_cancel,
+            udp_cancel,
         } = self;
         let mut session = session.expect("session present after establish/accept");
 
@@ -393,11 +397,11 @@ impl H3Engine {
                 maybe_batch = udp_recv_rx.recv(),
                     if !ingress_pending =>
                 {
-                    let Some((_remote, packets)) = maybe_batch else {
+                    let Some((remote, packets)) = maybe_batch else {
                         break LoopExit::Ok(b"udp rx closed");
                     };
 
-                    handle_udp_recv(&mut conn, packets, recv_info, Some(&mut run_state.rx_counters));
+                    handle_udp_recv(&mut conn, packets, meta.recv_info(remote), Some(&mut run_state.rx_counters));
 
                     // Drain H3 control events. Post-establishment, this detects
                     // stream close/reset/goaway. The header-parsing branch is
@@ -461,10 +465,10 @@ impl H3Engine {
                 {
                     match permit_res {
                         Ok(permit) => {
-                            let pending = run_state.pending_send.take()
+                            let (dest, pending) = run_state.pending_send.take()
                                 .expect("pending send present");
                             run_state.tx_counters.record_queue_full(pending.since.elapsed());
-                            permit.send((meta.remote_addr, pending.batch));
+                            permit.send((dest, pending.batch));
                         }
                         Err(_) => break LoopExit::Ok(b"udp tx closed"),
                     }
@@ -484,12 +488,11 @@ impl H3Engine {
             }
 
             if run_state.pending_send.is_none() {
-                let batch = collect_udp_send(&mut conn, meta.max_udp_payload);
-                if !batch.is_empty() {
-                    match udp_send_tx.try_send((meta.remote_addr, batch)) {
+                if let Some((dest, batch)) = collect_udp_send(&mut conn, meta.max_udp_payload) {
+                    match udp_send_tx.try_send((dest, batch)) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full((_, b))) => {
-                            run_state.pending_send = Some(PendingBatch::new(b));
+                            run_state.pending_send = Some((dest, PendingBatch::new(b)));
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             break LoopExit::Err {
@@ -512,14 +515,13 @@ impl H3Engine {
 
         // Single cleanup point: close QUIC and flush remaining packets.
         conn.close(true, 0, exit.close_reason()).ok();
-        let batch = collect_udp_send(&mut conn, meta.max_udp_payload);
-        if !batch.is_empty() {
-            let _ = udp_send_tx.send((meta.remote_addr, batch)).await;
+        if let Some(send) = collect_udp_send(&mut conn, meta.max_udp_payload) {
+            let _ = udp_send_tx.send(send).await;
         }
         // Cancel the RX actor, which blocks on socket.readable().
         // TX actor exits naturally when udp_send_tx is dropped at
         // function return, draining any remaining batches first.
-        if let Some(token) = _udp_cancel {
+        if let Some(token) = udp_cancel {
             token.cancel();
         }
         exit.into_result(&meta, origin)
@@ -614,8 +616,9 @@ mod tests {
     #[test]
     fn engine_meta_recv_info() {
         let meta = test_meta();
-        let info = meta.recv_info();
-        assert_eq!(info.from, meta.remote_addr);
+        let remote: SocketAddr = "10.0.0.2:9999".parse().unwrap();
+        let info = meta.recv_info(remote);
+        assert_eq!(info.from, remote);
         assert_eq!(info.to, meta.local_addr);
     }
 
