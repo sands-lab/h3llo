@@ -165,6 +165,10 @@ fn collect_udp_send(
             Ok((len, send_info)) => {
                 buf.truncate(len);
                 batch.push(buf);
+                // Safety: quiche builds packets on-the-fly from the current active
+                // path — it never queues pre-formed UDP packets.  Path migration
+                // only occurs inside `conn.recv()`, so `send_info.to` cannot
+                // change within a single send loop.
                 debug_assert!(
                     dest.is_none_or(|d| d == send_info.to),
                     "quiche returned mixed destinations in one send loop"
