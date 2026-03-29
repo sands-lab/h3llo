@@ -217,6 +217,8 @@ fn make_client_quiche_config(
                 .load_verify_locations_from_file(ca_path)
                 .map_err(|e| DialError::Handshake(format!("trusted CA `{ca_path}`: {e}")))?;
         }
+    } else {
+        config.verify_peer(false);
     }
     Ok(config)
 }
