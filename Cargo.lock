@@ -1391,6 +1391,7 @@ dependencies = [
  "quinn-udp",
  "rand 0.10.0",
  "rcgen",
+ "ring",
  "route_manager",
  "rustls-pemfile",
  "serde",

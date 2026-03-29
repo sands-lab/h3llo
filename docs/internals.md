@@ -38,6 +38,8 @@ Actor design principles:
   The orchestrator continues running on graceful exits but terminates on actor errors or task panics. Route Sync only returns `Ok(())` (graceful exit); sync errors are logged as warnings at origin. If initialization fails, the orchestrator degrades to no system route management.
 - **Graceful shutdown**: when all senders to an actor's command channel are dropped, `recv()` returns `None`. The actor detects this and exits its event loop gracefully.
 
+**Stateless retry**: The H3 dispatcher performs QUIC stateless retry on all incoming Initial packets without a token. Token generation and validation use HMAC-SHA256 via `ring::hmac` with a per-process random key generated at startup. This ensures no per-connection state is allocated until the client proves address ownership, mitigating amplification attacks on the QUIC handshake.
+
 #### Actor Initialization Pattern (make + spawn)
 
 Each actor follows a consistent two-function initialization pattern:
