@@ -832,9 +832,11 @@ mod tests {
 
         let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
 
+        let err =
+            result.expect_err("handshake with self-signed cert and no trusted CA should fail");
         assert!(
-            result.is_err(),
-            "handshake with self-signed cert and no trusted CA should fail, got: {result:?}",
+            matches!(err, DialError::Handshake(_)),
+            "expected TLS Handshake error, got: {err}",
         );
 
         drop(server.cmd_tx);
