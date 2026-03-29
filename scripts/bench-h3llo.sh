@@ -48,8 +48,7 @@ REMOTE_CTR="h3llo-bench-remote"
 TUN_IF="tun-bench"
 
 # Docker flags: host networking + TUN device access.
-# Intentionally unquoted at call sites to allow word splitting into separate args.
-DOCKER_FLAGS="--net=host --cap-add NET_ADMIN --device /dev/net/tun"
+DOCKER_FLAGS=(--net=host --cap-add NET_ADMIN --device /dev/net/tun)
 
 # --- Counter collection helpers ---
 
@@ -182,6 +181,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Clean up leftovers from previous runs
+cleanup
+
 stop_containers() {
     docker rm -f "$LOCAL_CTR" 2>/dev/null || true
     ssh "$REMOTE" "docker rm -f \"$REMOTE_CTR\"" 2>/dev/null || true
@@ -201,9 +203,10 @@ start_tunnel() {
     scp -q "$BENCH_DIR/$remote_cfg" "$REMOTE:$BENCH_DIR/$remote_cfg"
 
     # Start remote container
+    local docker_flags_str="${DOCKER_FLAGS[*]}"
     ssh "$REMOTE" "docker rm -f \"$REMOTE_CTR\" 2>/dev/null; \
         docker run -d --name \"$REMOTE_CTR\" \
-        $DOCKER_FLAGS \
+        $docker_flags_str \
         -e RUST_LOG=warn,h3llo=debug \
         -v \"$BENCH_DIR\":/etc/h3llo \
         -v \"$CERT_DIR\":/certs \
@@ -212,34 +215,20 @@ start_tunnel() {
     # Start local container
     docker rm -f "$LOCAL_CTR" 2>/dev/null || true
     docker run -d --name "$LOCAL_CTR" \
-        $DOCKER_FLAGS \
+        "${DOCKER_FLAGS[@]}" \
         -e RUST_LOG=warn,h3llo=debug \
         -v "$BENCH_DIR":/etc/h3llo \
         -v "$CERT_DIR":/certs \
         "$BENCH_IMAGE" -c "/etc/h3llo/$local_cfg"
 
-    sleep 5  # Wait for TUN creation and tunnel setup
-
-    # Verify connectivity
-    echo -n "  Connectivity: "
-    if docker exec "$LOCAL_CTR" ping -c 2 -W 2 "$REMOTE_TUN" >/dev/null 2>&1; then
-        echo "OK"
-    else
-        echo "FAILED"
+    # Wait for TUN creation and tunnel setup (--net=host: TUN is on the host)
+    if ! wait_for_connectivity "$REMOTE_TUN" 10; then
         echo "  --- Local container logs (tail) ---"
         docker logs "$LOCAL_CTR" 2>&1 | tail -40
         echo "  --- Remote container logs (tail) ---"
         ssh "$REMOTE" "docker logs \"$REMOTE_CTR\" 2>&1 | tail -40"
         return 1
     fi
-}
-
-# --- iperf3 helpers ---
-run_iperf_tcp() {
-    echo "--- TCP ---"
-    ssh "$REMOTE" "docker exec -d \"$REMOTE_CTR\" iperf3 -s -1"
-    sleep 1
-    docker exec "$LOCAL_CTR" iperf3 -c "$REMOTE_TUN" -t "$IPERF_TIME"
 }
 
 # --- Test runner ---
@@ -266,7 +255,7 @@ run_test() {
     collect_raw_counters "$label - BEFORE" "$LOCAL_IF"
     collect_raw_counters "$label - BEFORE" "$REMOTE_IF" remote
 
-    run_iperf_tcp
+    run_iperf_tcp "$REMOTE_TUN"
 
     # --- Capture post-test counters ---
     collect_container_counters "$label - AFTER" "$LOCAL_CTR" "$TUN_IF" "$udp_port"

@@ -42,14 +42,14 @@ require_cmds openvpn iperf3 ip ssh openssl scp
 # --- Cleanup ---
 cleanup() {
     echo "[cleanup] Tearing down OpenVPN..."
-    sudo killall openvpn 2>/dev/null || true
-    ssh "$REMOTE" "sudo killall openvpn" 2>/dev/null || true
-    ssh "$REMOTE" "pkill -f 'iperf3 -s'" 2>/dev/null || true
+    sudo pkill -f "openvpn --config $BENCH_DIR/" 2>/dev/null || true
+    ssh "$REMOTE" "sudo pkill -f 'openvpn --config $BENCH_DIR/'" 2>/dev/null || true
+    kill_remote_iperf
     sleep 1
     sudo ip link del "$OVPN_IF" 2>/dev/null || true
-    ssh "$REMOTE" "sudo ip link del $OVPN_IF" 2>/dev/null || true
+    ssh "$REMOTE" "sudo ip link del \"$OVPN_IF\"" 2>/dev/null || true
     rm -rf "$BENCH_DIR"
-    ssh "$REMOTE" "rm -rf $BENCH_DIR" 2>/dev/null || true
+    ssh "$REMOTE" "rm -rf \"$BENCH_DIR\"" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -64,7 +64,9 @@ ssh "$REMOTE" "sudo modprobe ovpn-dco-v2" 2>/dev/null || true
 mkdir -p "$BENCH_DIR"
 
 gen_self_signed_cert "$BENCH_DIR/server-key.pem" "$BENCH_DIR/server-cert.pem" "server"
+chmod 600 "$BENCH_DIR/server-key.pem"
 gen_self_signed_cert "$BENCH_DIR/client-key.pem" "$BENCH_DIR/client-cert.pem" "client"
+chmod 600 "$BENCH_DIR/client-key.pem"
 
 # Extract fingerprints
 SERVER_FP=$(openssl x509 -fingerprint -sha256 -noout -in "$BENCH_DIR/server-cert.pem" | sed 's/.*=//')
@@ -118,33 +120,24 @@ verb 3
 EOF
 
 # --- Sync certs and config to remote ---
-ssh "$REMOTE" "mkdir -p $BENCH_DIR"
+ssh "$REMOTE" "mkdir -p \"$BENCH_DIR\""
 scp -q "$BENCH_DIR"/* "$REMOTE:$BENCH_DIR/"
 
 # --- Start remote (server) ---
-ssh "$REMOTE" "sudo openvpn --config $BENCH_DIR/server.conf --daemon --log $BENCH_DIR/server.log"
+ssh "$REMOTE" "sudo openvpn --config \"$BENCH_DIR/server.conf\" --daemon --log \"$BENCH_DIR/server.log\""
 
 # --- Start local (client) ---
 sleep 1
 sudo openvpn --config "$BENCH_DIR/client.conf" --daemon --log "$BENCH_DIR/client.log"
 
 # --- Wait for tunnel ---
-echo -n "  Waiting for tunnel..."
-for i in $(seq 1 30); do
-    if ping -c 1 -W 1 "$REMOTE_TUN" >/dev/null 2>&1; then
-        echo " OK (${i}s)"
-        break
-    fi
-    if [[ $i -eq 30 ]]; then
-        echo " FAILED"
-        echo "  --- Local log ---"
-        cat "$BENCH_DIR/client.log" 2>/dev/null | tail -20
-        echo "  --- Remote log ---"
-        ssh "$REMOTE" "cat $BENCH_DIR/server.log 2>/dev/null | tail -20"
-        exit 1
-    fi
-    sleep 1
-done
+if ! wait_for_connectivity "$REMOTE_TUN" 30; then
+    echo "  --- Local log ---"
+    tail -20 "$BENCH_DIR/client.log" 2>/dev/null || true
+    echo "  --- Remote log ---"
+    ssh "$REMOTE" "tail -20 \"$BENCH_DIR/server.log\"" 2>/dev/null || true
+    exit 1
+fi
 
 # --- Verify DCO ---
 echo -n "  DCO: "
@@ -164,8 +157,8 @@ run_iperf_tcp "$REMOTE_TUN"
 # --- Dump logs for diagnostics ---
 echo ""
 echo "  --- Local OpenVPN log ---"
-sudo cat "$BENCH_DIR/client.log" 2>/dev/null | grep -i -E "dco|ovpn|offload|disabl|error|warn" | head -20
+sudo cat "$BENCH_DIR/client.log" 2>/dev/null | grep -i -E "dco|ovpn|offload|disabl|error|warn" | head -20 || true
 echo "  --- Remote OpenVPN log ---"
-ssh "$REMOTE" "sudo cat $BENCH_DIR/server.log 2>/dev/null | grep -i -E 'dco|ovpn|offload|disabl|error|warn' | head -20"
+ssh "$REMOTE" "sudo cat $BENCH_DIR/server.log 2>/dev/null | grep -i -E 'dco|ovpn|offload|disabl|error|warn' | head -20" || true
 
 print_done

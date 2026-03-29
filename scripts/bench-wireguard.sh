@@ -24,12 +24,11 @@ source "$(dirname "$0")/bench-common.sh"
 WG_PORT=51820
 WG_IF="wg-bench"
 
-# Fixed Curve25519 keys (test-only, NOT for production)
-# Generated via: wg genkey | tee priv | wg pubkey > pub
-KEY_A_PRIV="yAnw4/bFKWQyuiDKWrXruXyKk/Ah1CJWQfV0FTXcXWU="
-KEY_A_PUB="xopHDYsmeG7tk7UdovGv7RUBaiD1sADUrIlujSYHVFY="
-KEY_B_PRIV="0AMR6oqMwHg1NDZMRMtRXi/xd3Ot6Camb1euWJY1lWI="
-KEY_B_PUB="mqgf3siT/qS86WCoYmZFaXHUx5JRGSFVfjU4avuNanM="
+# WireGuard keys from bench-common.sh
+KEY_A_PRIV="$WG_KEY_A_PRIV"
+KEY_A_PUB="$WG_KEY_A_PUB"
+KEY_B_PRIV="$WG_KEY_B_PRIV"
+KEY_B_PUB="$WG_KEY_B_PUB"
 
 # Initialized after first cleanup; guarded in cleanup() via ${KEY_DIR:-}.
 KEY_DIR=""
@@ -41,11 +40,11 @@ require_cmds wg iperf3 ip ssh
 cleanup() {
     echo "[cleanup] Tearing down WireGuard interfaces..."
     sudo ip link del "$WG_IF" 2>/dev/null || true
-    ssh "$REMOTE" "sudo ip link del $WG_IF" 2>/dev/null || true
-    ssh "$REMOTE" "pkill -f 'iperf3 -s'" 2>/dev/null || true
+    ssh "$REMOTE" "sudo ip link del \"$WG_IF\"" 2>/dev/null || true
+    kill_remote_iperf
     if [[ -n "${KEY_DIR:-}" && -d "$KEY_DIR" ]]; then
         rm -rf "$KEY_DIR"
-        ssh "$REMOTE" "rm -rf $KEY_DIR" 2>/dev/null || true
+        ssh "$REMOTE" "rm -rf \"$KEY_DIR\"" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT INT TERM
@@ -54,10 +53,7 @@ trap cleanup EXIT INT TERM
 cleanup
 
 # --- Key files (avoids process substitution issues with sudo over SSH) ---
-KEY_DIR=$(mktemp -d /tmp/wg-bench-keys.XXXXXX)
-echo "$KEY_A_PRIV" > "$KEY_DIR/local.key"
-chmod 600 "$KEY_DIR/local.key"
-ssh "$REMOTE" "mkdir -p $KEY_DIR && printf '%s\n' '$KEY_B_PRIV' > $KEY_DIR/remote.key && chmod 600 $KEY_DIR/remote.key"
+setup_wg_key_files "$KEY_A_PRIV" "$KEY_B_PRIV"
 
 # --- Setup local WireGuard ---
 sudo ip link add "$WG_IF" type wireguard
@@ -69,21 +65,17 @@ sudo ip route add "${REMOTE_TUN}/32" dev "$WG_IF"
 
 # --- Setup remote WireGuard ---
 ssh "$REMOTE" "\
-    sudo ip link add $WG_IF type wireguard && \
-    sudo wg set $WG_IF listen-port $WG_PORT private-key $KEY_DIR/remote.key \
-        peer $KEY_A_PUB allowed-ips ${LOCAL_TUN}/32 endpoint ${LOCAL_IP}:${WG_PORT} && \
-    sudo ip addr add ${REMOTE_TUN}/32 dev $WG_IF && \
-    sudo ip link set $WG_IF mtu $TUN_MTU up && \
-    sudo ip route add ${LOCAL_TUN}/32 dev $WG_IF"
+    sudo ip link add \"$WG_IF\" type wireguard && \
+    sudo wg set \"$WG_IF\" listen-port $WG_PORT private-key \"$KEY_DIR/remote.key\" \
+        peer \"$KEY_A_PUB\" allowed-ips ${LOCAL_TUN}/32 endpoint ${LOCAL_IP}:${WG_PORT} && \
+    sudo ip addr add ${REMOTE_TUN}/32 dev \"$WG_IF\" && \
+    sudo ip link set \"$WG_IF\" mtu $TUN_MTU up && \
+    sudo ip route add ${LOCAL_TUN}/32 dev \"$WG_IF\""
 
 # --- Verify connectivity ---
-echo -n "  Connectivity: "
-if ping -c 2 -W 2 "$REMOTE_TUN" >/dev/null 2>&1; then
-    echo "OK"
-else
-    echo "FAILED"
+if ! wait_for_connectivity "$REMOTE_TUN"; then
     sudo wg show "$WG_IF"
-    ssh "$REMOTE" "sudo wg show $WG_IF"
+    ssh "$REMOTE" "sudo wg show \"$WG_IF\""
     exit 1
 fi
 

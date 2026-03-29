@@ -66,7 +66,7 @@ TT_USER="benchuser"
 TT_PASS="benchpass-12345678"
 
 # --- Prerequisites ---
-require_cmds numactl iperf3 ip ssh openssl curl tar
+require_cmds numactl iperf3 ip ssh scp openssl curl tar
 
 # --- Download & extract binaries ---
 download_binaries() {
@@ -105,21 +105,27 @@ download_binaries() {
     [[ -x "$BIN_DIR/trusttunnel_client" ]]   || { echo "Error: trusttunnel_client not found after extraction" >&2; exit 1; }
 
     # Sync endpoint binary to remote
-    ssh "$REMOTE" "mkdir -p $BIN_DIR"
+    ssh "$REMOTE" "mkdir -p \"$BIN_DIR\""
     scp -q "$BIN_DIR/trusttunnel_endpoint" "$REMOTE:$BIN_DIR/"
 
     echo "  Binaries: endpoint=$TT_ENDPOINT_VER  client=$TT_CLIENT_VER"
 }
 
+# --- Stop both sides (between tests) ---
+stop_tunnel() {
+    sudo pkill -f trusttunnel_client 2>/dev/null || true
+    ssh "$REMOTE" "sudo pkill -f trusttunnel_endpoint" 2>/dev/null || true
+    kill_remote_iperf
+    sleep 2
+    # TrustTunnel creates "tun0" by default; no config option to customize the name.
+    sudo ip link del tun0 2>/dev/null || true
+}
+
 # --- Cleanup ---
 cleanup() {
     echo "[cleanup] Stopping TrustTunnel..."
-    sudo pkill -f trusttunnel_client 2>/dev/null || true
-    ssh "$REMOTE" "sudo pkill -f trusttunnel_endpoint" 2>/dev/null || true
-    ssh "$REMOTE" "pkill -f 'iperf3 -s'" 2>/dev/null || true
-    sleep 1
-    sudo ip link del tun0 2>/dev/null || true
-    ssh "$REMOTE" "sudo ip addr del $TEST_IP/32 dev lo" 2>/dev/null || true
+    stop_tunnel
+    ssh "$REMOTE" "sudo ip addr del \"$TEST_IP/32\" dev lo" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 cleanup
@@ -133,7 +139,7 @@ gen_self_signed_cert "$CERT_DIR/key.pem" "$CERT_DIR/cert.pem" "$TT_HOSTNAME" "DN
 echo "  TLS certificate generated"
 
 # Benchmark IP on remote loopback
-ssh "$REMOTE" "sudo ip addr add $TEST_IP/32 dev lo 2>/dev/null || true"
+ssh "$REMOTE" "sudo ip addr add \"$TEST_IP/32\" dev lo 2>/dev/null || true"
 
 # --- Endpoint config (shared for both HTTP/2 and HTTP/3) ---
 cat > "$CONF_DIR/vpn.toml" <<EOF
@@ -177,11 +183,12 @@ cat > "$CONF_DIR/credentials.toml" <<EOF
 username = "$TT_USER"
 password = "$TT_PASS"
 EOF
+chmod 600 "$CONF_DIR/credentials.toml"
 
 : > "$CONF_DIR/rules.toml"  # empty = allow all
 
 # Sync everything to remote
-ssh "$REMOTE" "mkdir -p $CONF_DIR $CERT_DIR"
+ssh "$REMOTE" "mkdir -p \"$CONF_DIR\" \"$CERT_DIR\""
 scp -rq "$CONF_DIR/"* "$REMOTE:$CONF_DIR/"
 scp -rq "$CERT_DIR/"* "$REMOTE:$CERT_DIR/"
 
@@ -214,15 +221,6 @@ change_system_dns = false
 EOF
 }
 
-# --- Stop both sides (between tests) ---
-stop_tunnel() {
-    sudo pkill -f trusttunnel_client 2>/dev/null || true
-    ssh "$REMOTE" "sudo pkill -f trusttunnel_endpoint" 2>/dev/null || true
-    ssh "$REMOTE" "pkill -f 'iperf3 -s'" 2>/dev/null || true
-    sleep 2
-    sudo ip link del tun0 2>/dev/null || true
-}
-
 # --- Run a single benchmark ---
 run_test() {
     local label="$1"
@@ -233,8 +231,8 @@ run_test() {
     gen_client_config "$proto"
 
     # Start endpoint on remote (NUMA + CPU pinned)
-    ssh "$REMOTE" "sudo $NUMA $TT_PIN $BIN_DIR/trusttunnel_endpoint \
-        $CONF_DIR/vpn.toml $CONF_DIR/hosts.toml \
+    ssh "$REMOTE" "sudo $NUMA $TT_PIN \"$BIN_DIR/trusttunnel_endpoint\" \
+        \"$CONF_DIR/vpn.toml\" \"$CONF_DIR/hosts.toml\" \
         </dev/null >/dev/null 2>&1 &"
     sleep 3
 
@@ -243,14 +241,13 @@ run_test() {
     sudo $NUMA $TT_PIN "$BIN_DIR/trusttunnel_client" \
         -s -c "$BENCH_DIR/client-${proto}.toml" \
         >/dev/null 2>&1 &
-    sleep 15
 
-    # Verify connectivity
-    echo -n "  Connectivity: "
-    if ping -c 2 -W 2 "$TEST_IP" >/dev/null 2>&1; then
-        echo "OK"
-    else
-        echo "FAILED"
+    # TrustTunnel client needs ~10-15s for TLS handshake + TUN setup
+    if ! wait_for_connectivity "$TEST_IP" 20; then
+        echo "  --- Local client process ---"
+        ps aux | grep trusttunnel_client | grep -v grep || echo "  (not running)"
+        echo "  --- Remote endpoint process ---"
+        ssh "$REMOTE" "ps aux | grep trusttunnel_endpoint | grep -v grep" 2>/dev/null || echo "  (not running)"
         return
     fi
 
