@@ -55,7 +55,7 @@ pub enum ServerError {
 
 /// Mints a cryptographic retry token binding client address and original DCID.
 ///
-/// Token layout: `[timestamp: 8B | ip: 4/16B | port: 2B | odcid: var] | hmac_tag: 32B`
+/// Token layout: `[timestamp: 8B | ip: 4/16B | port: 2B | odcid: var | hmac_tag: 32B]`
 fn mint_retry_token(key: &hmac::Key, addr: &SocketAddr, odcid: &[u8]) -> Vec<u8> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1019,6 +1019,41 @@ mod tests {
         let tag = hmac::sign(&key, &token[..payload_len]);
         token[payload_len..].copy_from_slice(tag.as_ref());
         assert!(validate_retry_token(&key, &addr, &token, lifetime).is_none());
+    }
+
+    #[test]
+    fn retry_token_roundtrip_empty_odcid() {
+        let key = test_hmac_key();
+        let addr: SocketAddr = "10.0.0.1:443".parse().unwrap();
+        let token = mint_retry_token(&key, &addr, b"");
+        assert_eq!(
+            validate_retry_token(&key, &addr, &token, TEST_TOKEN_LIFETIME),
+            Some([].as_slice())
+        );
+    }
+
+    #[test]
+    fn retry_token_roundtrip_max_odcid() {
+        let key = test_hmac_key();
+        let addr: SocketAddr = "10.0.0.1:443".parse().unwrap();
+        let odcid = [0xAA; quiche::MAX_CONN_ID_LEN];
+        let token = mint_retry_token(&key, &addr, &odcid);
+        assert_eq!(
+            validate_retry_token(&key, &addr, &token, TEST_TOKEN_LIFETIME),
+            Some(odcid.as_slice())
+        );
+    }
+
+    #[test]
+    fn retry_token_rejects_cross_address_family() {
+        let key = test_hmac_key();
+        let v4_addr: SocketAddr = "192.168.1.1:1000".parse().unwrap();
+        let v6_addr: SocketAddr = "[::ffff:192.168.1.1]:1000".parse().unwrap();
+        // Token minted for IPv4, validated with IPv6 (and vice versa).
+        let token_v4 = mint_retry_token(&key, &v4_addr, b"dcid");
+        assert!(validate_retry_token(&key, &v6_addr, &token_v4, TEST_TOKEN_LIFETIME).is_none());
+        let token_v6 = mint_retry_token(&key, &v6_addr, b"dcid");
+        assert!(validate_retry_token(&key, &v4_addr, &token_v6, TEST_TOKEN_LIFETIME).is_none());
     }
 
     // ========== make_h3_dispatcher Tests ==========
