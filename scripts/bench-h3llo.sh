@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Cross-node Docker benchmark for h3llo.
 # Runs BareUDP and HTTP/3 throughput tests between two physical nodes using
-# Docker containers and iperf3 (TCP + UDP).
+# Docker containers and iperf3 (TCP).
 #
 # Test matrix: BareUDP → H3(none) → H3(cubic) → H3(bbr2) → H3(bbr2+pacing)
 #
@@ -13,7 +13,7 @@
 #   - Passwordless SSH access to REMOTE
 #   - openssl (for generating self-signed TLS certificates)
 #
-# Usage: ./scripts/bench-cross-node.sh
+# Usage: ./scripts/bench-h3llo.sh
 #
 # Environment variables:
 #   REMOTE              - remote hostname (default: mcnode26)
@@ -21,33 +21,28 @@
 #   REMOTE_IP           - remote underlay IP (default: 10.200.2.126)
 #   LOCAL_IF            - local outbound interface (default: bf3p1)
 #   REMOTE_IF           - remote outbound interface (default: bf3p1)
-#   TUN_MTU             - TUN interface MTU (default: 8980)
+#   TUN_MTU             - TUN interface MTU (default: 1291)
+#   BENCH_DIR           - base benchmark directory (default: /tmp/bench)
 #   IMAGE               - Docker image name (default: nekonuts/h3llo)
 #   CERT_DIR            - certificate directory on both nodes (default: auto-created temp dir)
 #   IPERF_TIME          - iperf3 test duration in seconds (default: 10)
 #   PACKET_QUEUE_DEPTH  - packet queue depth (default: 256)
+#   TUN_TX_QUEUE_LEN    - TUN transmit queue length (default: 1000)
 set -euo pipefail
+source "$(dirname "$0")/bench-common.sh"
 
 # --- Configuration ---
-REMOTE="${REMOTE:-mcnode26}"
-LOCAL_IP="${LOCAL_IP:-10.200.2.127}"
-REMOTE_IP="${REMOTE_IP:-10.200.2.126}"
-LOCAL_IF="${LOCAL_IF:-bf3p1}"
-REMOTE_IF="${REMOTE_IF:-bf3p1}"
-TUN_MTU="${TUN_MTU:-1393}"
 IMAGE="${IMAGE:-nekonuts/h3llo}"
-CERT_DIR="${CERT_DIR:-$(mktemp -d /tmp/h3llo-bench-certs.XXXXXX)}"
-IPERF_TIME="${IPERF_TIME:-10}"
+CERT_DIR="${CERT_DIR:-$(mktemp -d /tmp/bench-h3llo-certs.XXXXXX)}"
 PACKET_QUEUE_DEPTH="${PACKET_QUEUE_DEPTH:-256}"
 TUN_TX_QUEUE_LEN="${TUN_TX_QUEUE_LEN:-1000}"
 
-UDP_PAYLOAD=$((TUN_MTU - 28))  # Subtract IP+UDP overhead to avoid fragmentation
 H3_PORT=4433
 BAREUDP_PORT=5353
 H3_PATH="/bench"
 H3_TOKEN="bench-token-12ch"  # Test-only token, NOT for production
 
-BENCH_DIR="/tmp/h3llo-bench"
+BENCH_DIR="$BENCH_DIR/h3llo"
 LOCAL_CTR="h3llo-bench-local"
 REMOTE_CTR="h3llo-bench-remote"
 TUN_IF="tun-bench"
@@ -148,15 +143,13 @@ if [[ "${BENCH_DRY_RUN:-0}" == "1" ]]; then
     cat "$COUNTERS_FILE"
     rm -f "$COUNTERS_FILE"
     # Clean up auto-created temp cert dir (cleanup trap not registered yet)
-    [[ "$CERT_DIR" == /tmp/h3llo-bench-certs.* ]] && rm -rf "$CERT_DIR"
+    [[ "$CERT_DIR" == /tmp/bench-h3llo-certs.* ]] && rm -rf "$CERT_DIR"
     echo "[dry-run] OK"
     exit 0
 fi
 
 # --- Prerequisites ---
-for cmd in docker ssh scp iperf3 openssl; do
-    command -v "$cmd" >/dev/null 2>&1 || { echo "Error: $cmd not found" >&2; exit 1; }
-done
+require_cmds docker ssh scp iperf3 openssl
 
 # --- Pull latest Docker image and build bench variant ---
 echo "Pulling latest image: $IMAGE ..."
@@ -229,7 +222,7 @@ start_tunnel() {
 
     # Verify connectivity
     echo -n "  Connectivity: "
-    if docker exec "$LOCAL_CTR" ping -c 2 -W 2 10.0.0.2 >/dev/null 2>&1; then
+    if docker exec "$LOCAL_CTR" ping -c 2 -W 2 "$REMOTE_TUN" >/dev/null 2>&1; then
         echo "OK"
     else
         echo "FAILED"
@@ -246,14 +239,7 @@ run_iperf_tcp() {
     echo "--- TCP ---"
     ssh "$REMOTE" "docker exec -d \"$REMOTE_CTR\" iperf3 -s -1"
     sleep 1
-    docker exec "$LOCAL_CTR" iperf3 -c 10.0.0.2 -t "$IPERF_TIME"
-}
-
-run_iperf_udp() {
-    echo "--- UDP 5Gbps (payload=${UDP_PAYLOAD}B, no frag) ---"
-    ssh "$REMOTE" "docker exec -d \"$REMOTE_CTR\" iperf3 -s -1"
-    sleep 1
-    docker exec "$LOCAL_CTR" iperf3 -c 10.0.0.2 -u -b 5G -l "$UDP_PAYLOAD" -t "$IPERF_TIME"
+    docker exec "$LOCAL_CTR" iperf3 -c "$REMOTE_TUN" -t "$IPERF_TIME"
 }
 
 # --- Test runner ---
@@ -267,11 +253,7 @@ run_test() {
         udp_port="$H3_PORT"
     fi
 
-    echo ""
-    echo "================================================================"
-    echo "  $label"
-    echo "  TUN MTU: $TUN_MTU | UDP payload: $UDP_PAYLOAD"
-    echo "================================================================"
+    print_test_header "$label" "TUN MTU: $TUN_MTU"
 
     if ! start_tunnel "$local_cfg" "$remote_cfg"; then
         stop_containers
@@ -285,8 +267,6 @@ run_test() {
     collect_raw_counters "$label - BEFORE" "$REMOTE_IF" remote
 
     run_iperf_tcp
-    echo ""
-    run_iperf_udp
 
     # --- Capture post-test counters ---
     collect_container_counters "$label - AFTER" "$LOCAL_CTR" "$TUN_IF" "$udp_port"
@@ -314,7 +294,7 @@ local:
   tun:
     ifname: tun-bench
     addrs:
-      - 10.0.0.1/32
+      - ${LOCAL_TUN}/32
     mtu: $TUN_MTU
   bare:
     listen: "udp://0.0.0.0:5353"
@@ -329,7 +309,7 @@ peers:
       bindif: $LOCAL_IF
     tun:
       allowed_ips:
-        - 10.0.0.2/32
+        - ${REMOTE_TUN}/32
 EOF
 
     cat > "$BENCH_DIR/remote-bareudp.yaml" <<EOF
@@ -340,7 +320,7 @@ local:
   tun:
     ifname: tun-bench
     addrs:
-      - 10.0.0.2/32
+      - ${REMOTE_TUN}/32
     mtu: $TUN_MTU
   bare:
     listen: "udp://0.0.0.0:5353"
@@ -355,7 +335,7 @@ peers:
       bindif: $REMOTE_IF
     tun:
       allowed_ips:
-        - 10.0.0.1/32
+        - ${LOCAL_TUN}/32
 EOF
 }
 
@@ -380,7 +360,7 @@ local:
   tun:
     ifname: tun-bench
     addrs:
-      - 10.0.0.1/32
+      - ${LOCAL_TUN}/32
     mtu: $TUN_MTU
   h3:
     listen: "https://0.0.0.0:${H3_PORT}${H3_PATH}"
@@ -400,7 +380,7 @@ peers:
       bindif: $LOCAL_IF
     tun:
       allowed_ips:
-        - 10.0.0.2/32
+        - ${REMOTE_TUN}/32
 EOF
 
     cat > "$BENCH_DIR/remote-h3-${suffix}.yaml" <<EOF
@@ -411,7 +391,7 @@ local:
   tun:
     ifname: tun-bench
     addrs:
-      - 10.0.0.2/32
+      - ${REMOTE_TUN}/32
     mtu: $TUN_MTU
   h3:
     listen: "https://0.0.0.0:${H3_PORT}${H3_PATH}"
@@ -431,7 +411,7 @@ peers:
       bindif: $REMOTE_IF
     tun:
       allowed_ips:
-        - 10.0.0.1/32
+        - ${LOCAL_TUN}/32
 EOF
 }
 
@@ -451,14 +431,8 @@ echo "  Raw counters file: $COUNTERS_FILE"
 
 # --- Generate self-signed TLS certificates ---
 mkdir -p "$CERT_DIR"
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-    -keyout "$CERT_DIR/local-key.pem" -out "$CERT_DIR/local-cert.pem" \
-    -days 1 -nodes -subj "/CN=$LOCAL_IP" \
-    -addext "subjectAltName=IP:$LOCAL_IP" 2>/dev/null
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-    -keyout "$CERT_DIR/remote-key.pem" -out "$CERT_DIR/remote-cert.pem" \
-    -days 1 -nodes -subj "/CN=$REMOTE_IP" \
-    -addext "subjectAltName=IP:$REMOTE_IP" 2>/dev/null
+gen_self_signed_cert "$CERT_DIR/local-key.pem" "$CERT_DIR/local-cert.pem" "$LOCAL_IP" "IP:$LOCAL_IP"
+gen_self_signed_cert "$CERT_DIR/remote-key.pem" "$CERT_DIR/remote-cert.pem" "$REMOTE_IP" "IP:$REMOTE_IP"
 echo "  Certificates generated in $CERT_DIR"
 
 # Copy certificates to remote node
@@ -466,14 +440,8 @@ ssh "$REMOTE" "mkdir -p \"$CERT_DIR\""
 scp -q "$CERT_DIR"/*.pem "$REMOTE:$CERT_DIR/"
 echo "  Certificates synced to $REMOTE:$CERT_DIR"
 
-echo "================================================================"
-echo "  h3llo Cross-Node Benchmark"
-echo "  Local:  $LOCAL_IP ($LOCAL_IF) - $(hostname)"
-echo "  Remote: $REMOTE_IP ($REMOTE_IF) - $REMOTE"
-echo "  TUN MTU: $TUN_MTU | UDP payload: $UDP_PAYLOAD"
-echo "  Packet queue depth: $PACKET_QUEUE_DEPTH"
-echo "  Date: $(date -Iseconds)"
-echo "================================================================"
+print_banner "h3llo Cross-Node Benchmark" \
+    "TUN MTU: $TUN_MTU | Packet queue depth: $PACKET_QUEUE_DEPTH"
 
 # --- BareUDP ---
 gen_bareudp_configs
@@ -495,8 +463,4 @@ run_test "H3 (bbr2)" "local-h3-bbr2.yaml" "remote-h3-bbr2.yaml"
 gen_h3_configs "bbr2" "true"
 run_test "H3 (bbr2 + pacing)" "local-h3-bbr2-pacing.yaml" "remote-h3-bbr2-pacing.yaml"
 
-echo ""
-echo "================================================================"
-echo "  All benchmarks completed."
-echo "  Raw counters saved to: $COUNTERS_FILE"
-echo "================================================================"
+print_done "All benchmarks completed. Raw counters saved to: $COUNTERS_FILE"
