@@ -17,6 +17,21 @@ On CONNECT-IP authentication failure, the server rejects with 401 Unauthorized. 
 
 HTTP/3 summary: h3llo speaks CONNECT-IP over HTTP/3 with datagrams enabled; only mandatory pieces stay to minimize latency and complexity.
 
+#### Stateless Retry (Address Validation)
+
+The HTTP/3 listener performs QUIC stateless retry (RFC 9000 §8.1.2) on every
+new connection. When a client sends an Initial packet without a token, the
+server responds with a Retry packet containing an HMAC-SHA256 authenticated
+token. The client echoes the token in its next Initial, and the server
+validates it before allocating connection state — preventing address-spoofing
+amplification attacks.
+
+Token properties:
+- **Authenticated**: HMAC-SHA256 with a per-process random key.
+- **Time-bounded**: Tokens expire after 5 seconds (aligned with `h3_handshake_timeout`).
+- **Address-bound**: Token encodes the client’s IP and port.
+- **Stateless**: No per-token server state; validation is purely cryptographic.
+
 Issuing an Extended CONNECT request to h3llo’s HTTP path uses the standard CONNECT-IP protocol to transport IP packets.
 
 h3llo implements only the mandatory pieces of CONNECT-IP:

@@ -22,10 +22,11 @@ use crate::tun::alloc_uninit_packet_buf;
 use crate::udp;
 use quiche::h3::NameValue;
 use rand::Rng;
+use ring::hmac;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -48,6 +49,85 @@ pub enum ServerError {
     /// Connection acceptance or CONNECT-IP handshake failed.
     #[error("accept: {0}")]
     Accept(String),
+}
+
+// ========== Stateless Retry Token ==========
+
+/// Maximum age of a retry token before it is considered expired.
+const RETRY_TOKEN_LIFETIME_SECS: u64 = 5;
+
+/// Mints a cryptographic retry token binding client address and original DCID.
+///
+/// Token layout: `[timestamp: 8B | ip: 4/16B | port: 2B | odcid: var] | hmac_tag: 32B`
+fn mint_retry_token(key: &hmac::Key, addr: &SocketAddr, odcid: &[u8]) -> Vec<u8> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut payload = Vec::with_capacity(8 + 16 + 2 + odcid.len());
+    payload.extend_from_slice(&timestamp.to_be_bytes());
+    match addr.ip() {
+        IpAddr::V4(a) => payload.extend_from_slice(&a.octets()),
+        IpAddr::V6(a) => payload.extend_from_slice(&a.octets()),
+    }
+    payload.extend_from_slice(&addr.port().to_be_bytes());
+    payload.extend_from_slice(odcid);
+    let tag = hmac::sign(key, &payload);
+    payload.extend_from_slice(tag.as_ref());
+    payload
+}
+
+/// Validates a retry token and extracts the original destination CID.
+///
+/// Checks HMAC integrity, timestamp freshness, and client address match.
+/// Returns the original DCID as a borrowed slice of `token` on success.
+fn validate_retry_token<'a>(
+    key: &hmac::Key,
+    addr: &SocketAddr,
+    token: &'a [u8],
+) -> Option<&'a [u8]> {
+    let ip_len: usize = match addr {
+        SocketAddr::V4(_) => 4,
+        SocketAddr::V6(_) => 16,
+    };
+    let tag_len = ring::digest::SHA256_OUTPUT_LEN;
+    // 8 (timestamp) + ip_len + 2 (port) + 0 (min odcid) + tag_len
+    if token.len() < 8 + ip_len + 2 + tag_len {
+        return None;
+    }
+    let (payload, tag_bytes) = token.split_at(token.len() - tag_len);
+
+    // Verify HMAC first (constant-time).
+    hmac::verify(key, payload, tag_bytes).ok()?;
+
+    // Check timestamp freshness.
+    let timestamp = u64::from_be_bytes(payload[..8].try_into().ok()?);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.saturating_sub(timestamp) > RETRY_TOKEN_LIFETIME_SECS {
+        return None;
+    }
+
+    // Verify client IP.
+    let ip_end = 8 + ip_len;
+    let expected_ip: Vec<u8> = match addr.ip() {
+        IpAddr::V4(a) => a.octets().to_vec(),
+        IpAddr::V6(a) => a.octets().to_vec(),
+    };
+    if payload[8..ip_end] != *expected_ip {
+        return None;
+    }
+
+    // Verify client port.
+    let port_end = ip_end + 2;
+    if payload[ip_end..port_end] != addr.port().to_be_bytes() {
+        return None;
+    }
+
+    // Remaining bytes are the original DCID.
+    Some(&payload[port_end..])
 }
 
 // ========== Server Validation Helpers ==========
@@ -166,6 +246,9 @@ pub fn make_h3_dispatcher(
             .map_err(|e| ServerError::Socket(format!("make_udp: {e}")))?
     };
 
+    let retry_key = hmac::Key::generate(hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
+        .map_err(|_| ServerError::Config("failed to generate retry HMAC key".into()))?;
+
     let dispatcher = H3Dispatcher {
         bound_addr,
         config,
@@ -180,6 +263,7 @@ pub fn make_h3_dispatcher(
             metrics_interval: tuning.metrics_push_interval,
             keepalive_interval: tuning.h3_keepalive_interval,
         },
+        retry_key,
     };
 
     info!(%listen_addr, %bound_addr, "h3 dispatcher created");
@@ -194,6 +278,8 @@ struct ServerPacketHeader {
     hdr_ty: quiche::Type,
     hdr_version: u32,
     client_scid: Vec<u8>,
+    /// Address validation token from Initial packet (empty if no token).
+    token: Vec<u8>,
 }
 
 impl ServerPacketHeader {
@@ -204,6 +290,7 @@ impl ServerPacketHeader {
             hdr_ty: hdr.ty,
             hdr_version: hdr.version,
             client_scid: hdr.scid.as_ref().to_vec(),
+            token: hdr.token.unwrap_or_default(),
         })
     }
 }
@@ -380,6 +467,8 @@ pub struct H3Dispatcher {
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     conn_params: ConnParams,
+    /// HMAC key for stateless retry token authentication.
+    retry_key: hmac::Key,
 }
 
 /// Runtime state for the CID-routing dispatcher loop.
@@ -395,8 +484,10 @@ struct DispatcherRuntime {
     cid_table: HashMap<Vec<u8>, usize>,
     actors: HashMap<usize, ConnActorHandle>,
     next_conn_id: usize,
-    /// Reusable buffer for version negotiation packets only.
+    /// Reusable buffer for version negotiation and stateless retry packets.
     neg_buf: Vec<u8>,
+    /// HMAC key for stateless retry token authentication.
+    retry_key: hmac::Key,
 }
 
 impl DispatcherRuntime {
@@ -485,13 +576,57 @@ impl DispatcherRuntime {
             return;
         }
 
-        let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
-        rand::rng().fill_bytes(&mut scid_bytes);
-        let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+        // --- Stateless retry: address validation per RFC 9000 §8.1.2 ---
+        let odcid = if header.token.is_empty() {
+            // No token: mint one and send a Retry packet.
+            let token = mint_retry_token(&self.retry_key, &remote, &header.dcid);
+            let mut new_scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
+            rand::rng().fill_bytes(&mut new_scid_bytes);
 
-        // TODO: Stateless retry for public-facing deployments.
-        let mut conn = match quiche::accept(&scid, None, self.bound_addr, remote, &mut self.config)
-        {
+            match quiche::retry(
+                &quiche::ConnectionId::from_ref(&header.client_scid),
+                &quiche::ConnectionId::from_ref(&header.dcid),
+                &quiche::ConnectionId::from_ref(&new_scid_bytes),
+                &token,
+                header.hdr_version,
+                &mut self.neg_buf,
+            ) {
+                Ok(len) => {
+                    let mut pkt = alloc_uninit_packet_buf(len);
+                    pkt[..len].copy_from_slice(&self.neg_buf[..len]);
+                    pkt.truncate(len);
+                    let _ = self.io.udp_send_tx.try_send((remote, vec![pkt]));
+                    debug!(%remote, "sent stateless retry");
+                }
+                Err(e) => {
+                    warn!(%remote, error = ?e, "quiche retry failed");
+                }
+            }
+            return;
+        } else {
+            // Token present: validate it.
+            match validate_retry_token(&self.retry_key, &remote, &header.token) {
+                Some(odcid) => odcid,
+                None => {
+                    debug!(%remote, "invalid or expired retry token");
+                    return;
+                }
+            }
+        };
+
+        // Reuse the DCID from the re-Initial as the server's SCID — this is
+        // the Retry packet's Source CID, and quiche advertises it as the
+        // retry_source_connection_id transport parameter (RFC 9000 §7.3).
+        let scid = quiche::ConnectionId::from_ref(&header.dcid);
+
+        let odcid_cid = quiche::ConnectionId::from_ref(odcid);
+        let mut conn = match quiche::accept(
+            &scid,
+            Some(&odcid_cid),
+            self.bound_addr,
+            remote,
+            &mut self.config,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 warn!(%remote, error = ?e, "quiche accept failed");
@@ -514,7 +649,7 @@ impl DispatcherRuntime {
         self.next_conn_id += 1;
 
         // TODO: Track NEW_CONNECTION_ID / RETIRE_CONNECTION_ID for CID rotation.
-        let cids = vec![header.dcid, scid_bytes.to_vec()];
+        let cids = vec![header.dcid];
         for cid in &cids {
             self.cid_table.insert(cid.clone(), conn_id);
         }
@@ -639,6 +774,7 @@ pub fn spawn_h3_dispatcher(
         ingress_tx,
         events_tx,
         conn_params,
+        retry_key,
     } = dispatcher;
 
     // Spawn UDP actors on udp_rt.
@@ -672,6 +808,7 @@ pub fn spawn_h3_dispatcher(
             actors: HashMap::new(),
             next_conn_id: 0,
             neg_buf: vec![0u8; max_udp_payload],
+            retry_key,
         };
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
     });
@@ -775,6 +912,80 @@ mod tests {
         let mut tokens = HashMap::new();
         tokens.insert("peer-1".to_string(), "correct-token".to_string());
         assert!(validate_server_auth(&headers, &tokens).is_err());
+    }
+
+    // ========== Retry Token Tests ==========
+
+    fn test_hmac_key() -> hmac::Key {
+        hmac::Key::generate(hmac::HMAC_SHA256, &ring::rand::SystemRandom::new()).unwrap()
+    }
+
+    #[test]
+    fn retry_token_roundtrip_ipv4() {
+        let key = test_hmac_key();
+        let addr: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+        let odcid = b"original-dcid-bytes";
+        let token = mint_retry_token(&key, &addr, odcid);
+        assert_eq!(
+            validate_retry_token(&key, &addr, &token),
+            Some(odcid.as_slice())
+        );
+    }
+
+    #[test]
+    fn retry_token_roundtrip_ipv6() {
+        let key = test_hmac_key();
+        let addr: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let odcid = b"v6-dcid";
+        let token = mint_retry_token(&key, &addr, odcid);
+        assert_eq!(
+            validate_retry_token(&key, &addr, &token),
+            Some(odcid.as_slice())
+        );
+    }
+
+    #[test]
+    fn retry_token_rejects_wrong_ip() {
+        let key = test_hmac_key();
+        let mint_addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let check_addr: SocketAddr = "10.0.0.2:1000".parse().unwrap();
+        let token = mint_retry_token(&key, &mint_addr, b"dcid");
+        assert!(validate_retry_token(&key, &check_addr, &token).is_none());
+    }
+
+    #[test]
+    fn retry_token_rejects_wrong_port() {
+        let key = test_hmac_key();
+        let addr1: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let addr2: SocketAddr = "10.0.0.1:2000".parse().unwrap();
+        let token = mint_retry_token(&key, &addr1, b"dcid");
+        assert!(validate_retry_token(&key, &addr2, &token).is_none());
+    }
+
+    #[test]
+    fn retry_token_rejects_tampered() {
+        let key = test_hmac_key();
+        let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let mut token = mint_retry_token(&key, &addr, b"dcid");
+        token[4] ^= 0xFF;
+        assert!(validate_retry_token(&key, &addr, &token).is_none());
+    }
+
+    #[test]
+    fn retry_token_rejects_truncated() {
+        let key = test_hmac_key();
+        let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let token = mint_retry_token(&key, &addr, b"dcid");
+        assert!(validate_retry_token(&key, &addr, &token[..10]).is_none());
+    }
+
+    #[test]
+    fn retry_token_rejects_wrong_key() {
+        let key1 = test_hmac_key();
+        let key2 = test_hmac_key();
+        let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let token = mint_retry_token(&key1, &addr, b"dcid");
+        assert!(validate_retry_token(&key2, &addr, &token).is_none());
     }
 
     // ========== make_h3_dispatcher Tests ==========
