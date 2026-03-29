@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Cross-node WireGuard throughput baseline benchmark using iperf3.
 # Sets up a WireGuard tunnel between two physical nodes over SSH and
-# runs TCP + UDP throughput tests via iperf3.
+# runs a TCP throughput test via iperf3.
 #
 # Prerequisites:
 #   - Passwordless sudo on both nodes

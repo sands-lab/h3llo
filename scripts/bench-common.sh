@@ -56,7 +56,7 @@ gen_self_signed_cert() {
     openssl req -x509 -newkey ec -pkeyopt "ec_paramgen_curve:$curve" \
         -keyout "$key" -out "$cert" \
         -days 1 -nodes -subj "/CN=$cn" \
-        "${extra[@]}" 2>/dev/null \
+        "${extra[@]}" \
         || { echo "Error: certificate generation failed for CN=$cn" >&2; return 1; }
 }
 
