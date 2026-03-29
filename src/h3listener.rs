@@ -622,15 +622,20 @@ impl DispatcherRuntime {
             }
         };
 
-        // Reuse the DCID from the re-Initial as the server's SCID — this is
-        // the Retry packet's Source CID, and quiche advertises it as the
-        // retry_source_connection_id transport parameter (RFC 9000 §7.3).
-        let scid = quiche::ConnectionId::from_ref(&header.dcid);
+        let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
+        rand::rng().fill_bytes(&mut scid_bytes);
+        let scid = quiche::ConnectionId::from_ref(&scid_bytes);
 
         let odcid_cid = quiche::ConnectionId::from_ref(odcid);
-        let mut conn = match quiche::accept(
+        let retry_scid = quiche::ConnectionId::from_ref(&header.dcid);
+        let retry_cids = quiche::RetryConnectionIds {
+            original_destination_cid: &odcid_cid,
+            // The re-Initial's DCID is the Retry packet's Source CID.
+            retry_source_cid: &retry_scid,
+        };
+        let mut conn = match quiche::accept_with_retry(
             &scid,
-            Some(&odcid_cid),
+            retry_cids,
             self.bound_addr,
             remote,
             &mut self.config,
@@ -657,7 +662,7 @@ impl DispatcherRuntime {
         self.next_conn_id += 1;
 
         // TODO: Track NEW_CONNECTION_ID / RETIRE_CONNECTION_ID for CID rotation.
-        let cids = vec![header.dcid];
+        let cids = vec![header.dcid, scid_bytes.to_vec()];
         for cid in &cids {
             self.cid_table.insert(cid.clone(), conn_id);
         }
