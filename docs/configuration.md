@@ -43,6 +43,7 @@ tuning: # optional, all fields have defaults
   h3_cc_algorithm: none # optional, default: none (accepted: none, reno, cubic, bbr, bbr2)
   h3_enable_pacing: false # optional, default: false
   h3_insecure_skip_verify: false # optional, default: false (skip TLS verification; testing only)
+  h3_trusted_ca: /path/to/ca.pem # optional, default: none (PEM CA cert file for TLS verification)
 peers: # optional, default: []
 - id: example-node-1
   h3: # optional, conflicts with peers.bare; endpoint optional (listen-only if omitted)
@@ -95,13 +96,13 @@ peers: # optional, default: []
 - `tuning.h3_cc_algorithm` (default `none`): QUIC congestion control algorithm. Accepted values: `none`, `reno`, `cubic`, `bbr`, `bbr2`. Applied to both client (dial) and server (listener) QUIC connections.
 - `tuning.h3_enable_pacing` (default `false`): Enable QUIC packet pacing to smooth bursty sends. Requires OS-level support (e.g., `SO_TXTIME` on Linux). Applied to both client and server QUIC connections.
 - `tuning.h3_insecure_skip_verify` (default `false`): Skip TLS certificate verification globally for all H3 connections. Intended for testing with self-signed certificates only. **Not recommended for production.**
+- `tuning.h3_trusted_ca` (optional, default `none`): Path to a PEM-encoded CA certificate file. When set, the certificates in this file are added to the trust store alongside the platform's system CA certificates for H3 client TLS verification. Useful for private PKI or self-signed CA deployments. Ignored when `h3_insecure_skip_verify` is `true`.
 - `peers[]`: Remote peer entries.
 - `peers[].id`: Remote peer identifier; must be unique within the configuration and non-empty.
 - `peers[].h3.token`: Remote peer authentication token; required (and must be at least 12 characters) whenever `peers[].h3` is set, including listen-only entries with empty `endpoints`. Must be unique across all peers. Bearer Token auth for CONNECT uses `Authorization: Bearer <token>`; server matches tokens to identify peers.
 - `peers[].h3.endpoint` (optional): HTTP/3 dialing address (scheme/host/port/path); omit to wait for inbound HTTP/3 from the peer. Mutually exclusive with `peers[].bare`.
 - `peers[].h3.sni` (optional): TLS Server Name Indication (SNI) override for the QUIC/TLS handshake. When set, this value is sent as the SNI instead of the hostname from `peers[].h3.endpoint`. The HTTP/3 `:authority` pseudo-header is derived from the `endpoint` authority (`host`, or `host:port` when a non-default HTTPS port is used) and is not affected by `sni`. Useful for reverse proxy traversal, CDN-fronted deployments, or when `endpoint` uses an IP address but the server certificate contains a DNS name.
 - `peers[].h3.bindif` (optional): Interface for HTTP/3 dialer. When omitted, auto-detects at most one interface. Probe/bind fallbacks and recursive-routing warnings are described in [docs/internals.md](internals.md).
-- Custom CA certificate bundles are not currently supported. The underlying QUIC library (tokio-quiche) does not expose an API for configuring custom CA certificates; all TLS verification uses the system trust store.
 - `peers[].bare.endpoint`: BareUDP dialing address; mutually exclusive with peers[].h3. DNS handling, source-IP filtering, and multi-answer behavior are detailed in [docs/protocol.md](protocol.md).
 - `peers[].bare.bindif` (optional): Interface for BareUDP dialing. Auto-detect when absent; binding and fallback behavior is in [docs/internals.md](internals.md).
 - `peers[].tun.allowed_ips` (required): Prefixes routed via this peer; longest-prefix wins when multiple peers overlap.

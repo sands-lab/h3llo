@@ -290,6 +290,14 @@ pub struct Tuning {
     /// with self-signed certificates only. **Not recommended for production.**
     #[serde(default)]
     pub h3_insecure_skip_verify: bool,
+    /// Optional path to a PEM-encoded CA certificate file for H3 TLS verification.
+    ///
+    /// When set, the certificates in this file are added to the trust store
+    /// alongside system CA certificates. Useful for private PKI or self-signed
+    /// CA deployments. When `None` (default), only system CA certificates are
+    /// used. Ignored when `h3_insecure_skip_verify` is `true`.
+    #[serde(default)]
+    pub h3_trusted_ca: Option<String>,
 }
 
 impl Default for Tuning {
@@ -316,6 +324,7 @@ impl Default for Tuning {
             h3_cc_algorithm: "none".to_string(),
             h3_enable_pacing: false,
             h3_insecure_skip_verify: false,
+            h3_trusted_ca: None,
         }
     }
 }
@@ -1973,6 +1982,7 @@ peers:
         assert_eq!(cfg.tuning.h3_cc_algorithm, "none");
         assert!(!cfg.tuning.h3_enable_pacing);
         assert!(!cfg.tuning.h3_insecure_skip_verify);
+        assert!(cfg.tuning.h3_trusted_ca.is_none());
         assert_eq!(cfg.tuning.tun_tx_queue_len, 1000);
         assert!(!cfg.tuning.tun_enable_offload);
         assert!(!cfg.tuning.udp_enable_offload);
@@ -2189,6 +2199,23 @@ peers:
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert!(cfg.tuning.h3_insecure_skip_verify);
+    }
+
+    #[test]
+    fn tuning_h3_trusted_ca_override() {
+        let yaml = r#"
+local:
+  tun:
+    addrs:
+      - 192.168.180.1/32
+tuning:
+  h3_trusted_ca: /etc/ssl/custom-ca.pem
+"#;
+        let cfg = Config::load_from_str(yaml).expect("config should load");
+        assert_eq!(
+            cfg.tuning.h3_trusted_ca.as_deref(),
+            Some("/etc/ssl/custom-ca.pem")
+        );
     }
 
     #[test]
