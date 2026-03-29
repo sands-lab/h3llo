@@ -53,10 +53,6 @@ pub enum ServerError {
 
 // ========== Stateless Retry Token ==========
 
-/// Maximum age of a retry token before it is considered expired.
-/// Aligned with `Tuning::h3_handshake_timeout` default (5s).
-const RETRY_TOKEN_LIFETIME_SECS: u64 = 5;
-
 /// Mints a cryptographic retry token binding client address and original DCID.
 ///
 /// Token layout: `[timestamp: 8B | ip: 4/16B | port: 2B | odcid: var] | hmac_tag: 32B`
@@ -91,6 +87,7 @@ fn validate_retry_token<'a>(
     key: &hmac::Key,
     addr: &SocketAddr,
     token: &'a [u8],
+    lifetime: Duration,
 ) -> Option<&'a [u8]> {
     let ip_len: usize = match addr {
         SocketAddr::V4(_) => 4,
@@ -112,7 +109,7 @@ fn validate_retry_token<'a>(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if now.saturating_sub(timestamp) > RETRY_TOKEN_LIFETIME_SECS {
+    if now.saturating_sub(timestamp) > lifetime.as_secs() {
         return None;
     }
 
@@ -611,7 +608,12 @@ impl DispatcherRuntime {
             return;
         } else {
             // Token present: validate it.
-            match validate_retry_token(&self.retry_key, &remote, &header.token) {
+            match validate_retry_token(
+                &self.retry_key,
+                &remote,
+                &header.token,
+                self.conn_params.handshake_timeout,
+            ) {
                 Some(odcid) => odcid,
                 None => {
                     debug!(%remote, "invalid or expired retry token");
@@ -922,6 +924,9 @@ mod tests {
 
     // ========== Retry Token Tests ==========
 
+    /// Token lifetime used across retry token tests.
+    const TEST_TOKEN_LIFETIME: Duration = Duration::from_secs(10);
+
     fn test_hmac_key() -> hmac::Key {
         hmac::Key::generate(hmac::HMAC_SHA256, &ring::rand::SystemRandom::new()).unwrap()
     }
@@ -933,7 +938,7 @@ mod tests {
         let odcid = b"original-dcid-bytes";
         let token = mint_retry_token(&key, &addr, odcid);
         assert_eq!(
-            validate_retry_token(&key, &addr, &token),
+            validate_retry_token(&key, &addr, &token, TEST_TOKEN_LIFETIME),
             Some(odcid.as_slice())
         );
     }
@@ -945,7 +950,7 @@ mod tests {
         let odcid = b"v6-dcid";
         let token = mint_retry_token(&key, &addr, odcid);
         assert_eq!(
-            validate_retry_token(&key, &addr, &token),
+            validate_retry_token(&key, &addr, &token, TEST_TOKEN_LIFETIME),
             Some(odcid.as_slice())
         );
     }
@@ -956,7 +961,7 @@ mod tests {
         let mint_addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
         let check_addr: SocketAddr = "10.0.0.2:1000".parse().unwrap();
         let token = mint_retry_token(&key, &mint_addr, b"dcid");
-        assert!(validate_retry_token(&key, &check_addr, &token).is_none());
+        assert!(validate_retry_token(&key, &check_addr, &token, TEST_TOKEN_LIFETIME).is_none());
     }
 
     #[test]
@@ -965,7 +970,7 @@ mod tests {
         let addr1: SocketAddr = "10.0.0.1:1000".parse().unwrap();
         let addr2: SocketAddr = "10.0.0.1:2000".parse().unwrap();
         let token = mint_retry_token(&key, &addr1, b"dcid");
-        assert!(validate_retry_token(&key, &addr2, &token).is_none());
+        assert!(validate_retry_token(&key, &addr2, &token, TEST_TOKEN_LIFETIME).is_none());
     }
 
     #[test]
@@ -974,7 +979,7 @@ mod tests {
         let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
         let mut token = mint_retry_token(&key, &addr, b"dcid");
         token[4] ^= 0xFF;
-        assert!(validate_retry_token(&key, &addr, &token).is_none());
+        assert!(validate_retry_token(&key, &addr, &token, TEST_TOKEN_LIFETIME).is_none());
     }
 
     #[test]
@@ -982,7 +987,7 @@ mod tests {
         let key = test_hmac_key();
         let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
         let token = mint_retry_token(&key, &addr, b"dcid");
-        assert!(validate_retry_token(&key, &addr, &token[..10]).is_none());
+        assert!(validate_retry_token(&key, &addr, &token[..10], TEST_TOKEN_LIFETIME).is_none());
     }
 
     #[test]
@@ -991,20 +996,21 @@ mod tests {
         let key2 = test_hmac_key();
         let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
         let token = mint_retry_token(&key1, &addr, b"dcid");
-        assert!(validate_retry_token(&key2, &addr, &token).is_none());
+        assert!(validate_retry_token(&key2, &addr, &token, TEST_TOKEN_LIFETIME).is_none());
     }
 
     #[test]
     fn retry_token_rejects_expired() {
         let key = test_hmac_key();
         let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let lifetime = Duration::from_secs(5);
         let mut token = mint_retry_token(&key, &addr, b"dcid");
         // Overwrite timestamp to be past the lifetime window, then re-sign.
         let stale_ts = (SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
-            - RETRY_TOKEN_LIFETIME_SECS
+            - lifetime.as_secs()
             - 1)
         .to_be_bytes();
         token[..8].copy_from_slice(&stale_ts);
@@ -1012,7 +1018,7 @@ mod tests {
         let payload_len = token.len() - tag_len;
         let tag = hmac::sign(&key, &token[..payload_len]);
         token[payload_len..].copy_from_slice(tag.as_ref());
-        assert!(validate_retry_token(&key, &addr, &token).is_none());
+        assert!(validate_retry_token(&key, &addr, &token, lifetime).is_none());
     }
 
     // ========== make_h3_dispatcher Tests ==========

@@ -28,7 +28,7 @@ amplification attacks.
 
 Token properties:
 - **Authenticated**: HMAC-SHA256 with a per-process random key.
-- **Time-bounded**: Tokens expire after 5 seconds (aligned with `h3_handshake_timeout`).
+- **Time-bounded**: Tokens expire after `tuning.h3_handshake_timeout` (default 5 seconds).
 - **Address-bound**: Token encodes the client’s IP and port.
 - **Stateless**: No per-token server state; validation is purely cryptographic.
 
