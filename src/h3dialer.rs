@@ -207,10 +207,17 @@ fn make_client_quiche_config(
         .map_err(|e| DialError::Handshake(format!("quiche config: {e}")))?;
     apply_transport_config(&mut config, tuning, max_udp_payload)
         .map_err(|e| DialError::Handshake(format!("transport config: {e}")))?;
-    if tuning.h3_insecure_skip_verify {
-        config.verify_peer(false);
+    if !tuning.h3_insecure_skip_verify {
+        // Enable TLS peer verification. System CA certificates are already
+        // loaded by quiche::Config::new() via BoringSSL's
+        // SSL_CTX_set_default_verify_paths().
+        config.verify_peer(true);
+        if let Some(ca_path) = &tuning.h3_trusted_ca {
+            config
+                .load_verify_locations_from_file(ca_path)
+                .map_err(|e| DialError::Handshake(format!("trusted CA `{ca_path}`: {e}")))?;
+        }
     }
-    // TODO: Load system CA certs when verify_peer is true.
     Ok(config)
 }
 
@@ -398,6 +405,45 @@ mod tests {
 
         let err: DialError = ConnectFailure::Poll("poll failed".into()).into();
         assert!(matches!(err, DialError::Handshake(s) if s == "poll failed"));
+    }
+
+    // ========== make_client_quiche_config Unit Tests ==========
+
+    #[test]
+    fn make_client_config_bad_ca_path_errors() {
+        let tuning = Tuning {
+            h3_trusted_ca: Some("/nonexistent/ca.pem".to_string()),
+            ..Tuning::default()
+        };
+        let err = make_client_quiche_config(&tuning, 1350)
+            .err()
+            .expect("should fail");
+        assert!(
+            matches!(err, DialError::Handshake(ref msg) if msg.contains("trusted CA")),
+            "expected Handshake with trusted CA context, got: {err}",
+        );
+    }
+
+    #[test]
+    fn make_client_config_insecure_ignores_ca() {
+        let tuning = Tuning {
+            h3_insecure_skip_verify: true,
+            h3_trusted_ca: Some("/nonexistent/ca.pem".to_string()),
+            ..Tuning::default()
+        };
+        // Should succeed because insecure mode skips CA loading entirely.
+        let result = make_client_quiche_config(&tuning, 1350);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn make_client_config_default_enables_verify_peer() {
+        let tuning = Tuning::default();
+        // Default tuning: verify_peer=true, no custom CA.
+        // Should succeed — system CA certs are loaded automatically by quiche.
+        make_client_quiche_config(&tuning, 1350)
+            .map_err(|e| format!("default tuning should produce valid config: {e}"))
+            .unwrap();
     }
 
     // ========== Integration Test Helpers ==========
@@ -708,6 +754,88 @@ mod tests {
         // Best-effort check: they should not hang indefinitely.
         let _ = tokio::time::timeout(Duration::from_secs(2), udp_rx_handle).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), udp_tx_handle).await;
+
+        drop(server.cmd_tx);
+    }
+
+    // ========== TLS Verification Integration Tests ==========
+
+    #[tokio::test]
+    async fn h3v2_handshake_with_trusted_ca() {
+        let peer_id = "h3v2-ca-client";
+        let token = "h3v2-ca-token-12ch";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let server = TestServer::start(peer_tokens).await;
+
+        // Use the server's self-signed cert as the trusted CA.
+        let ca_path = server
+            ._certs
+            .cert_path()
+            .to_str()
+            .expect("cert path is valid UTF-8")
+            .to_string();
+
+        let peer_h3 = test_peer_h3(server.bound_addr, token);
+        let probe = FakeRouteProbe::noop();
+        let tuning = Tuning {
+            h3_trusted_ca: Some(ca_path),
+            ..Tuning::default()
+        };
+
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let ctx = DialContext {
+            peer_id: peer_id.to_string(),
+            tun_if: String::new(),
+            tun_mtu: default_mtu().into(),
+            tuning,
+            udp_rt: tokio::runtime::Handle::current(),
+            crypto_rt: tokio::runtime::Handle::current(),
+            events_tx,
+        };
+
+        let event = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx)
+            .await
+            .expect("dial with trusted CA should succeed");
+
+        assert_eq!(event.peer_id, peer_id);
+        drop(server.cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn h3v2_handshake_fails_without_trusted_ca() {
+        let peer_id = "h3v2-notrust-client";
+        let token = "h3v2-notrust-tok-12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let server = TestServer::start(peer_tokens).await;
+
+        // Default tuning: verify_peer=true, no custom CA.
+        // The server uses a self-signed cert not in the system trust store,
+        // so the handshake should fail with a TLS verification error.
+        let peer_h3 = test_peer_h3(server.bound_addr, token);
+        let probe = FakeRouteProbe::noop();
+        let tuning = Tuning::default();
+
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let ctx = DialContext {
+            peer_id: peer_id.to_string(),
+            tun_if: String::new(),
+            tun_mtu: default_mtu().into(),
+            tuning,
+            udp_rt: tokio::runtime::Handle::current(),
+            crypto_rt: tokio::runtime::Handle::current(),
+            events_tx,
+        };
+
+        let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
+
+        assert!(
+            result.is_err(),
+            "handshake with self-signed cert and no trusted CA should fail, got: {result:?}",
+        );
 
         drop(server.cmd_tx);
     }
