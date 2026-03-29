@@ -54,6 +54,7 @@ pub enum ServerError {
 // ========== Stateless Retry Token ==========
 
 /// Maximum age of a retry token before it is considered expired.
+/// Aligned with `Tuning::h3_handshake_timeout` default (5s).
 const RETRY_TOKEN_LIFETIME_SECS: u64 = 5;
 
 /// Mints a cryptographic retry token binding client address and original DCID.
@@ -64,7 +65,12 @@ fn mint_retry_token(key: &hmac::Key, addr: &SocketAddr, odcid: &[u8]) -> Vec<u8>
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let mut payload = Vec::with_capacity(8 + 16 + 2 + odcid.len());
+    let ip_len: usize = match addr {
+        SocketAddr::V4(_) => 4,
+        SocketAddr::V6(_) => 16,
+    };
+    let mut payload =
+        Vec::with_capacity(8 + ip_len + 2 + odcid.len() + ring::digest::SHA256_OUTPUT_LEN);
     payload.extend_from_slice(&timestamp.to_be_bytes());
     match addr.ip() {
         IpAddr::V4(a) => payload.extend_from_slice(&a.octets()),
@@ -112,11 +118,11 @@ fn validate_retry_token<'a>(
 
     // Verify client IP.
     let ip_end = 8 + ip_len;
-    let expected_ip: Vec<u8> = match addr.ip() {
-        IpAddr::V4(a) => a.octets().to_vec(),
-        IpAddr::V6(a) => a.octets().to_vec(),
+    let ip_matches = match addr.ip() {
+        IpAddr::V4(a) => payload[8..ip_end] == a.octets(),
+        IpAddr::V6(a) => payload[8..ip_end] == a.octets(),
     };
-    if payload[8..ip_end] != *expected_ip {
+    if !ip_matches {
         return None;
     }
 
@@ -986,6 +992,27 @@ mod tests {
         let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
         let token = mint_retry_token(&key1, &addr, b"dcid");
         assert!(validate_retry_token(&key2, &addr, &token).is_none());
+    }
+
+    #[test]
+    fn retry_token_rejects_expired() {
+        let key = test_hmac_key();
+        let addr: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let mut token = mint_retry_token(&key, &addr, b"dcid");
+        // Overwrite timestamp to be past the lifetime window, then re-sign.
+        let stale_ts = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - RETRY_TOKEN_LIFETIME_SECS
+            - 1)
+        .to_be_bytes();
+        token[..8].copy_from_slice(&stale_ts);
+        let tag_len = ring::digest::SHA256_OUTPUT_LEN;
+        let payload_len = token.len() - tag_len;
+        let tag = hmac::sign(&key, &token[..payload_len]);
+        token[payload_len..].copy_from_slice(tag.as_ref());
+        assert!(validate_retry_token(&key, &addr, &token).is_none());
     }
 
     // ========== make_h3_dispatcher Tests ==========
