@@ -395,8 +395,6 @@ struct DispatcherRuntime {
     cid_table: HashMap<Vec<u8>, usize>,
     actors: HashMap<usize, ConnActorHandle>,
     next_conn_id: usize,
-    /// Reusable buffer for version negotiation packets only.
-    neg_buf: Vec<u8>,
 }
 
 impl DispatcherRuntime {
@@ -472,13 +470,12 @@ impl DispatcherRuntime {
         }
 
         if !quiche::version_is_supported(header.hdr_version) {
+            let mut pkt = alloc_uninit_packet_buf(self.max_udp_payload);
             if let Ok(len) = quiche::negotiate_version(
                 &quiche::ConnectionId::from_ref(&header.client_scid),
                 &quiche::ConnectionId::from_ref(&header.dcid),
-                &mut self.neg_buf,
+                &mut pkt,
             ) {
-                let mut pkt = alloc_uninit_packet_buf(len);
-                pkt[..len].copy_from_slice(&self.neg_buf[..len]);
                 pkt.truncate(len);
                 let _ = self.io.udp_send_tx.try_send((remote, vec![pkt]));
             }
@@ -595,20 +592,17 @@ impl DispatcherRuntime {
     }
 
     fn cleanup_finished_actors(&mut self) {
-        let finished: Vec<usize> = self
-            .actors
-            .iter()
-            .filter(|(_, a)| a.handle.is_finished())
-            .map(|(&id, _)| id)
-            .collect();
-
-        for conn_id in finished {
-            if let Some(actor) = self.actors.remove(&conn_id) {
+        let cid_table = &mut self.cid_table;
+        self.actors.retain(|_, actor| {
+            if actor.handle.is_finished() {
                 for cid in &actor.cids {
-                    self.cid_table.remove(cid);
+                    cid_table.remove(cid);
                 }
+                false
+            } else {
+                true
             }
-        }
+        });
     }
 }
 
@@ -671,7 +665,6 @@ pub fn spawn_h3_dispatcher(
             cid_table: HashMap::new(),
             actors: HashMap::new(),
             next_conn_id: 0,
-            neg_buf: vec![0u8; max_udp_payload],
         };
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
     });
