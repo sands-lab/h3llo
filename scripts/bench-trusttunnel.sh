@@ -118,7 +118,11 @@ stop_tunnel() {
     kill_remote_iperf
     sleep 2
     # TrustTunnel creates "tun0" by default; no config option to customize the name.
-    sudo ip link del tun0 2>/dev/null || true
+    # Guard: only delete if tun0 has our test network route, to avoid tearing down
+    # an unrelated interface.
+    if ip route show "$TEST_NET" dev tun0 >/dev/null 2>&1; then
+        sudo ip link del tun0 2>/dev/null || true
+    fi
 }
 
 # --- Cleanup ---

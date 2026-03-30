@@ -290,6 +290,8 @@ local:
 tuning:
   packet_queue_depth: $PACKET_QUEUE_DEPTH
   tun_tx_queue_len: $TUN_TX_QUEUE_LEN
+  tun_enable_offload: true
+  udp_enable_offload: true
   metrics_log_interval: 1
 peers:
   - id: remote
@@ -316,6 +318,8 @@ local:
 tuning:
   packet_queue_depth: $PACKET_QUEUE_DEPTH
   tun_tx_queue_len: $TUN_TX_QUEUE_LEN
+  tun_enable_offload: true
+  udp_enable_offload: true
   metrics_log_interval: 1
 peers:
   - id: local
@@ -360,6 +364,8 @@ tuning:
   h3_insecure_skip_verify: true
   packet_queue_depth: ${PACKET_QUEUE_DEPTH}
   tun_tx_queue_len: ${TUN_TX_QUEUE_LEN}
+  tun_enable_offload: true
+  udp_enable_offload: true
   metrics_log_interval: 1${pacing_line}
 peers:
   - id: remote
@@ -391,6 +397,8 @@ tuning:
   h3_insecure_skip_verify: true
   packet_queue_depth: ${PACKET_QUEUE_DEPTH}
   tun_tx_queue_len: ${TUN_TX_QUEUE_LEN}
+  tun_enable_offload: true
+  udp_enable_offload: true
   metrics_log_interval: 1${pacing_line}
 peers:
   - id: local

@@ -159,6 +159,6 @@ echo ""
 echo "  --- Local OpenVPN log ---"
 sudo cat "$BENCH_DIR/client.log" 2>/dev/null | grep -i -E "dco|ovpn|offload|disabl|error|warn" | head -20 || true
 echo "  --- Remote OpenVPN log ---"
-ssh "$REMOTE" "sudo cat $BENCH_DIR/server.log 2>/dev/null | grep -i -E 'dco|ovpn|offload|disabl|error|warn' | head -20" || true
+ssh "$REMOTE" "sudo cat \"$BENCH_DIR/server.log\" 2>/dev/null | grep -i -E 'dco|ovpn|offload|disabl|error|warn' | head -20" || true
 
 print_done
