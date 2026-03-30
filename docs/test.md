@@ -54,11 +54,14 @@ The `test-utils` feature exposes internal testing utilities for integration test
 // [dev-dependencies]
 // h3llo = { path = ".", features = ["test-utils"] }
 
-use h3llo::test_utils::{memory_tun, MemoryTunRx, MemoryTunTx, FakeRouteProbe};
+use h3llo::test_utils::{memory_tun, memory_tun_with_errors, MemoryTunRx, MemoryTunTx, FakeRouteProbe};
 
 let (rx, tx, inject_tx, output_rx) = memory_tun("test0", 1500);
 // inject_tx: send packets into TUN RX (simulates incoming)
 // output_rx: receive packets from TUN TX (captures outgoing)
+
+// Fault-injection variant: pre-configure send errors for testing error handling
+let (rx, tx, inject_tx, output_rx) = memory_tun_with_errors("test0", 1500, vec![std::io::ErrorKind::WouldBlock]);
 
 // Route probe test doubles:
 let probe = FakeRouteProbe::noop();      // Returns empty interfaces (most common)
@@ -288,8 +291,10 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Linux CI: `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, Docker integration tests.
 - Unit: `src/config.rs` tests for defaults, H3/API config validation, peer transport exclusivity.
 - Unit: `src/h3.rs` tests for datagram encoding, error display, CONNECT-IP header validation, and listener spawn/shutdown.
-- Unit: `src/h3v2.rs` tests for QSI encode/decode, quiche config creation, DialError display, ConnectIpDatagramCodec framing (prepend/strip/undo roundtrip, rejection paths), ConnectFailure/LoopExit exit mapping, PendingBatch channel backpressure, EngineMeta data constructors, and RunState initialization. Integration tests for h3v2 client against h3.rs server (handshake, auth rejection, bidirectional datagrams, shutdown).
-- Unit: `src/h3listener.rs` tests for ServerError display, server header/auth validation, and make_h3v2_listener cert rejection. Integration tests for h3v2 server against h3.rs client (handshake, auth rejection, C2S/S2C/bidirectional datagrams) and h3dialer.rs client (handshake, auth rejection, C2S/S2C/bidirectional datagrams, client shutdown, listener shutdown).
+- Unit: `src/h3session.rs` tests for QSI encode/decode, ConnectIpDatagramCodec framing (prepend/strip/roundtrip, rejection paths), ConnectFailure close reason and actor reason mapping, and CONNECT-IP constant verification.
+- Unit: `src/h3engine.rs` tests for quiche transport config creation (valid and invalid CC), LoopExit close reason and result conversion, EngineMeta recv_info construction, and RunState initialization.
+- Unit: `src/h3dialer.rs` tests for DialError display, From<ConnectFailure> conversion, and client quiche config validation (bad CA path, insecure mode CA bypass, default verify_peer). Integration tests for h3dialer client against h3.rs server (handshake, auth rejection, C2S/S2C/bidirectional datagrams, shutdown, trusted CA validation, untrusted cert rejection).
+- Unit: `src/h3listener.rs` tests for ServerError display, server header/auth validation, and make_h3_dispatcher cert rejection. Integration tests for h3listener dispatcher against h3.rs client (handshake, auth rejection, C2S/S2C/bidirectional datagrams) and h3dialer.rs client (handshake, auth rejection, C2S/S2C/bidirectional datagrams, client shutdown, listener shutdown).
 - Unit: `src/auth.rs` tests for Bearer Token generation and validation.
 - Unit: `src/dns.rs` real-network DNS resolver tests.
 - Unit: `src/bare.rs` real-network BareUDP tests.
@@ -299,7 +304,9 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Unit: `src/bind.rs` tests for UDP socket creation, route probing, and interface binding.
 - Unit: `src/api.rs` tests for metrics encoding and snapshot collection.
 - Unit: `src/actor.rs` tests for actor error classification and display formatting.
-- Unit: `src/events.rs` tests for event type construction and label formatting.
+- Unit: `src/router.rs` tests for LPM routing table construction, TTL decrement with checksum update, batch splitting by destination, forwarding to peer and TUN, and drop reason classification (no-route, invalid IP version, TTL-expired, channel-closed).
+- Unit: `src/udp.rs` tests for UDP socket sharing (Arc<UdpSocket>), RX source address tagging, TX destination delivery, GSO batch sending, mixed-size batches, and graceful shutdown on channel close.
+- Unit: `src/metrics.rs` tests for PktCounters batch recording, single-packet recording, saturation arithmetic, multi-batch accumulation, CongestionStats recording and saturation, transport metrics logging with zero/nonzero drop counts, and Counters::send_and_record with success, channel-closed, and queue-full backpressure paths.
 - Unit: `src/helpers.rs` tests for IP packet destination extraction and retry logic.
 - Docker E2E: `tests/e2e/bareudp.rs` multi-node BareUDP connectivity, source IP filtering, and MTU boundary checks via testcontainers-rs.
 - Docker E2E: `tests/e2e/h3.rs` multi-node HTTP/3 connectivity via testcontainers-rs.

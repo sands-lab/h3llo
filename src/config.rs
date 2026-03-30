@@ -245,7 +245,7 @@ pub struct Tuning {
     /// the window are coalesced into the same snapshot.
     #[serde(with = "serde_duration_millis")]
     pub dns_snapshot_delay: Duration,
-    /// Minimum interval between consecutive DNS query sends (default: 10ms).
+    /// Minimum interval between consecutive DNS query sends (default: 50ms).
     ///
     /// Serializes outbound DNS queries to avoid triggering rate limits on
     /// public resolvers (e.g., Cloudflare 1.1.1.1). A sleep of this duration
