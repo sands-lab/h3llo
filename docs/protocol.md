@@ -31,9 +31,9 @@ h3llo intentionally omits the following optional features from RFC 9484:
 - URI template parameters `target` and `ipproto`.
 
 H3 connection management:
-- Build one connection per peer using `peers[].h3.endpoint` and auto-detected bindif.
-- When DNS returns multiple IPs, dial attempts are spawned in parallel for all IPs; first successful connection wins.
-- The single connection is used until it disconnects or its IP expires. Reconnection is automatic with per-IP exponential backoff (`tuning.reconnect_backoff_min` to `tuning.reconnect_backoff_max`). The reconciliation loop runs at `tuning.reconcile_interval`.
+- Build one connection per resolved IP for each peer using `peers[].h3.endpoint` and auto-detected bindif. Multiple active connections are maintained simultaneously (`Vec<BoundState>`).
+- When DNS returns multiple IPs, dial attempts are spawned for all uncovered IPs; all successful connections are kept. The first bound is the preferred TX path; remaining bounds provide automatic failover.
+- Each connection is used until it disconnects or its IP expires. When the preferred connection drops, the next available bound is promoted automatically. Reconnection is automatic with per-IP exponential backoff (`tuning.reconnect_backoff_min` to `tuning.reconnect_backoff_max`). The reconciliation loop runs at `tuning.reconcile_interval`.
 - Failures: TLS/handshake failures count as dial failures. Bind failures warn and fall back to unbound sockets, which can risk recursive routing if the system route points to the TUN.
 
 ```mermaid

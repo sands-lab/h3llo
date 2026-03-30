@@ -28,7 +28,7 @@ Platform tiers and binding behavior:
 Concurrency model overview: h3llo adopts the actor model—each coroutine (actor) owns private state, communicates exclusively via MPSC message queues, and never shares mutable data with other actors. This eliminates lock contention and simplifies reasoning about concurrent correctness.
 
 Actor design principles:
-- **Isolated state**: each actor (TUN-Rx, TUN-Tx, DNS Resolver, UDP-Rx/Tx, BareUDP-Rx/Tx, Route Sync, Orchestrator, H3 connections) maintains its own state; no `Arc<Mutex<_>>` across actors. UDP I/O actors (`udp.rs`) provide protocol-agnostic socket access via `Arc<UdpSocket>`; BareUDP actors (`bare.rs`) layer protocol logic (source-IP filtering, destination tagging) on top without touching sockets.
+- **Isolated state**: each actor (TUN-Rx, TUN-Tx, Router, DNS Resolver, UDP-Rx/Tx, BareUDP-Rx/Tx, Route Sync, Orchestrator, H3Dispatcher, H3Engine per connection) maintains its own state; no `Arc<Mutex<_>>` across actors. UDP I/O actors (`udp.rs`) provide protocol-agnostic socket access via `Arc<UdpSocket>`; BareUDP actors (`bare.rs`) layer protocol logic (source-IP filtering, destination tagging) on top without touching sockets.
 - **Actor-owned message box**: each actor creates its own channels during spawn. Control-plane command channels use `mpsc::unbounded_channel()`; data-plane packet channels use `mpsc::channel(PACKET_QUEUE_DEPTH)`. The actor owns the receiver; the caller receives the sender via tuple return (e.g., `(cmd_tx, JoinHandle)` or `(packet_tx, JoinHandle)`). This ensures clear ownership and enables graceful shutdown when all senders are dropped.
 - **Message passing**: actors communicate through typed `mpsc::channel` queues; the `Event` enum and command types define the message protocol.
 - **Async select loop**: each actor runs a `tokio::select!` loop over its input channels, I/O sources, and timers.
@@ -88,12 +88,12 @@ flowchart TB
     prog[Programs]@{shape: processes}
     cmd["Commands"]@{shape: braces}
 
-    subgraph cr-h3-1["Actor (H3-Rx)"]
-        hr1[H3 Datagram Reader]
+    subgraph cr-h3-1["Actor (H3Engine)"]
+        hr1[QUIC Decode + Datagram Reader]
     end
 
-    subgraph cr-h3-2["Actor (H3-Rx)"]
-        hr2[H3 Datagram Reader]
+    subgraph cr-h3-2["Actor (H3Engine)"]
+        hr2[QUIC Decode + Datagram Reader]
     end
 
     subgraph cr-bare["Actor (Bare-Rx)"]
@@ -102,13 +102,19 @@ flowchart TB
         br[Bare Datagram Reader]
     end
 
+    subgraph cr-router["Actor (Router)"]
+        rq[Ingress Queue]@{shape: h-cyl}
+        rlpm[/LPM + TTL\]
+    end
+
     subgraph cr-tun["Actor (TUN-Tx)"]
-        tq[MPSC Queue]@{shape: h-cyl}
+        tq[Input Queue]@{shape: h-cyl}
         tw[TUN Writer]
     end
 
-    wan --> bsf --> br ---> tq --> tw --> tun --> prog
-    wan --> hr1 & hr2 --> tq
+    wan --> bsf --> br --> rq --> rlpm --> tq --> tw --> tun --> prog
+    wan --> hr1 & hr2 --> rq
+    rlpm -. forwarded packets .-> cr-h3-1 & cr-h3-2
     cmd -.-> bq -.-> bsf
 ```
 
@@ -124,24 +130,28 @@ flowchart TB
 
     subgraph cr-tun["Actor (TUN-Rx)"]
         tr[TUN Reader]
-        tq[Command Queue]@{shape: h-cyl}
-        rint[/Internal<br>Route Table\]
     end
 
-    subgraph cr-h3-1["Actor (H3-Tx)"]
-        hw1[H3 Datagram Writer]
+    subgraph cr-router["Actor (Router)"]
+        oq[Output Queue]@{shape: h-cyl}
+        rcmd[Command Queue]@{shape: h-cyl}
+        rint[/LPM<br>Route Table\]
     end
 
-    subgraph cr-h3-2["Actor (H3-Tx)"]
-        hw2[H3 Datagram Writer]
+    subgraph cr-h3-1["Actor (H3Engine)"]
+        hw1[QUIC Encode + Datagram Writer]
+    end
+
+    subgraph cr-h3-2["Actor (H3Engine)"]
+        hw2[QUIC Encode + Datagram Writer]
     end
 
     subgraph cr-bare["Actor (Bare-Tx)"]
         bw[Bare Datagram Writer]
     end
 
-    cmd -.-> tq -.-> rint
-    prog --> rsys --> tun --> tr --> rint --> bw & hw1
+    cmd -.-> rcmd -.-> rint
+    prog --> rsys --> tun --> tr --> oq --> rint --> bw & hw1
     rint -. backup path -.-> hw2
     hw1 & hw2 & bw -- bypass system route table --> wan
 ```
@@ -160,23 +170,23 @@ flowchart TB
 
     ctrl["External Controller"]
     cr-api["Actor<br>(API-Server)"]
-    cr-h3r["Actor (H3-Rx)"]
-    cr-timer["Actor (Timer)"]
+    cr-h3e["Actor (H3Engine)"]
+    cr-h3disp["Actor<br>(H3Dispatcher)"]
 
     rsys[/System<br>Route Table\]
-    cr-tun["Actor<br>(TUN-Rx)"]
+    cr-router["Actor<br>(Router)"]
     cr-bare["Actor<br>(Bare-Rx)"]
     cr-dns["Actor<br>(DNS-Resolver)"]
     cr-h3d["Actor<br>(H3-Dialer)"]
 
     ctrl -- HTTP/1.1 GET/POST/DELETE --> cr-api -- emit(conf-update) --> cr-orch
-    cr-h3r -- emit(conn-close) --> cr-orch
-    cr-timer -- emit(dns-refresh) --> cr-orch
-    
+    cr-h3e -- emit(conn-close) --> cr-orch
+    cr-h3disp -- emit(conn-estab) --> cr-orch
+
     cr-route["Actor<br>(Route-Sync)"]
     cr-orch -- cmd(SyncRoutes) --> cr-route -- exec(route add/del) --> rsys
-    cr-orch -- emit(route-update) --> cr-tun
-    cr-orch -- emit(query) --> cr-dns -- emit(dns-update)--> cr-orch
+    cr-orch -- cmd(UpdateRouting) --> cr-router
+    cr-orch -- cmd(SetHostnames) --> cr-dns -- emit(dns-snapshot)--> cr-orch
     cr-orch -- spawn --> cr-h3d -- emit(conn-estab) --> cr-orch
     cr-orch -- emit(filter-update) --> cr-bare
 ```
@@ -192,7 +202,7 @@ The orchestrator and control-plane actors (DNS, Route Sync, API) share the main 
 Orchestrator responsibilities and invariants:
 - Maintain the latest configuration snapshot and H3 connection pool; receive commands from other actors through its MPSC queue.
 - Stay fully async: handle config updates, DNS refresh results, connection close notifications, and timer ticks without blocking other commands.
-- Spawn child actors (DNS resolver, H3 dialers) and push newly established H3 connections to the TUN-Rx actor for routing decisions. The DNS resolver is a long-lived child actor that joins the orchestrator's JoinSet.
+- Spawn child actors (DNS resolver, H3 dialers, H3Dispatcher) and register newly established H3 connections' TX channels in the Router's routing table via `RouterCommand::UpdateRouting`. The DNS resolver and H3Dispatcher are long-lived child actors that join the orchestrator's JoinSet.
 - Process events from child actors (metrics, DNS) and log them appropriately; child actors control their own metric emission timing.
 - Handle graceful shutdown on `ctrl_c` signal; task exit errors include task labels for debugging.
 
@@ -202,7 +212,7 @@ Orchestrator DNS handling:
 - **Unified hostname registration**: The orchestrator sends a single `SetHostnames { hosts: HashSet<String> }` command at startup with all unique peer endpoint hostnames. IP literals are handled by the DNS module directly (recorded with max TTL, included in next snapshot). The DNS module owns hostname tracking, refresh scheduling, and TTL-based expiration internally.
 - **Event-driven IP lifecycle**: The orchestrator reacts to DNS state snapshot events. When a snapshot arrives, the orchestrator updates each peer's `resolved_ips`, prunes stale bounds, and attempts connections to uncovered IPs via `try_connect`. All resolved IPs are added to the accepted source filter.
 
-Spawn an actor for every I/O reader (TUN-Rx, TUN-Tx, each H3 connection, BareUDP, DNS resolver). Each H3 connection owns its own Rx actor; BareUDP owns one listener socket for RX and a separate TX-only socket per BareUDP peer.
+Spawn an actor for every I/O path (TUN-Rx, TUN-Tx, Router, H3Dispatcher, each H3Engine, BareUDP-Rx pipeline, DNS resolver). Each H3 connection is managed by a unified H3Engine actor (both Rx and Tx). The H3Dispatcher accepts inbound QUIC connections and spawns per-connection H3Engine actors. BareUDP owns one listener socket for RX (UDP RX actor + source-filter actor pipeline) and a separate TX-only socket per BareUDP peer.
 
 When configuration changes arrive (management API POST/DELETE or initialization), update the accepted-source filter first (fast, in-memory), then the internal routing table, then the system routing table. Dynamic reconfiguration flows through the orchestrator via the event channel.
 
@@ -240,12 +250,12 @@ DNS lifecycle management:
 - Refreshing an existing IP extends its TTL without changing the snapshot (no duplicate events).
 - DNS warnings (NXDOMAIN, recursion refusal) are logged via `warn!` at the DNS module (origin) rather than propagating through events. Truncated responses are treated as packet loss and retried after `dns_query_timeout`.
 
-During packet forwarding, TUN-Rx sends outbound packets to the Router actor via a bounded MPSC channel. The Router performs destination IP extraction, LPM lookup, TTL decrement with checksum update, and forwards packets to the appropriate peer's TX channel (H3 or BareUDP writer). For inbound traffic, transport actors (H3-Rx, BareUDP-Rx) enqueue packets to the Router's ingress channel; the Router performs LPM lookup, TTL decrement, and forwards locally-destined packets to TUN-Tx.
+During packet forwarding, TUN-Rx sends outbound packets to the Router actor via a bounded MPSC channel. The Router performs first-packet destination IP extraction, LPM lookup, and forwards the entire batch to the matched peer's TX channel (H3Engine or BareUDP writer) — no TTL mutation on the outbound path. For inbound traffic, transport actors (H3Engine, BareUDP-Rx) enqueue packets to the Router's ingress channel; the Router scans each packet's destination IP, performs LPM lookup, and routes accordingly: locally-destined packets (matching TUN addresses) are forwarded directly to TUN-Tx without TTL decrement; forwarded packets (destined for another peer) undergo per-packet TTL decrement with IPv4 checksum update (RFC 1624), and TTL-expired packets are sent to TUN-Tx for ICMP generation.
 
 Key flows:
 
-- TUN Reader → Router (LPM + TTL) → H3/Bare datagram writer.
-- H3/Bare datagram reader → Router (LPM + TTL) → TUN Writer.
+- TUN Reader → Router (LPM) → H3Engine/BareUDP-Tx.
+- H3Engine/BareUDP-Rx → Router (LPM + TTL for forwarded packets) → TUN Writer or another peer.
 - Management API updates → internal routes → system routes.
 
 ### System Route Updates
@@ -271,11 +281,11 @@ Route deduplication: when synchronizing system routes, if a TUN address prefix (
 
 ### Observability
 
-Observability summary: two metric sources are exposed. (1) Transport-level: interface loops emit cumulative metrics (batches/packets/bytes, drops, and drop-reason breakdowns) on a timer (`tuning.metrics_push_interval`); per-connection metrics are stored in `BoundState` (RX and TX fields), while non-peer-scoped metrics (TUN RX/TX, BareUDP RX) are stored in `non_peer_metrics`; on scrape, the orchestrator collects metrics from live peer state into a snapshot via event and renders locally using the `prometheus-client` crate. (2) QUIC-level: `tokio_quiche::metrics::DefaultMetrics` automatically registers metrics in the `foundations` global registry; on scrape, `foundations::telemetry::metrics::collect()` returns the data as Prometheus text and it is appended to the response. Both metric types are periodically logged at `debug!` level by a unified metrics log ticker (`tuning.metrics_log_interval`, default 3s), decoupling logging cadence from emission cadence. No shared mutable state exists in the metrics path.
+Observability summary: two metric sources are exposed. (1) Transport-level: actor loops emit cumulative metrics (batches/packets/bytes, drops, and drop-reason breakdowns) on a timer (`tuning.metrics_push_interval`); per-connection metrics are stored in `BoundState` (RX and TX fields), while non-peer-scoped metrics (TUN RX/TX, BareUDP RX, Router) are stored in `non_peer_metrics`; on scrape, the orchestrator collects metrics from live peer state into a snapshot via event and renders locally using the `prometheus-client` crate. (2) QUIC-level: `tokio_quiche::metrics::DefaultMetrics` automatically registers metrics in the `foundations` global registry; on scrape, `foundations::telemetry::metrics::collect()` returns the data as Prometheus text and it is appended to the response. Both metric types are periodically logged at `debug!` level by a unified metrics log ticker (`tuning.metrics_log_interval`, default 3s), decoupling logging cadence from emission cadence. No shared mutable state exists in the metrics path.
 
-- Metric shape: every emit carries labels `{kind: Tun|BareUdp|Http3, direction: Rx|Tx, peer_id?: string, remote_addr?: SocketAddr}` plus total succeeded and dropped counters (batches, packets, bytes), a drop-reason map keyed by `DropReason`, and congestion stats (queue_full count/duration, would_block count/duration). Congestion metrics are separate from drops because the affected packets are ultimately delivered — they are only delayed. The `batches` counter tracks `record()` invocations; `packets / batches` reveals GSO/GRO coalescing effectiveness (ratio > 1 indicates active offloading). For H3 TX, batch boundaries additionally reflect channel saturation: all packets flowing through `try_send` without backpressure count as one batch, and each `TrySendError::Full` event starts a new batch. Per-connection actors (BareUDP TX, H3 RX, H3 TX) populate both `peer_id` and `remote_addr`; shared actors (TUN RX/TX, BareUDP RX) emit `(None, None)`.
+- Metric shape: every emit carries labels `{kind: Tun|BareUdp|Http3|Router, direction: Rx|Tx, peer_id?: string, remote_addr?: SocketAddr}` plus total succeeded and dropped counters (batches, packets, bytes), a drop-reason map keyed by `DropReason`, and congestion stats (queue_full count/duration, would_block count/duration). Congestion metrics are separate from drops because the affected packets are ultimately delivered — they are only delayed. The `batches` counter tracks `record()` invocations; `packets / batches` reveals GSO/GRO coalescing effectiveness (ratio > 1 indicates active offloading). For H3 TX, batch boundaries additionally reflect channel saturation: all packets flowing through `try_send` without backpressure count as one batch, and each `TrySendError::Full` event starts a new batch. Per-connection actors (BareUDP TX, H3Engine) populate both `peer_id` and `remote_addr`; shared actors (TUN RX/TX, BareUDP RX, Router) emit `(None, None)`.
 - Prometheus exposition: per-connection metrics live in `BoundState.rx_metrics` / `BoundState.tx_metrics`; non-peer metrics (TUN, BareUDP RX) live in `Orchestrator.non_peer_metrics` — no `Arc<Mutex<_>>`, fully consistent with the actor model. On `GET /metrics`, the orchestrator collects metrics from all live bounds plus non-peer storage into a `HashMap`, sends it via oneshot channel to the API actor, which builds a temporary `Registry` with a `SnapshotCollector` wrapping the owned data and encodes via `prometheus-client`'s `text::encode()`. Seven counter families are produced: `h3llo_transport_packets`, `h3llo_transport_bytes`, `h3llo_transport_batches`, `h3llo_transport_drops`, `h3llo_transport_drop_bytes`, `h3llo_transport_congestion`, `h3llo_transport_congestion_wait_milliseconds` — using `ConstCounter` values with no atomic operations on data-plane hot paths. Labels: `kind`, `direction`, `peer_id`, `remote_addr`, plus `outcome`, `reason`, or `event` (`queue_full` / `would_block`). Output uses OpenMetrics text format. Metrics lifecycle follows connection lifecycle: when `prune()` removes a bound, its metrics vanish from the next scrape.
-- Drop accounting: TUN TX counts oversize and send failures; TUN RX counts channel-closed drops when forwarding to the writer queue fails; BareUDP RX counts disallowed sources; BareUDP TX counts send failures. All counters saturate to avoid panics.
+- Drop accounting: TUN TX counts oversize and send failures; TUN RX counts channel-closed drops when forwarding to the Router queue fails; Router counts no-route, invalid IP version, TTL-expired, and channel-closed drops; BareUDP RX counts disallowed sources; BareUDP TX counts send failures. All counters saturate to avoid panics.
 - Reporting: only the orchestrator prints periodic drop summaries (when counters change); transport loops stay silent, including oversized TUN drops.
 
 ### Logging and Warning Handling
