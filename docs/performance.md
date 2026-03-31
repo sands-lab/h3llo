@@ -14,7 +14,7 @@ All benchmarks run on mcnode27 ↔ mcnode26, bf3p1 NIC (NUMA node 3), `iommu=pt`
 | Kernel WireGuard | 3.44 Gbps | — | 1 | ChaCha20-Poly1305 |
 | OpenVPN DCO | 1.57 Gbps | — | — | AES-256-GCM |
 
-h3llo H3 (cc=none) is 2.15× faster than kernel WireGuard with full QUIC/TLS encryption. BareUDP mode reaches near line-rate on a 10 GbE NIC.
+In this MTU 1291 benchmark set, h3llo H3 (cc=none) delivers 1.62× the forward TCP throughput of kernel WireGuard while retaining full QUIC/TLS encryption. BareUDP mode reaches near line-rate on a 10 GbE NIC.
 
 ### Thread-per-Core Runtime
 
@@ -23,13 +23,13 @@ h3llo dedicates one OS thread per data-plane function using multiple single-thre
 | Thread | Name | Actors |
 |--------|------|--------|
 | TUN | `h3llo-tun` | TUN RX, TUN TX |
-| Crypto | `h3llo-crypto` | Router, H3 Engine (QUIC crypto + session + datagram forwarding) |
+| Crypto | `h3llo-crypto` | Router, H3 dispatcher, H3 engines (QUIC crypto + session + datagram forwarding) |
 | UDP | `h3llo-udp` | UDP RX/TX (BareUDP and H3 transport) |
 | Main | `h3llo` | Orchestrator, DNS, Route Sync, API |
 
 Key design choices:
 
-- **Co-locate H3 engine with router on `crypto_rt`**: the router dispatches packets directly to the H3 engine's TX channel. Co-location eliminates a cross-thread hop for every routed packet.
+- **Co-locate H3 dispatcher and engines with router on `crypto_rt`**: the router dispatches packets directly to each H3 engine's TX channel, and inbound QUIC CID routing plus CONNECT-IP session state stay on the same thread. This eliminates a cross-thread hop for routed packets and keeps QUIC control/data-plane state together.
 - **Isolate UDP I/O on `udp_rt`**: kernel `sendmsg`/`recvmmsg` syscalls are the dominant cost in the UDP thread (see [profiling data](#profiling-insights)); isolating them prevents syscall latency from blocking TUN or crypto processing.
 - **Control plane on main thread**: orchestrator, DNS, and API are low-frequency; sharing the main thread avoids wasting a core.
 
@@ -73,7 +73,10 @@ TUN offload is disabled by default (`tun_enable_offload: false`) due to compatib
 
 #### H3 GSO/GRO
 
-When `tuning.udp_enable_offload` is true, `apply_max_capabilities()` is called on QUIC sockets for both H3 client and listener transports, enabling GSO for TX and GRO for RX at the tokio-quiche level.
+The current H3 transport uses the same shared UDP actors as BareUDP rather than a separate tokio-quiche socket wrapper. As a result, H3 offload behavior matches the generic UDP actor semantics:
+
+- **H3 TX**: `tuning.udp_enable_offload` controls GSO segment count, exactly like BareUDP TX.
+- **H3 RX**: GRO follows the socket's actual capability; quinn-udp enables `UDP_GRO` during socket state initialization, and the receive buffer is always sized for `gro_segments()`.
 
 #### NIC Hardware Offload
 
@@ -81,31 +84,31 @@ Software GSO/GRO can be further accelerated by NIC hardware offload. When `tx-ud
 
 ### Zero-Copy Buffer Pool
 
-Data-plane buffers are allocated from tokio-quiche's `BufFactory` pool and reused across the entire packet lifecycle without reallocation. The pool has two tiers: a 1.5 KB datagram pool (64K capacity) for typical packets, and a 64 KB generic pool (16K capacity) for oversized payloads.
+Data-plane buffers are allocated from tokio-quiche's `BufFactory` pool and reused across the entire packet lifecycle without reallocation. The pool has two tiers: a 1.5 KB datagram pool (64K total entries) for typical packets, and a 64 KB generic pool (64 total entries) for oversized payloads.
 
 #### Headroom Layout
 
-Every data-plane `PooledBuf` reserves 10 bytes of headroom at the front:
+Every data-plane `PooledBuf` reserves 10 bytes of prepend space at the front:
 
 ```
-[ 10B headroom ][ packet payload ]
- └── 9B DGRAM_PREFIX (tokio-quiche)
- └── 1B Context ID (CONNECT-IP)
+[ 10B prepend space ][ packet payload ]
+ └── 9B DGRAM_PREFIX reserve from tokio-quiche `BufFactory`
+ └── 1B extra reserve carved out by h3llo
 ```
 
-This headroom enables zero-copy operations at two points:
+This prepend space enables zero-copy operations at two points:
 
-- **H3 TX**: `add_prefix(&[CONTEXT_ID_IP])` prepends the 1-byte Context ID in-place, consuming headroom without allocation.
-- **TUN TX**: `TunBuf::prepend_hdr()` prepends a zeroed 10-byte `virtio_net_hdr` via `add_prefix`, also using headroom. A compile-time assertion (`HEADROOM >= VIRTIO_NET_HDR_LEN`) guards this invariant.
+- **H3 TX**: `ConnectIpDatagramCodec::prepend()` prepends `QSI varint + Context ID` in-place. In the current one-CONNECT-stream-per-connection design, that prefix is 2 bytes (`QSI=0` + `Context ID=0`), leaving ample prepend space.
+- **TUN TX**: `TunBuf::prepend_hdr()` prepends a zeroed 10-byte `virtio_net_hdr` via `add_prefix`, also using prepend space. A compile-time assertion (`HEADROOM >= VIRTIO_NET_HDR_LEN`) guards this invariant.
 
-H3 RX uses `pop_front(1)` to strip the Context ID in-place, restoring headroom for the downstream TUN TX path.
+H3 RX uses `ConnectIpDatagramCodec::strip()` to remove the full CONNECT-IP DATAGRAM prefix (`qsi_len + 1`) in-place, restoring prepend space for the downstream TUN TX path.
 
 #### Size-Aware Dual-Pool Allocation
 
 `alloc_uninit_packet_buf(length)` selects the smallest pool that fits:
 
-- Packets where `length + HEADROOM ≤ MAX_DGRAM_SIZE` (1500): allocated from the **datagram pool** (1.5 KB per buffer, 64K capacity).
-- Larger payloads: allocated from the **generic pool** (64 KB per buffer, 16K capacity).
+- Packets where `length + HEADROOM ≤ MAX_DGRAM_SIZE` (1500): allocated from the **datagram pool** (1.5 KB per buffer, 64K total entries).
+- Larger payloads: allocated from the **generic pool** (64 KB per buffer, 64 total entries).
 
 Typical IP packets (≤ MTU 1291) always land in the datagram pool, reducing per-packet memory by ~97% compared to unconditionally using the 64 KB pool.
 
@@ -128,9 +131,9 @@ When TUN GRO is enabled, tun-rs coalesces same-flow packets by extending a `TunB
 | Data path | Allocation | Zero-copy? |
 |-----------|-----------|------------|
 | TUN RX → channel | `TunBuf::alloc_uninit` → kernel fills → `into_pooled` | Yes |
-| H3 TX encoding | `add_prefix` consumes headroom | Yes |
+| H3 TX encoding | `ConnectIpDatagramCodec::prepend` consumes prepend space | Yes |
 | TUN TX writing | `TunBuf::prepend_hdr` consumes headroom | Yes |
-| H3 RX decoding | `pop_front(1)` strips Context ID | Yes |
+| H3 RX decoding | `ConnectIpDatagramCodec::strip` removes QSI + Context ID | Yes |
 | BareUDP/H3 RX | `alloc_packet_buf` (copy into pooled buffer) | Copy once |
 
 ### Batch Channel Transmission
@@ -139,7 +142,7 @@ Data-plane channels carry `Vec<PooledBuf>` batches rather than individual packet
 
 Channels use `mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth)` with a default depth of 256. `packet_queue_depth` counts batch messages, not individual packets. Bounded channels provide backpressure: when a consumer falls behind, the producer blocks rather than buffering unboundedly.
 
-The router (`src/router.rs`) splits ingress batches by destination IP into consecutive groups, performs LPM lookup and TTL decrement (RFC 1624 incremental checksum) once per group, and forwards each group as a `Vec<PooledBuf>` to the appropriate peer TX channel.
+The router (`src/router.rs`) splits ingress batches by destination IP into consecutive groups, performs one LPM lookup per group, decrements TTL / hop limit per packet (with RFC 1624 incremental checksum for IPv4), and forwards each group as a `Vec<PooledBuf>` to the appropriate peer TX channel.
 
 ### Allocator Tuning (mimalloc)
 
@@ -174,13 +177,13 @@ The patch adds a "none" congestion control algorithm to quiche, which disables Q
 
 Key findings from `perf record` profiling on the BareUDP and H3 data planes.
 
-#### CPU Budget Breakdown (BareUDP, forward direction)
+#### CPU Budget Breakdown (BareUDP, dominant hotspots by direction)
 
-| Category | CPU% | Notes |
-|----------|------|-------|
-| Kernel `sendmsg` / UDP GSO | ~30% | `__x64_sys_sendmsg` → `udp_sendmsg` → `skb_segment` → driver |
-| Kernel `recvmmsg` / copy | ~18% | `_copy_to_iter` is the single largest kernel hotspot (9.6%) |
-| Kernel TUN write | ~17% | `tun_get_user` → skb build → `netif_receive_skb` (re-traverses stack) |
+| Path | CPU% | Notes |
+|------|------|-------|
+| Forward TX `sendmsg` / UDP GSO | ~30% | `__x64_sys_sendmsg` → `udp_sendmsg` → `skb_segment` → driver |
+| Reverse RX `recvmmsg` / copy | ~18% | `_copy_to_iter` is the single largest kernel hotspot (9.6%) |
+| Reverse RX TUN write | ~17% | `tun_get_user` → skb build → `netif_receive_skb` (re-traverses stack) |
 | Userspace memcpy | 6–10% | Packet data copy between pool buffers and syscalls |
 | TUN checksum (GSO/GRO) | 3–6% | `checksum_no_fold_avx2` for software GSO split / GRO |
 | Spectre SRSO mitigation | ~2% | `srso_alias_return_thunk` + `srso_alias_safe_ret` (AMD) |
@@ -236,7 +239,7 @@ This ~12% copy overhead is inherent to the TUN architecture. Eliminating it woul
 
 | Bottleneck | Impact | Potential fix |
 |------------|--------|--------------|
-| `_copy_to_iter` in `recvmmsg` | ~10% CPU (receiver) | io_uring / MSG_ZEROCOPY |
+| `_copy_to_iter` in `recvmmsg` | ~10% CPU (receiver) | Different RX architecture (for example AF_XDP / kernel-bypass receive path) |
 | TUN write re-injection | ~17% CPU (receiver) | vhost-net / kernel TUN splice |
 | `dgram_send` per-packet `to_vec()` in quiche | ~2% CPU + alloc pressure | Upstream quiche API change |
 | TUN checksum (software GSO/GRO) | 3–6% CPU | Verify kernel handles checksums when offload enabled |

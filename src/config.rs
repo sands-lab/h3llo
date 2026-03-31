@@ -185,16 +185,15 @@ pub struct Tuning {
     ///
     /// Effect varies by transport:
     ///
-    /// - **BareUDP TX**: controls GSO segment count. When `true`, batches
-    ///   multiple packets into a single `sendmsg` via `UDP_SEGMENT`. When
-    ///   `false`, segment count is capped to 1 (per-packet sends).
-    /// - **BareUDP RX**: **no effect**. quinn-udp's `UdpSocketState::new()`
-    ///   unconditionally enables `UDP_GRO`; the receive buffer is always
-    ///   sized for the socket's actual GRO capability to prevent silent
-    ///   truncation of coalesced datagrams.
-    /// - **HTTP/3** (both client and listener): controls GSO **and** GRO
-    ///   via `apply_max_capabilities()`. When `false`, neither GSO nor GRO
-    ///   is enabled on the QUIC socket.
+    /// - **UDP TX** (BareUDP and the current H3 data plane): controls GSO
+    ///   segment count. When `true`, batches multiple packets into a single
+    ///   `sendmsg` via `UDP_SEGMENT`. When `false`, segment count is capped
+    ///   to 1 (per-packet sends).
+    /// - **UDP RX** (BareUDP and the current H3 data plane): **no effect**.
+    ///   quinn-udp's `UdpSocketState::new()` unconditionally enables
+    ///   `UDP_GRO`; the receive buffer is always sized for the socket's
+    ///   actual GRO capability to prevent silent truncation of coalesced
+    ///   datagrams.
     ///
     /// Disabled by default due to compatibility issues with certain NIC
     /// drivers and platforms (e.g., incorrect checksums, EINVAL on
