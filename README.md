@@ -104,3 +104,4 @@ BareUDP is an opt-in plaintext fast path for controlled networks where confident
 - Protocol details: [docs/protocol.md](docs/protocol.md)
 - Configuration examples: [docs/configuration.md](docs/configuration.md)
 - Implementation notes: [docs/internals.md](docs/internals.md)
+- Performance optimizations: [docs/performance.md](docs/performance.md)
