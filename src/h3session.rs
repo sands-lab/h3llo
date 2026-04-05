@@ -106,10 +106,9 @@ impl H3Session {
     /// - **Client**: checks `:status=200`, returns `Accept` or error.
     /// - **Server**: validates CONNECT-IP + auth, sends 200 OK,
     ///   returns `Accept { peer_id: Some(...) }` or error.
-    /// - **Post-establishment**: use an ignore-all handler.
-    ///
-    /// After `connect_accepted` is true, headers are silently ignored
-    /// regardless of the handler.
+    /// - **Post-establishment**: extra streams are rejected with 400 + FIN
+    ///   (headers on the CONNECT-IP stream itself are still forwarded to
+    ///   the handler). The caller typically passes an ignore-all handler.
     pub(crate) fn poll_h3_events<F>(
         &mut self,
         conn: &mut quiche::Connection,
@@ -127,11 +126,12 @@ impl H3Session {
         loop {
             match self.h3_conn.poll(conn) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                    // Reject extra streams post-establishment: send 400 +
-                    // FIN to close the stream and free quiche resources,
-                    // without tearing down the connection. Skip the
-                    // CONNECT-IP stream itself (e.g. trailers) to avoid
-                    // an invalid duplicate response.
+                    // Reject extra streams post-establishment (server-only;
+                    // clients never receive inbound request headers): send
+                    // 400 + FIN to close the stream and free quiche
+                    // resources without tearing down the connection. Skip
+                    // the CONNECT-IP stream itself to avoid an invalid
+                    // duplicate response.
                     if self.connect_accepted && stream_id != self.connect_stream_id {
                         debug!(%peer_id, stream_id, "rejecting stream post-establishment");
                         let _ = self.h3_conn.send_response(
