@@ -126,20 +126,10 @@ impl H3Session {
         loop {
             match self.h3_conn.poll(conn) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                    // Reject extra streams post-establishment (server-only;
-                    // clients never receive inbound request headers): send
-                    // 400 + FIN to close the stream and free quiche
-                    // resources without tearing down the connection. Skip
-                    // the CONNECT-IP stream itself to avoid an invalid
-                    // duplicate response.
-                    if self.connect_accepted && stream_id != self.connect_stream_id {
-                        debug!(%peer_id, stream_id, "rejecting stream post-establishment");
-                        let _ = self.h3_conn.send_response(
-                            conn,
-                            stream_id,
-                            &[quiche::h3::Header::new(b":status", b"400")],
-                            true,
-                        );
+                    // Ignore extra streams post-establishment without
+                    // tearing down the connection.
+                    if self.connect_accepted {
+                        debug!(%peer_id, stream_id, "ignoring headers post-establishment");
                         continue;
                     }
                     match on_headers(&mut self.h3_conn, conn, stream_id, &list)? {
