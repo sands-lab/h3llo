@@ -337,16 +337,6 @@ impl H3Engine {
 
 // ========== Server Dispatcher ==========
 
-/// Handle for a spawned per-connection actor.
-struct ConnActorHandle {
-    /// Forward tagged QUIC packets from the dispatcher to this actor.
-    packet_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
-    /// Registered CIDs for cleanup on actor completion.
-    cids: Vec<Vec<u8>>,
-    /// Actor task handle for lifecycle tracking.
-    handle: JoinHandle<ActorExitResult>,
-}
-
 /// Shared channel senders cloned into each per-connection [`H3Engine`].
 #[derive(Clone)]
 struct DispatchIo {
@@ -385,16 +375,15 @@ pub struct H3Dispatcher {
 /// Runtime state for the CID-routing dispatcher loop.
 ///
 /// Built by [`spawn_h3_dispatcher`] from an [`H3Dispatcher`] after UDP actors
-/// are spawned. Owns per-connection actor tracking and CID routing tables.
+/// are spawned. Routes packets to per-connection actors by CID.
 struct DispatcherRuntime {
     bound_addr: SocketAddr,
     config: quiche::Config,
     max_udp_payload: usize,
     io: DispatchIo,
     conn_params: ConnParams,
-    cid_table: HashMap<Vec<u8>, usize>,
-    actors: HashMap<usize, ConnActorHandle>,
-    next_conn_id: usize,
+    /// Maps each registered CID directly to the per-connection packet sender.
+    cid_table: HashMap<Vec<u8>, mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>>,
 }
 
 impl DispatcherRuntime {
@@ -422,7 +411,7 @@ impl DispatcherRuntime {
                 }
 
                 _ = cleanup_ticker.tick() => {
-                    self.cleanup_finished_actors();
+                    self.cid_table.retain(|_, tx| !tx.is_closed());
                 }
 
                 cmd = cmd_rx.recv() => {
@@ -448,10 +437,8 @@ impl DispatcherRuntime {
             return;
         };
 
-        if let Some(&conn_id) = self.cid_table.get(&header.dcid) {
-            if let Some(actor) = self.actors.get(&conn_id) {
-                let _ = actor.packet_tx.send((remote, batch)).await;
-            }
+        if let Some(tx) = self.cid_table.get(&header.dcid) {
+            let _ = tx.send((remote, batch)).await;
             return;
         }
 
@@ -506,19 +493,15 @@ impl DispatcherRuntime {
             None,
         );
 
-        // Register CIDs before spawning actor so subsequent packets route correctly.
-        let conn_id = self.next_conn_id;
-        self.next_conn_id += 1;
-
-        // TODO: Track NEW_CONNECTION_ID / RETIRE_CONNECTION_ID for CID rotation.
-        let cids = vec![header.dcid, scid_bytes.to_vec()];
-        for cid in &cids {
-            self.cid_table.insert(cid.clone(), conn_id);
-        }
-
         // Create per-connection channels.
         let depth = self.conn_params.packet_queue_depth;
         let (packet_tx, packet_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(depth);
+
+        // Register CIDs before spawning actor so subsequent packets route correctly.
+        // TODO: Track NEW_CONNECTION_ID / RETIRE_CONNECTION_ID for CID rotation.
+        for cid in [header.dcid, scid_bytes.to_vec()] {
+            self.cid_table.insert(cid, packet_tx.clone());
+        }
         let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(depth);
         let channels = self.io.clone();
         let peer_tokens = peer_tokens.clone();
@@ -551,8 +534,8 @@ impl DispatcherRuntime {
         // spawning the task, preserving current timing behavior.
         engine.flush_send();
 
-        // Spawn per-connection actor.
-        let handle = tokio::spawn(async move {
+        // Spawn per-connection actor (detached — cleanup via sender liveness).
+        tokio::spawn(async move {
             let engine = match engine.accept(&peer_tokens, handshake_timeout).await {
                 Ok(engine) => engine,
                 Err(e) => {
@@ -579,29 +562,6 @@ impl DispatcherRuntime {
                 }));
 
             engine.run().await
-        });
-
-        self.actors.insert(
-            conn_id,
-            ConnActorHandle {
-                packet_tx,
-                cids,
-                handle,
-            },
-        );
-    }
-
-    fn cleanup_finished_actors(&mut self) {
-        let cid_table = &mut self.cid_table;
-        self.actors.retain(|_, actor| {
-            if actor.handle.is_finished() {
-                for cid in &actor.cids {
-                    cid_table.remove(cid);
-                }
-                false
-            } else {
-                true
-            }
         });
     }
 }
@@ -663,8 +623,6 @@ pub fn spawn_h3_dispatcher(
             },
             conn_params,
             cid_table: HashMap::new(),
-            actors: HashMap::new(),
-            next_conn_id: 0,
         };
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
     });
