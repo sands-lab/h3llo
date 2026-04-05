@@ -199,6 +199,7 @@ impl H3Session {
 // ========== CONNECT-IP Progress / Failure ==========
 
 /// Result of advancing CONNECT-IP control-plane state.
+#[derive(Debug)]
 pub(crate) enum ConnectProgress {
     /// CONNECT-IP is not ready for datagram forwarding yet.
     Pending,
@@ -207,6 +208,7 @@ pub(crate) enum ConnectProgress {
 }
 
 /// Error raised while advancing CONNECT-IP control-plane state.
+#[derive(Debug)]
 pub(crate) enum ConnectFailure {
     /// CONNECT-IP rejected with the given status code.
     Rejected(String),
@@ -522,6 +524,325 @@ mod tests {
             );
             assert_eq!(&recv_buf[..], payload);
         }
+    }
+
+    // ========== poll_h3_events Loopback Tests ==========
+
+    /// In-memory quiche client-server pair with H3 sessions for testing
+    /// `poll_h3_events` without network I/O.
+    struct H3LoopbackPair {
+        client_conn: quiche::Connection,
+        server_conn: quiche::Connection,
+        client_h3: H3Session,
+        server_h3: H3Session,
+        client_addr: std::net::SocketAddr,
+        server_addr: std::net::SocketAddr,
+        buf: Vec<u8>,
+    }
+
+    impl H3LoopbackPair {
+        fn new() -> Self {
+            use crate::h3session::test_support::TestCertBundle;
+
+            let certs = TestCertBundle::generate();
+
+            let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            client_config
+                .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+                .unwrap();
+            client_config.set_initial_max_data(10_000_000);
+            client_config.set_initial_max_stream_data_bidi_local(1_000_000);
+            client_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+            client_config.set_initial_max_stream_data_uni(1_000_000);
+            client_config.set_initial_max_streams_bidi(100);
+            client_config.set_initial_max_streams_uni(100);
+            client_config.enable_dgram(true, 1024, 1024);
+            client_config.set_max_idle_timeout(5000);
+            client_config.verify_peer(false);
+
+            let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            server_config
+                .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+                .unwrap();
+            server_config.set_initial_max_data(10_000_000);
+            server_config.set_initial_max_stream_data_bidi_local(1_000_000);
+            server_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+            server_config.set_initial_max_stream_data_uni(1_000_000);
+            server_config.set_initial_max_streams_bidi(100);
+            server_config.set_initial_max_streams_uni(100);
+            server_config.enable_dgram(true, 1024, 1024);
+            server_config.set_max_idle_timeout(5000);
+            server_config
+                .load_cert_chain_from_pem_file(certs.cert_path().to_str().unwrap())
+                .unwrap();
+            server_config
+                .load_priv_key_from_pem_file(certs.key_path().to_str().unwrap())
+                .unwrap();
+
+            let client_addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+            let server_addr: std::net::SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+            let scid = quiche::ConnectionId::from_ref(&[0xaa; quiche::MAX_CONN_ID_LEN]);
+            let dcid = quiche::ConnectionId::from_ref(&[0xbb; quiche::MAX_CONN_ID_LEN]);
+
+            let mut client_conn = quiche::connect(
+                Some("localhost"),
+                &scid,
+                client_addr,
+                server_addr,
+                &mut client_config,
+            )
+            .unwrap();
+
+            let mut server_conn =
+                quiche::accept(&dcid, None, server_addr, client_addr, &mut server_config).unwrap();
+
+            // Drive QUIC handshake to completion.
+            let mut buf = vec![0u8; 65535];
+            loop {
+                pump(
+                    &mut client_conn,
+                    &mut server_conn,
+                    client_addr,
+                    server_addr,
+                    &mut buf,
+                );
+                pump(
+                    &mut server_conn,
+                    &mut client_conn,
+                    server_addr,
+                    client_addr,
+                    &mut buf,
+                );
+                if client_conn.is_established() && server_conn.is_established() {
+                    break;
+                }
+            }
+
+            // Create H3 sessions on both sides.
+            let client_h3 = H3Session::with_transport(&mut client_conn).unwrap();
+            let server_h3 = H3Session::with_transport(&mut server_conn).unwrap();
+
+            // Exchange H3 SETTINGS frames.
+            pump(
+                &mut client_conn,
+                &mut server_conn,
+                client_addr,
+                server_addr,
+                &mut buf,
+            );
+            pump(
+                &mut server_conn,
+                &mut client_conn,
+                server_addr,
+                client_addr,
+                &mut buf,
+            );
+
+            Self {
+                client_conn,
+                server_conn,
+                client_h3,
+                server_h3,
+                client_addr,
+                server_addr,
+                buf,
+            }
+        }
+
+        /// Flush pending packets from client to server.
+        fn flush_c2s(&mut self) {
+            pump(
+                &mut self.client_conn,
+                &mut self.server_conn,
+                self.client_addr,
+                self.server_addr,
+                &mut self.buf,
+            );
+        }
+
+        /// Flush pending packets from server to client.
+        fn flush_s2c(&mut self) {
+            pump(
+                &mut self.server_conn,
+                &mut self.client_conn,
+                self.server_addr,
+                self.client_addr,
+                &mut self.buf,
+            );
+        }
+
+        /// Complete CONNECT-IP handshake: client sends CONNECT, server accepts.
+        fn establish_connect_ip(&mut self) {
+            let connect_headers = vec![
+                quiche::h3::Header::new(b":method", b"CONNECT"),
+                quiche::h3::Header::new(b":protocol", b"connect-ip"),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"localhost"),
+                quiche::h3::Header::new(b":path", b"/tunnel"),
+                quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+            ];
+            let stream_id = self
+                .client_h3
+                .h3_conn
+                .send_request(&mut self.client_conn, &connect_headers, false)
+                .unwrap();
+            self.client_h3.bind_connect_stream(stream_id);
+
+            self.flush_c2s();
+
+            // Server polls: sees headers, accepts.
+            let result = self.server_h3.poll_h3_events(
+                &mut self.server_conn,
+                "test-peer",
+                &mut |h3, conn, sid, _headers| {
+                    h3.send_response(
+                        conn,
+                        sid,
+                        &[
+                            quiche::h3::Header::new(b":status", b"200"),
+                            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+                        ],
+                        false,
+                    )
+                    .unwrap();
+                    Ok(HeaderAction::Accept {
+                        stream_id: sid,
+                        peer_id: Some("test-peer".into()),
+                    })
+                },
+            );
+            assert!(matches!(
+                result,
+                Ok(ConnectProgress::Pending | ConnectProgress::Ready)
+            ));
+            assert!(self.server_h3.connect_accepted);
+
+            self.flush_s2c();
+
+            // Client polls: sees 200 OK.
+            let connect_sid = self.client_h3.connect_stream_id;
+            let result = self.client_h3.poll_h3_events(
+                &mut self.client_conn,
+                "client",
+                &mut |_h3, _conn, sid, _headers| {
+                    if sid == connect_sid {
+                        Ok(HeaderAction::Accept {
+                            stream_id: sid,
+                            peer_id: None,
+                        })
+                    } else {
+                        Ok(HeaderAction::Ignore)
+                    }
+                },
+            );
+            assert!(matches!(result, Ok(ConnectProgress::Ready)));
+        }
+    }
+
+    /// Pump all pending packets from sender to receiver.
+    fn pump(
+        sender: &mut quiche::Connection,
+        receiver: &mut quiche::Connection,
+        from: std::net::SocketAddr,
+        to: std::net::SocketAddr,
+        buf: &mut [u8],
+    ) {
+        loop {
+            let (len, _) = match sender.send(buf) {
+                Ok(v) => v,
+                Err(quiche::Error::Done) => break,
+                Err(e) => panic!("send error: {e}"),
+            };
+            match receiver.recv(&mut buf[..len], quiche::RecvInfo { from, to }) {
+                Ok(_) | Err(quiche::Error::Done) => {}
+                Err(e) => panic!("recv error: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn poll_h3_events_rejects_extra_stream_post_establishment() {
+        let mut pair = H3LoopbackPair::new();
+        pair.establish_connect_ip();
+
+        // Client opens an extra stream (e.g. a GET request).
+        let extra_headers = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/"),
+        ];
+        let extra_sid = pair
+            .client_h3
+            .h3_conn
+            .send_request(&mut pair.client_conn, &extra_headers, true)
+            .unwrap();
+        assert_ne!(extra_sid, pair.server_h3.connect_stream_id);
+
+        pair.flush_c2s();
+
+        // Server polls with ignore-all handler (post-establishment).
+        let result =
+            pair.server_h3
+                .poll_h3_events(&mut pair.server_conn, "test-peer", &mut |_, _, _, _| {
+                    Ok(HeaderAction::Ignore)
+                });
+
+        // Should NOT return error — connection stays alive.
+        assert!(
+            matches!(result, Ok(ConnectProgress::Ready)),
+            "expected Ready, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn poll_h3_events_finished_on_unbound_stream_0_ignored() {
+        let mut pair = H3LoopbackPair::new();
+
+        // Before any CONNECT-IP handshake, connect_stream_id defaults to 0.
+        // Client opens a request on stream 0 and finishes it.
+        assert!(!pair.server_h3.connect_accepted);
+        assert_eq!(pair.server_h3.connect_stream_id, 0);
+
+        let headers = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/probe"),
+        ];
+        let sid = pair
+            .client_h3
+            .h3_conn
+            .send_request(&mut pair.client_conn, &headers, true)
+            .unwrap();
+        // First client bidi stream is stream ID 0.
+        assert_eq!(sid, 0);
+
+        pair.flush_c2s();
+
+        // Server polls: sees Headers for stream 0 (handler ignores).
+        // Then sees Finished for stream 0. Because connect_accepted is
+        // false, this should NOT trigger ConnectFailure::Closed.
+        let result = pair.server_h3.poll_h3_events(
+            &mut pair.server_conn,
+            "test-peer",
+            &mut |h3, conn, stream_id, _headers| {
+                let _ = h3.send_response(
+                    conn,
+                    stream_id,
+                    &[quiche::h3::Header::new(b":status", b"400")],
+                    true,
+                );
+                Ok(HeaderAction::Ignore)
+            },
+        );
+
+        // Connection should stay alive (Pending, waiting for real CONNECT-IP).
+        assert!(
+            matches!(result, Ok(ConnectProgress::Pending)),
+            "expected Pending, got {result:?}",
+        );
     }
 
     // ========== ConnectFailure Tests ==========
