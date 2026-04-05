@@ -129,8 +129,10 @@ impl H3Session {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                     // Reject extra streams post-establishment: send 400 +
                     // FIN to close the stream and free quiche resources,
-                    // without tearing down the connection.
-                    if self.connect_accepted {
+                    // without tearing down the connection. Skip the
+                    // CONNECT-IP stream itself (e.g. trailers) to avoid
+                    // an invalid duplicate response.
+                    if self.connect_accepted && stream_id != self.connect_stream_id {
                         debug!(%peer_id, stream_id, "rejecting stream post-establishment");
                         let _ = self.h3_conn.send_response(
                             conn,
@@ -154,13 +156,13 @@ impl H3Session {
                 }
 
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
-                    if stream_id == self.connect_stream_id {
+                    if self.connect_accepted && stream_id == self.connect_stream_id {
                         return Err(ConnectFailure::Closed("CONNECT-IP stream finished".into()));
                     }
                 }
 
                 Ok((stream_id, quiche::h3::Event::Reset(code))) => {
-                    if stream_id == self.connect_stream_id {
+                    if self.connect_accepted && stream_id == self.connect_stream_id {
                         return Err(ConnectFailure::Closed(format!(
                             "CONNECT-IP stream reset: {code}"
                         )));

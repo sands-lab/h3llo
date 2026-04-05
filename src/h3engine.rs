@@ -398,9 +398,7 @@ impl H3Engine {
                     handle_udp_recv(&mut conn, packets, meta.recv_info(remote), Some(&mut run_state.rx_counters));
 
                     // Drain H3 control events. Post-establishment, this detects
-                    // stream close/reset/goaway. The header-parsing branch is
-                    // unreachable after establishment (server never sees :status;
-                    // client's connect_ready() is already true).
+                    // stream close/reset/goaway and rejects extra streams.
                     match session.poll_h3_events(
                         &mut conn,
                         &meta.peer_id,
