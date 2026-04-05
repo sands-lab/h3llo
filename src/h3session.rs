@@ -127,11 +127,17 @@ impl H3Session {
         loop {
             match self.h3_conn.poll(conn) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                    // Post-acceptance headers (including duplicate CONNECT-IP
-                    // requests) are silently ignored rather than hard-rejected,
-                    // avoiding unnecessary connection teardown.
+                    // Reject extra streams post-establishment: send 400 +
+                    // FIN to close the stream and free quiche resources,
+                    // without tearing down the connection.
                     if self.connect_accepted {
-                        debug!(%peer_id, stream_id, "ignoring headers post-establishment");
+                        debug!(%peer_id, stream_id, "rejecting stream post-establishment");
+                        let _ = self.h3_conn.send_response(
+                            conn,
+                            stream_id,
+                            &[quiche::h3::Header::new(b":status", b"400")],
+                            true,
+                        );
                         continue;
                     }
                     match on_headers(&mut self.h3_conn, conn, stream_id, &list)? {
@@ -209,14 +215,6 @@ pub(crate) enum ConnectFailure {
 }
 
 impl ConnectFailure {
-    pub(crate) fn close_reason(&self) -> &'static [u8] {
-        match self {
-            Self::Rejected(_) => b"connect-ip rejected",
-            Self::Closed(_) => b"connect-ip control closed",
-            Self::Poll(_) => b"h3 poll error",
-        }
-    }
-
     pub(crate) fn into_actor_reason(self) -> String {
         match self {
             Self::Rejected(status) => format!("CONNECT-IP rejected after establish: {status}"),
@@ -525,22 +523,6 @@ mod tests {
     }
 
     // ========== ConnectFailure Tests ==========
-
-    #[test]
-    fn connect_failure_close_reason() {
-        assert_eq!(
-            ConnectFailure::Rejected("403".into()).close_reason(),
-            b"connect-ip rejected"
-        );
-        assert_eq!(
-            ConnectFailure::Closed("stream fin".into()).close_reason(),
-            b"connect-ip control closed"
-        );
-        assert_eq!(
-            ConnectFailure::Poll("h3 error".into()).close_reason(),
-            b"h3 poll error"
-        );
-    }
 
     #[test]
     fn connect_failure_into_actor_reason() {

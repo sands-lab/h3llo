@@ -231,24 +231,26 @@ impl H3Engine {
                                   stream_id: u64,
                                   headers: &[quiche::h3::Header]| {
             if let Err(reason) = validate_server_connect_headers(headers) {
+                debug!(stream_id, reason, "rejecting non-CONNECT-IP stream");
                 let _ = h3.send_response(
                     conn,
                     stream_id,
                     &[quiche::h3::Header::new(b":status", b"400")],
                     true,
                 );
-                return Err(ConnectFailure::Closed(reason));
+                return Ok(HeaderAction::Ignore);
             }
             let pid = match validate_server_auth(headers, peer_tokens) {
                 Ok(id) => id,
                 Err(e) => {
+                    debug!(stream_id, error = %e, "rejecting unauthenticated stream");
                     let _ = h3.send_response(
                         conn,
                         stream_id,
                         &[quiche::h3::Header::new(b":status", b"401")],
                         true,
                     );
-                    return Err(ConnectFailure::Closed(format!("auth: {e}")));
+                    return Ok(HeaderAction::Ignore);
                 }
             };
 
