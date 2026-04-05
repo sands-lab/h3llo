@@ -45,6 +45,7 @@
 ### 开发者文档
 
 - [docs/internals.md](docs/internals.md)：内部架构与线程模型、路由更新策略及循环路由防护。
+- [docs/performance.md](docs/performance.md)：性能优化策略、profiling 数据与基准测试结果。
 - [docs/plan.md](docs/plan.md)：迭代计划、模块顺序与测试闸口。
 - [docs/protocol.md](docs/protocol.md)：认证方案、HTTP/3 CONNECT-IP 与 BareUDP 行为、动态重配置规则。
 - [docs/test.md](docs/test.md)：测试分层指南、容器化多节点测试思路、证书策略示例。

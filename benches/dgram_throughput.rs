@@ -13,7 +13,7 @@ const MAX_UDP_PAYLOAD: usize = 1350;
 const DGRAM_QUEUE_SIZE: usize = 4096;
 
 // Payload sizes to benchmark (typical IP packet sizes).
-const PAYLOAD_SIZES: &[usize] = &[64, 512, 1200];
+const PAYLOAD_SIZES: &[usize] = &[64, 512, 1291];
 
 // ---------------------------------------------------------------------------
 // quiche config helpers
