@@ -23,7 +23,6 @@ set -euo pipefail
 source "$(dirname "$0")/bench-common.sh"
 
 # --- Configuration ---
-NUMA_NODE="${NUMA_NODE:-3}"  # NUMA node of NIC (bf3p1) on both nodes
 WG_CPUS="${WG_CPUS:-48-63,112-127}"  # CPUs for wireguard-go (default: all on NUMA node 3)
 NUMA="numactl --membind=$NUMA_NODE"
 TASKSET="taskset -c $WG_CPUS"
@@ -101,6 +100,6 @@ echo ""
 print_banner "wireguard-go Cross-Node Benchmark (TCP only)" \
     "TUN MTU: $TUN_MTU | NUMA: $NUMA_NODE | WG CPUs: $WG_CPUS"
 
-run_iperf_tcp "$REMOTE_TUN" "$NUMA"
+run_iperf_tcp "$REMOTE_TUN"
 
 print_done

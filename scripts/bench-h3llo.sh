@@ -28,6 +28,8 @@
 #   IPERF_TIME          - iperf3 test duration in seconds (default: 10)
 #   PACKET_QUEUE_DEPTH  - packet queue depth (default: 256)
 #   TUN_TX_QUEUE_LEN    - TUN transmit queue length (default: 1000)
+#   VPN_CPUS            - CPU set for VPN containers (default: 48-51, NUMA node 3)
+#   IPERF_CPU           - CPU for iperf3 client/server (default: 52, NUMA node 3)
 set -euo pipefail
 source "$(dirname "$0")/bench-common.sh"
 
@@ -37,7 +39,7 @@ CERT_DIR="${CERT_DIR:-$(mktemp -d /tmp/bench-h3llo-certs.XXXXXX)}"
 PACKET_QUEUE_DEPTH="${PACKET_QUEUE_DEPTH:-256}"
 TUN_TX_QUEUE_LEN="${TUN_TX_QUEUE_LEN:-1000}"
 
-H3_PORT=4433
+H3_PORT=443
 BAREUDP_PORT=5353
 H3_PATH="/bench"
 H3_TOKEN="bench-token-12ch"  # Test-only token, NOT for production
@@ -47,8 +49,8 @@ LOCAL_CTR="h3llo-bench-local"
 REMOTE_CTR="h3llo-bench-remote"
 TUN_IF="tun-bench"
 
-# Docker flags: host networking + TUN device access.
-DOCKER_FLAGS=(--net=host --cap-add NET_ADMIN --device /dev/net/tun)
+# Docker flags: host networking + TUN device access + NUMA pinning.
+DOCKER_FLAGS=(--net=host --cap-add NET_ADMIN --device /dev/net/tun --cpuset-cpus "$VPN_CPUS")
 
 # --- Counter collection helpers ---
 
@@ -148,7 +150,7 @@ if [[ "${BENCH_DRY_RUN:-0}" == "1" ]]; then
 fi
 
 # --- Prerequisites ---
-require_cmds docker ssh scp iperf3 openssl
+require_cmds numactl docker ssh scp iperf3 openssl
 
 # --- Pull latest Docker image and build bench variant ---
 echo "Pulling latest image: $IMAGE ..."

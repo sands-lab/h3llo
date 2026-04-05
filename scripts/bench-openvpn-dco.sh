@@ -37,7 +37,7 @@ OVPN_IF="ovpn-bench"
 BENCH_DIR="$BENCH_DIR/openvpn-dco"
 
 # --- Prerequisites ---
-require_cmds openvpn iperf3 ip ssh openssl scp
+require_cmds numactl openvpn iperf3 ip ssh openssl scp
 
 # --- Cleanup ---
 cleanup() {

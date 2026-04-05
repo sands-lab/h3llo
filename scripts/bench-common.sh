@@ -5,7 +5,7 @@
 #
 # Provides:
 #   Variables: REMOTE, LOCAL_IP, REMOTE_IP, LOCAL_IF, REMOTE_IF, TUN_MTU,
-#              IPERF_TIME, BENCH_DIR, LOCAL_TUN, REMOTE_TUN
+#              NUMA_NODE, IPERF_TIME, BENCH_DIR, LOCAL_TUN, REMOTE_TUN
 #   Functions: require_cmds, gen_self_signed_cert, run_iperf_tcp,
 #              wait_for_connectivity, setup_wg_key_files, kill_remote_iperf,
 #              print_banner, print_test_header, print_done
@@ -20,6 +20,11 @@ REMOTE_IF="${REMOTE_IF:-bf3p1}"
 TUN_MTU="${TUN_MTU:-1291}"
 IPERF_TIME="${IPERF_TIME:-10}"
 BENCH_DIR="${BENCH_DIR:-/tmp/bench}"
+
+# NUMA pinning: VPN on VPN_CPUS, iperf3 on IPERF_CPU (all NUMA-local).
+NUMA_NODE="${NUMA_NODE:-3}"
+VPN_CPUS="${VPN_CPUS:-48-51}"
+IPERF_CPU="${IPERF_CPU:-52}"
 
 # Overlay addresses
 LOCAL_TUN="${LOCAL_TUN:-10.0.0.1}"
@@ -62,14 +67,14 @@ gen_self_signed_cert() {
 
 # Run an iperf3 TCP throughput test over the tunnel.
 # Starts a one-shot iperf3 server on REMOTE, then runs the client locally.
-# Usage: run_iperf_tcp <target_ip> [prefix]
-#   prefix - optional command prefix for both sides (e.g. "numactl --membind=3")
+# NUMA memory and CPU pinning are applied automatically via NUMA_NODE / IPERF_CPU.
+# Usage: run_iperf_tcp <target_ip>
 run_iperf_tcp() {
-    local target="$1" prefix="${2:-}"
+    local target="$1"
     echo "--- TCP ---"
-    ssh "$REMOTE" "$prefix iperf3 -s -1 -B \"$target\" -D"
+    ssh "$REMOTE" "numactl --membind=$NUMA_NODE taskset -c $IPERF_CPU iperf3 -s -1 -B \"$target\" -D"
     sleep 1
-    $prefix iperf3 -c "$target" -t "$IPERF_TIME"
+    numactl --membind="$NUMA_NODE" taskset -c "$IPERF_CPU" iperf3 -c "$target" -t "$IPERF_TIME"
 }
 
 # Wait for tunnel connectivity via ping.

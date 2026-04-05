@@ -40,12 +40,9 @@ set -euo pipefail
 source "$(dirname "$0")/bench-common.sh"
 
 # --- Configuration ---
-NUMA_NODE="${NUMA_NODE:-3}"
 TT_CPUS="${TT_CPUS:-48-51}"
-IPERF_CPU="${IPERF_CPU:-52}"
 NUMA="numactl --membind=$NUMA_NODE"
 TT_PIN="taskset -c $TT_CPUS"
-IPERF_PIN="taskset -c $IPERF_CPU"
 
 TT_PORT=8443
 TEST_IP="198.18.0.1"  # RFC 2544 benchmarking range, on remote loopback
@@ -255,7 +252,7 @@ run_test() {
         return
     fi
 
-    run_iperf_tcp "$TEST_IP" "$NUMA $IPERF_PIN"
+    run_iperf_tcp "$TEST_IP"
 
     stop_tunnel
 }

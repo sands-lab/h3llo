@@ -34,7 +34,7 @@ KEY_B_PUB="$WG_KEY_B_PUB"
 KEY_DIR=""
 
 # --- Prerequisites ---
-require_cmds wg iperf3 ip ssh
+require_cmds numactl wg iperf3 ip ssh
 
 # --- Cleanup ---
 cleanup() {
