@@ -411,7 +411,7 @@ impl DispatcherRuntime {
                 }
 
                 _ = cleanup_ticker.tick() => {
-                    self.cleanup_closed_cids();
+                    self.cid_table.retain(|_, tx| !tx.is_closed());
                 }
 
                 cmd = cmd_rx.recv() => {
@@ -563,11 +563,6 @@ impl DispatcherRuntime {
 
             engine.run().await
         });
-    }
-
-    /// Remove CID entries whose connection actors have exited (receiver dropped).
-    fn cleanup_closed_cids(&mut self) {
-        self.cid_table.retain(|_, tx| !tx.is_closed());
     }
 }
 
