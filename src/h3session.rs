@@ -127,9 +127,13 @@ impl H3Session {
             match self.h3_conn.poll(conn) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                     // Ignore extra streams post-establishment without
-                    // tearing down the connection.
+                    // tearing down the connection. Shutdown the read side
+                    // so the peer stops sending body data and quiche frees
+                    // the stream's receive buffer.
                     if self.connect_accepted {
                         debug!(%peer_id, stream_id, "ignoring headers post-establishment");
+                        conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+                            .ok();
                         continue;
                     }
                     match on_headers(&mut self.h3_conn, conn, stream_id, &list)? {
