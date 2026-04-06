@@ -47,6 +47,7 @@
 - [docs/internals.md](docs/internals.md)：内部架构与线程模型、路由更新策略及循环路由防护。
 - [docs/plan.md](docs/plan.md)：迭代计划、模块顺序与测试闸口。
 - [docs/protocol.md](docs/protocol.md)：认证方案、HTTP/3 CONNECT-IP 与 BareUDP 行为、动态重配置规则。
+- [docs/refactoring.md](docs/refactoring.md)：重构模式库，三层分级（代码卫生 / 日常改进 / 架构级），~60 个可复用策略。
 - [docs/test.md](docs/test.md)：测试分层指南、容器化多节点测试思路、证书策略示例。
 
 ## 文档要求
