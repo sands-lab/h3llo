@@ -46,8 +46,8 @@ pub(crate) struct H3Session {
     ///
     /// Boxed because `quiche::h3::Connection` is ~544 B.
     pub(crate) h3_conn: Box<quiche::h3::Connection>,
-    /// Stream ID of the CONNECT-IP request.
-    pub(crate) connect_stream_id: u64,
+    /// Stream ID of the CONNECT-IP request (`None` until bound).
+    pub(crate) connect_stream_id: Option<u64>,
     /// CONNECT-IP DATAGRAM framing codec for this request stream.
     pub(crate) datagram_codec: ConnectIpDatagramCodec,
     /// Whether the CONNECT-IP request has been accepted (200 OK received).
@@ -69,7 +69,7 @@ impl H3Session {
 
         Ok(Self {
             h3_conn: Box::new(h3_conn),
-            connect_stream_id: 0,
+            connect_stream_id: None,
             datagram_codec: ConnectIpDatagramCodec::new(0),
             connect_accepted: false,
             accepted_peer_id: None,
@@ -77,9 +77,9 @@ impl H3Session {
     }
 
     /// Binds the CONNECT-IP stream ID and updates the DATAGRAM codec.
-    pub(crate) fn bind_connect_stream(&mut self, connect_stream_id: u64) {
-        self.connect_stream_id = connect_stream_id;
-        self.datagram_codec = ConnectIpDatagramCodec::new(connect_stream_id);
+    pub(crate) fn bind_connect_stream(&mut self, stream_id: u64) {
+        self.connect_stream_id = Some(stream_id);
+        self.datagram_codec = ConnectIpDatagramCodec::new(stream_id);
     }
 
     /// Marks the CONNECT-IP request as accepted.
@@ -150,13 +150,13 @@ impl H3Session {
                 }
 
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
-                    if self.connect_accepted && stream_id == self.connect_stream_id {
+                    if self.connect_stream_id == Some(stream_id) {
                         return Err(ConnectFailure::Closed("CONNECT-IP stream finished".into()));
                     }
                 }
 
                 Ok((stream_id, quiche::h3::Event::Reset(code))) => {
-                    if self.connect_accepted && stream_id == self.connect_stream_id {
+                    if self.connect_stream_id == Some(stream_id) {
                         return Err(ConnectFailure::Closed(format!(
                             "CONNECT-IP stream reset: {code}"
                         )));
@@ -720,7 +720,7 @@ mod tests {
                 &mut self.client_conn,
                 "client",
                 &mut |_h3, _conn, sid, _headers| {
-                    if sid == connect_sid {
+                    if connect_sid == Some(sid) {
                         Ok(HeaderAction::Accept {
                             stream_id: sid,
                             peer_id: None,
@@ -772,7 +772,7 @@ mod tests {
             .h3_conn
             .send_request(&mut pair.client_conn, &extra_headers, true)
             .unwrap();
-        assert_ne!(extra_sid, pair.server_h3.connect_stream_id);
+        assert_ne!(Some(extra_sid), pair.server_h3.connect_stream_id);
 
         pair.flush_c2s();
 
@@ -794,10 +794,10 @@ mod tests {
     fn poll_h3_events_finished_on_unbound_stream_0_ignored() {
         let mut pair = H3LoopbackPair::new();
 
-        // Before any CONNECT-IP handshake, connect_stream_id defaults to 0.
+        // Before any CONNECT-IP handshake, connect_stream_id is None.
         // Client opens a request on stream 0 and finishes it.
         assert!(!pair.server_h3.connect_accepted);
-        assert_eq!(pair.server_h3.connect_stream_id, 0);
+        assert!(pair.server_h3.connect_stream_id.is_none());
 
         let headers = vec![
             quiche::h3::Header::new(b":method", b"GET"),
