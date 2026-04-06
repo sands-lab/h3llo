@@ -839,6 +839,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn poll_h3_events_reset_on_bound_stream_before_accept_detected() {
+        let mut pair = H3LoopbackPair::new();
+
+        // Client sends CONNECT-IP request (binds stream, but not yet accepted).
+        let connect_headers = vec![
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"connect-ip"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/tunnel"),
+            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+        ];
+        let stream_id = pair
+            .client_h3
+            .h3_conn
+            .send_request(&mut pair.client_conn, &connect_headers, false)
+            .unwrap();
+        pair.client_h3.bind_connect_stream(stream_id);
+        assert!(!pair.client_h3.connect_accepted);
+        assert_eq!(pair.client_h3.connect_stream_id, Some(stream_id));
+
+        pair.flush_c2s();
+
+        // Server receives headers, but instead of sending 200 OK, resets
+        // the stream (simulating an abrupt rejection).
+        let _ = pair.server_h3.poll_h3_events(
+            &mut pair.server_conn,
+            "test-peer",
+            &mut |_h3, conn, sid, _headers| {
+                conn.stream_shutdown(sid, quiche::Shutdown::Write, 0x0100)
+                    .ok();
+                Ok(HeaderAction::Ignore)
+            },
+        );
+        pair.flush_s2c();
+
+        // Client polls: should detect the Reset on the bound CONNECT stream
+        // even though connect_accepted is still false.
+        let result =
+            pair.client_h3
+                .poll_h3_events(&mut pair.client_conn, "client", &mut |_, _, _, _| {
+                    Ok(HeaderAction::Ignore)
+                });
+
+        assert!(
+            matches!(result, Err(ConnectFailure::Closed(_))),
+            "expected Closed error on pre-accept reset, got {result:?}",
+        );
+    }
+
     // ========== ConnectFailure Tests ==========
 
     #[test]
