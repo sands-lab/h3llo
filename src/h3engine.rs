@@ -267,25 +267,15 @@ impl EngineMeta {
 /// Carried out of the loop via `break` so that QUIC close + UDP flush
 /// happen exactly once, after the loop.
 pub(crate) enum LoopExit {
-    Ok(&'static [u8]),
-    Err {
-        close_reason: &'static [u8],
-        reason: String,
-    },
+    Ok,
+    Err { reason: String },
 }
 
 impl LoopExit {
-    pub(crate) fn close_reason(&self) -> &'static [u8] {
-        match self {
-            Self::Ok(r) => r,
-            Self::Err { close_reason, .. } => close_reason,
-        }
-    }
-
     pub(crate) fn into_result(self, meta: &EngineMeta, origin: ConnOrigin) -> ActorExitResult {
         match self {
-            Self::Ok(_) => Ok(()),
-            Self::Err { reason, .. } => Err(ActorError::H3Engine {
+            Self::Ok => Ok(()),
+            Self::Err { reason } => Err(ActorError::H3Engine {
                 origin,
                 peer_id: meta.peer_id.clone(),
                 reason,
@@ -402,15 +392,13 @@ impl H3Engine {
                     if !ingress_pending =>
                 {
                     let Some((remote, packets)) = maybe_batch else {
-                        break LoopExit::Ok(b"udp rx closed");
+                        break LoopExit::Ok;
                     };
 
                     handle_udp_recv(&mut conn, packets, meta.recv_info(remote), Some(&mut run_state.rx_counters));
 
                     // Drain H3 control events. Post-establishment, this detects
-                    // stream close/reset/goaway. The header-parsing branch is
-                    // unreachable after establishment (server never sees :status;
-                    // client's connect_ready() is already true).
+                    // stream close/reset/goaway and rejects extra streams.
                     match session.poll_h3_events(
                         &mut conn,
                         &meta.peer_id,
@@ -418,7 +406,6 @@ impl H3Engine {
                     ) {
                         Ok(ConnectProgress::Pending | ConnectProgress::Ready) => {}
                         Err(err) => break LoopExit::Err {
-                            close_reason: err.close_reason(),
                             reason: err.into_actor_reason(),
                         },
                     }
@@ -433,7 +420,7 @@ impl H3Engine {
                         run_state.pending_ingress = match ingress_tx.try_send(batch) {
                             Ok(()) => None,
                             Err(mpsc::error::TrySendError::Full(b)) => Some(PendingBatch::new(b)),
-                            Err(mpsc::error::TrySendError::Closed(_)) => break LoopExit::Ok(b"shutdown"),
+                            Err(mpsc::error::TrySendError::Closed(_)) => break LoopExit::Ok,
                         };
                     }
                 }
@@ -447,13 +434,13 @@ impl H3Engine {
                             run_state.rx_counters.record_queue_full(pending.since.elapsed());
                             permit.send(pending.batch);
                         }
-                        Err(_) => break LoopExit::Ok(b"shutdown"),
+                        Err(_) => break LoopExit::Ok,
                     }
                 }
 
                 maybe_batch = egress_rx.recv() => {
                     let Some(packets) = maybe_batch else {
-                        break LoopExit::Ok(b"shutdown");
+                        break LoopExit::Ok;
                     };
 
                     handle_router_egress(
@@ -474,7 +461,7 @@ impl H3Engine {
                             run_state.tx_counters.record_queue_full(pending.since.elapsed());
                             permit.send((dest, pending.batch));
                         }
-                        Err(_) => break LoopExit::Ok(b"udp tx closed"),
+                        Err(_) => break LoopExit::Ok,
                     }
                 }
 
@@ -500,7 +487,6 @@ impl H3Engine {
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             break LoopExit::Err {
-                                close_reason: b"udp tx closed",
                                 reason: "UDP TX channel closed".into(),
                             }
                         }
@@ -511,14 +497,15 @@ impl H3Engine {
 
             if conn.is_closed() {
                 break LoopExit::Err {
-                    close_reason: b"conn closed",
                     reason: "QUIC connection closed".into(),
                 };
             }
         };
 
         // Single cleanup point: close QUIC and flush remaining packets.
-        conn.close(true, 0, exit.close_reason()).ok();
+        // Empty reason phrase avoids leaking implementation details in
+        // the CONNECTION_CLOSE frame visible to the peer.
+        conn.close(true, 0, b"").ok();
         if let Some(send) = collect_udp_send(&mut conn, meta.max_udp_payload) {
             let _ = udp_send_tx.send(send).await;
         }
@@ -556,18 +543,6 @@ mod tests {
 
     // ========== Engine Type Tests ==========
 
-    #[test]
-    fn loop_exit_close_reason() {
-        let ok = LoopExit::Ok(b"shutdown");
-        assert_eq!(ok.close_reason(), b"shutdown");
-
-        let err = LoopExit::Err {
-            close_reason: b"conn closed",
-            reason: "QUIC closed".into(),
-        };
-        assert_eq!(err.close_reason(), b"conn closed");
-    }
-
     fn test_meta() -> EngineMeta {
         EngineMeta {
             local_addr: "127.0.0.1:5000".parse().unwrap(),
@@ -579,14 +554,13 @@ mod tests {
 
     #[test]
     fn loop_exit_into_result_ok() {
-        let exit = LoopExit::Ok(b"graceful");
+        let exit = LoopExit::Ok;
         assert!(exit.into_result(&test_meta(), ConnOrigin::Client).is_ok());
     }
 
     #[test]
     fn loop_exit_into_result_err_client() {
         let exit = LoopExit::Err {
-            close_reason: b"conn closed",
             reason: "QUIC connection closed".into(),
         };
         let err = exit
@@ -603,7 +577,6 @@ mod tests {
     #[test]
     fn loop_exit_into_result_err_server() {
         let exit = LoopExit::Err {
-            close_reason: b"conn closed",
             reason: "auth failed".into(),
         };
         let err = exit

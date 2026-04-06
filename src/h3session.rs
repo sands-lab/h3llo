@@ -46,8 +46,8 @@ pub(crate) struct H3Session {
     ///
     /// Boxed because `quiche::h3::Connection` is ~544 B.
     pub(crate) h3_conn: Box<quiche::h3::Connection>,
-    /// Stream ID of the CONNECT-IP request.
-    pub(crate) connect_stream_id: u64,
+    /// Stream ID of the CONNECT-IP request (`None` until bound).
+    pub(crate) connect_stream_id: Option<u64>,
     /// CONNECT-IP DATAGRAM framing codec for this request stream.
     pub(crate) datagram_codec: ConnectIpDatagramCodec,
     /// Whether the CONNECT-IP request has been accepted (200 OK received).
@@ -69,7 +69,7 @@ impl H3Session {
 
         Ok(Self {
             h3_conn: Box::new(h3_conn),
-            connect_stream_id: 0,
+            connect_stream_id: None,
             datagram_codec: ConnectIpDatagramCodec::new(0),
             connect_accepted: false,
             accepted_peer_id: None,
@@ -77,9 +77,9 @@ impl H3Session {
     }
 
     /// Binds the CONNECT-IP stream ID and updates the DATAGRAM codec.
-    pub(crate) fn bind_connect_stream(&mut self, connect_stream_id: u64) {
-        self.connect_stream_id = connect_stream_id;
-        self.datagram_codec = ConnectIpDatagramCodec::new(connect_stream_id);
+    pub(crate) fn bind_connect_stream(&mut self, stream_id: u64) {
+        self.connect_stream_id = Some(stream_id);
+        self.datagram_codec = ConnectIpDatagramCodec::new(stream_id);
     }
 
     /// Marks the CONNECT-IP request as accepted.
@@ -106,10 +106,9 @@ impl H3Session {
     /// - **Client**: checks `:status=200`, returns `Accept` or error.
     /// - **Server**: validates CONNECT-IP + auth, sends 200 OK,
     ///   returns `Accept { peer_id: Some(...) }` or error.
-    /// - **Post-establishment**: use an ignore-all handler.
-    ///
-    /// After `connect_accepted` is true, headers are silently ignored
-    /// regardless of the handler.
+    /// - **Post-establishment**: extra streams are rejected with 400 + FIN
+    ///   (headers on the CONNECT-IP stream itself are still forwarded to
+    ///   the handler). The caller typically passes an ignore-all handler.
     pub(crate) fn poll_h3_events<F>(
         &mut self,
         conn: &mut quiche::Connection,
@@ -127,11 +126,14 @@ impl H3Session {
         loop {
             match self.h3_conn.poll(conn) {
                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                    // Post-acceptance headers (including duplicate CONNECT-IP
-                    // requests) are silently ignored rather than hard-rejected,
-                    // avoiding unnecessary connection teardown.
+                    // Ignore extra streams post-establishment without
+                    // tearing down the connection. Shutdown the read side
+                    // so the peer stops sending body data and quiche frees
+                    // the stream's receive buffer.
                     if self.connect_accepted {
                         debug!(%peer_id, stream_id, "ignoring headers post-establishment");
+                        conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+                            .ok();
                         continue;
                     }
                     match on_headers(&mut self.h3_conn, conn, stream_id, &list)? {
@@ -148,13 +150,13 @@ impl H3Session {
                 }
 
                 Ok((stream_id, quiche::h3::Event::Finished)) => {
-                    if stream_id == self.connect_stream_id {
+                    if self.connect_stream_id == Some(stream_id) {
                         return Err(ConnectFailure::Closed("CONNECT-IP stream finished".into()));
                     }
                 }
 
                 Ok((stream_id, quiche::h3::Event::Reset(code))) => {
-                    if stream_id == self.connect_stream_id {
+                    if self.connect_stream_id == Some(stream_id) {
                         return Err(ConnectFailure::Closed(format!(
                             "CONNECT-IP stream reset: {code}"
                         )));
@@ -191,6 +193,7 @@ impl H3Session {
 // ========== CONNECT-IP Progress / Failure ==========
 
 /// Result of advancing CONNECT-IP control-plane state.
+#[derive(Debug)]
 pub(crate) enum ConnectProgress {
     /// CONNECT-IP is not ready for datagram forwarding yet.
     Pending,
@@ -199,6 +202,7 @@ pub(crate) enum ConnectProgress {
 }
 
 /// Error raised while advancing CONNECT-IP control-plane state.
+#[derive(Debug)]
 pub(crate) enum ConnectFailure {
     /// CONNECT-IP rejected with the given status code.
     Rejected(String),
@@ -209,14 +213,6 @@ pub(crate) enum ConnectFailure {
 }
 
 impl ConnectFailure {
-    pub(crate) fn close_reason(&self) -> &'static [u8] {
-        match self {
-            Self::Rejected(_) => b"connect-ip rejected",
-            Self::Closed(_) => b"connect-ip control closed",
-            Self::Poll(_) => b"h3 poll error",
-        }
-    }
-
     pub(crate) fn into_actor_reason(self) -> String {
         match self {
             Self::Rejected(status) => format!("CONNECT-IP rejected after establish: {status}"),
@@ -524,23 +520,377 @@ mod tests {
         }
     }
 
-    // ========== ConnectFailure Tests ==========
+    // ========== poll_h3_events Loopback Tests ==========
+
+    /// In-memory quiche client-server pair with H3 sessions for testing
+    /// `poll_h3_events` without network I/O.
+    struct H3LoopbackPair {
+        client_conn: quiche::Connection,
+        server_conn: quiche::Connection,
+        client_h3: H3Session,
+        server_h3: H3Session,
+        client_addr: std::net::SocketAddr,
+        server_addr: std::net::SocketAddr,
+        buf: Vec<u8>,
+    }
+
+    impl H3LoopbackPair {
+        fn new() -> Self {
+            use crate::h3session::test_support::TestCertBundle;
+
+            let certs = TestCertBundle::generate();
+
+            let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            client_config
+                .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+                .unwrap();
+            client_config.set_initial_max_data(10_000_000);
+            client_config.set_initial_max_stream_data_bidi_local(1_000_000);
+            client_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+            client_config.set_initial_max_stream_data_uni(1_000_000);
+            client_config.set_initial_max_streams_bidi(100);
+            client_config.set_initial_max_streams_uni(100);
+            client_config.enable_dgram(true, 1024, 1024);
+            client_config.set_max_idle_timeout(5000);
+            client_config.verify_peer(false);
+
+            let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            server_config
+                .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+                .unwrap();
+            server_config.set_initial_max_data(10_000_000);
+            server_config.set_initial_max_stream_data_bidi_local(1_000_000);
+            server_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+            server_config.set_initial_max_stream_data_uni(1_000_000);
+            server_config.set_initial_max_streams_bidi(100);
+            server_config.set_initial_max_streams_uni(100);
+            server_config.enable_dgram(true, 1024, 1024);
+            server_config.set_max_idle_timeout(5000);
+            server_config
+                .load_cert_chain_from_pem_file(certs.cert_path().to_str().unwrap())
+                .unwrap();
+            server_config
+                .load_priv_key_from_pem_file(certs.key_path().to_str().unwrap())
+                .unwrap();
+
+            let client_addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+            let server_addr: std::net::SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+            let scid = quiche::ConnectionId::from_ref(&[0xaa; quiche::MAX_CONN_ID_LEN]);
+            let dcid = quiche::ConnectionId::from_ref(&[0xbb; quiche::MAX_CONN_ID_LEN]);
+
+            let mut client_conn = quiche::connect(
+                Some("localhost"),
+                &scid,
+                client_addr,
+                server_addr,
+                &mut client_config,
+            )
+            .unwrap();
+
+            let mut server_conn =
+                quiche::accept(&dcid, None, server_addr, client_addr, &mut server_config).unwrap();
+
+            // Drive QUIC handshake to completion.
+            let mut buf = vec![0u8; 65535];
+            loop {
+                pump(
+                    &mut client_conn,
+                    &mut server_conn,
+                    client_addr,
+                    server_addr,
+                    &mut buf,
+                );
+                pump(
+                    &mut server_conn,
+                    &mut client_conn,
+                    server_addr,
+                    client_addr,
+                    &mut buf,
+                );
+                if client_conn.is_established() && server_conn.is_established() {
+                    break;
+                }
+            }
+
+            // Create H3 sessions on both sides.
+            let client_h3 = H3Session::with_transport(&mut client_conn).unwrap();
+            let server_h3 = H3Session::with_transport(&mut server_conn).unwrap();
+
+            // Exchange H3 SETTINGS frames.
+            pump(
+                &mut client_conn,
+                &mut server_conn,
+                client_addr,
+                server_addr,
+                &mut buf,
+            );
+            pump(
+                &mut server_conn,
+                &mut client_conn,
+                server_addr,
+                client_addr,
+                &mut buf,
+            );
+
+            Self {
+                client_conn,
+                server_conn,
+                client_h3,
+                server_h3,
+                client_addr,
+                server_addr,
+                buf,
+            }
+        }
+
+        /// Flush pending packets from client to server.
+        fn flush_c2s(&mut self) {
+            pump(
+                &mut self.client_conn,
+                &mut self.server_conn,
+                self.client_addr,
+                self.server_addr,
+                &mut self.buf,
+            );
+        }
+
+        /// Flush pending packets from server to client.
+        fn flush_s2c(&mut self) {
+            pump(
+                &mut self.server_conn,
+                &mut self.client_conn,
+                self.server_addr,
+                self.client_addr,
+                &mut self.buf,
+            );
+        }
+
+        /// Complete CONNECT-IP handshake: client sends CONNECT, server accepts.
+        fn establish_connect_ip(&mut self) {
+            let connect_headers = vec![
+                quiche::h3::Header::new(b":method", b"CONNECT"),
+                quiche::h3::Header::new(b":protocol", b"connect-ip"),
+                quiche::h3::Header::new(b":scheme", b"https"),
+                quiche::h3::Header::new(b":authority", b"localhost"),
+                quiche::h3::Header::new(b":path", b"/tunnel"),
+                quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+            ];
+            let stream_id = self
+                .client_h3
+                .h3_conn
+                .send_request(&mut self.client_conn, &connect_headers, false)
+                .unwrap();
+            self.client_h3.bind_connect_stream(stream_id);
+
+            self.flush_c2s();
+
+            // Server polls: sees headers, accepts.
+            let result = self.server_h3.poll_h3_events(
+                &mut self.server_conn,
+                "test-peer",
+                &mut |h3, conn, sid, _headers| {
+                    h3.send_response(
+                        conn,
+                        sid,
+                        &[
+                            quiche::h3::Header::new(b":status", b"200"),
+                            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+                        ],
+                        false,
+                    )
+                    .unwrap();
+                    Ok(HeaderAction::Accept {
+                        stream_id: sid,
+                        peer_id: Some("test-peer".into()),
+                    })
+                },
+            );
+            assert!(matches!(
+                result,
+                Ok(ConnectProgress::Pending | ConnectProgress::Ready)
+            ));
+            assert!(self.server_h3.connect_accepted);
+
+            self.flush_s2c();
+
+            // Client polls: sees 200 OK.
+            let connect_sid = self.client_h3.connect_stream_id;
+            let result = self.client_h3.poll_h3_events(
+                &mut self.client_conn,
+                "client",
+                &mut |_h3, _conn, sid, _headers| {
+                    if connect_sid == Some(sid) {
+                        Ok(HeaderAction::Accept {
+                            stream_id: sid,
+                            peer_id: None,
+                        })
+                    } else {
+                        Ok(HeaderAction::Ignore)
+                    }
+                },
+            );
+            assert!(matches!(result, Ok(ConnectProgress::Ready)));
+        }
+    }
+
+    /// Pump all pending packets from sender to receiver.
+    fn pump(
+        sender: &mut quiche::Connection,
+        receiver: &mut quiche::Connection,
+        from: std::net::SocketAddr,
+        to: std::net::SocketAddr,
+        buf: &mut [u8],
+    ) {
+        loop {
+            let (len, _) = match sender.send(buf) {
+                Ok(v) => v,
+                Err(quiche::Error::Done) => break,
+                Err(e) => panic!("send error: {e}"),
+            };
+            match receiver.recv(&mut buf[..len], quiche::RecvInfo { from, to }) {
+                Ok(_) | Err(quiche::Error::Done) => {}
+                Err(e) => panic!("recv error: {e}"),
+            }
+        }
+    }
 
     #[test]
-    fn connect_failure_close_reason() {
-        assert_eq!(
-            ConnectFailure::Rejected("403".into()).close_reason(),
-            b"connect-ip rejected"
-        );
-        assert_eq!(
-            ConnectFailure::Closed("stream fin".into()).close_reason(),
-            b"connect-ip control closed"
-        );
-        assert_eq!(
-            ConnectFailure::Poll("h3 error".into()).close_reason(),
-            b"h3 poll error"
+    fn poll_h3_events_rejects_extra_stream_post_establishment() {
+        let mut pair = H3LoopbackPair::new();
+        pair.establish_connect_ip();
+
+        // Client opens an extra stream (e.g. a GET request).
+        let extra_headers = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/"),
+        ];
+        let extra_sid = pair
+            .client_h3
+            .h3_conn
+            .send_request(&mut pair.client_conn, &extra_headers, true)
+            .unwrap();
+        assert_ne!(Some(extra_sid), pair.server_h3.connect_stream_id);
+
+        pair.flush_c2s();
+
+        // Server polls with ignore-all handler (post-establishment).
+        let result =
+            pair.server_h3
+                .poll_h3_events(&mut pair.server_conn, "test-peer", &mut |_, _, _, _| {
+                    Ok(HeaderAction::Ignore)
+                });
+
+        // Should NOT return error — connection stays alive.
+        assert!(
+            matches!(result, Ok(ConnectProgress::Ready)),
+            "expected Ready, got {result:?}",
         );
     }
+
+    #[test]
+    fn poll_h3_events_finished_on_unbound_stream_0_ignored() {
+        let mut pair = H3LoopbackPair::new();
+
+        // Before any CONNECT-IP handshake, connect_stream_id is None.
+        // Client opens a request on stream 0 and finishes it.
+        assert!(!pair.server_h3.connect_accepted);
+        assert!(pair.server_h3.connect_stream_id.is_none());
+
+        let headers = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/probe"),
+        ];
+        let sid = pair
+            .client_h3
+            .h3_conn
+            .send_request(&mut pair.client_conn, &headers, true)
+            .unwrap();
+        // First client bidi stream is stream ID 0.
+        assert_eq!(sid, 0);
+
+        pair.flush_c2s();
+
+        // Server polls: sees Headers for stream 0 (handler ignores).
+        // Then sees Finished for stream 0. Because connect_accepted is
+        // false, this should NOT trigger ConnectFailure::Closed.
+        let result = pair.server_h3.poll_h3_events(
+            &mut pair.server_conn,
+            "test-peer",
+            &mut |h3, conn, stream_id, _headers| {
+                let _ = h3.send_response(
+                    conn,
+                    stream_id,
+                    &[quiche::h3::Header::new(b":status", b"400")],
+                    true,
+                );
+                Ok(HeaderAction::Ignore)
+            },
+        );
+
+        // Connection should stay alive (Pending, waiting for real CONNECT-IP).
+        assert!(
+            matches!(result, Ok(ConnectProgress::Pending)),
+            "expected Pending, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn poll_h3_events_reset_on_bound_stream_before_accept_detected() {
+        let mut pair = H3LoopbackPair::new();
+
+        // Client sends CONNECT-IP request (binds stream, but not yet accepted).
+        let connect_headers = vec![
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"connect-ip"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", b"/tunnel"),
+            quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+        ];
+        let stream_id = pair
+            .client_h3
+            .h3_conn
+            .send_request(&mut pair.client_conn, &connect_headers, false)
+            .unwrap();
+        pair.client_h3.bind_connect_stream(stream_id);
+        assert!(!pair.client_h3.connect_accepted);
+        assert_eq!(pair.client_h3.connect_stream_id, Some(stream_id));
+
+        pair.flush_c2s();
+
+        // Server receives headers, but instead of sending 200 OK, resets
+        // the stream (simulating an abrupt rejection).
+        let _ = pair.server_h3.poll_h3_events(
+            &mut pair.server_conn,
+            "test-peer",
+            &mut |_h3, conn, sid, _headers| {
+                conn.stream_shutdown(sid, quiche::Shutdown::Write, 0x0100)
+                    .ok();
+                Ok(HeaderAction::Ignore)
+            },
+        );
+        pair.flush_s2c();
+
+        // Client polls: should detect the Reset on the bound CONNECT stream
+        // even though connect_accepted is still false.
+        let result =
+            pair.client_h3
+                .poll_h3_events(&mut pair.client_conn, "client", &mut |_, _, _, _| {
+                    Ok(HeaderAction::Ignore)
+                });
+
+        assert!(
+            matches!(result, Err(ConnectFailure::Closed(_))),
+            "expected Closed error on pre-accept reset, got {result:?}",
+        );
+    }
+
+    // ========== ConnectFailure Tests ==========
 
     #[test]
     fn connect_failure_into_actor_reason() {

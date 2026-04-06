@@ -97,14 +97,12 @@ impl H3Engine {
                     }
 
                     if let Some(session) = &mut self.session {
-                        // Guaranteed set by send_connect_request → bind_connect_stream
-                        // above. Note: stream ID 0 is valid (first client bidi stream).
                         let connect_sid = session.connect_stream_id;
                         match session.poll_h3_events(
                             &mut self.conn,
                             &self.meta.peer_id,
                             &mut |_h3, _conn, sid, headers| {
-                                if sid != connect_sid {
+                                if connect_sid != Some(sid) {
                                     return Ok(HeaderAction::Ignore);
                                 }
                                 let status = headers
