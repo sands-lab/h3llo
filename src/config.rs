@@ -635,12 +635,12 @@ impl Config {
             check_trimmed(&h3.key, "local.h3", "key", true, &mut errors);
         }
 
-        if self.local.tun.addrs.is_empty() {
-            errors.push(ValidationError::FieldEmpty {
-                context: "local.tun".to_string(),
-                field: "addrs",
-            });
-        }
+        check_not_empty(
+            self.local.tun.addrs.is_empty(),
+            "local.tun",
+            "addrs",
+            &mut errors,
+        );
 
         if let Err(ValidationErrors(peer_errors)) = validate_peers(&self.peers) {
             errors.extend(peer_errors);
@@ -651,6 +651,38 @@ impl Config {
         } else {
             Err(ConfigError::Validation(ValidationErrors(errors)))
         }
+    }
+}
+
+/// Pushes a `FieldEmpty` error if the collection/field is empty.
+fn check_not_empty(
+    is_empty: bool,
+    context: &str,
+    field: &'static str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if is_empty {
+        errors.push(ValidationError::FieldEmpty {
+            context: context.to_string(),
+            field,
+        });
+    }
+}
+
+/// Pushes a `DuplicateValue` error if `value` is already in `seen`.
+fn check_unique<T: Eq + std::hash::Hash + Clone + ToString>(
+    seen: &mut HashSet<T>,
+    value: &T,
+    context: &str,
+    field: &'static str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !seen.insert(value.clone()) {
+        errors.push(ValidationError::DuplicateValue {
+            context: context.to_string(),
+            field,
+            value: value.to_string(),
+        });
     }
 }
 
@@ -687,14 +719,7 @@ pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
         let ctx = format!("peer '{}'", peer.id);
 
         check_trimmed(&peer.id, &ctx, "id", true, &mut errors);
-
-        if !seen_peer_ids.insert(peer.id.clone()) {
-            errors.push(ValidationError::DuplicateValue {
-                context: ctx.clone(),
-                field: "id",
-                value: peer.id.clone(),
-            });
-        }
+        check_unique(&mut seen_peer_ids, &peer.id, &ctx, "id", &mut errors);
 
         if let PeerTransport::H3(h3) = &peer.transport {
             if h3.token.len() < 12 {
@@ -704,14 +729,14 @@ pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
             } else {
                 check_trimmed(&h3.token, &ctx, "h3.token", false, &mut errors);
             }
+            check_unique(
+                &mut seen_peer_tokens,
+                &h3.token,
+                &ctx,
+                "h3.token",
+                &mut errors,
+            );
 
-            if !seen_peer_tokens.insert(h3.token.clone()) {
-                errors.push(ValidationError::DuplicateValue {
-                    context: ctx.clone(),
-                    field: "h3.token",
-                    value: h3.token.clone(),
-                });
-            }
             if let Some(sni) = &h3.sni {
                 check_trimmed(sni, &ctx, "h3.sni", true, &mut errors);
             }
@@ -720,22 +745,16 @@ pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
             }
         }
 
-        if peer.tun.allowed_ips.is_empty() {
-            errors.push(ValidationError::FieldEmpty {
-                context: ctx.clone(),
-                field: "tun.allowed_ips",
-            });
-        }
+        check_not_empty(
+            peer.tun.allowed_ips.is_empty(),
+            &ctx,
+            "tun.allowed_ips",
+            &mut errors,
+        );
 
         let mut seen_allowed = HashSet::new();
         for net in &peer.tun.allowed_ips {
-            if !seen_allowed.insert(*net) {
-                errors.push(ValidationError::DuplicateValue {
-                    context: ctx.clone(),
-                    field: "tun.allowed_ips",
-                    value: net.to_string(),
-                });
-            }
+            check_unique(&mut seen_allowed, net, &ctx, "tun.allowed_ips", &mut errors);
         }
     }
 
