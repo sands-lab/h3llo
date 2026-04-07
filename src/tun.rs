@@ -547,7 +547,10 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             }
                             let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
                             let pkt_count = batch.len() as u64;
-                            counters.send_and_record(&output_tx, batch, pkt_count, total_bytes).await;
+                            if !counters.send_and_record(&output_tx, batch, pkt_count, total_bytes).await {
+                                info!(tun = %tun_name, "TUN RX: router channel closed, shutting down");
+                                return Ok(());
+                            }
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(err) => {

@@ -226,6 +226,7 @@ impl H3Engine {
         let timer = time::sleep(self.conn.timeout().unwrap_or(MAX_TIMEOUT));
         tokio::pin!(timer);
 
+        let remote_addr = self.meta.remote_addr;
         let mut server_handler = |h3: &mut quiche::h3::Connection,
                                   conn: &mut quiche::Connection,
                                   stream_id: u64,
@@ -243,7 +244,7 @@ impl H3Engine {
             let pid = match validate_server_auth(headers, peer_tokens) {
                 Ok(id) => id,
                 Err(e) => {
-                    debug!(stream_id, error = %e, "rejecting unauthenticated stream");
+                    warn!(stream_id, %remote_addr, error = %e, "rejecting unauthenticated stream");
                     let _ = h3.send_response(
                         conn,
                         stream_id,
@@ -552,7 +553,7 @@ impl DispatcherRuntime {
                 "server: CONNECT-IP established"
             );
 
-            let _ = engine
+            if engine
                 .io
                 .events_tx
                 .send(Event::H3v2Connected(H3v2ConnectedEvent {
@@ -561,7 +562,12 @@ impl DispatcherRuntime {
                     tx: egress_tx,
                     origin: ConnOrigin::Server,
                     handles: Vec::new(),
-                }));
+                }))
+                .is_err()
+            {
+                warn!(peer_id = %engine.meta.peer_id, %remote, "events channel closed; aborting connection");
+                return Ok(());
+            }
 
             engine.run().await
         });
