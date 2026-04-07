@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::helpers::{send_with_backpressure, SendEvent};
 
@@ -261,7 +261,7 @@ pub(crate) fn log_transport_metrics(metrics: &Metrics) {
         .remote_addr
         .map(|a| a.to_string())
         .unwrap_or_else(|| "-".into());
-    debug!(
+    info!(
         "{:?} {:?} {} {}: {} batches/{} pkts/{} bytes ok, \
          {} batches/{} pkts/{} bytes dropped",
         labels.source,
@@ -278,7 +278,7 @@ pub(crate) fn log_transport_metrics(metrics: &Metrics) {
     if stats.dropped.packets > 0 {
         for (reason, counters) in &stats.drop_reasons {
             if counters.packets > 0 {
-                debug!(
+                info!(
                     "  drop reason {:?}: {} pkts/{} bytes",
                     reason, counters.packets, counters.bytes
                 );
@@ -287,7 +287,7 @@ pub(crate) fn log_transport_metrics(metrics: &Metrics) {
     }
     let cg = &stats.congestion;
     if cg.queue_full_count > 0 || cg.would_block_count > 0 {
-        debug!(
+        info!(
             "  congestion: queue_full {}x/{:?} total, would_block {}x/{:?} total",
             cg.queue_full_count,
             cg.queue_full_duration,
@@ -303,10 +303,15 @@ pub(crate) fn log_transport_metrics(metrics: &Metrics) {
 /// `encode_metrics_snapshot` relies on this termination convention when
 /// concatenating transport and QUIC metric blocks.
 pub(crate) fn collect_quic_metrics() -> String {
-    foundations::telemetry::metrics::collect(
+    match foundations::telemetry::metrics::collect(
         &foundations::telemetry::settings::MetricsSettings::default(),
-    )
-    .unwrap_or_default()
+    ) {
+        Ok(text) => text,
+        Err(e) => {
+            warn!(error = %e, "failed to collect QUIC metrics");
+            String::new()
+        }
+    }
 }
 
 /// Logs QUIC-level metrics from the `foundations` global registry at `debug!` level.

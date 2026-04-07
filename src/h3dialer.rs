@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 // ========== Dial Error ==========
 
@@ -76,6 +76,7 @@ impl H3Engine {
             tokio::select! {
                 maybe_batch = self.io.udp_recv_rx.recv() => {
                     let Some((remote, packets)) = maybe_batch else {
+                        warn!(%self.meta.peer_id, "establish: UDP RX closed during startup");
                         return Err(DialError::Handshake("UDP Rx closed during startup".into()));
                     };
 
@@ -135,6 +136,7 @@ impl H3Engine {
                 }
 
                 _ = &mut deadline => {
+                    warn!(%self.meta.peer_id, ?timeout, "establish: handshake timeout");
                     self.conn.close(true, 0, b"handshake timeout").ok();
                     self.flush_send();
                     return Err(DialError::Timeout(timeout));
@@ -145,6 +147,7 @@ impl H3Engine {
             reset_timer(timer.as_mut(), &self.conn);
 
             if self.conn.is_closed() {
+                warn!(%self.meta.peer_id, "establish: QUIC connection closed during startup");
                 return Err(DialError::Handshake(
                     "QUIC connection closed during startup".into(),
                 ));

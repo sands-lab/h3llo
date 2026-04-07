@@ -421,7 +421,7 @@ impl DispatcherRuntime {
                     match cmd {
                         Some(DispatcherCommand::UpdatePeerTokens(update)) => {
                             peer_tokens = update;
-                            debug!("dispatcher: updated peer tokens");
+                            info!("dispatcher: updated peer tokens");
                         }
                         None => return Ok(()),
                     }
@@ -437,11 +437,14 @@ impl DispatcherRuntime {
         peer_tokens: &HashMap<String, String>,
     ) {
         let Some(header) = ServerPacketHeader::parse(&mut batch) else {
+            debug!(%remote, "dispatcher: failed to parse packet header, dropping batch");
             return;
         };
 
         if let Some(tx) = self.cid_table.get(&header.dcid) {
-            let _ = tx.send((remote, batch)).await;
+            if tx.send((remote, batch)).await.is_err() {
+                debug!(%remote, "dispatcher: connection channel closed, dropping packet");
+            }
             return;
         }
 
@@ -456,6 +459,7 @@ impl DispatcherRuntime {
         peer_tokens: &HashMap<String, String>,
     ) {
         if header.hdr_ty != quiche::Type::Initial {
+            debug!(%remote, ty = ?header.hdr_ty, "dispatcher: dropping non-Initial packet for unknown CID");
             return;
         }
 
@@ -467,7 +471,9 @@ impl DispatcherRuntime {
                 &mut pkt,
             ) {
                 pkt.truncate(len);
-                let _ = self.io.udp_send_tx.try_send((remote, vec![pkt]));
+                if self.io.udp_send_tx.try_send((remote, vec![pkt])).is_err() {
+                    debug!(%remote, "dispatcher: failed to send version negotiation");
+                }
             }
             return;
         }

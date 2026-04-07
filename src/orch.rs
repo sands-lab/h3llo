@@ -140,7 +140,7 @@ impl PeerEntry {
         self.bounds.retain(|bound| {
             // TX channel closed -> remove
             if bound.tx.is_closed() {
-                warn!(peer = %peer_id, dest = %bound.dest, "pruned: tx channel closed");
+                info!(peer = %peer_id, dest = %bound.dest, "pruned: tx channel closed");
                 return false;
             }
             // Inbound connections (endpoint: None) are never pruned by DNS/endpoint checks
@@ -149,12 +149,12 @@ impl PeerEntry {
             };
             // Endpoint changed (dynamic reconfig)
             if config_ep.as_ref() != Some(bound_ep) {
-                warn!(peer = %peer_id, dest = %bound.dest, "pruned: endpoint changed");
+                info!(peer = %peer_id, dest = %bound.dest, "pruned: endpoint changed");
                 return false;
             }
             // Dest IP no longer in resolved_ips (DNS changed)
             if !self.resolved_ips.contains(&bound.dest.ip()) {
-                warn!(peer = %peer_id, dest = %bound.dest, "pruned: IP no longer in DNS");
+                info!(peer = %peer_id, dest = %bound.dest, "pruned: IP no longer in DNS");
                 return false;
             }
             true
@@ -430,9 +430,12 @@ impl Orchestrator {
         // DNS: hostnames
         let peer_configs = self.peer_configs();
         let hostnames = collect_hostnames(&peer_configs);
-        let _ = self
+        if let Err(e) = self
             .dns_cmd_tx
-            .send(DnsCommand::SetHostnames { hosts: hostnames });
+            .send(DnsCommand::SetHostnames { hosts: hostnames })
+        {
+            warn!(error = %e, "failed to send hostnames update to DNS actor");
+        }
     }
 
     /// Updates internal routing table and system routes.
@@ -752,7 +755,8 @@ impl Orchestrator {
                             break;
                         }
                         Err(e) => {
-                            warn!("signal handler error: {e}");
+                            error!("signal handler error (process may be unkillable): {e}");
+                            break;
                         }
                     }
                 }
@@ -964,7 +968,7 @@ impl Orchestrator {
             Event::H3Connected(event) => {
                 // Deprecated: old h3.rs path no longer used in production.
                 // Kept for compilation compatibility while h3.rs exists.
-                warn!(
+                error!(
                     origin = ?event.origin,
                     "received old-style H3Connected event (h3.rs path); ignoring"
                 );

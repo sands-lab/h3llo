@@ -112,7 +112,7 @@ pub(crate) fn collect_router_ingress(
             }
             Err(quiche::Error::Done) => break,
             Err(e) => {
-                debug!(error = ?e, "dgram_recv error");
+                warn!(error = ?e, "dgram_recv error");
                 break;
             }
         }
@@ -215,7 +215,7 @@ pub(crate) fn handle_router_egress(
                 counters.record_drop(DropReason::QueueFull, 1, pkt_len);
             }
             Err(e) => {
-                debug!(error = ?e, "dgram_send failed; dropping packet");
+                warn!(error = ?e, "dgram_send failed; dropping packet");
                 counters.record_drop(DropReason::SendError, 1, pkt_len);
             }
         }

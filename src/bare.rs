@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
 
 /// Commands accepted by the BareUDP receive loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,13 +97,16 @@ fn spawn_bare_filter(
     let interval = tuning.metrics_push_interval;
 
     let handle = tokio::spawn(async move {
+        info!("bare RX filter actor started");
         let mut counters = Counters::new(Source::BareUdp, Direction::Rx);
         let mut ticker = time::interval(interval);
-
         loop {
             tokio::select! {
                 maybe = udp_rx.recv() => {
-                    let Some((remote, batch)) = maybe else { return Ok(()); };
+                    let Some((remote, batch)) = maybe else {
+                        info!("bare RX: UDP channel closed, shutting down");
+                        return Ok(());
+                    };
                     let count = batch.len() as u64;
                     let bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
                     if !accepted_sources.contains(&remote.ip()) {
@@ -110,14 +114,17 @@ fn spawn_bare_filter(
                         continue;
                     }
                     if !counters.send_and_record(&ingress_tx, batch, count, bytes).await {
+                        info!("bare RX: ingress channel closed, shutting down");
                         return Ok(());
                     }
                 }
                 cmd = cmd_rx.recv() => {
                     let Some(command) = cmd else {
+                        info!("bare RX: command channel closed, shutting down");
                         return Ok(());
                     };
                     let BareUdpRxCommand::UpdateAcceptedSources(update) = command;
+                    debug!(count = update.len(), "bare RX: accepted sources updated");
                     accepted_sources = update;
                 }
                 _ = ticker.tick() => {
@@ -209,20 +216,27 @@ pub fn spawn_bare_tx(
     let metrics_interval = tuning.metrics_push_interval;
 
     let handle = tokio::spawn(async move {
+        info!(peer = %peer_id, dest = %destination, "bare TX actor started");
         let mut counters = Counters::new(Source::BareUdp, Direction::Tx);
         let mut ticker = time::interval(metrics_interval);
 
         loop {
             tokio::select! {
                 maybe_batch = egress_rx.recv() => {
-                    let Some(packets) = maybe_batch else { return Ok(()); };
+                    let Some(packets) = maybe_batch else {
+                        info!(peer = %peer_id, "bare TX: egress channel closed, shutting down");
+                        return Ok(());
+                    };
                     if packets.is_empty() { continue; }
                     let count = packets.len() as u64;
                     let bytes: u64 = packets.iter().map(|p| p.len() as u64).sum();
                     // Record success AFTER send — avoids inflating metrics on channel close.
                     match udp_tx.send((destination, packets)).await {
                         Ok(()) => counters.record_success(count, bytes),
-                        Err(_) => return Ok(()),
+                        Err(_) => {
+                            info!(peer = %peer_id, "bare TX: UDP channel closed, shutting down");
+                            return Ok(());
+                        }
                     }
                 }
                 _ = ticker.tick() => {

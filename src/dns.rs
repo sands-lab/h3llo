@@ -148,7 +148,9 @@ impl DnsState {
             .iter()
             .map(|(host, entry)| (host.clone(), entry.ips.keys().copied().collect()))
             .collect();
-        let _ = events_tx.send(Event::Dns(DnsEvent { state }));
+        if events_tx.send(Event::Dns(DnsEvent { state })).is_err() {
+            warn!("DNS: events channel closed, snapshot dropped");
+        }
     }
 
     /// Validates and clears a pending query matching (hostname, record_type, txid).

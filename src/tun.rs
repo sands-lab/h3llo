@@ -285,7 +285,9 @@ pub async fn make_tun(
 
     #[cfg(not(target_os = "linux"))]
     {
-        warn!("TUN: offload and tx_queue_len are not supported on this platform");
+        if enable_offload {
+            warn!("TUN: offload is not supported on this platform, ignoring");
+        }
         let _ = (tx_queue_len, enable_offload);
     }
 

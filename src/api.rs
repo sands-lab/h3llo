@@ -34,7 +34,7 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::info;
 
 /// OpenMetrics text format EOF marker.
 const OPENMETRICS_EOF: &str = "# EOF\n";
@@ -421,7 +421,7 @@ pub fn spawn_api(
                 let svc =
                     service_fn(|req| handle_request(req, events_tx.clone(), api_path.clone()));
                 if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                    debug!(remote = %remote, error = %e, "API connection error");
+                    info!(remote = %remote, error = %e, "API connection error");
                 }
             });
         }
