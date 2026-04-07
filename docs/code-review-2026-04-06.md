@@ -14,7 +14,7 @@ Findings are grouped into batches ordered by priority and dependency. Each batch
 | Batch | Scope | Sections | Status |
 |-------|-------|----------|--------|
 | **1** | **Critical bug fixes**: ~~TUN RX infinite loop~~, ~~H3v2Connected silent drop~~, ~~auth log level~~ (§1.2 auth timing, §1.4 stale routes: skipped) | §1.2–1.6 | ✅ |
-| **2** | **Observability**: bare.rs + udp.rs zero tracing, logging level fixes, silent drop handling | §1.7, §4.1, §4.2 | ⬚ |
+| **2** | **Observability**: ~~bare.rs + udp.rs zero tracing~~, ~~logging level fixes~~, ~~silent drop handling~~ (router.rs send_and_record: kept as-is, already tracked via metrics) | §1.7, §4.1, §4.2 | ✅ |
 | **3** | **Rename & cleanup**: H3v2→H3 rename, stale docs, redundant derives, visibility narrowing | §2.1, §6, §9, §10 | ⬚ |
 | **4** | **Type-level refinements**: `PeerTransport` enum, `CcAlgorithm` enum, `ConnectState` enum, `ConnParams` removal, other type/API fixes | §2.2, §2.11, §2.12, §2.14, §7 | ⬚ |
 | **5** | **Code extraction & dedup**: metrics_encode.rs, buf.rs, serde macro, validation helper, TUN dedup, cross-file dedup patterns | §2.3, §2.4, §2.9, §2.10, §2.15, §2.16, §3 | ⬚ |
