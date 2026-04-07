@@ -299,9 +299,9 @@ pub(crate) fn log_transport_metrics(metrics: &Metrics) {
 
 /// Collects QUIC-level metrics from the `foundations` global registry as Prometheus text.
 ///
-/// Returns Prometheus text format with `# EOF\n` termination.
-/// `encode_metrics_snapshot` relies on this termination convention when
-/// concatenating transport and QUIC metric blocks.
+/// On success, returns Prometheus text format with `# EOF\n` termination.
+/// On collection error, logs a warning and returns an empty string.
+/// Callers should check for empty before concatenating.
 pub(crate) fn collect_quic_metrics() -> String {
     match foundations::telemetry::metrics::collect(
         &foundations::telemetry::settings::MetricsSettings::default(),
