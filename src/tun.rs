@@ -266,7 +266,7 @@ pub trait TunTx: Send + 'static {
 /// Returns `TunError::DeviceBuild` when device creation or address assignment fails.
 pub async fn make_tun(
     local_tun: &LocalTun,
-    tx_queue_len: u32,
+    tx_queue_len: Option<u32>,
     enable_offload: bool,
 ) -> Result<(TunReader, TunWriter), TunError> {
     let (v4_addrs, v6_addrs) = split_addrs_by_version(&local_tun.addrs);
@@ -277,16 +277,22 @@ pub async fn make_tun(
         .enable(true)
         .layer(Layer::L3);
 
-    // Enable GSO/GRO offload on Linux for batched TUN I/O.
+    // Enable GSO/GRO offload and TX queue len on Linux.
     #[cfg(target_os = "linux")]
     {
-        builder = builder.offload(enable_offload).tx_queue_len(tx_queue_len);
+        builder = builder.offload(enable_offload);
+        if let Some(len) = tx_queue_len {
+            builder = builder.tx_queue_len(len);
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         if enable_offload {
             warn!("TUN: offload is not supported on this platform, ignoring");
+        }
+        if tx_queue_len.is_some() {
+            warn!("TUN: tx_queue_len is not supported on this platform, ignoring");
         }
         let _ = (tx_queue_len, enable_offload);
     }
@@ -480,7 +486,6 @@ impl TunTx for TunWriter {
 /// Describes TUN errors for creation and operation.
 #[derive(Debug, Error)]
 pub enum TunError {
-    // Note: InvalidAddress variant removed - parsing now happens during config deserialization.
     /// Device creation or address assignment failed.
     #[error("failed to build TUN device: {0}")]
     DeviceBuild(String),

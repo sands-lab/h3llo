@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 
 /// Error type for H3 server listener setup and per-connection acceptance.
 #[derive(Debug, thiserror::Error)]
-pub enum ServerError {
+pub(crate) enum ServerError {
     /// Socket or listener setup failed.
     #[error("socket: {0}")]
     Socket(String),
@@ -130,7 +130,7 @@ fn make_server_quiche_config(
 // ========== H3 Dispatcher ==========
 
 /// Commands accepted by the H3 dispatcher actor.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum DispatcherCommand {
     /// Replace the peer token map used for CONNECT-IP authentication.
     UpdatePeerTokens(HashMap<String, String>),
@@ -142,7 +142,7 @@ pub enum DispatcherCommand {
 /// QUIC config construction, and UDP socket initialization. Does NOT spawn
 /// any tasks — use [`spawn_h3_dispatcher`] for that.
 #[allow(clippy::too_many_arguments)]
-pub fn make_h3_dispatcher(
+pub(crate) fn make_h3_dispatcher(
     listen_addr: SocketAddr,
     cert_path: &Path,
     key_path: &Path,

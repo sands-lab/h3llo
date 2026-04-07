@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 /// Commands accepted by the BareUDP receive loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum BareUdpRxCommand {
     /// Replace the accepted source IP filter set.
     ///
@@ -148,7 +148,7 @@ fn spawn_bare_filter(
 ///
 /// `ctx.udp_rt` is used for socket registration and the UDP TX actor;
 /// `ctx.crypto_rt` is used for the bare TX adapter actor.
-pub async fn dial_bare_tx<P: RouteProbe>(
+pub(crate) async fn dial_bare_tx<P: RouteProbe>(
     endpoint: UdpEndpoint,
     destination: SocketAddr,
     ctx: &DialContext,
@@ -196,16 +196,7 @@ pub async fn dial_bare_tx<P: RouteProbe>(
 /// peer's destination address, and forwards to the UDP TX actor.
 /// Records metrics after successful channel send to avoid inflating
 /// counters when the downstream actor is unavailable.
-///
-/// # Arguments
-///
-/// * `udp_tx` - Tagged channel to `udp::spawn_udp_tx`.
-/// * `destination` - Peer destination socket address.
-/// * `peer_id` - Peer identifier for metrics labels.
-/// * `events_tx` - Metrics event channel.
-/// * `metrics_interval` - Metrics emission interval.
-/// * `packet_queue_depth` - Bounded channel capacity for router → bare TX.
-pub fn spawn_bare_tx(
+pub(crate) fn spawn_bare_tx(
     udp_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     destination: SocketAddr,
     peer_id: String,

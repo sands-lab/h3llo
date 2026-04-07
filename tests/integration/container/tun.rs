@@ -158,7 +158,7 @@ async fn check_tx_queue_len() -> Result<(), String> {
         mtu: h3llo::config::default_mtu(),
     };
 
-    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun, 2000, true)
+    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun, Some(2000), true)
         .await
         .map_err(|e| format!("tx_queue_len: make_tun failed: {e}"))?;
 

@@ -139,7 +139,6 @@ fn log_duplicate_allowed(peer_id: &str, cidr: &str) {
 }
 
 /// Stores routing metadata for a prefix, including the channel to forward packets.
-#[derive(Clone)]
 pub struct RouteEntry {
     /// Identifier of the peer owning the prefix.
     pub peer_id: String,
@@ -155,16 +154,8 @@ impl std::fmt::Debug for RouteEntry {
     }
 }
 
-impl PartialEq for RouteEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.peer_id == other.peer_id
-    }
-}
-
-impl Eq for RouteEntry {}
-
 /// Represents the result of a longest-prefix lookup.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RouteMatch<'a> {
     /// Matched prefix.
     pub prefix: IpNet,
@@ -175,7 +166,6 @@ pub struct RouteMatch<'a> {
 }
 
 /// In-memory routing table supporting IPv4 and IPv6 longest-prefix matches.
-#[derive(Clone)]
 pub struct RoutingTable {
     trie: IpnetTrie<RouteEntry>,
 }
@@ -312,7 +302,7 @@ impl RoutingTable {
 }
 
 /// Routing table construction or lookup error.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum RoutingError {
     /// Two peers claim the same prefix.
     #[error("prefix {prefix} already assigned to peer '{existing_peer_id}', cannot assign to '{new_peer_id}'")]

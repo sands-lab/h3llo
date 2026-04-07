@@ -28,7 +28,7 @@ pub enum Endpoint {
 ///
 /// Shared by [`crate::h3dialer::dial_h3_client`] and
 /// [`crate::bare::dial_bare_tx`] to avoid parameter duplication.
-pub struct DialContext {
+pub(crate) struct DialContext {
     /// Peer identifier from configuration.
     pub peer_id: String,
     /// TUN interface name (for route-probe exclusion).
