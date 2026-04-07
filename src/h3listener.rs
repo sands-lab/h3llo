@@ -226,6 +226,7 @@ impl H3Engine {
         let timer = time::sleep(self.conn.timeout().unwrap_or(MAX_TIMEOUT));
         tokio::pin!(timer);
 
+        let remote_addr = self.meta.remote_addr;
         let mut server_handler = |h3: &mut quiche::h3::Connection,
                                   conn: &mut quiche::Connection,
                                   stream_id: u64,
@@ -243,7 +244,7 @@ impl H3Engine {
             let pid = match validate_server_auth(headers, peer_tokens) {
                 Ok(id) => id,
                 Err(e) => {
-                    debug!(stream_id, error = %e, "rejecting unauthenticated stream");
+                    warn!(stream_id, %remote_addr, error = %e, "rejecting unauthenticated stream");
                     let _ = h3.send_response(
                         conn,
                         stream_id,
@@ -420,7 +421,7 @@ impl DispatcherRuntime {
                     match cmd {
                         Some(DispatcherCommand::UpdatePeerTokens(update)) => {
                             peer_tokens = update;
-                            debug!("dispatcher: updated peer tokens");
+                            info!("dispatcher: updated peer tokens");
                         }
                         None => return Ok(()),
                     }
@@ -436,11 +437,14 @@ impl DispatcherRuntime {
         peer_tokens: &HashMap<String, String>,
     ) {
         let Some(header) = ServerPacketHeader::parse(&mut batch) else {
+            debug!(%remote, "dispatcher: failed to parse packet header, dropping batch");
             return;
         };
 
         if let Some(tx) = self.cid_table.get(&header.dcid) {
-            let _ = tx.send((remote, batch)).await;
+            if tx.send((remote, batch)).await.is_err() {
+                debug!(%remote, "dispatcher: connection channel closed, dropping packet");
+            }
             return;
         }
 
@@ -455,6 +459,7 @@ impl DispatcherRuntime {
         peer_tokens: &HashMap<String, String>,
     ) {
         if header.hdr_ty != quiche::Type::Initial {
+            debug!(%remote, ty = ?header.hdr_ty, "dispatcher: dropping non-Initial packet for unknown CID");
             return;
         }
 
@@ -466,7 +471,9 @@ impl DispatcherRuntime {
                 &mut pkt,
             ) {
                 pkt.truncate(len);
-                let _ = self.io.udp_send_tx.try_send((remote, vec![pkt]));
+                if self.io.udp_send_tx.try_send((remote, vec![pkt])).is_err() {
+                    debug!(%remote, "dispatcher: failed to send version negotiation");
+                }
             }
             return;
         }
@@ -552,7 +559,7 @@ impl DispatcherRuntime {
                 "server: CONNECT-IP established"
             );
 
-            let _ = engine
+            if engine
                 .io
                 .events_tx
                 .send(Event::H3v2Connected(H3v2ConnectedEvent {
@@ -561,7 +568,12 @@ impl DispatcherRuntime {
                     tx: egress_tx,
                     origin: ConnOrigin::Server,
                     handles: Vec::new(),
-                }));
+                }))
+                .is_err()
+            {
+                warn!(peer_id = %engine.meta.peer_id, %remote, "events channel closed; aborting connection");
+                return Ok(());
+            }
 
             engine.run().await
         });

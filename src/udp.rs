@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_quiche::buf_factory::PooledBuf;
 use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
 /// Receive side of a shared UDP socket with quinn-udp GRO support.
 #[derive(Debug)]
@@ -105,6 +106,7 @@ pub fn spawn_udp_rx(
         .unwrap_or_default();
 
     tokio::spawn(async move {
+        info!(addr = %local_addr, "UDP RX actor started");
         let gro_segments = state.gro_segments();
         let mut buf = vec![0u8; max_udp_payload * gro_segments];
         let mut meta = RecvMeta::default();
@@ -117,7 +119,10 @@ pub fn spawn_udp_rx(
                         source: e,
                     })?;
                 }
-                _ = cancel.cancelled() => return Ok(()),
+                _ = cancel.cancelled() => {
+                    info!(addr = %local_addr, "UDP RX: cancelled, shutting down");
+                    return Ok(());
+                }
             }
             loop {
                 let result = socket.try_io(Interest::READABLE, || {
@@ -138,12 +143,14 @@ pub fn spawn_udp_rx(
                             .map(alloc_packet_buf)
                             .collect();
                         if output.send((remote, batch)).await.is_err() {
+                            info!(addr = %local_addr, "UDP RX: output channel closed, shutting down");
                             return Ok(());
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
                     Err(e) => {
+                        warn!(addr = %local_addr, error = %e, "UDP RX: fatal I/O error");
                         return Err(ActorError::UdpRxRecv {
                             addr: local_addr,
                             source: e,
@@ -183,6 +190,7 @@ pub fn spawn_udp_tx(
         .unwrap_or_default();
 
     let handle = tokio::spawn(async move {
+        info!(addr = %local_addr, "UDP TX actor started");
         let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
         let max_segs = if enable_offload {
             state.max_gso_segments()
@@ -253,6 +261,7 @@ pub fn spawn_udp_tx(
                 })?;
             }
         }
+        info!(addr = %local_addr, "UDP TX: input channel closed, shutting down");
         Ok(())
     });
 
