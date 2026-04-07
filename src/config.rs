@@ -450,33 +450,19 @@ impl std::error::Error for ValidationErrors {}
 /// Individual validation error.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
-    /// `tuning.packet_queue_depth` must be > 0 (mpsc::channel(0) panics).
-    #[error("tuning.packet_queue_depth must be greater than 0")]
-    TuningPacketQueueDepthZero,
-    /// A tuning Duration field must be greater than zero.
-    ///
-    /// Zero values cause `tokio::time::interval` panics or semantically
-    /// broken behavior (instant timeouts, no debouncing).
-    #[error("tuning.{field} must be greater than 0")]
-    TuningDurationZero {
-        /// The field name (e.g., "reconcile_interval").
-        field: &'static str,
-    },
+    /// A field that must be positive is zero.
+    #[error("{field} must be greater than 0")]
+    FieldMustBePositive { field: &'static str },
     /// `tuning.h3_keepalive_interval` must be strictly less than `tuning.h3_max_idle_timeout`.
     #[error(
         "tuning.h3_keepalive_interval ({keepalive:?}) must be less than \
          tuning.h3_max_idle_timeout ({idle_timeout:?})"
     )]
     H3KeepaliveExceedsIdleTimeout {
-        /// Configured keepalive interval.
         keepalive: Duration,
-        /// Configured idle timeout.
         idle_timeout: Duration,
     },
-    /// TUN addresses are missing.
-    #[error("local.tun.addrs must include at least one address")]
-    MissingLocalTunAddrs,
-    /// A required string field is empty (after trimming whitespace).
+    /// A required field is empty (after trimming whitespace) or has no entries.
     #[error("{context}: {field} must not be empty")]
     FieldEmpty {
         context: String,
@@ -488,41 +474,28 @@ pub enum ValidationError {
         context: String,
         field: &'static str,
     },
-    /// Duplicate peer identifier.
-    #[error("duplicate peer id '{peer_id}'")]
-    DuplicatePeerId { peer_id: String },
+    /// A field value is duplicated where uniqueness is required.
+    #[error("{context}: duplicate {field} '{value}'")]
+    DuplicateValue {
+        context: String,
+        field: &'static str,
+        value: String,
+    },
     /// Peer token missing or too short.
     #[error("peer '{peer_id}' requires h3.token of at least 12 characters when h3 is configured")]
     PeerTokenTooShort { peer_id: String },
-    /// Duplicate peer token.
-    #[error("duplicate peer token for peer '{peer_id}'")]
-    DuplicatePeerToken { peer_id: String },
-    /// Allowed IP list missing.
-    #[error("peer '{peer_id}' must include at least one allowed_ips entry")]
-    PeerMissingAllowedIps { peer_id: String },
-    /// Allowed IP entry duplicates another entry on the same peer.
-    #[error("peer '{peer_id}' has duplicate allowed_ips entry '{cidr}'")]
-    PeerDuplicateAllowedIp { peer_id: String, cidr: String },
     /// `tuning.h3_cc_algorithm` is not a recognized congestion control algorithm.
     #[error(
         "tuning.h3_cc_algorithm '{algorithm}' is not recognized \
          (accepted: reno, cubic, bbr, bbr2, none)"
     )]
-    InvalidCcAlgorithm {
-        /// The unrecognized algorithm name.
-        algorithm: String,
-    },
+    InvalidCcAlgorithm { algorithm: String },
     /// `reconnect_backoff_min` must not exceed `reconnect_backoff_max`.
     #[error(
         "tuning.reconnect_backoff_min ({min:?}) must not exceed \
          tuning.reconnect_backoff_max ({max:?})"
     )]
-    BackoffMinExceedsMax {
-        /// Configured minimum.
-        min: Duration,
-        /// Configured maximum.
-        max: Duration,
-    },
+    BackoffMinExceedsMax { min: Duration, max: Duration },
 }
 
 impl Config {
@@ -546,27 +519,50 @@ impl Config {
 
         // Tuning validation
         if self.tuning.packet_queue_depth == 0 {
-            errors.push(ValidationError::TuningPacketQueueDepthZero);
+            errors.push(ValidationError::FieldMustBePositive {
+                field: "tuning.packet_queue_depth",
+            });
         }
 
         // Duration fields that must be strictly positive.
         // dns_refresh_interval is intentionally excluded: zero disables periodic refresh.
-        let duration_checks: &[(&str, Duration)] = &[
-            ("reconcile_interval", self.tuning.reconcile_interval),
-            ("reconnect_backoff_min", self.tuning.reconnect_backoff_min),
-            ("reconnect_backoff_max", self.tuning.reconnect_backoff_max),
-            ("metrics_push_interval", self.tuning.metrics_push_interval),
-            ("metrics_log_interval", self.tuning.metrics_log_interval),
-            ("dns_query_timeout", self.tuning.dns_query_timeout),
-            ("dns_snapshot_delay", self.tuning.dns_snapshot_delay),
-            ("dns_query_interval", self.tuning.dns_query_interval),
-            ("h3_handshake_timeout", self.tuning.h3_handshake_timeout),
-            ("h3_max_idle_timeout", self.tuning.h3_max_idle_timeout),
-            ("h3_keepalive_interval", self.tuning.h3_keepalive_interval),
+        let duration_checks: &[(&'static str, Duration)] = &[
+            ("tuning.reconcile_interval", self.tuning.reconcile_interval),
+            (
+                "tuning.reconnect_backoff_min",
+                self.tuning.reconnect_backoff_min,
+            ),
+            (
+                "tuning.reconnect_backoff_max",
+                self.tuning.reconnect_backoff_max,
+            ),
+            (
+                "tuning.metrics_push_interval",
+                self.tuning.metrics_push_interval,
+            ),
+            (
+                "tuning.metrics_log_interval",
+                self.tuning.metrics_log_interval,
+            ),
+            ("tuning.dns_query_timeout", self.tuning.dns_query_timeout),
+            ("tuning.dns_snapshot_delay", self.tuning.dns_snapshot_delay),
+            ("tuning.dns_query_interval", self.tuning.dns_query_interval),
+            (
+                "tuning.h3_handshake_timeout",
+                self.tuning.h3_handshake_timeout,
+            ),
+            (
+                "tuning.h3_max_idle_timeout",
+                self.tuning.h3_max_idle_timeout,
+            ),
+            (
+                "tuning.h3_keepalive_interval",
+                self.tuning.h3_keepalive_interval,
+            ),
         ];
         for &(field, dur) in duration_checks {
             if dur.is_zero() {
-                errors.push(ValidationError::TuningDurationZero { field });
+                errors.push(ValidationError::FieldMustBePositive { field });
             }
         }
 
@@ -640,7 +636,10 @@ impl Config {
         }
 
         if self.local.tun.addrs.is_empty() {
-            errors.push(ValidationError::MissingLocalTunAddrs);
+            errors.push(ValidationError::FieldEmpty {
+                context: "local.tun".to_string(),
+                field: "addrs",
+            });
         }
 
         if let Err(ValidationErrors(peer_errors)) = validate_peers(&self.peers) {
@@ -690,8 +689,10 @@ pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
         check_trimmed(&peer.id, &ctx, "id", true, &mut errors);
 
         if !seen_peer_ids.insert(peer.id.clone()) {
-            errors.push(ValidationError::DuplicatePeerId {
-                peer_id: peer.id.clone(),
+            errors.push(ValidationError::DuplicateValue {
+                context: ctx.clone(),
+                field: "id",
+                value: peer.id.clone(),
             });
         }
 
@@ -705,8 +706,10 @@ pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
             }
 
             if !seen_peer_tokens.insert(h3.token.clone()) {
-                errors.push(ValidationError::DuplicatePeerToken {
-                    peer_id: peer.id.clone(),
+                errors.push(ValidationError::DuplicateValue {
+                    context: ctx.clone(),
+                    field: "h3.token",
+                    value: h3.token.clone(),
                 });
             }
             if let Some(sni) = &h3.sni {
@@ -718,17 +721,19 @@ pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
         }
 
         if peer.tun.allowed_ips.is_empty() {
-            errors.push(ValidationError::PeerMissingAllowedIps {
-                peer_id: peer.id.clone(),
+            errors.push(ValidationError::FieldEmpty {
+                context: ctx.clone(),
+                field: "tun.allowed_ips",
             });
         }
 
         let mut seen_allowed = HashSet::new();
         for net in &peer.tun.allowed_ips {
             if !seen_allowed.insert(*net) {
-                errors.push(ValidationError::PeerDuplicateAllowedIp {
-                    peer_id: peer.id.clone(),
-                    cidr: net.to_string(),
+                errors.push(ValidationError::DuplicateValue {
+                    context: ctx.clone(),
+                    field: "tun.allowed_ips",
+                    value: net.to_string(),
                 });
             }
         }
@@ -1203,7 +1208,7 @@ peers:
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::DuplicatePeerId { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::DuplicateValue { field: "id", .. }))
         ));
     }
 
@@ -1216,7 +1221,7 @@ peers:
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::DuplicatePeerToken { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::DuplicateValue { field: "h3.token", .. }))
         ));
     }
 
@@ -1296,7 +1301,7 @@ peers:
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerMissingAllowedIps { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "tun.allowed_ips", .. }))
         ));
     }
 
@@ -1494,7 +1499,7 @@ peers:
             ConfigError::Validation(ValidationErrors(ref errs))
                 if errs
                     .iter()
-                    .any(|e| matches!(e, ValidationError::PeerDuplicateAllowedIp { .. }))
+                    .any(|e| matches!(e, ValidationError::DuplicateValue { field: "tun.allowed_ips", .. }))
         ));
     }
 
@@ -2118,7 +2123,7 @@ peers:
         assert!(matches!(
             result,
             Err(ConfigError::Validation(ValidationErrors(ref errs)))
-                if errs.contains(&ValidationError::TuningPacketQueueDepthZero)
+                if errs.contains(&ValidationError::FieldMustBePositive { field: "tuning.packet_queue_depth" })
         ));
     }
 
@@ -2387,10 +2392,11 @@ peers:
                     ConfigError::Validation(ValidationErrors(ref errs))
                         if errs.iter().any(|e| matches!(
                             e,
-                            ValidationError::TuningDurationZero { field } if *field == field_name
+                            ValidationError::FieldMustBePositive { field }
+                                if field.ends_with(field_name)
                         ))
                 ),
-                "expected TuningDurationZero for field '{field_name}'"
+                "expected FieldMustBePositive for field '{field_name}'"
             );
         }
     }
