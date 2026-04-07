@@ -473,39 +473,30 @@ pub enum ValidationError {
         /// Configured idle timeout.
         idle_timeout: Duration,
     },
-    /// `local.h3.cert` and `local.h3.key` must not be empty when `local.h3` is set.
-    #[error("local.h3.cert and local.h3.key must not be empty when local.h3 is configured")]
-    LocalH3CredentialsMissing,
     /// TUN addresses are missing.
     #[error("local.tun.addrs must include at least one address")]
     MissingLocalTunAddrs,
-    /// Peer identifier is empty.
-    #[error("peer id must not be empty")]
-    PeerIdEmpty { peer_id: String },
-    /// Peer identifier has leading or trailing whitespace.
-    #[error("peer id '{peer_id}' must not have leading or trailing whitespace")]
-    PeerIdHasWhitespace { peer_id: String },
+    /// A required string field is empty (after trimming whitespace).
+    #[error("{context}: {field} must not be empty")]
+    FieldEmpty {
+        context: String,
+        field: &'static str,
+    },
+    /// A string field has leading or trailing whitespace.
+    #[error("{context}: {field} must not have leading or trailing whitespace")]
+    FieldHasWhitespace {
+        context: String,
+        field: &'static str,
+    },
     /// Duplicate peer identifier.
     #[error("duplicate peer id '{peer_id}'")]
     DuplicatePeerId { peer_id: String },
     /// Peer token missing or too short.
     #[error("peer '{peer_id}' requires h3.token of at least 12 characters when h3 is configured")]
     PeerTokenTooShort { peer_id: String },
-    /// Peer token has leading or trailing whitespace.
-    #[error("peer '{peer_id}' h3.token must not have leading or trailing whitespace")]
-    PeerTokenHasWhitespace { peer_id: String },
     /// Duplicate peer token.
     #[error("duplicate peer token for peer '{peer_id}'")]
     DuplicatePeerToken { peer_id: String },
-    /// Peer SNI is empty.
-    #[error("peer '{peer_id}' h3.sni must not be empty")]
-    PeerSniEmpty { peer_id: String },
-    /// Peer SNI has leading or trailing whitespace.
-    #[error("peer '{peer_id}' h3.sni must not have leading or trailing whitespace")]
-    PeerSniHasWhitespace { peer_id: String },
-    /// Peer bindif has leading or trailing whitespace.
-    #[error("peer '{peer_id}' h3.bindif must not have leading or trailing whitespace")]
-    PeerBindifHasWhitespace { peer_id: String },
     /// Allowed IP list missing.
     #[error("peer '{peer_id}' must include at least one allowed_ips entry")]
     PeerMissingAllowedIps { peer_id: String },
@@ -644,9 +635,8 @@ impl Config {
 
         // H3 validation: cert/key must not be empty when local.h3 is set
         if let Some(h3) = self.local.h3.as_ref() {
-            if h3.cert.trim().is_empty() || h3.key.trim().is_empty() {
-                errors.push(ValidationError::LocalH3CredentialsMissing);
-            }
+            check_trimmed(&h3.cert, "local.h3", "cert", true, &mut errors);
+            check_trimmed(&h3.key, "local.h3", "key", true, &mut errors);
         }
 
         if self.local.tun.addrs.is_empty() {
@@ -665,92 +655,65 @@ impl Config {
     }
 }
 
+/// Validates a string field for emptiness and leading/trailing whitespace.
+fn check_trimmed(
+    value: &str,
+    context: &str,
+    field: &'static str,
+    check_empty: bool,
+    errors: &mut Vec<ValidationError>,
+) {
+    if check_empty && value.trim().is_empty() {
+        errors.push(ValidationError::FieldEmpty {
+            context: context.to_string(),
+            field,
+        });
+        return;
+    }
+    if value != value.trim() {
+        errors.push(ValidationError::FieldHasWhitespace {
+            context: context.to_string(),
+            field,
+        });
+    }
+}
+
 /// Validates a peer list in isolation (ID, token, transport, allowed_ips).
 pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
-    /// Validates a string field for emptiness and leading/trailing whitespace.
-    fn check_trimmed(
-        value: &str,
-        on_empty: Option<ValidationError>,
-        on_whitespace: ValidationError,
-        errors: &mut Vec<ValidationError>,
-    ) {
-        if let Some(err) = on_empty {
-            if value.trim().is_empty() {
-                errors.push(err);
-                return;
-            }
-        }
-        if value != value.trim() {
-            errors.push(on_whitespace);
-        }
-    }
-
     let mut errors = Vec::new();
     let mut seen_peer_ids = HashSet::new();
     let mut seen_peer_tokens = HashSet::new();
 
     for peer in peers {
-        let pid = peer.id.clone();
+        let ctx = format!("peer '{}'", peer.id);
 
-        check_trimmed(
-            &peer.id,
-            Some(ValidationError::PeerIdEmpty {
-                peer_id: pid.clone(),
-            }),
-            ValidationError::PeerIdHasWhitespace {
-                peer_id: pid.clone(),
-            },
-            &mut errors,
-        );
+        check_trimmed(&peer.id, &ctx, "id", true, &mut errors);
 
-        if !seen_peer_ids.insert(pid.clone()) {
+        if !seen_peer_ids.insert(peer.id.clone()) {
             errors.push(ValidationError::DuplicatePeerId {
-                peer_id: pid.clone(),
+                peer_id: peer.id.clone(),
             });
         }
 
         if let PeerTransport::H3(h3) = &peer.transport {
             if h3.token.len() < 12 {
                 errors.push(ValidationError::PeerTokenTooShort {
-                    peer_id: pid.clone(),
+                    peer_id: peer.id.clone(),
                 });
             } else {
-                check_trimmed(
-                    &h3.token,
-                    None,
-                    ValidationError::PeerTokenHasWhitespace {
-                        peer_id: pid.clone(),
-                    },
-                    &mut errors,
-                );
+                check_trimmed(&h3.token, &ctx, "h3.token", false, &mut errors);
             }
 
             if !seen_peer_tokens.insert(h3.token.clone()) {
                 errors.push(ValidationError::DuplicatePeerToken {
-                    peer_id: pid.clone(),
+                    peer_id: peer.id.clone(),
                 });
             }
             if let Some(sni) = &h3.sni {
-                check_trimmed(
-                    sni,
-                    Some(ValidationError::PeerSniEmpty {
-                        peer_id: pid.clone(),
-                    }),
-                    ValidationError::PeerSniHasWhitespace {
-                        peer_id: pid.clone(),
-                    },
-                    &mut errors,
-                );
+                check_trimmed(sni, &ctx, "h3.sni", true, &mut errors);
             }
             if let Some(bindif) = &h3.bindif {
-                check_trimmed(
-                    bindif,
-                    None,
-                    ValidationError::PeerBindifHasWhitespace {
-                        peer_id: pid.clone(),
-                    },
-                    &mut errors,
-                );
+                check_trimmed(bindif, &ctx, "h3.bindif", false, &mut errors);
             }
         }
 
@@ -1076,7 +1039,7 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerIdEmpty { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "id", .. }))
         ));
     }
 
@@ -1094,7 +1057,7 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerIdHasWhitespace { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "id", .. }))
         ));
     }
 
@@ -1105,7 +1068,7 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerIdHasWhitespace { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "id", .. }))
         ));
     }
 
@@ -1125,7 +1088,7 @@ mod tests {
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.contains(&ValidationError::LocalH3CredentialsMissing)
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "cert", .. }))
         ));
     }
 
@@ -1145,7 +1108,7 @@ mod tests {
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.contains(&ValidationError::LocalH3CredentialsMissing)
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "key", .. }))
         ));
     }
 
@@ -1212,7 +1175,7 @@ peers:
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerTokenHasWhitespace { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.token", .. }))
         ));
     }
 
@@ -1225,7 +1188,7 @@ peers:
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerTokenHasWhitespace { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.token", .. }))
         ));
     }
 
@@ -1444,7 +1407,7 @@ peers:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniEmpty { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "h3.sni", .. }))
         ));
     }
 
@@ -1458,7 +1421,7 @@ peers:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniEmpty { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "h3.sni", .. }))
         ));
     }
 
@@ -1472,7 +1435,7 @@ peers:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniHasWhitespace { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.sni", .. }))
         ));
     }
 
@@ -1486,7 +1449,7 @@ peers:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniHasWhitespace { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.sni", .. }))
         ));
     }
 
@@ -1500,7 +1463,7 @@ peers:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerBindifHasWhitespace { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.bindif", .. }))
         ));
     }
 
@@ -1514,7 +1477,7 @@ peers:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerBindifHasWhitespace { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.bindif", .. }))
         ));
     }
 
