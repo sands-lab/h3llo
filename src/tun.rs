@@ -258,8 +258,10 @@ pub trait TunTx: Send + 'static {
 /// # Arguments
 ///
 /// * `local_tun` - TUN configuration including interface name, addresses, and MTU.
-/// * `tx_queue_len` - Transmit queue length in packets (applied on Linux only).
-/// * `enable_offload` - Enable GSO/GRO offload (applied on Linux only).
+/// * `tx_queue_len` - Transmit queue length in packets. `None` leaves the OS
+///   default. On non-Linux platforms, `Some(_)` logs a warning and is ignored.
+/// * `enable_offload` - Enable GSO/GRO offload. On non-Linux platforms,
+///   `true` logs a warning and is ignored.
 ///
 /// # Errors
 ///
