@@ -97,20 +97,73 @@ pub struct LocalTun {
     pub mtu: u16,
 }
 
+/// Peer transport selection: exactly one of H3 or BareUDP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerTransport {
+    /// HTTP/3 transport.
+    H3(PeerH3),
+    /// BareUDP transport.
+    Bare(PeerBare),
+}
+
 /// Peer configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawPeer", into = "RawPeer")]
 pub struct Peer {
     /// Remote node identifier.
     pub id: String,
-    /// HTTP/3 transport options.
-    #[serde(default)]
-    pub h3: Option<PeerH3>,
-    /// BareUDP transport options.
-    #[serde(default)]
-    pub bare: Option<PeerBare>,
+    /// Transport configuration (exactly one of H3 or BareUDP).
+    pub transport: PeerTransport,
     /// Peer routing details.
     pub tun: PeerTun,
+}
+
+/// Wire format for [`Peer`] serde (de)serialization.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPeer {
+    id: String,
+    #[serde(default)]
+    h3: Option<PeerH3>,
+    #[serde(default)]
+    bare: Option<PeerBare>,
+    tun: PeerTun,
+}
+
+impl TryFrom<RawPeer> for Peer {
+    type Error = String;
+    fn try_from(raw: RawPeer) -> Result<Self, String> {
+        let transport = match (raw.h3, raw.bare) {
+            (Some(h3), None) => PeerTransport::H3(h3),
+            (None, Some(bare)) => PeerTransport::Bare(bare),
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(format!(
+                    "peer '{}' must configure exactly one of h3 or bare",
+                    raw.id
+                ));
+            }
+        };
+        Ok(Peer {
+            id: raw.id,
+            transport,
+            tun: raw.tun,
+        })
+    }
+}
+
+impl From<Peer> for RawPeer {
+    fn from(peer: Peer) -> Self {
+        let (h3, bare) = match peer.transport {
+            PeerTransport::H3(h3) => (Some(h3), None),
+            PeerTransport::Bare(bare) => (None, Some(bare)),
+        };
+        RawPeer {
+            id: peer.id,
+            h3,
+            bare,
+            tun: peer.tun,
+        }
+    }
 }
 
 /// HTTP/3 options per peer.
@@ -453,9 +506,6 @@ pub enum ValidationError {
     /// Peer bindif has leading or trailing whitespace.
     #[error("peer '{peer_id}' h3.bindif must not have leading or trailing whitespace")]
     PeerBindifHasWhitespace { peer_id: String },
-    /// Peer transport fields conflict.
-    #[error("peer '{peer_id}' must configure exactly one of h3 or bare")]
-    PeerTransportConflict { peer_id: String },
     /// Allowed IP list missing.
     #[error("peer '{peer_id}' must include at least one allowed_ips entry")]
     PeerMissingAllowedIps { peer_id: String },
@@ -546,7 +596,10 @@ impl Config {
         }
 
         // H3-peer-conditional warnings (non-fatal best-practice checks).
-        let has_h3_peers = self.peers.iter().any(|p| p.h3.is_some());
+        let has_h3_peers = self
+            .peers
+            .iter()
+            .any(|p| matches!(p.transport, PeerTransport::H3(_)));
         if has_h3_peers {
             if self.local.tun.mtu > MAX_H3_IPV4_MTU {
                 tracing::warn!(
@@ -636,7 +689,7 @@ pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
             });
         }
 
-        if let Some(h3) = peer.h3.as_ref() {
+        if let PeerTransport::H3(h3) = &peer.transport {
             // Token validation: must be >= 12 chars and have no leading/trailing whitespace
             if h3.token.len() < 12 {
                 errors.push(ValidationError::PeerTokenTooShort {
@@ -672,12 +725,6 @@ pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
                     });
                 }
             }
-        }
-
-        if peer.h3.is_some() == peer.bare.is_some() {
-            errors.push(ValidationError::PeerTransportConflict {
-                peer_id: peer.id.clone(),
-            });
         }
 
         if peer.tun.allowed_ips.is_empty() {
@@ -992,7 +1039,7 @@ mod tests {
             tuning: Tuning::default(),
             peers: vec![Peer {
                 id: "example-node-2".to_string(),
-                h3: Some(PeerH3 {
+                transport: PeerTransport::H3(PeerH3 {
                     token: "example-node-2-token".to_string(), // >= 12 chars
                     endpoint: Some(H3Endpoint {
                         host: "peer.example.com".to_string(),
@@ -1002,7 +1049,6 @@ mod tests {
                     bindif: None,
                     sni: None,
                 }),
-                bare: None,
                 tun: PeerTun {
                     allowed_ips: vec!["192.168.180.2/32".parse().unwrap()],
                 },
@@ -1110,26 +1156,29 @@ local:
     }
 
     #[test]
-    fn rejects_peer_transport_conflict() {
-        let mut config = sample_h3_config();
-        config.peers[0].bare = Some(PeerBare {
-            endpoint: UdpEndpoint {
-                host: "peer.example.com".to_string(),
-                port: 6635,
-            },
-            bindif: None,
-        });
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerTransportConflict { .. }))
-        ));
+    fn rejects_peer_transport_conflict_at_deserialization() {
+        let yaml = r#"
+local:
+  tun:
+    addrs:
+      - 192.168.180.1/32
+peers:
+  - id: bad-peer
+    h3:
+      token: "long-enough-token"
+    bare:
+      endpoint: udp://127.0.0.1:5353
+    tun:
+      allowed_ips:
+        - 10.0.0.0/24
+"#;
+        assert!(Config::load_from_str(yaml).is_err());
     }
 
     #[test]
     fn rejects_short_peer_token() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.token = "short".to_string(); // < 12 chars
         }
         let err = config.validate().unwrap_err();
@@ -1142,7 +1191,7 @@ local:
     #[test]
     fn accepts_12_char_peer_token() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.token = "123456789012".to_string(); // Exactly 12 chars
         }
         assert!(config.validate().is_ok());
@@ -1151,7 +1200,7 @@ local:
     #[test]
     fn rejects_token_with_leading_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.token = " 123456789012".to_string(); // 13 chars but has leading space
         }
         let err = config.validate().unwrap_err();
@@ -1164,7 +1213,7 @@ local:
     #[test]
     fn rejects_token_with_trailing_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.token = "123456789012 ".to_string(); // 13 chars but has trailing space
         }
         let err = config.validate().unwrap_err();
@@ -1178,7 +1227,9 @@ local:
     fn rejects_duplicate_peer_ids() {
         let mut config = sample_h3_config();
         let mut peer2 = config.peers[0].clone();
-        peer2.h3.as_mut().unwrap().token = "different-token-123".to_string();
+        if let PeerTransport::H3(h3) = &mut peer2.transport {
+            h3.token = "different-token-123".to_string();
+        }
         config.peers.push(peer2);
         let err = config.validate().unwrap_err();
         assert!(matches!(
@@ -1308,13 +1359,11 @@ peers:
         assert_eq!(cfg.local.dns.bindif, None);
         assert_eq!(cfg.local.tun.ifname, "h3llo0");
         assert_eq!(cfg.local.tun.mtu, 1291);
-        assert!(cfg.peers[0].h3.is_some());
-        if let Some(h3) = cfg.peers[0].h3.as_ref() {
-            assert!(h3.endpoint.is_none());
-            assert!(h3.bindif.is_none());
-        } else {
-            panic!("peer h3 should be present");
-        }
+        let PeerTransport::H3(h3) = &cfg.peers[0].transport else {
+            panic!("peer should be H3");
+        };
+        assert!(h3.endpoint.is_none());
+        assert!(h3.bindif.is_none());
     }
 
     #[test]
@@ -1341,7 +1390,9 @@ peers:
             cfg.local.dns.server,
             "8.8.8.8:53".parse::<SocketAddr>().unwrap()
         );
-        let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
+        let PeerTransport::H3(h3) = &cfg.peers[0].transport else {
+            panic!("should be H3")
+        };
         let endpoint = h3.endpoint.as_ref().expect("endpoint should be present");
         assert_eq!(endpoint.host, "peer.example.com");
         assert_eq!(endpoint.port, 443);
@@ -1352,7 +1403,7 @@ peers:
     #[test]
     fn accepts_peer_h3_with_bindif() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.bindif = Some("eth0".to_string());
         }
         assert!(config.validate().is_ok());
@@ -1361,7 +1412,7 @@ peers:
     #[test]
     fn accepts_peer_h3_with_sni() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.sni = Some("custom-sni.example.com".to_string());
         }
         assert!(config.validate().is_ok());
@@ -1370,14 +1421,17 @@ peers:
     #[test]
     fn accepts_peer_h3_without_sni() {
         let config = sample_h3_config();
-        assert!(config.peers[0].h3.as_ref().unwrap().sni.is_none());
+        let PeerTransport::H3(h3) = &config.peers[0].transport else {
+            panic!("should be H3")
+        };
+        assert!(h3.sni.is_none());
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn rejects_empty_sni() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.sni = Some("".to_string());
         }
         let err = config.validate().unwrap_err();
@@ -1391,7 +1445,7 @@ peers:
     #[test]
     fn rejects_whitespace_only_sni() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.sni = Some("   ".to_string());
         }
         let err = config.validate().unwrap_err();
@@ -1405,7 +1459,7 @@ peers:
     #[test]
     fn rejects_sni_with_leading_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.sni = Some(" leading".to_string());
         }
         let err = config.validate().unwrap_err();
@@ -1419,7 +1473,7 @@ peers:
     #[test]
     fn rejects_sni_with_trailing_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.sni = Some("trailing ".to_string());
         }
         let err = config.validate().unwrap_err();
@@ -1433,7 +1487,7 @@ peers:
     #[test]
     fn rejects_bindif_with_leading_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.bindif = Some(" eth0".to_string());
         }
         let err = config.validate().unwrap_err();
@@ -1447,7 +1501,7 @@ peers:
     #[test]
     fn rejects_bindif_with_trailing_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.bindif = Some("eth0 ".to_string());
         }
         let err = config.validate().unwrap_err();
@@ -1675,7 +1729,9 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
+        let PeerTransport::H3(h3) = &cfg.peers[0].transport else {
+            panic!("should be H3")
+        };
         assert_eq!(h3.bindif, Some("eth0".to_string()));
     }
 
@@ -2473,8 +2529,7 @@ tuning:
     fn no_mtu_warning_without_h3_peers() {
         let mut config = sample_h3_config();
         config.local.tun.mtu = 1500;
-        config.peers[0].h3 = None;
-        config.peers[0].bare = Some(PeerBare {
+        config.peers[0].transport = PeerTransport::Bare(PeerBare {
             endpoint: UdpEndpoint {
                 host: "peer.example.com".to_string(),
                 port: 6635,
@@ -2520,8 +2575,7 @@ tuning:
         let mut config = sample_h3_config();
         config.tuning.reconnect_backoff_min = Duration::from_secs(1);
         config.tuning.h3_handshake_timeout = Duration::from_secs(5);
-        config.peers[0].h3 = None;
-        config.peers[0].bare = Some(PeerBare {
+        config.peers[0].transport = PeerTransport::Bare(PeerBare {
             endpoint: UdpEndpoint {
                 host: "peer.example.com".to_string(),
                 port: 6635,

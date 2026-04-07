@@ -4,7 +4,7 @@ use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
 use crate::api;
 use crate::bare::{dial_bare_tx, make_bare_rx, spawn_bare_rx, BareUdpRxCommand};
 use crate::bind::DefaultRouteProbe;
-use crate::config::{validate_peers, Config, ConfigError, Local, Peer, Tuning};
+use crate::config::{validate_peers, Config, ConfigError, Local, Peer, PeerTransport, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
     ApiEvent, BareConnectedEvent, ConnOrigin, DialContext, DialFailedEvent, DnsEvent, Endpoint,
@@ -117,12 +117,9 @@ impl PeerEntry {
 
     /// Returns the current config endpoint as an `Endpoint` enum, if configured.
     fn config_endpoint(&self) -> Option<Endpoint> {
-        if let Some(bare) = &self.config.bare {
-            Some(Endpoint::Udp(bare.endpoint.clone()))
-        } else if let Some(h3) = &self.config.h3 {
-            h3.endpoint.as_ref().map(|ep| Endpoint::H3(ep.clone()))
-        } else {
-            None
+        match &self.config.transport {
+            PeerTransport::Bare(bare) => Some(Endpoint::Udp(bare.endpoint.clone())),
+            PeerTransport::H3(h3) => h3.endpoint.as_ref().map(|ep| Endpoint::H3(ep.clone())),
         }
     }
 
@@ -236,54 +233,56 @@ impl PeerEntry {
                 events_tx: events_tx.clone(),
             };
 
-            if let Some(bare) = self.config.bare.as_ref() {
-                let destination = SocketAddr::new(dial_ip, bare.endpoint.port);
-                let bindif = bare.bindif.clone();
-                let endpoint = bare.endpoint.clone();
-                tokio::spawn(async move {
-                    let probe = DefaultRouteProbe;
-                    match dial_bare_tx(endpoint, destination, &ctx, &probe, bindif.as_deref()).await
-                    {
-                        Ok(event) => {
-                            let _ = ctx.events_tx.send(Event::BareConnected(event));
+            match &self.config.transport {
+                PeerTransport::Bare(bare) => {
+                    let destination = SocketAddr::new(dial_ip, bare.endpoint.port);
+                    let bindif = bare.bindif.clone();
+                    let endpoint = bare.endpoint.clone();
+                    tokio::spawn(async move {
+                        let probe = DefaultRouteProbe;
+                        match dial_bare_tx(endpoint, destination, &ctx, &probe, bindif.as_deref())
+                            .await
+                        {
+                            Ok(event) => {
+                                let _ = ctx.events_tx.send(Event::BareConnected(event));
+                            }
+                            Err(err) => {
+                                warn!(peer = %ctx.peer_id, addr = %destination, error = %err, "bare dial failed");
+                                let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
+                                    peer_id: ctx.peer_id,
+                                    ip: dial_ip,
+                                }));
+                            }
                         }
-                        Err(err) => {
-                            warn!(peer = %ctx.peer_id, addr = %destination, error = %err, "bare dial failed");
-                            let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
-                                peer_id: ctx.peer_id,
-                                ip: dial_ip,
-                            }));
-                        }
-                    }
-                });
-            } else if let Some(h3) = self.config.h3.as_ref() {
-                let Some(h3_endpoint) = h3.endpoint.as_ref() else {
-                    self.dials.remove(ip);
-                    continue;
-                };
-                let destination = SocketAddr::new(dial_ip, h3_endpoint.port);
-                let peer_h3 = h3.clone();
-                let ingress_tx = ingress_tx.clone();
+                    });
+                }
+                PeerTransport::H3(h3) => {
+                    let Some(h3_endpoint) = h3.endpoint.as_ref() else {
+                        self.dials.remove(ip);
+                        continue;
+                    };
+                    let destination = SocketAddr::new(dial_ip, h3_endpoint.port);
+                    let peer_h3 = h3.clone();
+                    let ingress_tx = ingress_tx.clone();
 
-                tokio::spawn(async move {
-                    let probe = DefaultRouteProbe;
-                    match dial_h3_client(&peer_h3, destination, &ctx, &probe, ingress_tx).await {
-                        Ok(event) => {
-                            info!(peer = %event.peer_id, addr = %event.remote_addr, "H3 connected");
-                            let _ = ctx.events_tx.send(Event::H3v2Connected(event));
+                    tokio::spawn(async move {
+                        let probe = DefaultRouteProbe;
+                        match dial_h3_client(&peer_h3, destination, &ctx, &probe, ingress_tx).await
+                        {
+                            Ok(event) => {
+                                info!(peer = %event.peer_id, addr = %event.remote_addr, "H3 connected");
+                                let _ = ctx.events_tx.send(Event::H3v2Connected(event));
+                            }
+                            Err(e) => {
+                                warn!(peer = %ctx.peer_id, addr = %destination, error = %e, "H3 dial failed");
+                                let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
+                                    peer_id: ctx.peer_id,
+                                    ip: dial_ip,
+                                }));
+                            }
                         }
-                        Err(e) => {
-                            warn!(peer = %ctx.peer_id, addr = %destination, error = %e, "H3 dial failed");
-                            let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
-                                peer_id: ctx.peer_id,
-                                ip: dial_ip,
-                            }));
-                        }
-                    }
-                });
-            } else {
-                // No transport configured; remove in-flight marker
-                self.dials.remove(ip);
+                    });
+                }
             }
         }
     }
@@ -294,12 +293,9 @@ impl PeerEntry {
 /// Extracts the hostname from BareUDP or H3 endpoint configuration,
 /// stripping IPv6 brackets from H3 hosts.
 fn peer_dns_hostname(peer: &Peer) -> Option<&str> {
-    if let Some(bare) = &peer.bare {
-        Some(&bare.endpoint.host)
-    } else if let Some(h3) = &peer.h3 {
-        h3.endpoint.as_ref().map(|ep| strip_ipv6_brackets(&ep.host))
-    } else {
-        None
+    match &peer.transport {
+        PeerTransport::Bare(bare) => Some(&bare.endpoint.host),
+        PeerTransport::H3(h3) => h3.endpoint.as_ref().map(|ep| strip_ipv6_brackets(&ep.host)),
     }
 }
 
@@ -396,7 +392,7 @@ impl Orchestrator {
             let accepted_ips: HashSet<IpAddr> = self
                 .peers
                 .values()
-                .filter(|e| e.config.bare.is_some())
+                .filter(|e| matches!(e.config.transport, PeerTransport::Bare(_)))
                 .flat_map(|e| e.resolved_ips.iter().copied())
                 .collect();
             if let Err(e) = cmd_tx.send(BareUdpRxCommand::UpdateAcceptedSources(accepted_ips)) {
@@ -414,11 +410,9 @@ impl Orchestrator {
             let tokens = self
                 .peers
                 .values()
-                .filter_map(|p| {
-                    p.config
-                        .h3
-                        .as_ref()
-                        .map(|h3| (p.config.id.clone(), h3.token.clone()))
+                .filter_map(|p| match &p.config.transport {
+                    PeerTransport::H3(h3) => Some((p.config.id.clone(), h3.token.clone())),
+                    PeerTransport::Bare(_) => None,
                 })
                 .collect::<HashMap<_, _>>();
 
@@ -1120,12 +1114,10 @@ impl Orchestrator {
         };
 
         let endpoint = match origin {
-            ConnOrigin::Client => entry
-                .config
-                .h3
-                .as_ref()
-                .and_then(|h3| h3.endpoint.as_ref())
-                .map(|ep| Endpoint::H3(ep.clone())),
+            ConnOrigin::Client => match &entry.config.transport {
+                PeerTransport::H3(h3) => h3.endpoint.as_ref().map(|ep| Endpoint::H3(ep.clone())),
+                PeerTransport::Bare(_) => None,
+            },
             ConnOrigin::Server => None,
         };
 
@@ -1360,8 +1352,7 @@ mod tests {
         Peer {
             id: id.to_string(),
 
-            h3: None,
-            bare: Some(PeerBare {
+            transport: PeerTransport::Bare(PeerBare {
                 endpoint: UdpEndpoint {
                     host: "127.0.0.1".to_string(),
                     port: 5353,
@@ -1379,8 +1370,7 @@ mod tests {
         Peer {
             id: id.to_string(),
 
-            h3: None,
-            bare: Some(PeerBare {
+            transport: PeerTransport::Bare(PeerBare {
                 endpoint: UdpEndpoint {
                     host: hostname.to_string(),
                     port,
@@ -1942,9 +1932,12 @@ mod tests {
     fn collect_hostnames_skips_non_bare_peers() {
         let peer = Peer {
             id: "h3only".to_string(),
-
-            h3: None,
-            bare: None,
+            transport: PeerTransport::H3(PeerH3 {
+                endpoint: None,
+                token: "test-token-12chars".to_string(),
+                bindif: None,
+                sni: None,
+            }),
             tun: PeerTun {
                 allowed_ips: vec![],
             },
@@ -1973,7 +1966,7 @@ mod tests {
         Peer {
             id: id.to_string(),
 
-            h3: Some(PeerH3 {
+            transport: PeerTransport::H3(PeerH3 {
                 endpoint: Some(H3Endpoint {
                     host: host.to_string(),
                     port,
@@ -1983,7 +1976,6 @@ mod tests {
                 bindif: None,
                 sni: None,
             }),
-            bare: None,
             tun: PeerTun {
                 allowed_ips: allowed.iter().map(|s| s.parse().unwrap()).collect(),
             },
@@ -2675,13 +2667,12 @@ mod tests {
     async fn api_get_config_returns_snapshot() {
         let peer = Peer {
             id: "peer-1".to_string(),
-            h3: Some(PeerH3 {
+            transport: PeerTransport::H3(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
                 sni: None,
             }),
-            bare: None,
             tun: PeerTun {
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
             },
@@ -2707,13 +2698,12 @@ mod tests {
 
         let new_peer = Peer {
             id: "new-peer".to_string(),
-            h3: Some(PeerH3 {
+            transport: PeerTransport::H3(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
                 sni: None,
             }),
-            bare: None,
             tun: PeerTun {
                 allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
             },
@@ -2739,8 +2729,13 @@ mod tests {
 
         let bad_peer = Peer {
             id: "".to_string(), // empty id is invalid
-            h3: None,
-            bare: None,
+            transport: PeerTransport::Bare(PeerBare {
+                endpoint: UdpEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: 5353,
+                },
+                bindif: None,
+            }),
             tun: PeerTun {
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
             },
@@ -2761,13 +2756,12 @@ mod tests {
     async fn api_delete_config_removes_peer() {
         let peer = Peer {
             id: "peer-1".to_string(),
-            h3: Some(PeerH3 {
+            transport: PeerTransport::H3(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
                 sni: None,
             }),
-            bare: None,
             tun: PeerTun {
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
             },
@@ -2793,13 +2787,12 @@ mod tests {
     async fn api_delete_config_ignores_unknown_ids() {
         let peer = Peer {
             id: "keeper".to_string(),
-            h3: Some(PeerH3 {
+            transport: PeerTransport::H3(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch".to_string(),
                 bindif: None,
                 sni: None,
             }),
-            bare: None,
             tun: PeerTun {
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
             },
@@ -2828,13 +2821,12 @@ mod tests {
 
         let peer = Peer {
             id: "h3-peer".to_string(),
-            h3: Some(PeerH3 {
+            transport: PeerTransport::H3(PeerH3 {
                 endpoint: None,
                 token: "secure-token-12ch".to_string(),
                 bindif: None,
                 sni: None,
             }),
-            bare: None,
             tun: PeerTun {
                 allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
             },
@@ -2855,13 +2847,12 @@ mod tests {
     async fn api_delete_config_sends_h3_token_update() {
         let peer = Peer {
             id: "h3-peer".to_string(),
-            h3: Some(PeerH3 {
+            transport: PeerTransport::H3(PeerH3 {
                 endpoint: None,
                 token: "secure-token-12ch".to_string(),
                 bindif: None,
                 sni: None,
             }),
-            bare: None,
             tun: PeerTun {
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
             },
@@ -2887,13 +2878,12 @@ mod tests {
     async fn api_delete_config_no_h3_update_when_unchanged() {
         let peer = Peer {
             id: "keeper".to_string(),
-            h3: Some(PeerH3 {
+            transport: PeerTransport::H3(PeerH3 {
                 endpoint: None,
                 token: "test-token-12ch1".to_string(),
                 bindif: None,
                 sni: None,
             }),
-            bare: None,
             tun: PeerTun {
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
             },
@@ -2915,13 +2905,12 @@ mod tests {
     async fn api_post_config_h3_tokens_exclude_bare_peers() {
         let h3_peer = Peer {
             id: "h3-peer".to_string(),
-            h3: Some(PeerH3 {
+            transport: PeerTransport::H3(PeerH3 {
                 endpoint: None,
                 token: "h3-token-12chars1".to_string(),
                 bindif: None,
                 sni: None,
             }),
-            bare: None,
             tun: PeerTun {
                 allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
             },

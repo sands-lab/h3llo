@@ -7,7 +7,7 @@
 //! Retained only for interop tests; will be deleted once tests are migrated.
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::auth::{generate_bearer_auth, validate_connect_auth};
+use crate::auth::{generate_bearer_auth, validate_connect_auth, AuthError};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::{ConnOrigin, Event, H3ConnectedEvent};
@@ -71,7 +71,7 @@ const H3_RX_BATCH_SIZE: usize = 128;
 fn extract_and_validate_auth(
     headers: &[Header],
     tokens: &HashMap<String, String>,
-) -> Result<String, &'static str> {
+) -> Result<String, AuthError> {
     let auth_header = headers
         .iter()
         .find(|h| h.name().eq_ignore_ascii_case(b"authorization"))
