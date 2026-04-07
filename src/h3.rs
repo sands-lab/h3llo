@@ -1,15 +1,10 @@
-//! HTTP/3 CONNECT-IP transport: connection setup, auth, and datagram send/receive.
+//! **Deprecated**: HTTP/3 CONNECT-IP transport using tokio-quiche high-level API.
 //!
-//! Implements RFC 9484 CONNECT-IP over HTTP/3 using QUIC DATAGRAM frames.
-//! Context ID is always 0 (no dynamic context allocation).
-//!
-//! # Architecture
-//!
-//! Follows the same actor pattern as BareUDP:
-//! - `spawn_h3_rx`: Receives DATAGRAM frames and forwards to TUN-Tx
-//! - `spawn_h3_tx`: Receives packets from TUN-Rx and sends as DATAGRAMs
-//! - `dial_h3`: Establishes outbound CONNECT-IP connections (socket + handshake)
-//! - `spawn_h3_listener`: Accepts inbound CONNECT-IP connections
+//! This module is superseded by the production stack:
+//! [`h3dialer`](crate::h3dialer), [`h3listener`](crate::h3listener),
+//! [`h3engine`](crate::h3engine), [`h3session`](crate::h3session).
+//! The orchestrator ignores `Event::H3Connected` events from this module.
+//! Retained only for interop tests; will be deleted once tests are migrated.
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_bearer_auth, validate_connect_auth};
@@ -1008,7 +1003,7 @@ pub struct H3Listener {
 /// Commands accepted by the H3 listener actor.
 ///
 /// Note: No Shutdown command - shutdown via channel close (consistent with other actors).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum H3ListenerCommand {
     /// Update peer tokens for authentication.
     UpdatePeerTokens(HashMap<String, String>),

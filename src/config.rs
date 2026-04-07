@@ -275,19 +275,18 @@ pub struct Tuning {
     /// QUIC congestion control algorithm (default: `"none"`).
     ///
     /// Accepted values: `"reno"`, `"cubic"`, `"bbr"`, `"bbr2"`, `"none"`.
-    /// Applied to both client (dial) and server (listener) QUIC connections.
+    /// Applied to both dialer and listener QUIC connections.
     pub h3_cc_algorithm: String,
     /// Enable QUIC packet pacing (default: `false`).
     ///
     /// Smooths out bursty sends at the cost of slight latency increase.
     /// Requires OS-level pacing support (e.g., `SO_TXTIME` on Linux).
-    /// Applied to both client and server QUIC connections.
+    /// Applied to both dialer and listener QUIC connections.
     pub h3_enable_pacing: bool,
     /// Skip TLS certificate verification for all H3 connections (default: `false`).
     ///
     /// When `true`, QUIC/TLS peer verification is disabled. Intended for testing
     /// with self-signed certificates only. **Not recommended for production.**
-    #[serde(default)]
     pub h3_insecure_skip_verify: bool,
     /// Optional path to a PEM-encoded CA certificate file for H3 TLS verification.
     ///
@@ -295,7 +294,6 @@ pub struct Tuning {
     /// alongside system CA certificates. Useful for private PKI or self-signed
     /// CA deployments. When `None` (default), only system CA certificates are
     /// used. Ignored when `h3_insecure_skip_verify` is `true`.
-    #[serde(default)]
     pub h3_trusted_ca: Option<String>,
 }
 
@@ -888,7 +886,7 @@ fn parse_endpoint_uri(
 /// Parses a UDP DNS server URI (e.g., `udp://1.1.1.1:53`) into a socket address, enforcing IP literals.
 ///
 /// Supports both IPv4 (`udp://1.1.1.1:53`) and IPv6 (`udp://[::1]:53`) addresses.
-pub fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
+pub(crate) fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
     let (host, port, path) = parse_endpoint_uri(raw, "udp")?;
     let port = port.ok_or("port is required (e.g., udp://1.1.1.1:53)")?;
     if path != "/" && !path.is_empty() {
@@ -919,7 +917,7 @@ pub fn parse_dns_server_uri(raw: &str) -> Result<SocketAddr, String> {
 /// # Errors
 ///
 /// Returns an error if the URI is invalid, uses a non-https scheme, or is missing a host.
-pub fn parse_h3_uri(raw: &str) -> Result<H3Endpoint, String> {
+pub(crate) fn parse_h3_uri(raw: &str) -> Result<H3Endpoint, String> {
     let (host, port, path) = parse_endpoint_uri(raw, "https")?;
     Ok(H3Endpoint {
         host,
@@ -941,7 +939,7 @@ pub fn parse_h3_uri(raw: &str) -> Result<H3Endpoint, String> {
 /// # Errors
 ///
 /// Returns an error if the URI is invalid, uses a non-http scheme, or is missing a host.
-pub fn parse_api_uri(raw: &str) -> Result<ApiEndpoint, String> {
+pub(crate) fn parse_api_uri(raw: &str) -> Result<ApiEndpoint, String> {
     let (host, port, path) = parse_endpoint_uri(raw, "http")?;
     Ok(ApiEndpoint {
         host,
@@ -951,7 +949,7 @@ pub fn parse_api_uri(raw: &str) -> Result<ApiEndpoint, String> {
 }
 
 /// Parses a UDP URI (e.g., `udp://host:6635`) into host and port components.
-pub fn parse_udp_uri(raw: &str) -> Result<UdpEndpoint, String> {
+pub(crate) fn parse_udp_uri(raw: &str) -> Result<UdpEndpoint, String> {
     let (host, port, path) = parse_endpoint_uri(raw, "udp")?;
     let port = port.ok_or("port is required (e.g., udp://host:6635)")?;
     if path != "/" && !path.is_empty() {

@@ -1,5 +1,5 @@
-//! Provides interface-binding helpers for DNS sockets and route probing.
-pub use socket2::Domain;
+//! Provides interface-binding helpers for UDP sockets and route probing.
+pub(crate) use socket2::Domain;
 use socket2::{Protocol, Socket, Type};
 use thiserror::Error;
 use tracing::warn;
@@ -47,7 +47,7 @@ pub enum UdpError {
 ///
 /// # Errors
 /// Returns an `io::Error` when socket creation or binding fails.
-pub fn make_udp_socket_raw(
+pub(crate) fn make_udp_socket_raw(
     domain: Domain,
     bind_addr: Option<SocketAddr>,
     bind_interface: Option<&str>,
@@ -214,7 +214,7 @@ pub async fn make_client_udp_socket<P: RouteProbe>(
 /// # Returns
 /// The chosen interface name (first entry); returns `None` when probing fails or yields no match.
 /// Warnings are logged directly.
-pub async fn select_bind_interface<P: RouteProbe>(
+pub(crate) async fn select_bind_interface<P: RouteProbe>(
     target: IpAddr,
     tun_if: Option<&str>,
     preferred_if: Option<&str>,
@@ -267,7 +267,7 @@ pub async fn select_bind_interface<P: RouteProbe>(
 ///
 /// # Errors
 /// Returns an `io::Error` when binding fails or is unsupported.
-pub fn bind_to_device(socket: &Socket, domain: Domain, interface: &str) -> io::Result<()> {
+pub(crate) fn bind_to_device(socket: &Socket, domain: Domain, interface: &str) -> io::Result<()> {
     let iface = interface.trim();
     if iface.is_empty() {
         return Err(io::Error::new(
@@ -321,7 +321,7 @@ pub trait RouteProbe {
 ///
 /// # Errors
 /// Returns `UnsupportedPlatform` on unsupported operating systems (BSD placeholder).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct DefaultRouteProbe;
 
 impl RouteProbe for DefaultRouteProbe {

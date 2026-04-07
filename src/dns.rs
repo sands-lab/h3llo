@@ -188,7 +188,6 @@ impl DnsState {
 /// Describes resolver initialization failures.
 #[derive(Debug, Error)]
 pub enum ResolveInitError {
-    // Note: InvalidServer variant removed - parsing now happens during config deserialization.
     /// DNS socket could not be prepared.
     #[error("dns resolver failed to initialize: {0}")]
     Socket(String),

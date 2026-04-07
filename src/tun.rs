@@ -480,7 +480,6 @@ impl TunTx for TunWriter {
 /// Describes TUN errors for creation and operation.
 #[derive(Debug, Error)]
 pub enum TunError {
-    // Note: InvalidAddress variant removed - parsing now happens during config deserialization.
     /// Device creation or address assignment failed.
     #[error("failed to build TUN device: {0}")]
     DeviceBuild(String),

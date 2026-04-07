@@ -230,7 +230,7 @@ fn make_client_quiche_config(
 ///
 /// On success, returns [`H3v2ConnectedEvent`] with origin `Client`.
 /// The caller is responsible for sending the event and handling errors.
-pub async fn dial_h3_client<P: RouteProbe>(
+pub(crate) async fn dial_h3_client<P: RouteProbe>(
     peer_h3: &PeerH3,
     remote_addr: SocketAddr,
     ctx: &DialContext,

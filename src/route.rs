@@ -27,7 +27,7 @@ pub trait IfIndexResolver: Send + Sync + 'static {
 }
 
 /// Uses platform APIs to resolve interface indexes.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug)]
 pub struct PlatformIfIndexResolver;
 
 impl IfIndexResolver for PlatformIfIndexResolver {

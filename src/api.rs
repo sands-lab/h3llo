@@ -384,7 +384,7 @@ struct DeletePayload {
 /// # Errors
 ///
 /// Returns an I/O error if binding fails.
-pub async fn make_api(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
+pub(crate) async fn make_api(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
     TcpListener::bind(addr).await
 }
 
@@ -397,7 +397,7 @@ pub async fn make_api(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
 /// * `listener` - Bound TCP listener from `make_api`.
 /// * `api_path` - Configured base path for prefix-strip routing.
 /// * `events_tx` - Channel to send API events to the orchestrator.
-pub fn spawn_api(
+pub(crate) fn spawn_api(
     listener: TcpListener,
     api_path: String,
     events_tx: mpsc::UnboundedSender<Event>,

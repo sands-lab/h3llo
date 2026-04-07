@@ -1441,9 +1441,6 @@ mod tests {
         assert!(result.contains(&"172.16.0.0/16".parse().unwrap()));
     }
 
-    // Note: collect_allowed_ips_rejects_invalid_cidr test removed - CIDR parsing
-    // now happens during config deserialization
-
     #[test]
     fn collect_allowed_ips_handles_empty_peers() {
         let peers: Vec<Peer> = vec![];
@@ -1451,18 +1448,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // Note: tun_prefixes tests removed - function deleted; LocalTun.addrs is now Vec<IpNet>
-
     // ========== OrchestratorError tests ==========
-
-    // Note: orchestrator_error_missing_bare_listen test removed - this error
-    // variant was removed; validation moved to Config::validate()
-
-    // Note: orchestrator_error_invalid_bare_listen test removed - URI parsing
-    // now happens during config deserialization
-
-    // Note: orchestrator_error_invalid_peer_endpoint test removed - URI parsing
-    // now happens during config deserialization
 
     #[test]
     fn orchestrator_error_listen_resolve_failed() {
@@ -1967,10 +1953,6 @@ mod tests {
         let result = collect_hostnames(&[peer]);
         assert!(result.is_empty(), "no hostnames should be collected");
     }
-
-    // Note: collect_hostnames_returns_error_for_invalid_endpoint test removed -
-    // invalid endpoint URIs now fail at config deserialization time, and
-    // collect_hostnames is now infallible.
 
     #[test]
     fn collect_hostnames_includes_ip_literals() {
