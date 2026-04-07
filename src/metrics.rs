@@ -250,7 +250,7 @@ impl Counters {
 // Logging helpers
 // ---------------------------------------------------------------------------
 
-/// Logs a transport metrics snapshot at `debug!` level.
+/// Logs a transport metrics snapshot at `info!` level.
 ///
 /// Prints succeeded/dropped batch/packet/byte totals and per-reason
 /// drop breakdowns when any drops are present.
