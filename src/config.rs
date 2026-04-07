@@ -667,63 +667,90 @@ impl Config {
 
 /// Validates a peer list in isolation (ID, token, transport, allowed_ips).
 pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
+    /// Validates a string field for emptiness and leading/trailing whitespace.
+    fn check_trimmed(
+        value: &str,
+        on_empty: Option<ValidationError>,
+        on_whitespace: ValidationError,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        if let Some(err) = on_empty {
+            if value.trim().is_empty() {
+                errors.push(err);
+                return;
+            }
+        }
+        if value != value.trim() {
+            errors.push(on_whitespace);
+        }
+    }
+
     let mut errors = Vec::new();
     let mut seen_peer_ids = HashSet::new();
     let mut seen_peer_tokens = HashSet::new();
 
     for peer in peers {
-        // Peer ID validation: must be non-empty and have no leading/trailing whitespace
-        if peer.id.trim().is_empty() {
-            errors.push(ValidationError::PeerIdEmpty {
-                peer_id: peer.id.clone(),
-            });
-        } else if peer.id != peer.id.trim() {
-            errors.push(ValidationError::PeerIdHasWhitespace {
-                peer_id: peer.id.clone(),
-            });
-        }
+        let pid = peer.id.clone();
 
-        if !seen_peer_ids.insert(peer.id.clone()) {
+        check_trimmed(
+            &peer.id,
+            Some(ValidationError::PeerIdEmpty {
+                peer_id: pid.clone(),
+            }),
+            ValidationError::PeerIdHasWhitespace {
+                peer_id: pid.clone(),
+            },
+            &mut errors,
+        );
+
+        if !seen_peer_ids.insert(pid.clone()) {
             errors.push(ValidationError::DuplicatePeerId {
-                peer_id: peer.id.clone(),
+                peer_id: pid.clone(),
             });
         }
 
         if let PeerTransport::H3(h3) = &peer.transport {
-            // Token validation: must be >= 12 chars and have no leading/trailing whitespace
             if h3.token.len() < 12 {
                 errors.push(ValidationError::PeerTokenTooShort {
-                    peer_id: peer.id.clone(),
+                    peer_id: pid.clone(),
                 });
-            } else if h3.token != h3.token.trim() {
-                errors.push(ValidationError::PeerTokenHasWhitespace {
-                    peer_id: peer.id.clone(),
-                });
+            } else {
+                check_trimmed(
+                    &h3.token,
+                    None,
+                    ValidationError::PeerTokenHasWhitespace {
+                        peer_id: pid.clone(),
+                    },
+                    &mut errors,
+                );
             }
 
             if !seen_peer_tokens.insert(h3.token.clone()) {
                 errors.push(ValidationError::DuplicatePeerToken {
-                    peer_id: peer.id.clone(),
+                    peer_id: pid.clone(),
                 });
             }
             if let Some(sni) = &h3.sni {
-                if sni.trim().is_empty() {
-                    errors.push(ValidationError::PeerSniEmpty {
-                        peer_id: peer.id.clone(),
-                    });
-                } else if sni != sni.trim() {
-                    errors.push(ValidationError::PeerSniHasWhitespace {
-                        peer_id: peer.id.clone(),
-                    });
-                }
+                check_trimmed(
+                    sni,
+                    Some(ValidationError::PeerSniEmpty {
+                        peer_id: pid.clone(),
+                    }),
+                    ValidationError::PeerSniHasWhitespace {
+                        peer_id: pid.clone(),
+                    },
+                    &mut errors,
+                );
             }
-
             if let Some(bindif) = &h3.bindif {
-                if bindif != bindif.trim() {
-                    errors.push(ValidationError::PeerBindifHasWhitespace {
-                        peer_id: peer.id.clone(),
-                    });
-                }
+                check_trimmed(
+                    bindif,
+                    None,
+                    ValidationError::PeerBindifHasWhitespace {
+                        peer_id: pid.clone(),
+                    },
+                    &mut errors,
+                );
             }
         }
 
@@ -811,24 +838,34 @@ pub struct UdpEndpoint {
     pub port: u16,
 }
 
-impl<'de> Deserialize<'de> for UdpEndpoint {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        parse_udp_uri(&s).map_err(de::Error::custom)
-    }
+/// Implements `Serialize`/`Deserialize` for a URI-based endpoint type.
+macro_rules! impl_uri_serde {
+    ($ty:ty, $parse_fn:path, $format_fn:expr) => {
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let s = String::deserialize(deserializer)?;
+                $parse_fn(&s).map_err(de::Error::custom)
+            }
+        }
+
+        impl Serialize for $ty {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&$format_fn(self))
+            }
+        }
+    };
 }
 
-impl Serialize for UdpEndpoint {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&format!("udp://{}:{}", self.host, self.port))
-    }
-}
+impl_uri_serde!(UdpEndpoint, parse_udp_uri, |ep: &UdpEndpoint| format!(
+    "udp://{}:{}",
+    ep.host, ep.port
+));
 
 /// Represents an HTTP/3 endpoint parsed from an `https://` URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -841,29 +878,13 @@ pub struct H3Endpoint {
     pub path: String,
 }
 
-impl<'de> Deserialize<'de> for H3Endpoint {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        parse_h3_uri(&s).map_err(de::Error::custom)
+impl_uri_serde!(H3Endpoint, parse_h3_uri, |ep: &H3Endpoint| {
+    if ep.port == 443 {
+        format!("https://{}{}", ep.host, ep.path)
+    } else {
+        format!("https://{}:{}{}", ep.host, ep.port, ep.path)
     }
-}
-
-impl Serialize for H3Endpoint {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let uri = if self.port == 443 {
-            format!("https://{}{}", self.host, self.path)
-        } else {
-            format!("https://{}:{}{}", self.host, self.port, self.path)
-        };
-        serializer.serialize_str(&uri)
-    }
-}
+});
 
 /// Management API settings for the local node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -884,26 +905,11 @@ pub struct ApiEndpoint {
     pub path: String,
 }
 
-impl<'de> Deserialize<'de> for ApiEndpoint {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        parse_api_uri(&s).map_err(de::Error::custom)
-    }
-}
-
-impl Serialize for ApiEndpoint {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        // Always include the port to avoid round-trip bugs (HTTP default is 80, not 9090).
-        let uri = format!("http://{}:{}{}", self.host, self.port, self.path);
-        serializer.serialize_str(&uri)
-    }
-}
+// Always include the port to avoid round-trip bugs (HTTP default is 80, not 9090).
+impl_uri_serde!(ApiEndpoint, parse_api_uri, |ep: &ApiEndpoint| format!(
+    "http://{}:{}{}",
+    ep.host, ep.port, ep.path
+));
 
 /// Parses a scheme-specific endpoint URI into host/port/path components.
 ///

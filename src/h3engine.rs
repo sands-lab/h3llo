@@ -13,8 +13,8 @@ use crate::events::{ConnOrigin, Event};
 use crate::h3session::{
     ConnectIpDatagramCodec, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT,
 };
+use crate::helpers::alloc_uninit_packet_buf;
 use crate::metrics::{Counters, Direction, DropReason, Source};
-use crate::tun::alloc_uninit_packet_buf;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;

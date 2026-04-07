@@ -22,13 +22,7 @@ use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 /// Headroom reserved in every datapath PooledBuf.
 ///
-/// 9 bytes tokio-quiche DGRAM_PREFIX (flow ID + flow context encoding) +
-/// 1 byte CONNECT-IP Context ID (0x00). If tokio-quiche `DGRAM_PREFIX`
-/// changes, this value must be updated accordingly.
-///
-/// All packet-producing paths (TUN RX, BareUDP RX) reserve this headroom
-/// so downstream consumers (H3 TX, TUN TX) can prepend headers in-place.
-pub(crate) const HEADROOM: usize = 10;
+use crate::helpers::{alloc_packet_buf, alloc_uninit_packet_buf, HEADROOM};
 
 // Compile-time guard: TunBuf::prepend_hdr relies on HEADROOM being sufficient
 // to prepend a zeroed virtio_net_hdr via add_prefix without allocation.
@@ -37,47 +31,6 @@ const _: () = assert!(
     HEADROOM >= VIRTIO_NET_HDR_LEN,
     "HEADROOM must be >= VIRTIO_NET_HDR_LEN for zero-copy TUN TX"
 );
-
-/// Allocates an uninitialized pooled buffer with [`HEADROOM`] bytes reserved,
-/// selecting the smallest pool that fits `length + HEADROOM`.
-///
-/// Uses the datagram pool (≤ [`BufFactory::MAX_DGRAM_SIZE`] bytes) for typical
-/// packets and falls back to the generic pool for oversized payloads.
-///
-/// The returned buffer's visible length is `pool_capacity - HEADROOM`, which
-/// may exceed `length`. Callers must [`truncate`](PooledBuf::truncate) to the
-/// actual payload size.
-///
-/// # Arguments
-///
-/// * `length` - Expected payload size (excluding headroom).
-pub(crate) fn alloc_uninit_packet_buf(length: usize) -> PooledBuf {
-    if length + HEADROOM <= BufFactory::MAX_DGRAM_SIZE {
-        let mut buf = BufFactory::get_max_datagram();
-        // get_max_datagram() reserves an internal prefix (DGRAM_PREFIX) that
-        // may differ from our HEADROOM.  Compute and consume the difference.
-        let dgram_headroom = BufFactory::MAX_DGRAM_SIZE - buf.len();
-        if dgram_headroom < HEADROOM {
-            buf.pop_front(HEADROOM - dgram_headroom);
-        }
-        buf
-    } else {
-        let mut buf = BufFactory::get_max_buf();
-        buf.pop_front(HEADROOM);
-        buf
-    }
-}
-
-/// Allocates a pooled buffer with headroom for in-place header prepending.
-///
-/// Data starts at offset `HEADROOM`, leaving room for downstream consumers
-/// to prepend headers via `add_prefix` without reallocation.
-pub(crate) fn alloc_packet_buf(data: &[u8]) -> PooledBuf {
-    let mut buf = alloc_uninit_packet_buf(data.len());
-    buf.truncate(data.len());
-    buf[..data.len()].copy_from_slice(data);
-    buf
-}
 
 /// Zero-copy wrapper around [`PooledBuf`] for TUN I/O (RX and TX).
 ///
@@ -409,23 +362,13 @@ impl TunRx for TunReader {
         sizes: &mut [usize],
     ) -> io::Result<usize> {
         #[cfg(target_os = "linux")]
-        {
-            if self.offload {
-                self.device.recv_multiple(scratch, bufs, sizes, 0).await
-            } else {
-                let _ = scratch;
-                let len = self.device.recv(bufs[0].as_mut()).await?;
-                sizes[0] = len;
-                Ok(1)
-            }
+        if self.offload {
+            return self.device.recv_multiple(scratch, bufs, sizes, 0).await;
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = scratch;
-            let len = self.device.recv(bufs[0].as_mut()).await?;
-            sizes[0] = len;
-            Ok(1)
-        }
+        let _ = scratch;
+        let len = self.device.recv(bufs[0].as_mut()).await?;
+        sizes[0] = len;
+        Ok(1)
     }
 }
 
@@ -459,29 +402,19 @@ impl TunTx for TunWriter {
 
     async fn send_batch(&mut self, bufs: &mut [TunBuf]) -> io::Result<usize> {
         #[cfg(target_os = "linux")]
-        {
-            if self.offload {
-                for buf in bufs.iter_mut() {
-                    buf.prepend_hdr();
-                }
-                self.device
-                    .send_multiple(&mut self.gro_table, bufs, VIRTIO_NET_HDR_LEN)
-                    .await?;
-                Ok(bufs.len())
-            } else {
-                for buf in bufs.iter() {
-                    retry_on_transient!(self.device.send(buf.as_ref()).await, |_| {})?;
-                }
-                Ok(bufs.len())
+        if self.offload {
+            for buf in bufs.iter_mut() {
+                buf.prepend_hdr();
             }
+            self.device
+                .send_multiple(&mut self.gro_table, bufs, VIRTIO_NET_HDR_LEN)
+                .await?;
+            return Ok(bufs.len());
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            for buf in bufs.iter() {
-                retry_on_transient!(self.device.send(buf.as_ref()).await, |_| {})?;
-            }
-            Ok(bufs.len())
+        for buf in bufs.iter() {
+            retry_on_transient!(self.device.send(buf.as_ref()).await, |_| {})?;
         }
+        Ok(bufs.len())
     }
 }
 

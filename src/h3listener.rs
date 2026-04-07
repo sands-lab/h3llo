@@ -18,7 +18,7 @@ use crate::h3engine::{
 };
 use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
-use crate::tun::alloc_uninit_packet_buf;
+use crate::helpers::alloc_uninit_packet_buf;
 use crate::udp;
 use quiche::h3::NameValue;
 use rand::Rng;
@@ -759,8 +759,8 @@ mod tests {
     use crate::h3::{dial_h3, spawn_h3_rx, spawn_h3_tx, DialError as OldDialError, H3Connection};
     use crate::h3dialer::{dial_h3_client, DialError};
     use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
+    use crate::helpers::alloc_packet_buf;
     use crate::helpers::test_packets::make_ipv4_packet;
-    use crate::tun::alloc_packet_buf;
     use std::net::Ipv4Addr;
     use test_support::await_h3v2_connection;
     use tokio_quiche::buf_factory::PooledBuf;

@@ -1,6 +1,59 @@
-//! Helpers for retrying transient I/O errors and channel backpressure.
+//! Helpers for retrying transient I/O errors, channel backpressure, and
+//! headroom-aware packet buffer allocation.
 
 use std::time::{Duration, Instant};
+use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
+
+/// Reserved headroom bytes at the start of every packet buffer.
+///
+/// 9 bytes tokio-quiche DGRAM_PREFIX (flow ID + flow context encoding) +
+/// 1 byte CONNECT-IP Context ID (0x00). If tokio-quiche `DGRAM_PREFIX`
+/// changes, this value must be updated accordingly.
+///
+/// All packet-producing paths (TUN RX, BareUDP RX) reserve this headroom
+/// so downstream consumers (H3 TX, TUN TX) can prepend headers in-place.
+pub(crate) const HEADROOM: usize = 10;
+
+/// Allocates an uninitialized pooled buffer with [`HEADROOM`] bytes reserved,
+/// selecting the smallest pool that fits `length + HEADROOM`.
+///
+/// Uses the datagram pool (≤ [`BufFactory::MAX_DGRAM_SIZE`] bytes) for typical
+/// packets and falls back to the generic pool for oversized payloads.
+///
+/// The returned buffer's visible length is `pool_capacity - HEADROOM`, which
+/// may exceed `length`. Callers must [`truncate`](PooledBuf::truncate) to the
+/// actual payload size.
+///
+/// # Arguments
+///
+/// * `length` - Expected payload size (excluding headroom).
+pub(crate) fn alloc_uninit_packet_buf(length: usize) -> PooledBuf {
+    if length + HEADROOM <= BufFactory::MAX_DGRAM_SIZE {
+        let mut buf = BufFactory::get_max_datagram();
+        // get_max_datagram() reserves an internal prefix (DGRAM_PREFIX) that
+        // may differ from our HEADROOM.  Compute and consume the difference.
+        let dgram_headroom = BufFactory::MAX_DGRAM_SIZE - buf.len();
+        if dgram_headroom < HEADROOM {
+            buf.pop_front(HEADROOM - dgram_headroom);
+        }
+        buf
+    } else {
+        let mut buf = BufFactory::get_max_buf();
+        buf.pop_front(HEADROOM);
+        buf
+    }
+}
+
+/// Allocates a pooled buffer with headroom for in-place header prepending.
+///
+/// Data starts at offset `HEADROOM`, leaving room for downstream consumers
+/// to prepend headers via `add_prefix` without reallocation.
+pub(crate) fn alloc_packet_buf(data: &[u8]) -> PooledBuf {
+    let mut buf = alloc_uninit_packet_buf(data.len());
+    buf.truncate(data.len());
+    buf[..data.len()].copy_from_slice(data);
+    buf
+}
 
 /// Retries an async I/O expression on transient errors (`Interrupted`, `WouldBlock`).
 ///

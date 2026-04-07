@@ -7,8 +7,8 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::UdpError;
+use crate::helpers::alloc_packet_buf;
 use crate::helpers::retry_on_transient;
-use crate::tun::alloc_packet_buf;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::io;
 use std::io::IoSliceMut;

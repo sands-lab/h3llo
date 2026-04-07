@@ -381,7 +381,7 @@ mod tests {
     };
     use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::h3session::ConnectFailure;
-    use crate::tun::alloc_packet_buf;
+    use crate::helpers::alloc_packet_buf;
     use std::collections::HashMap;
 
     #[test]

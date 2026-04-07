@@ -533,8 +533,8 @@ async fn handle_ingress_batch(
 mod tests {
     use super::*;
     use crate::config::{PeerBare, PeerTransport, PeerTun, UdpEndpoint};
+    use crate::helpers::alloc_packet_buf;
     use crate::helpers::test_packets::{make_ipv4_packet, make_ipv4_with_ttl, make_ipv6_packet};
-    use crate::tun::alloc_packet_buf;
     use ipnet::IpNet;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use tokio::sync::mpsc;
