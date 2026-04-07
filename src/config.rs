@@ -166,11 +166,11 @@ pub struct Tuning {
     /// Applied to all UDP sockets. Set to 0 to skip buffer configuration and use
     /// system defaults. Actual kernel buffer may be clamped by OS limits.
     pub socket_buffer_size: usize,
-    /// TUN transmit queue length in packets (default: 1000).
+    /// TUN transmit queue length in packets (default: unset, OS default).
     ///
     /// Controls how many packets the kernel queues for transmission on the TUN
-    /// interface. Applied on Linux only; ignored on other platforms.
-    pub tun_tx_queue_len: u32,
+    /// interface. Linux only; warns on other platforms if set.
+    pub tun_tx_queue_len: Option<u32>,
     /// Enable GSO/GRO offload on the TUN device (default: `false`).
     ///
     /// When `true` on Linux, the TUN device uses batched I/O with
@@ -302,7 +302,7 @@ impl Default for Tuning {
         Self {
             packet_queue_depth: 256,
             socket_buffer_size: 16,
-            tun_tx_queue_len: 1000,
+            tun_tx_queue_len: None,
             tun_enable_offload: false,
             udp_enable_offload: false,
             reconcile_interval: Duration::from_secs(10),
@@ -1980,7 +1980,7 @@ peers:
         assert!(!cfg.tuning.h3_enable_pacing);
         assert!(!cfg.tuning.h3_insecure_skip_verify);
         assert!(cfg.tuning.h3_trusted_ca.is_none());
-        assert_eq!(cfg.tuning.tun_tx_queue_len, 1000);
+        assert!(cfg.tuning.tun_tx_queue_len.is_none());
         assert!(!cfg.tuning.tun_enable_offload);
         assert!(!cfg.tuning.udp_enable_offload);
     }
@@ -2226,7 +2226,7 @@ tuning:
   tun_tx_queue_len: 500
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.tun_tx_queue_len, 500);
+        assert_eq!(cfg.tuning.tun_tx_queue_len, Some(500));
     }
 
     #[test]
