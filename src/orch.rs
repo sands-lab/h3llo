@@ -509,8 +509,8 @@ impl Orchestrator {
             let _guard = tun_rt.handle().enter();
             tun::make_tun(
                 &config.local.tun,
-                tuning.tun_tx_queue_len,
-                tuning.tun_enable_offload,
+                tuning.io.tun_tx_queue_len,
+                tuning.io.tun_enable_offload,
             )
             .await
             .map_err(|err| OrchestratorError::Tun(err.to_string()))?
@@ -533,12 +533,7 @@ impl Orchestrator {
         // TUN-Tx on TUN runtime (sync fn — enter guard is safe, no .await).
         let (input_tx, tun_tx_handle) = {
             let _guard = tun_rt.handle().enter();
-            tun::spawn_tun_tx(
-                tun_writer,
-                events_tx.clone(),
-                tuning.metrics_push_interval,
-                tuning.packet_queue_depth,
-            )
+            tun::spawn_tun_tx(tun_writer, events_tx.clone(), &tuning.io)
         };
 
         // Router on crypto runtime (sync fn — enter guard is safe, no .await).
@@ -548,20 +543,15 @@ impl Orchestrator {
                 routing,
                 input_tx.clone(),
                 events_tx.clone(),
-                tuning.metrics_push_interval,
-                tuning.packet_queue_depth,
+                tuning.io.metrics_push_interval,
+                tuning.io.packet_queue_depth,
             )
         };
 
         // TUN-Rx on TUN runtime (sync fn — enter guard is safe, no .await).
         let tun_rx_handle = {
             let _guard = tun_rt.handle().enter();
-            tun::spawn_tun_rx(
-                tun_reader,
-                output_tx,
-                events_tx.clone(),
-                tuning.metrics_push_interval,
-            )
+            tun::spawn_tun_rx(tun_reader, output_tx, events_tx.clone(), &tuning.io)
         };
 
         join_set.spawn(tun_tx_handle);
@@ -1608,7 +1598,7 @@ mod tests {
 
         let snapshot = reply_rx.await.expect("should receive metrics snapshot");
         assert_eq!(snapshot.len(), 2);
-        let text = api::encode_metrics_snapshot(snapshot);
+        let text = crate::metrics::encode_metrics_snapshot(snapshot);
         assert!(
             text.contains("h3llo_transport_packets_total"),
             "missing packets metric: {text}"

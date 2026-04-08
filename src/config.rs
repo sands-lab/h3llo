@@ -209,9 +209,54 @@ pub struct PeerTun {
 /// All fields have sensible defaults. The entire section is optional in YAML.
 /// When partially specified, unset fields use their defaults.
 /// Duration fields use human-readable strings (e.g. `"3s"`, `"500ms"`, `"2m"`).
+///
+/// Fields are grouped into sub-structs by subsystem (`io`, `dns`, `h3`)
+/// and flattened for a single-level YAML layout.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Tuning {
+    /// Interval for the periodic reconciliation cycle (default: 10s).
+    ///
+    /// Controls how often the orchestrator prunes stale bounds and attempts
+    /// reconnections for uncovered IPs.
+    #[serde(with = "humantime_serde")]
+    pub reconcile_interval: Duration,
+    /// Minimum backoff duration between reconnection attempts per IP (default: 3s).
+    ///
+    /// The backoff grows exponentially from this base value after each failed attempt.
+    #[serde(with = "humantime_serde")]
+    pub reconnect_backoff_min: Duration,
+    /// Maximum backoff duration between reconnection attempts per IP (default: 60s).
+    ///
+    /// The exponential backoff is capped at this ceiling.
+    /// Must be greater than or equal to `reconnect_backoff_min`.
+    #[serde(with = "humantime_serde")]
+    pub reconnect_backoff_max: Duration,
+    /// Metrics log interval (default: 3s).
+    ///
+    /// Controls how often the orchestrator logs QUIC and transport metrics at
+    /// `debug!` level. Independent of `metrics_push_interval`, which controls
+    /// how often actors emit metrics events.
+    #[serde(with = "humantime_serde")]
+    pub metrics_log_interval: Duration,
+    /// I/O and data-plane tuning shared across transport actors.
+    #[serde(flatten)]
+    pub io: IoTuning,
+    /// DNS resolver tuning.
+    #[serde(flatten)]
+    pub dns: DnsTuning,
+    /// HTTP/3 and QUIC transport tuning.
+    #[serde(flatten)]
+    pub h3: H3Tuning,
+}
+
+/// I/O and data-plane tuning shared across transport actors.
+///
+/// Used by TUN, BareUDP, and H3 actors for channel sizing, socket
+/// configuration, and offload settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IoTuning {
     /// Data-plane packet queue depth for bounded backpressure channels (default: 256).
     pub packet_queue_depth: usize,
     /// Socket buffer size in megabytes for SO_RCVBUF and SO_SNDBUF (default: 16).
@@ -253,33 +298,35 @@ pub struct Tuning {
     /// aarch64). Enable for better performance and verify with thorough
     /// testing. See troubleshooting guide for known issues.
     pub udp_enable_offload: bool,
-    /// Interval for the periodic reconciliation cycle (default: 10s).
-    ///
-    /// Controls how often the orchestrator prunes stale bounds and attempts
-    /// reconnections for uncovered IPs.
-    #[serde(with = "humantime_serde")]
-    pub reconcile_interval: Duration,
-    /// Minimum backoff duration between reconnection attempts per IP (default: 3s).
-    ///
-    /// The backoff grows exponentially from this base value after each failed attempt.
-    #[serde(with = "humantime_serde")]
-    pub reconnect_backoff_min: Duration,
-    /// Maximum backoff duration between reconnection attempts per IP (default: 60s).
-    ///
-    /// The exponential backoff is capped at this ceiling.
-    /// Must be greater than or equal to `reconnect_backoff_min`.
-    #[serde(with = "humantime_serde")]
-    pub reconnect_backoff_max: Duration,
     /// Metrics push interval (default: `"1s"`).
     #[serde(with = "humantime_serde")]
     pub metrics_push_interval: Duration,
-    /// Metrics log interval in seconds (default: 3s).
-    ///
-    /// Controls how often the orchestrator logs QUIC and transport metrics at
-    /// `debug!` level. Independent of `metrics_push_interval`, which controls
-    /// how often actors emit metrics events.
-    #[serde(with = "humantime_serde")]
-    pub metrics_log_interval: Duration,
+}
+
+impl IoTuning {
+    /// Returns socket buffer size in bytes, or 0 to skip configuration.
+    pub fn socket_buffer_bytes(&self) -> usize {
+        self.socket_buffer_size.saturating_mul(1024 * 1024)
+    }
+}
+
+impl Default for IoTuning {
+    fn default() -> Self {
+        Self {
+            packet_queue_depth: 256,
+            socket_buffer_size: 16,
+            tun_tx_queue_len: None,
+            tun_enable_offload: false,
+            udp_enable_offload: false,
+            metrics_push_interval: Duration::from_millis(1000),
+        }
+    }
+}
+
+/// DNS resolver tuning parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DnsTuning {
     /// DNS query timeout (default: 2s).
     #[serde(with = "humantime_serde")]
     pub dns_query_timeout: Duration,
@@ -317,6 +364,24 @@ pub struct Tuning {
     /// guarantee that every refresh cycle renews the TTL before expiry.
     #[serde(with = "humantime_serde")]
     pub dns_min_ttl: Duration,
+}
+
+impl Default for DnsTuning {
+    fn default() -> Self {
+        Self {
+            dns_query_timeout: Duration::from_secs(2),
+            dns_refresh_interval: Duration::from_secs(120),
+            dns_snapshot_delay: Duration::from_millis(100),
+            dns_query_interval: Duration::from_millis(50),
+            dns_min_ttl: Duration::from_secs(300),
+        }
+    }
+}
+
+/// HTTP/3 and QUIC transport tuning parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct H3Tuning {
     /// HTTP/3 handshake timeout (default: 5s).
     #[serde(with = "humantime_serde")]
     pub h3_handshake_timeout: Duration,
@@ -351,24 +416,9 @@ pub struct Tuning {
     pub h3_trusted_ca: Option<String>,
 }
 
-impl Default for Tuning {
+impl Default for H3Tuning {
     fn default() -> Self {
         Self {
-            packet_queue_depth: 256,
-            socket_buffer_size: 16,
-            tun_tx_queue_len: None,
-            tun_enable_offload: false,
-            udp_enable_offload: false,
-            reconcile_interval: Duration::from_secs(10),
-            reconnect_backoff_min: Duration::from_secs(3),
-            reconnect_backoff_max: Duration::from_secs(60),
-            metrics_push_interval: Duration::from_millis(1000),
-            metrics_log_interval: Duration::from_secs(3),
-            dns_query_timeout: Duration::from_secs(2),
-            dns_refresh_interval: Duration::from_secs(120),
-            dns_snapshot_delay: Duration::from_millis(100),
-            dns_query_interval: Duration::from_millis(50),
-            dns_min_ttl: Duration::from_secs(300),
             h3_handshake_timeout: Duration::from_secs(5),
             h3_max_idle_timeout: Duration::from_secs(60),
             h3_keepalive_interval: Duration::from_secs(20),
@@ -380,10 +430,17 @@ impl Default for Tuning {
     }
 }
 
-impl Tuning {
-    /// Returns socket buffer size in bytes, or 0 to skip configuration.
-    pub fn socket_buffer_bytes(&self) -> usize {
-        self.socket_buffer_size.saturating_mul(1024 * 1024)
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            reconcile_interval: Duration::from_secs(10),
+            reconnect_backoff_min: Duration::from_secs(3),
+            reconnect_backoff_max: Duration::from_secs(60),
+            metrics_log_interval: Duration::from_secs(3),
+            io: IoTuning::default(),
+            dns: DnsTuning::default(),
+            h3: H3Tuning::default(),
+        }
     }
 }
 
@@ -477,7 +534,7 @@ impl Config {
         let mut errors = Vec::new();
 
         // Tuning validation
-        if self.tuning.packet_queue_depth == 0 {
+        if self.tuning.io.packet_queue_depth == 0 {
             errors.push(ValidationError::FieldMustBePositive {
                 field: "tuning.packet_queue_depth",
             });
@@ -497,26 +554,35 @@ impl Config {
             ),
             (
                 "tuning.metrics_push_interval",
-                self.tuning.metrics_push_interval,
+                self.tuning.io.metrics_push_interval,
             ),
             (
                 "tuning.metrics_log_interval",
                 self.tuning.metrics_log_interval,
             ),
-            ("tuning.dns_query_timeout", self.tuning.dns_query_timeout),
-            ("tuning.dns_snapshot_delay", self.tuning.dns_snapshot_delay),
-            ("tuning.dns_query_interval", self.tuning.dns_query_interval),
+            (
+                "tuning.dns_query_timeout",
+                self.tuning.dns.dns_query_timeout,
+            ),
+            (
+                "tuning.dns_snapshot_delay",
+                self.tuning.dns.dns_snapshot_delay,
+            ),
+            (
+                "tuning.dns_query_interval",
+                self.tuning.dns.dns_query_interval,
+            ),
             (
                 "tuning.h3_handshake_timeout",
-                self.tuning.h3_handshake_timeout,
+                self.tuning.h3.h3_handshake_timeout,
             ),
             (
                 "tuning.h3_max_idle_timeout",
-                self.tuning.h3_max_idle_timeout,
+                self.tuning.h3.h3_max_idle_timeout,
             ),
             (
                 "tuning.h3_keepalive_interval",
-                self.tuning.h3_keepalive_interval,
+                self.tuning.h3.h3_keepalive_interval,
             ),
         ];
         for &(field, dur) in duration_checks {
@@ -525,12 +591,12 @@ impl Config {
             }
         }
 
-        if self.tuning.h3_keepalive_interval >= self.tuning.h3_max_idle_timeout {
+        if self.tuning.h3.h3_keepalive_interval >= self.tuning.h3.h3_max_idle_timeout {
             errors.push(ValidationError::FieldConflict {
                 description: format!(
                     "tuning.h3_keepalive_interval ({:?}) must be less than \
                      tuning.h3_max_idle_timeout ({:?})",
-                    self.tuning.h3_keepalive_interval, self.tuning.h3_max_idle_timeout,
+                    self.tuning.h3.h3_keepalive_interval, self.tuning.h3.h3_max_idle_timeout,
                 ),
             });
         }
@@ -538,9 +604,9 @@ impl Config {
         // Subset of quiche::CongestionControlAlgorithm::from_str();
         // excludes internal aliases (bbr2_gcongestion).
         const VALID_CC_ALGORITHMS: &[&str] = &["reno", "cubic", "bbr", "bbr2", "none"];
-        if !VALID_CC_ALGORITHMS.contains(&self.tuning.h3_cc_algorithm.as_str()) {
+        if !VALID_CC_ALGORITHMS.contains(&self.tuning.h3.h3_cc_algorithm.as_str()) {
             errors.push(ValidationError::InvalidCcAlgorithm {
-                algorithm: self.tuning.h3_cc_algorithm.clone(),
+                algorithm: self.tuning.h3.h3_cc_algorithm.clone(),
             });
         }
 
@@ -558,10 +624,10 @@ impl Config {
                      oversized QUIC DATAGRAMs may fail to send"
                 );
             }
-            if self.tuning.reconnect_backoff_min <= self.tuning.h3_handshake_timeout {
+            if self.tuning.reconnect_backoff_min <= self.tuning.h3.h3_handshake_timeout {
                 tracing::warn!(
                     reconnect_backoff_min = ?self.tuning.reconnect_backoff_min,
-                    h3_handshake_timeout = ?self.tuning.h3_handshake_timeout,
+                    h3_handshake_timeout = ?self.tuning.h3.h3_handshake_timeout,
                     "tuning.reconnect_backoff_min should be greater than \
                      tuning.h3_handshake_timeout to prevent overlapping handshake attempts"
                 );
@@ -570,12 +636,12 @@ impl Config {
 
         // DNS TTL floor vs refresh interval: if min_ttl < 2× refresh, IPs can
         // expire between refresh cycles, causing repeated connection churn.
-        if !self.tuning.dns_refresh_interval.is_zero() {
-            let min_safe_ttl = self.tuning.dns_refresh_interval.saturating_mul(2);
-            if self.tuning.dns_min_ttl < min_safe_ttl {
+        if !self.tuning.dns.dns_refresh_interval.is_zero() {
+            let min_safe_ttl = self.tuning.dns.dns_refresh_interval.saturating_mul(2);
+            if self.tuning.dns.dns_min_ttl < min_safe_ttl {
                 tracing::warn!(
-                    dns_min_ttl = ?self.tuning.dns_min_ttl,
-                    dns_refresh_interval = ?self.tuning.dns_refresh_interval,
+                    dns_min_ttl = ?self.tuning.dns.dns_min_ttl,
+                    dns_refresh_interval = ?self.tuning.dns.dns_refresh_interval,
                     recommended_min_ttl = ?min_safe_ttl,
                     "tuning.dns_min_ttl should be at least 2× tuning.dns_refresh_interval; \
                      otherwise cached IPs may expire before the next refresh, \
@@ -1972,31 +2038,37 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.packet_queue_depth, 256);
-        assert_eq!(cfg.tuning.socket_buffer_size, 16);
+        assert_eq!(cfg.tuning.io.packet_queue_depth, 256);
+        assert_eq!(cfg.tuning.io.socket_buffer_size, 16);
         assert_eq!(cfg.tuning.reconcile_interval, Duration::from_secs(10));
         assert_eq!(cfg.tuning.reconnect_backoff_min, Duration::from_secs(3));
         assert_eq!(cfg.tuning.reconnect_backoff_max, Duration::from_secs(60));
         assert_eq!(
-            cfg.tuning.metrics_push_interval,
+            cfg.tuning.io.metrics_push_interval,
             Duration::from_millis(1000)
         );
         assert_eq!(cfg.tuning.metrics_log_interval, Duration::from_secs(3));
-        assert_eq!(cfg.tuning.dns_query_timeout, Duration::from_secs(2));
-        assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(120));
-        assert_eq!(cfg.tuning.dns_snapshot_delay, Duration::from_millis(100));
-        assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(50));
-        assert_eq!(cfg.tuning.dns_min_ttl, Duration::from_secs(300));
-        assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(5));
-        assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
-        assert_eq!(cfg.tuning.h3_keepalive_interval, Duration::from_secs(20));
-        assert_eq!(cfg.tuning.h3_cc_algorithm, "none");
-        assert!(!cfg.tuning.h3_enable_pacing);
-        assert!(!cfg.tuning.h3_insecure_skip_verify);
-        assert!(cfg.tuning.h3_trusted_ca.is_none());
-        assert!(cfg.tuning.tun_tx_queue_len.is_none());
-        assert!(!cfg.tuning.tun_enable_offload);
-        assert!(!cfg.tuning.udp_enable_offload);
+        assert_eq!(cfg.tuning.dns.dns_query_timeout, Duration::from_secs(2));
+        assert_eq!(
+            cfg.tuning.dns.dns_refresh_interval,
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            cfg.tuning.dns.dns_snapshot_delay,
+            Duration::from_millis(100)
+        );
+        assert_eq!(cfg.tuning.dns.dns_query_interval, Duration::from_millis(50));
+        assert_eq!(cfg.tuning.dns.dns_min_ttl, Duration::from_secs(300));
+        assert_eq!(cfg.tuning.h3.h3_handshake_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.tuning.h3.h3_max_idle_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.tuning.h3.h3_keepalive_interval, Duration::from_secs(20));
+        assert_eq!(cfg.tuning.h3.h3_cc_algorithm, "none");
+        assert!(!cfg.tuning.h3.h3_enable_pacing);
+        assert!(!cfg.tuning.h3.h3_insecure_skip_verify);
+        assert!(cfg.tuning.h3.h3_trusted_ca.is_none());
+        assert!(cfg.tuning.io.tun_tx_queue_len.is_none());
+        assert!(!cfg.tuning.io.tun_enable_offload);
+        assert!(!cfg.tuning.io.udp_enable_offload);
     }
 
     #[test]
@@ -2022,14 +2094,14 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.h3_cc_algorithm, "cubic");
-        assert!(!cfg.tuning.h3_enable_pacing);
+        assert_eq!(cfg.tuning.h3.h3_cc_algorithm, "cubic");
+        assert!(!cfg.tuning.h3.h3_enable_pacing);
     }
 
     #[test]
     fn rejects_invalid_cc_algorithm() {
         let mut config = sample_h3_config();
-        config.tuning.h3_cc_algorithm = "invalid".to_string();
+        config.tuning.h3.h3_cc_algorithm = "invalid".to_string();
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
@@ -2042,7 +2114,7 @@ peers:
     fn accepts_all_valid_cc_algorithms() {
         for algo in &["reno", "cubic", "bbr", "bbr2", "none"] {
             let mut config = sample_h3_config();
-            config.tuning.h3_cc_algorithm = algo.to_string();
+            config.tuning.h3.h3_cc_algorithm = algo.to_string();
             assert!(
                 config.validate().is_ok(),
                 "should accept cc_algorithm={algo}"
@@ -2073,11 +2145,11 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.packet_queue_depth, 512);
-        assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(120));
+        assert_eq!(cfg.tuning.io.packet_queue_depth, 512);
+        assert_eq!(cfg.tuning.h3.h3_max_idle_timeout, Duration::from_secs(120));
         assert_eq!(cfg.tuning.reconcile_interval, Duration::from_secs(10));
         assert_eq!(
-            cfg.tuning.metrics_push_interval,
+            cfg.tuning.io.metrics_push_interval,
             Duration::from_millis(1000)
         );
     }
@@ -2114,8 +2186,8 @@ peers:
     #[test]
     fn rejects_keepalive_equal_to_idle_timeout() {
         let mut config = sample_h3_config();
-        config.tuning.h3_keepalive_interval = Duration::from_secs(60);
-        config.tuning.h3_max_idle_timeout = Duration::from_secs(60);
+        config.tuning.h3.h3_keepalive_interval = Duration::from_secs(60);
+        config.tuning.h3.h3_max_idle_timeout = Duration::from_secs(60);
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
@@ -2127,8 +2199,8 @@ peers:
     #[test]
     fn rejects_keepalive_greater_than_idle_timeout() {
         let mut config = sample_h3_config();
-        config.tuning.h3_keepalive_interval = Duration::from_secs(120);
-        config.tuning.h3_max_idle_timeout = Duration::from_secs(60);
+        config.tuning.h3.h3_keepalive_interval = Duration::from_secs(120);
+        config.tuning.h3.h3_max_idle_timeout = Duration::from_secs(60);
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
@@ -2166,23 +2238,23 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.socket_buffer_size, 32);
+        assert_eq!(cfg.tuning.io.socket_buffer_size, 32);
     }
 
     #[test]
     fn socket_buffer_bytes_conversion() {
-        let tuning = Tuning::default();
+        let tuning = IoTuning::default();
         assert_eq!(tuning.socket_buffer_bytes(), 16 * 1024 * 1024);
 
-        let tuning = Tuning {
+        let tuning = IoTuning {
             socket_buffer_size: 0,
-            ..Tuning::default()
+            ..IoTuning::default()
         };
         assert_eq!(tuning.socket_buffer_bytes(), 0);
 
-        let tuning = Tuning {
+        let tuning = IoTuning {
             socket_buffer_size: 1,
-            ..Tuning::default()
+            ..IoTuning::default()
         };
         assert_eq!(tuning.socket_buffer_bytes(), 1024 * 1024);
     }
@@ -2209,7 +2281,7 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert!(cfg.tuning.h3_insecure_skip_verify);
+        assert!(cfg.tuning.h3.h3_insecure_skip_verify);
     }
 
     #[test]
@@ -2224,7 +2296,7 @@ tuning:
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(
-            cfg.tuning.h3_trusted_ca.as_deref(),
+            cfg.tuning.h3.h3_trusted_ca.as_deref(),
             Some("/etc/ssl/custom-ca.pem")
         );
     }
@@ -2240,7 +2312,7 @@ tuning:
   tun_tx_queue_len: 500
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.tun_tx_queue_len, Some(500));
+        assert_eq!(cfg.tuning.io.tun_tx_queue_len, Some(500));
     }
 
     #[test]
@@ -2254,7 +2326,10 @@ tuning:
   dns_query_interval: 100ms
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(100));
+        assert_eq!(
+            cfg.tuning.dns.dns_query_interval,
+            Duration::from_millis(100)
+        );
     }
 
     #[test]
@@ -2279,7 +2354,10 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert_eq!(cfg.tuning.metrics_push_interval, Duration::from_millis(500));
+        assert_eq!(
+            cfg.tuning.io.metrics_push_interval,
+            Duration::from_millis(500)
+        );
     }
 
     #[test]
@@ -2342,28 +2420,28 @@ peers:
                 t.reconnect_backoff_max = Duration::ZERO
             }),
             ("metrics_push_interval", |t| {
-                t.metrics_push_interval = Duration::ZERO
+                t.io.metrics_push_interval = Duration::ZERO
             }),
             ("metrics_log_interval", |t| {
                 t.metrics_log_interval = Duration::ZERO
             }),
             ("dns_query_timeout", |t| {
-                t.dns_query_timeout = Duration::ZERO
+                t.dns.dns_query_timeout = Duration::ZERO
             }),
             ("dns_snapshot_delay", |t| {
-                t.dns_snapshot_delay = Duration::ZERO
+                t.dns.dns_snapshot_delay = Duration::ZERO
             }),
             ("dns_query_interval", |t| {
-                t.dns_query_interval = Duration::ZERO
+                t.dns.dns_query_interval = Duration::ZERO
             }),
             ("h3_handshake_timeout", |t| {
-                t.h3_handshake_timeout = Duration::ZERO
+                t.h3.h3_handshake_timeout = Duration::ZERO
             }),
             ("h3_max_idle_timeout", |t| {
-                t.h3_max_idle_timeout = Duration::ZERO
+                t.h3.h3_max_idle_timeout = Duration::ZERO
             }),
             ("h3_keepalive_interval", |t| {
-                t.h3_keepalive_interval = Duration::ZERO
+                t.h3.h3_keepalive_interval = Duration::ZERO
             }),
         ];
         for &(field_name, setter) in fields {
@@ -2413,7 +2491,7 @@ peers:
     #[test]
     fn allows_zero_dns_refresh_interval() {
         let mut config = sample_h3_config();
-        config.tuning.dns_refresh_interval = Duration::ZERO;
+        config.tuning.dns.dns_refresh_interval = Duration::ZERO;
         // dns_refresh_interval = 0 means "disable periodic refresh" — this is valid
         assert!(config.validate().is_ok());
     }
@@ -2427,8 +2505,8 @@ local:
       - 192.168.180.1/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert!(!cfg.tuning.tun_enable_offload);
-        assert!(!cfg.tuning.udp_enable_offload);
+        assert!(!cfg.tuning.io.tun_enable_offload);
+        assert!(!cfg.tuning.io.udp_enable_offload);
     }
 
     #[test]
@@ -2443,8 +2521,8 @@ tuning:
   udp_enable_offload: true
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert!(cfg.tuning.tun_enable_offload);
-        assert!(cfg.tuning.udp_enable_offload);
+        assert!(cfg.tuning.io.tun_enable_offload);
+        assert!(cfg.tuning.io.udp_enable_offload);
     }
 
     #[test]
@@ -2458,8 +2536,8 @@ tuning:
   udp_enable_offload: true
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        assert!(!cfg.tuning.tun_enable_offload); // still default
-        assert!(cfg.tuning.udp_enable_offload);
+        assert!(!cfg.tuning.io.tun_enable_offload); // still default
+        assert!(cfg.tuning.io.udp_enable_offload);
     }
 
     // ========== H3 validation warning tests ==========
@@ -2504,7 +2582,7 @@ tuning:
     fn warns_backoff_min_equals_handshake_timeout() {
         let mut config = sample_h3_config();
         config.tuning.reconnect_backoff_min = Duration::from_secs(5);
-        config.tuning.h3_handshake_timeout = Duration::from_secs(5);
+        config.tuning.h3.h3_handshake_timeout = Duration::from_secs(5);
         assert!(config.validate().is_ok());
         assert!(logs_contain("reconnect_backoff_min should be greater"));
     }
@@ -2514,7 +2592,7 @@ tuning:
     fn warns_backoff_min_less_than_handshake_timeout() {
         let mut config = sample_h3_config();
         config.tuning.reconnect_backoff_min = Duration::from_secs(2);
-        config.tuning.h3_handshake_timeout = Duration::from_secs(5);
+        config.tuning.h3.h3_handshake_timeout = Duration::from_secs(5);
         assert!(config.validate().is_ok());
         assert!(logs_contain("reconnect_backoff_min should be greater"));
     }
@@ -2533,7 +2611,7 @@ tuning:
     fn no_backoff_warning_without_h3_peers() {
         let mut config = sample_h3_config();
         config.tuning.reconnect_backoff_min = Duration::from_secs(1);
-        config.tuning.h3_handshake_timeout = Duration::from_secs(5);
+        config.tuning.h3.h3_handshake_timeout = Duration::from_secs(5);
         config.peers[0].transport = PeerTransport::Bare(PeerBare {
             endpoint: UdpEndpoint {
                 host: "peer.example.com".to_string(),
@@ -2551,7 +2629,7 @@ tuning:
         let mut config = sample_h3_config();
         config.local.tun.mtu = 1500;
         config.tuning.reconnect_backoff_min = Duration::from_secs(2);
-        config.tuning.h3_handshake_timeout = Duration::from_secs(5);
+        config.tuning.h3.h3_handshake_timeout = Duration::from_secs(5);
         assert!(config.validate().is_ok());
         assert!(logs_contain("exceeds safe maximum"));
         assert!(logs_contain("reconnect_backoff_min should be greater"));

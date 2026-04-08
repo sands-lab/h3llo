@@ -208,12 +208,12 @@ fn make_client_quiche_config(
         .map_err(|e| DialError::Handshake(format!("quiche config: {e}")))?;
     apply_transport_config(&mut config, tuning, max_udp_payload)
         .map_err(|e| DialError::Handshake(format!("transport config: {e}")))?;
-    if !tuning.h3_insecure_skip_verify {
+    if !tuning.h3.h3_insecure_skip_verify {
         // Enable TLS peer verification. System CA certificates are already
         // loaded by quiche::Config::new() via BoringSSL's
         // SSL_CTX_set_default_verify_paths().
         config.verify_peer(true);
-        if let Some(ca_path) = &tuning.h3_trusted_ca {
+        if let Some(ca_path) = &tuning.h3.h3_trusted_ca {
             config
                 .load_verify_locations_from_file(ca_path)
                 .map_err(|e| DialError::Handshake(format!("trusted CA `{ca_path}`: {e}")))?;
@@ -268,7 +268,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
         Some(tun_if.as_str()),
         peer_h3.bindif.as_deref(),
         probe,
-        tuning.socket_buffer_bytes(),
+        tuning.io.socket_buffer_bytes(),
     )
     .await
     .map_err(|e| DialError::Socket(e.to_string()))?;
@@ -283,12 +283,12 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
             .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
         let max_udp_payload = *tun_mtu + CONNECT_IP_OVERHEAD;
         let (udp_rx, udp_tx) =
-            udp::make_udp(std_socket, max_udp_payload, tuning.udp_enable_offload)
+            udp::make_udp(std_socket, max_udp_payload, tuning.io.udp_enable_offload)
                 .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
         let (udp_recv_tx, udp_recv_rx) =
-            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
+            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
         let udp_rx_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx, udp_cancel.clone());
-        let (udp_send_tx, udp_tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth);
+        let (udp_send_tx, udp_tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.io.packet_queue_depth);
         (
             local_addr,
             max_udp_payload,
@@ -315,7 +315,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     )
     .map_err(|e| DialError::Handshake(format!("quiche connect: {e}")))?;
 
-    let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.packet_queue_depth);
+    let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.io.packet_queue_depth);
 
     let engine = H3Engine {
         conn,
@@ -336,8 +336,8 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
         },
         run_state: RunState::new(),
 
-        metrics_interval: tuning.metrics_push_interval,
-        keepalive_interval: tuning.h3_keepalive_interval,
+        metrics_interval: tuning.io.metrics_push_interval,
+        keepalive_interval: tuning.h3.h3_keepalive_interval,
         origin: ConnOrigin::Client,
         udp_cancel: Some(udp_cancel),
     };
@@ -347,7 +347,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
             authority,
             connect_path,
             auth_header,
-            tuning.h3_handshake_timeout,
+            tuning.h3.h3_handshake_timeout,
         ))
         .await
         .map_err(|join_err| {
@@ -373,7 +373,7 @@ mod tests {
     use super::*;
     use crate::actor::ActorExitResult;
     use crate::bind::test_support::FakeRouteProbe;
-    use crate::config::default_mtu;
+    use crate::config::{default_mtu, H3Tuning};
     use crate::events::{ConnOrigin, Event, H3v2ConnectedEvent};
     use crate::h3::test_support::await_server_connection;
     use crate::h3::{
@@ -415,7 +415,10 @@ mod tests {
     #[test]
     fn make_client_config_bad_ca_path_errors() {
         let tuning = Tuning {
-            h3_trusted_ca: Some("/nonexistent/ca.pem".to_string()),
+            h3: H3Tuning {
+                h3_trusted_ca: Some("/nonexistent/ca.pem".to_string()),
+                ..H3Tuning::default()
+            },
             ..Tuning::default()
         };
         let err = make_client_quiche_config(&tuning, 1350)
@@ -430,8 +433,11 @@ mod tests {
     #[test]
     fn make_client_config_insecure_ignores_ca() {
         let tuning = Tuning {
-            h3_insecure_skip_verify: true,
-            h3_trusted_ca: Some("/nonexistent/ca.pem".to_string()),
+            h3: H3Tuning {
+                h3_insecure_skip_verify: true,
+                h3_trusted_ca: Some("/nonexistent/ca.pem".to_string()),
+                ..H3Tuning::default()
+            },
             ..Tuning::default()
         };
         // Should succeed because insecure mode skips CA loading entirely.
@@ -503,15 +509,7 @@ mod tests {
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = DialContext {
-            peer_id: peer_id.to_string(),
-            tun_if: String::new(),
-            tun_mtu: default_mtu().into(),
-            tuning,
-            udp_rt: tokio::runtime::Handle::current(),
-            crypto_rt: tokio::runtime::Handle::current(),
-            events_tx,
-        };
+        let ctx = DialContext::test(peer_id, tuning, events_tx);
 
         let event = dial_h3_client(&peer_h3, bound_addr, &ctx, &probe, ingress_tx)
             .await
@@ -559,15 +557,7 @@ mod tests {
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let ctx = DialContext {
-            peer_id: peer_id.to_string(),
-            tun_if: String::new(),
-            tun_mtu: default_mtu().into(),
-            tuning,
-            udp_rt: tokio::runtime::Handle::current(),
-            crypto_rt: tokio::runtime::Handle::current(),
-            events_tx,
-        };
+        let ctx = DialContext::test(peer_id, tuning, events_tx);
 
         let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
 
@@ -782,21 +772,16 @@ mod tests {
         let peer_h3 = test_peer_h3(server.bound_addr, token);
         let probe = FakeRouteProbe::noop();
         let tuning = Tuning {
-            h3_trusted_ca: Some(ca_path),
+            h3: H3Tuning {
+                h3_trusted_ca: Some(ca_path),
+                ..H3Tuning::default()
+            },
             ..Tuning::default()
         };
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = DialContext {
-            peer_id: peer_id.to_string(),
-            tun_if: String::new(),
-            tun_mtu: default_mtu().into(),
-            tuning,
-            udp_rt: tokio::runtime::Handle::current(),
-            crypto_rt: tokio::runtime::Handle::current(),
-            events_tx,
-        };
+        let ctx = DialContext::test(peer_id, tuning, events_tx);
 
         let event = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx)
             .await
@@ -823,15 +808,7 @@ mod tests {
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = DialContext {
-            peer_id: peer_id.to_string(),
-            tun_if: String::new(),
-            tun_mtu: default_mtu().into(),
-            tuning,
-            udp_rt: tokio::runtime::Handle::current(),
-            crypto_rt: tokio::runtime::Handle::current(),
-            events_tx,
-        };
+        let ctx = DialContext::test(peer_id, tuning, events_tx);
 
         let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
 

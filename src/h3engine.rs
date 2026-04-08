@@ -48,9 +48,9 @@ pub(crate) fn apply_transport_config(
     config.set_initial_max_streams_uni(100);
     // Enable QUIC DATAGRAM with a queue of 1024 send and 1024 recv slots.
     config.enable_dgram(true, 1024, 1024);
-    config.set_max_idle_timeout(tuning.h3_max_idle_timeout.as_millis() as u64);
-    config.set_cc_algorithm_name(&tuning.h3_cc_algorithm)?;
-    config.enable_pacing(tuning.h3_enable_pacing);
+    config.set_max_idle_timeout(tuning.h3.h3_max_idle_timeout.as_millis() as u64);
+    config.set_cc_algorithm_name(&tuning.h3.h3_cc_algorithm)?;
+    config.enable_pacing(tuning.h3.h3_enable_pacing);
     Ok(())
 }
 
@@ -523,6 +523,7 @@ impl H3Engine {
 mod tests {
     use super::*;
     use crate::actor::ActorKind;
+    use crate::config::H3Tuning;
 
     #[test]
     fn apply_transport_config_valid() {
@@ -534,7 +535,10 @@ mod tests {
     #[test]
     fn apply_transport_config_rejects_bad_cc() {
         let tuning = Tuning {
-            h3_cc_algorithm: "invalid_algo".to_string(),
+            h3: H3Tuning {
+                h3_cc_algorithm: "invalid_algo".to_string(),
+                ..H3Tuning::default()
+            },
             ..Tuning::default()
         };
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();

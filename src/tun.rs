@@ -1,7 +1,7 @@
 //! TUN management: device creation, read/write loops with backpressure, and metrics reporting.
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::config::LocalTun;
+use crate::config::{IoTuning, LocalTun};
 use crate::events::Event;
 use crate::helpers::retry_on_transient;
 use crate::metrics::{Counters, Direction, DropReason, Source};
@@ -9,7 +9,6 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::io;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -22,7 +21,7 @@ use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 /// Headroom reserved in every datapath PooledBuf.
 ///
-use crate::helpers::{alloc_packet_buf, alloc_uninit_packet_buf, HEADROOM};
+use crate::helpers::{alloc_packet_buf, alloc_uninit_packet_buf, batch_stats, HEADROOM};
 
 // Compile-time guard: TunBuf::prepend_hdr relies on HEADROOM being sufficient
 // to prepend a zeroed virtio_net_hdr via add_prefix without allocation.
@@ -449,20 +448,21 @@ fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
 /// * `tun` - TUN device reader.
 /// * `output_tx` - Bounded sender to the router actor's outbound channel.
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
-/// * `interval` - Metrics emission interval.
+/// * `io` - I/O tuning parameters (uses `metrics_push_interval`).
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
     output_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
-    interval: Duration,
+    io: &IoTuning,
 ) -> JoinHandle<ActorExitResult> {
     let tun_name = tun.name().to_string();
     let batch_size = tun.batch_size();
     let scratch_buf_size = tun.scratch_buf_size();
+    let metrics_push_interval = io.metrics_push_interval;
 
     tokio::spawn(async move {
         let mut counters = Counters::new(Source::Tun, Direction::Rx);
-        let mut ticker = time::interval(interval);
+        let mut ticker = time::interval(metrics_push_interval);
         let mtu = tun.mtu();
 
         let mut scratch = vec![0u8; scratch_buf_size];
@@ -487,8 +487,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             if batch.is_empty() {
                                 continue;
                             }
-                            let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
-                            let pkt_count = batch.len() as u64;
+                            let (pkt_count, total_bytes) = batch_stats(&batch);
                             if !counters.send_and_record(&output_tx, batch, pkt_count, total_bytes).await {
                                 info!(tun = %tun_name, "TUN RX: router channel closed, shutting down");
                                 return Ok(());
@@ -501,7 +500,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Metrics(counters.snapshot(None, None))).is_err() {
+                    if !counters.emit(&events_tx, None, None) {
                         return Ok(()); // Events channel closed during shutdown
                     }
                 }
@@ -517,17 +516,17 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
 pub(crate) fn spawn_tun_tx<T: TunTx>(
     mut tun: T,
     events_tx: mpsc::UnboundedSender<Event>,
-    interval: Duration,
-    packet_queue_depth: usize,
+    io: &IoTuning,
 ) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
-    let (input_tx, mut input_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
+    let (input_tx, mut input_rx) = mpsc::channel::<Vec<PooledBuf>>(io.packet_queue_depth);
     let tun_name = tun.name().to_string();
+    let metrics_push_interval = io.metrics_push_interval;
 
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
         let mut counters = Counters::new(Source::Tun, Direction::Tx);
-        let mut ticker = time::interval(interval);
+        let mut ticker = time::interval(metrics_push_interval);
 
         loop {
             tokio::select! {
@@ -564,7 +563,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Metrics(counters.snapshot(None, None))).is_err() {
+                    if !counters.emit(&events_tx, None, None) {
                         return Ok(()); // Events channel closed during shutdown
                     }
                 }
@@ -762,7 +761,15 @@ mod tests {
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
-        let tun_rx_task = spawn_tun_rx(rx_tun, output_tx, events_tx, Duration::from_millis(10));
+        let tun_rx_task = spawn_tun_rx(
+            rx_tun,
+            output_tx,
+            events_tx,
+            &IoTuning {
+                metrics_push_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        );
 
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
         let batch = output_rx
@@ -799,8 +806,15 @@ mod tests {
     async fn tun_tx_drops_oversize_and_reports_metrics() {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) = memory_tun("mem1", 4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (input_tx, tun_tx_task) =
-            spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(10), 256);
+        let (input_tx, tun_tx_task) = spawn_tun_tx(
+            tx_tun,
+            events_tx,
+            &IoTuning {
+                metrics_push_interval: Duration::from_millis(10),
+                packet_queue_depth: 256,
+                ..Default::default()
+            },
+        );
 
         input_tx
             .send(vec![BufFactory::buf_from_slice(&[0, 1, 2, 3, 4, 5])])
@@ -859,8 +873,15 @@ mod tests {
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) =
             memory_tun_with_errors("mem-interrupt", 16, vec![std::io::ErrorKind::Interrupted]);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (input_tx, tun_tx_task) =
-            spawn_tun_tx(tx_tun, events_tx, Duration::from_millis(5), 256);
+        let (input_tx, tun_tx_task) = spawn_tun_tx(
+            tx_tun,
+            events_tx,
+            &IoTuning {
+                metrics_push_interval: Duration::from_millis(5),
+                packet_queue_depth: 256,
+                ..Default::default()
+            },
+        );
 
         input_tx
             .send(vec![BufFactory::buf_from_slice(&[1, 2, 3])])
@@ -902,7 +923,15 @@ mod tests {
         let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-lifecycle", 64);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (input_tx, handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
+        let (input_tx, handle) = spawn_tun_tx(
+            tx_tun,
+            events_tx,
+            &IoTuning {
+                metrics_push_interval: Duration::from_secs(60),
+                packet_queue_depth: 256,
+                ..Default::default()
+            },
+        );
 
         // Verify input_tx is functional by sending a batch
         assert!(input_tx
@@ -918,7 +947,15 @@ mod tests {
         let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-shutdown", 64);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (input_tx, join_handle) = spawn_tun_tx(tx_tun, events_tx, Duration::from_secs(60), 256);
+        let (input_tx, join_handle) = spawn_tun_tx(
+            tx_tun,
+            events_tx,
+            &IoTuning {
+                metrics_push_interval: Duration::from_secs(60),
+                packet_queue_depth: 256,
+                ..Default::default()
+            },
+        );
 
         // Drop sender to signal shutdown
         drop(input_tx);
@@ -952,7 +989,15 @@ mod tests {
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
-        let tun_rx_task = spawn_tun_rx(rx_tun, output_tx, events_tx, Duration::from_millis(10));
+        let tun_rx_task = spawn_tun_rx(
+            rx_tun,
+            output_tx,
+            events_tx,
+            &IoTuning {
+                metrics_push_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        );
 
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
         let batch = output_rx

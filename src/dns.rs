@@ -3,7 +3,7 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_client_udp_socket, RouteProbe};
-use crate::config::{LocalDns, Tuning};
+use crate::config::{DnsTuning, LocalDns, Tuning};
 use crate::events::{DnsEvent, Event};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
@@ -201,11 +201,7 @@ pub enum ResolveInitError {
 pub struct DnsActor {
     server: SocketAddr,
     socket: UdpSocket,
-    timeout: Duration,
-    refresh_interval: Duration,
-    snapshot_delay: Duration,
-    min_ttl: Duration,
-    query_interval: Duration,
+    dns: DnsTuning,
 }
 
 /// Creates a DNS resolver actor state from configuration.
@@ -236,7 +232,7 @@ pub async fn make_dns<P: RouteProbe>(
         tun_if,
         local_dns.bindif.as_deref(),
         probe,
-        tuning.socket_buffer_bytes(),
+        tuning.io.socket_buffer_bytes(),
     )
     .await
     .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
@@ -246,11 +242,7 @@ pub async fn make_dns<P: RouteProbe>(
     Ok(DnsActor {
         server,
         socket,
-        timeout: tuning.dns_query_timeout,
-        refresh_interval: tuning.dns_refresh_interval,
-        snapshot_delay: tuning.dns_snapshot_delay,
-        min_ttl: tuning.dns_min_ttl,
-        query_interval: tuning.dns_query_interval,
+        dns: tuning.dns.clone(),
     })
 }
 
@@ -276,19 +268,15 @@ pub fn spawn_dns(
     let DnsActor {
         server,
         socket,
-        timeout,
-        refresh_interval,
-        snapshot_delay,
-        min_ttl,
-        query_interval,
+        dns,
     } = actor;
 
     let server_str = server.to_string();
 
     info!(
         server = %server,
-        refresh_interval = ?refresh_interval,
-        min_ttl = ?min_ttl,
+        refresh_interval = ?dns.dns_refresh_interval,
+        min_ttl = ?dns.dns_min_ttl,
         "dns: resolver started"
     );
 
@@ -296,21 +284,21 @@ pub fn spawn_dns(
         let mut state = DnsState {
             hostnames: HashMap::new(),
             dirty: false,
-            min_ttl,
+            min_ttl: dns.dns_min_ttl,
         };
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
-        let mut ticker = time::interval(timeout / 2);
+        let mut ticker = time::interval(dns.dns_query_timeout / 2);
 
         // Debounce timer: armed when state becomes dirty, fires after snapshot_delay.
-        let snapshot_timer = time::sleep(snapshot_delay);
+        let snapshot_timer = time::sleep(dns.dns_snapshot_delay);
         tokio::pin!(snapshot_timer);
         let mut snapshot_armed = false;
 
-        let refresh_duration = if refresh_interval.is_zero() {
+        let refresh_duration = if dns.dns_refresh_interval.is_zero() {
             Duration::from_secs(3600) // placeholder; branch disabled below
         } else {
-            refresh_interval
+            dns.dns_refresh_interval
         };
         let mut refresh_ticker = time::interval(refresh_duration);
         refresh_ticker.tick().await; // consume immediate first tick
@@ -321,7 +309,7 @@ pub fn spawn_dns(
                 if state.dirty && !snapshot_armed {
                     snapshot_timer
                         .as_mut()
-                        .reset(time::Instant::now() + snapshot_delay);
+                        .reset(time::Instant::now() + dns.dns_snapshot_delay);
                     snapshot_armed = true;
                 }
             };
@@ -332,7 +320,7 @@ pub fn spawn_dns(
                 maybe_cmd = cmd_rx.recv() => {
                     match maybe_cmd {
                         Some(DnsCommand::SetHostnames { hosts }) => {
-                            handle_set_hostnames(hosts, &mut state, &socket, query_interval, refresh_interval, &events_tx).await;
+                            handle_set_hostnames(hosts, &mut state, &socket, dns.dns_query_interval, dns.dns_refresh_interval, &events_tx).await;
                         }
                         None => return Ok(()),
                     }
@@ -355,12 +343,12 @@ pub fn spawn_dns(
                     state.emit_snapshot(&events_tx);
                 }
                 _ = ticker.tick() => {
-                    handle_tick(&mut state, &socket, timeout, query_interval).await;
+                    handle_tick(&mut state, &socket, dns.dns_query_timeout, dns.dns_query_interval).await;
                     state.expire_stale();
                     arm_snapshot_timer!();
                 }
-                _ = refresh_ticker.tick(), if !refresh_interval.is_zero() => {
-                    trigger_refresh(&mut state, &socket, query_interval, refresh_interval).await;
+                _ = refresh_ticker.tick(), if !dns.dns_refresh_interval.is_zero() => {
+                    trigger_refresh(&mut state, &socket, dns.dns_query_interval, dns.dns_refresh_interval).await;
                 }
             }
         }

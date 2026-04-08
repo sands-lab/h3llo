@@ -418,6 +418,18 @@ mod tests {
         }
     }
 
+    /// Shorthand for `sync_tun_routes("tun0", ...)` in tests.
+    async fn sync_test(
+        tun_addrs: &[IpNet],
+        allowed: &[IpNet],
+        handle: &mut FakeHandle,
+        resolver: &FakeResolver,
+    ) {
+        sync_tun_routes("tun0", tun_addrs, allowed, handle, resolver)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[traced_test]
     /// Adds missing routes while skipping already present TUN prefixes.
@@ -430,9 +442,7 @@ mod tests {
         ];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
         assert_eq!(handle.ops(), vec!["add 10.0.1.0/24"]);
         // No warnings expected for normal operation
         assert!(!logs_contain("route"));
@@ -448,9 +458,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec![];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
         assert_eq!(handle.ops(), vec!["del 10.5.0.0/16"]);
         assert!(handle.routes.lock().unwrap().is_empty());
         // No warnings expected for normal operation
@@ -466,9 +474,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["192.168.0.0/24".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
         assert_eq!(handle.ops(), vec!["add 192.168.0.0/24"]);
         assert!(logs_contain("route conflict"));
         assert!(logs_contain("192.168.0.0/24"));
@@ -484,9 +490,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["10.0.0.0/24".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert_eq!(handle.ops(), vec!["add 10.0.0.0/24"]);
         assert!(logs_contain("route conflict"));
@@ -502,9 +506,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         let ops = handle.ops();
         assert_eq!(ops.len(), 2);
@@ -526,9 +528,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert!(handle.ops().is_empty());
         // Default route split warning is still emitted during expansion
@@ -547,9 +547,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         let ops = handle.ops();
         assert_eq!(ops.len(), 2);
@@ -571,9 +569,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["10.0.0.1/32".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert_eq!(handle.ops(), vec!["add 10.0.0.1/32"]);
         assert!(logs_contain("route conflict"));
@@ -589,9 +585,7 @@ mod tests {
         let allowed: Vec<IpNet> = vec!["2001:db8::/64".parse().unwrap()];
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert_eq!(handle.ops(), vec!["add 2001:db8::/64"]);
         assert!(logs_contain("route conflict"));
@@ -608,9 +602,7 @@ mod tests {
         let mut handle = FakeHandle::with_failures(vec![stale.clone()], true, true);
         let tun_addrs: Vec<IpNet> = Vec::new();
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert_eq!(handle.ops(), vec!["del 10.9.0.0/16", "add 10.8.0.0/16"]);
         assert!(logs_contain("route delete failed"));
@@ -631,9 +623,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         // Kernel route preserved, not deleted or re-added
         assert!(handle.ops().is_empty());
@@ -649,9 +639,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert!(handle.ops().is_empty());
     }
@@ -665,9 +653,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec!["10.0.0.1/24".parse().unwrap()];
         let allowed: Vec<IpNet> = vec!["192.168.1.0/24".parse().unwrap()];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         // Only allowed route added; tun_addr routes are OS-managed, not added by us
         assert_eq!(handle.ops(), vec!["add 192.168.1.0/24"]);
@@ -686,9 +672,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
         let allowed: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         // All routes already exist, no operations
         assert!(handle.ops().is_empty());
@@ -706,9 +690,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert!(handle.ops().is_empty());
     }
@@ -722,9 +704,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec![];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert!(handle.ops().is_empty());
     }
@@ -739,9 +719,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec!["10.0.0.1/31".parse().unwrap()];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         // 10.0.0.0/31 (connected) and 10.0.0.1/32 (host) are protected,
         // but 10.0.0.0/32 is NOT — it gets deleted as stale
@@ -759,9 +737,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec![];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert!(handle.ops().is_empty());
     }
@@ -775,9 +751,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec![];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert!(handle.ops().is_empty());
     }
@@ -791,9 +765,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec![];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert!(handle.ops().is_empty());
     }
@@ -807,9 +779,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec![];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert_eq!(handle.ops(), vec!["del 2001:db8::/32"]);
     }
@@ -828,9 +798,7 @@ mod tests {
         let tun_addrs: Vec<IpNet> = vec![];
         let allowed: Vec<IpNet> = vec![];
 
-        sync_tun_routes("tun0", &tun_addrs, &allowed, &mut handle, &resolver)
-            .await
-            .unwrap();
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
 
         assert!(handle.ops().is_empty());
         assert!(!logs_contain("route conflict"));

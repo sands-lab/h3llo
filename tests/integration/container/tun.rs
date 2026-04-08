@@ -67,7 +67,7 @@ async fn check_device_creation() -> Result<(), String> {
 
     let (_reader, _writer) = h3llo::tun::make_tun(
         &local_tun,
-        h3llo::config::Tuning::default().tun_tx_queue_len,
+        h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
     .await
@@ -123,7 +123,7 @@ async fn check_multi_address() -> Result<(), String> {
 
     let (_reader, _writer) = h3llo::tun::make_tun(
         &local_tun,
-        h3llo::config::Tuning::default().tun_tx_queue_len,
+        h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
     .await
@@ -192,7 +192,7 @@ async fn check_send_recv() -> Result<(), String> {
 
     let (mut reader, mut writer) = h3llo::tun::make_tun(
         &local_tun,
-        h3llo::config::Tuning::default().tun_tx_queue_len,
+        h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
     .await
@@ -333,7 +333,7 @@ async fn check_mtu_configuration() -> Result<(), String> {
 
     let (_reader, _writer) = h3llo::tun::make_tun(
         &local_tun,
-        h3llo::config::Tuning::default().tun_tx_queue_len,
+        h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
     .await
