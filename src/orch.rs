@@ -533,12 +533,7 @@ impl Orchestrator {
         // TUN-Tx on TUN runtime (sync fn — enter guard is safe, no .await).
         let (input_tx, tun_tx_handle) = {
             let _guard = tun_rt.handle().enter();
-            tun::spawn_tun_tx(
-                tun_writer,
-                events_tx.clone(),
-                tuning.io.metrics_push_interval,
-                tuning.io.packet_queue_depth,
-            )
+            tun::spawn_tun_tx(tun_writer, events_tx.clone(), &tuning.io)
         };
 
         // Router on crypto runtime (sync fn — enter guard is safe, no .await).
@@ -556,12 +551,7 @@ impl Orchestrator {
         // TUN-Rx on TUN runtime (sync fn — enter guard is safe, no .await).
         let tun_rx_handle = {
             let _guard = tun_rt.handle().enter();
-            tun::spawn_tun_rx(
-                tun_reader,
-                output_tx,
-                events_tx.clone(),
-                tuning.io.metrics_push_interval,
-            )
+            tun::spawn_tun_rx(tun_reader, output_tx, events_tx.clone(), &tuning.io)
         };
 
         join_set.spawn(tun_tx_handle);
