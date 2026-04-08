@@ -520,8 +520,8 @@ fn encode_counter_family(
 /// Label set for packet/byte counter families.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct PacketLabelSet {
-    source: SourceLabel,
-    direction: DirectionLabel,
+    source: Source,
+    direction: Direction,
     peer_id: String,
     remote_addr: String,
     outcome: String,
@@ -530,8 +530,8 @@ struct PacketLabelSet {
 impl PacketLabelSet {
     fn from_metrics(m: &Metrics, outcome: &str) -> Self {
         Self {
-            source: SourceLabel(m.labels.source),
-            direction: DirectionLabel(m.labels.direction),
+            source: m.labels.source,
+            direction: m.labels.direction,
             peer_id: m.labels.peer_id.clone().unwrap_or_default(),
             remote_addr: m
                 .labels
@@ -546,39 +546,35 @@ impl PacketLabelSet {
 /// Label set for drop-reason counter families.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct DropLabelSet {
-    source: SourceLabel,
-    direction: DirectionLabel,
+    source: Source,
+    direction: Direction,
     peer_id: String,
     remote_addr: String,
-    reason: DropReasonLabel,
+    reason: DropReason,
 }
 
 impl DropLabelSet {
     fn from_metrics(m: &Metrics, reason: DropReason) -> Self {
         Self {
-            source: SourceLabel(m.labels.source),
-            direction: DirectionLabel(m.labels.direction),
+            source: m.labels.source,
+            direction: m.labels.direction,
             peer_id: m.labels.peer_id.clone().unwrap_or_default(),
             remote_addr: m
                 .labels
                 .remote_addr
                 .map(|a| a.to_string())
                 .unwrap_or_default(),
-            reason: DropReasonLabel(reason),
+            reason,
         }
     }
 }
 
-/// Prometheus label value for packet source.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct SourceLabel(Source);
-
-impl EncodeLabelValue for SourceLabel {
+impl EncodeLabelValue for Source {
     fn encode(
         &self,
         encoder: &mut prometheus_client::encoding::LabelValueEncoder,
     ) -> Result<(), fmt::Error> {
-        let s = match self.0 {
+        let s = match self {
             Source::Tun => "tun",
             Source::BareUdp => "bare_udp",
             Source::Http3 => "http3",
@@ -588,16 +584,12 @@ impl EncodeLabelValue for SourceLabel {
     }
 }
 
-/// Prometheus label value for direction.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct DirectionLabel(Direction);
-
-impl EncodeLabelValue for DirectionLabel {
+impl EncodeLabelValue for Direction {
     fn encode(
         &self,
         encoder: &mut prometheus_client::encoding::LabelValueEncoder,
     ) -> Result<(), fmt::Error> {
-        let s = match self.0 {
+        let s = match self {
             Direction::Rx => "rx",
             Direction::Tx => "tx",
         };
@@ -608,8 +600,8 @@ impl EncodeLabelValue for DirectionLabel {
 /// Label set for congestion counter families with `event` dimension.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct CongestionLabelSet {
-    source: SourceLabel,
-    direction: DirectionLabel,
+    source: Source,
+    direction: Direction,
     peer_id: String,
     remote_addr: String,
     event: String,
@@ -618,8 +610,8 @@ struct CongestionLabelSet {
 impl CongestionLabelSet {
     fn from_metrics(m: &Metrics, event: &str) -> Self {
         Self {
-            source: SourceLabel(m.labels.source),
-            direction: DirectionLabel(m.labels.direction),
+            source: m.labels.source,
+            direction: m.labels.direction,
             peer_id: m.labels.peer_id.clone().unwrap_or_default(),
             remote_addr: m
                 .labels
@@ -631,16 +623,12 @@ impl CongestionLabelSet {
     }
 }
 
-/// Prometheus label value for drop reason.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct DropReasonLabel(DropReason);
-
-impl EncodeLabelValue for DropReasonLabel {
+impl EncodeLabelValue for DropReason {
     fn encode(
         &self,
         encoder: &mut prometheus_client::encoding::LabelValueEncoder,
     ) -> Result<(), fmt::Error> {
-        let s = match self.0 {
+        let s = match self {
             DropReason::Oversize => "oversize",
             DropReason::DisallowedSource => "disallowed_source",
             DropReason::SendError => "send_error",
