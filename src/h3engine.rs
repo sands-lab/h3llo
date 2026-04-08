@@ -8,7 +8,7 @@
 //! [`run`](H3Engine::run) for steady-state datagram forwarding.
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::config::Tuning;
+use crate::config::H3Tuning;
 use crate::events::{ConnOrigin, Event};
 use crate::h3session::{
     ConnectIpDatagramCodec, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT,
@@ -31,7 +31,7 @@ use tracing::{debug, warn};
 /// stream limits, DATAGRAM support, idle timeout, congestion control, pacing.
 pub(crate) fn apply_transport_config(
     config: &mut quiche::Config,
-    tuning: &Tuning,
+    h3: &H3Tuning,
     max_udp_payload: usize,
 ) -> Result<(), quiche::Error> {
     config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
@@ -48,9 +48,9 @@ pub(crate) fn apply_transport_config(
     config.set_initial_max_streams_uni(100);
     // Enable QUIC DATAGRAM with a queue of 1024 send and 1024 recv slots.
     config.enable_dgram(true, 1024, 1024);
-    config.set_max_idle_timeout(tuning.h3.h3_max_idle_timeout.as_millis() as u64);
-    config.set_cc_algorithm_name(&tuning.h3.h3_cc_algorithm)?;
-    config.enable_pacing(tuning.h3.h3_enable_pacing);
+    config.set_max_idle_timeout(h3.h3_max_idle_timeout.as_millis() as u64);
+    config.set_cc_algorithm_name(&h3.h3_cc_algorithm)?;
+    config.enable_pacing(h3.h3_enable_pacing);
     Ok(())
 }
 
@@ -523,26 +523,22 @@ impl H3Engine {
 mod tests {
     use super::*;
     use crate::actor::ActorKind;
-    use crate::config::H3Tuning;
 
     #[test]
     fn apply_transport_config_valid() {
-        let tuning = Tuning::default();
+        let h3 = H3Tuning::default();
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-        assert!(apply_transport_config(&mut config, &tuning, 1350).is_ok());
+        assert!(apply_transport_config(&mut config, &h3, 1350).is_ok());
     }
 
     #[test]
     fn apply_transport_config_rejects_bad_cc() {
-        let tuning = Tuning {
-            h3: H3Tuning {
-                h3_cc_algorithm: "invalid_algo".to_string(),
-                ..H3Tuning::default()
-            },
-            ..Tuning::default()
+        let h3 = H3Tuning {
+            h3_cc_algorithm: "invalid_algo".to_string(),
+            ..H3Tuning::default()
         };
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-        assert!(apply_transport_config(&mut config, &tuning, 1350).is_err());
+        assert!(apply_transport_config(&mut config, &h3, 1350).is_err());
     }
 
     // ========== Engine Type Tests ==========

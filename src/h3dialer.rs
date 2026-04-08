@@ -206,7 +206,7 @@ fn make_client_quiche_config(
 ) -> Result<quiche::Config, DialError> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| DialError::Handshake(format!("quiche config: {e}")))?;
-    apply_transport_config(&mut config, tuning, max_udp_payload)
+    apply_transport_config(&mut config, &tuning.h3, max_udp_payload)
         .map_err(|e| DialError::Handshake(format!("transport config: {e}")))?;
     if !tuning.h3.h3_insecure_skip_verify {
         // Enable TLS peer verification. System CA certificates are already

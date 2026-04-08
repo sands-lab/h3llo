@@ -11,7 +11,7 @@
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::validate_connect_auth;
 use crate::bind::make_server_udp_socket;
-use crate::config::Tuning;
+use crate::config::{H3Tuning, IoTuning};
 use crate::events::{ConnOrigin, Event, H3v2ConnectedEvent};
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, H3Engine, RunState,
@@ -101,7 +101,7 @@ fn validate_server_auth(
 
 /// Creates a quiche QUIC server configuration with TLS credentials.
 fn make_server_quiche_config(
-    tuning: &Tuning,
+    h3: &H3Tuning,
     max_udp_payload: usize,
     cert_path: &Path,
     key_path: &Path,
@@ -122,7 +122,7 @@ fn make_server_quiche_config(
                 .ok_or_else(|| ServerError::Config("invalid key path encoding".into()))?,
         )
         .map_err(|e| ServerError::Config(format!("key: {e}")))?;
-    apply_transport_config(&mut config, tuning, max_udp_payload)
+    apply_transport_config(&mut config, h3, max_udp_payload)
         .map_err(|e| ServerError::Config(format!("transport config: {e}")))?;
     Ok(config)
 }
@@ -147,22 +147,23 @@ pub(crate) fn make_h3_dispatcher(
     cert_path: &Path,
     key_path: &Path,
     tun_mtu: u16,
-    tuning: &Tuning,
+    io: &IoTuning,
+    h3: &H3Tuning,
     udp_rt: &RuntimeHandle,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
 ) -> Result<(H3Dispatcher, SocketAddr), ServerError> {
-    let std_socket = make_server_udp_socket(listen_addr, tuning.io.socket_buffer_bytes())
+    let std_socket = make_server_udp_socket(listen_addr, io.socket_buffer_bytes())
         .map_err(|e| ServerError::Socket(e.to_string()))?;
     let bound_addr = std_socket
         .local_addr()
         .map_err(|e| ServerError::Socket(format!("local_addr: {e}")))?;
     let max_udp_payload = tun_mtu as usize + CONNECT_IP_OVERHEAD;
-    let config = make_server_quiche_config(tuning, max_udp_payload, cert_path, key_path)?;
+    let config = make_server_quiche_config(h3, max_udp_payload, cert_path, key_path)?;
 
     let (udp_rx, udp_tx) = {
         let _guard = udp_rt.enter();
-        udp::make_udp(std_socket, max_udp_payload, tuning.io.udp_enable_offload)
+        udp::make_udp(std_socket, max_udp_payload, io.udp_enable_offload)
             .map_err(|e| ServerError::Socket(format!("make_udp: {e}")))?
     };
 
@@ -174,7 +175,8 @@ pub(crate) fn make_h3_dispatcher(
         udp_tx,
         ingress_tx,
         events_tx,
-        tuning: tuning.clone(),
+        io: io.clone(),
+        h3: h3.clone(),
     };
 
     info!(%listen_addr, %bound_addr, "h3 dispatcher created");
@@ -359,7 +361,8 @@ pub struct H3Dispatcher {
     udp_tx: udp::UdpTx,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
-    tuning: Tuning,
+    io: IoTuning,
+    h3: H3Tuning,
 }
 
 /// Runtime state for the CID-routing dispatcher loop.
@@ -370,8 +373,9 @@ struct DispatcherRuntime {
     bound_addr: SocketAddr,
     config: quiche::Config,
     max_udp_payload: usize,
-    io: DispatchIo,
-    tuning: Tuning,
+    dispatch_io: DispatchIo,
+    io: IoTuning,
+    h3: H3Tuning,
     /// Maps each registered CID directly to the per-connection packet sender.
     cid_table: HashMap<Vec<u8>, mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>>,
 }
@@ -458,7 +462,12 @@ impl DispatcherRuntime {
                 &mut pkt,
             ) {
                 pkt.truncate(len);
-                if self.io.udp_send_tx.try_send((remote, vec![pkt])).is_err() {
+                if self
+                    .dispatch_io
+                    .udp_send_tx
+                    .try_send((remote, vec![pkt]))
+                    .is_err()
+                {
                     debug!(%remote, "dispatcher: failed to send version negotiation");
                 }
             }
@@ -490,7 +499,7 @@ impl DispatcherRuntime {
         );
 
         // Create per-connection channels.
-        let depth = self.tuning.io.packet_queue_depth;
+        let depth = self.io.packet_queue_depth;
         let (packet_tx, packet_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(depth);
 
         // Register CIDs before spawning actor so subsequent packets route correctly.
@@ -499,9 +508,9 @@ impl DispatcherRuntime {
             self.cid_table.insert(cid, packet_tx.clone());
         }
         let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(depth);
-        let channels = self.io.clone();
+        let channels = self.dispatch_io.clone();
         let peer_tokens = peer_tokens.clone();
-        let handshake_timeout = self.tuning.h3.h3_handshake_timeout;
+        let handshake_timeout = self.h3.h3_handshake_timeout;
 
         let mut engine = H3Engine {
             conn,
@@ -520,8 +529,8 @@ impl DispatcherRuntime {
                 max_udp_payload: self.max_udp_payload,
             },
             run_state: RunState::new(),
-            metrics_interval: self.tuning.io.metrics_push_interval,
-            keepalive_interval: self.tuning.h3.h3_keepalive_interval,
+            metrics_interval: self.io.metrics_push_interval,
+            keepalive_interval: self.h3.h3_keepalive_interval,
             origin: ConnOrigin::Server,
             udp_cancel: None,
         };
@@ -593,7 +602,8 @@ pub fn spawn_h3_dispatcher(
         udp_tx,
         ingress_tx,
         events_tx,
-        tuning,
+        io,
+        h3,
     } = dispatcher;
 
     // Spawn UDP actors on udp_rt.
@@ -603,10 +613,10 @@ pub fn spawn_h3_dispatcher(
     let (udp_recv_rx, udp_send_tx) = {
         let _guard = udp_rt.enter();
         let (udp_recv_tx, udp_recv_rx) =
-            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
+            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(io.packet_queue_depth);
         let cancel = CancellationToken::new();
         let _recv_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx, cancel);
-        let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.io.packet_queue_depth);
+        let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, io.packet_queue_depth);
         (udp_recv_rx, udp_send_tx)
     };
 
@@ -617,12 +627,13 @@ pub fn spawn_h3_dispatcher(
             bound_addr,
             config,
             max_udp_payload,
-            io: DispatchIo {
+            dispatch_io: DispatchIo {
                 udp_send_tx,
                 ingress_tx,
                 events_tx,
             },
-            tuning,
+            io,
+            h3,
             cid_table: HashMap::new(),
         };
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
@@ -734,7 +745,8 @@ mod tests {
     #[tokio::test]
     async fn make_h3_dispatcher_rejects_missing_cert() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let tuning = Tuning::default();
+        let io = IoTuning::default();
+        let h3 = H3Tuning::default();
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let (ingress_tx, _ingress_rx) = mpsc::channel(1);
         let rt = tokio::runtime::Handle::current();
@@ -743,7 +755,8 @@ mod tests {
             Path::new("/nonexistent/cert.pem"),
             Path::new("/nonexistent/key.pem"),
             1400,
-            &tuning,
+            &io,
+            &h3,
             &rt,
             ingress_tx,
             events_tx,
@@ -781,7 +794,8 @@ mod tests {
         async fn start(peer_tokens: HashMap<String, String>) -> Self {
             let certs = TestCertBundle::generate();
             let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let tuning = Tuning::default();
+            let io = IoTuning::default();
+            let h3 = H3Tuning::default();
             let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
             let (events_tx, events_rx) = mpsc::unbounded_channel();
             let rt = tokio::runtime::Handle::current();
@@ -791,7 +805,8 @@ mod tests {
                 certs.cert_path(),
                 certs.key_path(),
                 default_mtu(),
-                &tuning,
+                &io,
+                &h3,
                 &rt,
                 ingress_tx,
                 events_tx,

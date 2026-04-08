@@ -372,7 +372,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Tuning;
+    use crate::config::H3Tuning;
     use crate::h3engine::apply_transport_config;
     use crate::helpers::alloc_packet_buf;
     use tokio_quiche::buf_factory::BufFactory;
@@ -546,11 +546,11 @@ mod tests {
             let certs = TestCertBundle::generate();
 
             let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-            apply_transport_config(&mut client_config, &Tuning::default(), 1350).unwrap();
+            apply_transport_config(&mut client_config, &H3Tuning::default(), 1350).unwrap();
             client_config.verify_peer(false);
 
             let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-            apply_transport_config(&mut server_config, &Tuning::default(), 1350).unwrap();
+            apply_transport_config(&mut server_config, &H3Tuning::default(), 1350).unwrap();
             server_config
                 .load_cert_chain_from_pem_file(certs.cert_path().to_str().unwrap())
                 .unwrap();
