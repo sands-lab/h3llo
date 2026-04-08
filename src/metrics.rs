@@ -236,6 +236,22 @@ impl Counters {
         }
     }
 
+    /// Emits a metrics snapshot via the events channel.
+    ///
+    /// Returns `true` if the event was sent, `false` if the channel is closed.
+    pub(crate) fn emit(
+        &self,
+        events_tx: &tokio::sync::mpsc::UnboundedSender<crate::events::Event>,
+        peer_id: Option<&str>,
+        remote_addr: Option<SocketAddr>,
+    ) -> bool {
+        events_tx
+            .send(crate::events::Event::Metrics(
+                self.snapshot(peer_id, remote_addr),
+            ))
+            .is_ok()
+    }
+
     /// Generates a metrics snapshot with optional peer and remote address labels.
     pub(crate) fn snapshot(
         &self,

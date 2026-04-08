@@ -45,6 +45,22 @@ pub(crate) struct DialContext {
     pub events_tx: mpsc::UnboundedSender<Event>,
 }
 
+#[cfg(test)]
+impl DialContext {
+    /// Creates a `DialContext` for tests with minimal boilerplate.
+    pub fn test(peer_id: &str, tuning: Tuning, events_tx: mpsc::UnboundedSender<Event>) -> Self {
+        Self {
+            peer_id: peer_id.to_string(),
+            tun_if: String::new(),
+            tun_mtu: crate::config::default_mtu().into(),
+            tuning,
+            udp_rt: tokio::runtime::Handle::current(),
+            crypto_rt: tokio::runtime::Handle::current(),
+            events_tx,
+        }
+    }
+}
+
 /// Which side created a connection: `Client` (we dialed) or `Server` (we accepted).
 ///
 /// Distinct from `Direction` (Rx/Tx) which describes data flow for metrics.

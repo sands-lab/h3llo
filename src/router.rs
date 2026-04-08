@@ -7,7 +7,7 @@
 use crate::actor::ActorExitResult;
 use crate::config::{LocalTun, Peer};
 use crate::events::Event;
-use crate::helpers::{send_with_backpressure, SendEvent};
+use crate::helpers::{batch_stats, send_with_backpressure, SendEvent};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
@@ -390,9 +390,7 @@ pub fn spawn_router(
                     routing = new_routing;
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Metrics(
-                        counters.snapshot(None, None)
-                    )).is_err() {
+                    if !counters.emit(&events_tx, None, None) {
                         return Ok(());
                     }
                 }
@@ -409,8 +407,7 @@ async fn handle_output_batch(
     routing: &RoutingTable,
     counters: &mut Counters,
 ) {
-    let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
-    let pkt_count = batch.len() as u64;
+    let (pkt_count, total_bytes) = batch_stats(&batch);
 
     let Some(first) = batch.first() else {
         return;
@@ -466,8 +463,7 @@ async fn handle_ingress_batch(
         } else {
             batch.drain(..group_end).collect()
         };
-        let group_count = group.len() as u64;
-        let group_bytes: u64 = group.iter().map(|p| p.len() as u64).sum();
+        let (group_count, group_bytes) = batch_stats(&group);
 
         let Some(route) = routing.lookup(dst) else {
             counters.record_drop(DropReason::NoRoute, group_count, group_bytes);
@@ -504,16 +500,14 @@ async fn handle_ingress_batch(
             }
 
             if !forward.is_empty() {
-                let fwd_count = forward.len() as u64;
-                let fwd_bytes: u64 = forward.iter().map(|p| p.len() as u64).sum();
+                let (fwd_count, fwd_bytes) = batch_stats(&forward);
                 counters
                     .send_and_record(route.tx, forward, fwd_count, fwd_bytes)
                     .await;
             }
 
             if !expired.is_empty() {
-                let exp_count = expired.len() as u64;
-                let exp_bytes: u64 = expired.iter().map(|p| p.len() as u64).sum();
+                let (exp_count, exp_bytes) = batch_stats(&expired);
                 counters.record_drop(DropReason::TtlExpired, exp_count, exp_bytes);
                 if send_with_backpressure(input_tx, expired, |event| match event {
                     SendEvent::Waited(waited) => counters.record_queue_full(waited),

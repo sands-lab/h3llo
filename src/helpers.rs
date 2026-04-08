@@ -55,6 +55,14 @@ pub(crate) fn alloc_packet_buf(data: &[u8]) -> PooledBuf {
     buf
 }
 
+/// Returns `(packet_count, total_bytes)` for a batch of pooled buffers.
+pub(crate) fn batch_stats(batch: &[PooledBuf]) -> (u64, u64) {
+    (
+        batch.len() as u64,
+        batch.iter().map(|p| p.len() as u64).sum(),
+    )
+}
+
 /// Retries an async I/O expression on transient errors (`Interrupted`, `WouldBlock`).
 ///
 /// `Interrupted` errors retry immediately (no yield). `WouldBlock` errors

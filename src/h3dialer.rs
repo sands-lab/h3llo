@@ -503,15 +503,7 @@ mod tests {
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = DialContext {
-            peer_id: peer_id.to_string(),
-            tun_if: String::new(),
-            tun_mtu: default_mtu().into(),
-            tuning,
-            udp_rt: tokio::runtime::Handle::current(),
-            crypto_rt: tokio::runtime::Handle::current(),
-            events_tx,
-        };
+        let ctx = DialContext::test(peer_id, tuning, events_tx);
 
         let event = dial_h3_client(&peer_h3, bound_addr, &ctx, &probe, ingress_tx)
             .await
@@ -559,15 +551,7 @@ mod tests {
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let ctx = DialContext {
-            peer_id: peer_id.to_string(),
-            tun_if: String::new(),
-            tun_mtu: default_mtu().into(),
-            tuning,
-            udp_rt: tokio::runtime::Handle::current(),
-            crypto_rt: tokio::runtime::Handle::current(),
-            events_tx,
-        };
+        let ctx = DialContext::test(peer_id, tuning, events_tx);
 
         let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
 
@@ -788,15 +772,7 @@ mod tests {
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = DialContext {
-            peer_id: peer_id.to_string(),
-            tun_if: String::new(),
-            tun_mtu: default_mtu().into(),
-            tuning,
-            udp_rt: tokio::runtime::Handle::current(),
-            crypto_rt: tokio::runtime::Handle::current(),
-            events_tx,
-        };
+        let ctx = DialContext::test(peer_id, tuning, events_tx);
 
         let event = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx)
             .await
@@ -823,15 +799,7 @@ mod tests {
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = DialContext {
-            peer_id: peer_id.to_string(),
-            tun_if: String::new(),
-            tun_mtu: default_mtu().into(),
-            tuning,
-            udp_rt: tokio::runtime::Handle::current(),
-            crypto_rt: tokio::runtime::Handle::current(),
-            events_tx,
-        };
+        let ctx = DialContext::test(peer_id, tuning, events_tx);
 
         let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
 

@@ -22,7 +22,7 @@ use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 /// Headroom reserved in every datapath PooledBuf.
 ///
-use crate::helpers::{alloc_packet_buf, alloc_uninit_packet_buf, HEADROOM};
+use crate::helpers::{alloc_packet_buf, alloc_uninit_packet_buf, batch_stats, HEADROOM};
 
 // Compile-time guard: TunBuf::prepend_hdr relies on HEADROOM being sufficient
 // to prepend a zeroed virtio_net_hdr via add_prefix without allocation.
@@ -487,8 +487,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                             if batch.is_empty() {
                                 continue;
                             }
-                            let total_bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
-                            let pkt_count = batch.len() as u64;
+                            let (pkt_count, total_bytes) = batch_stats(&batch);
                             if !counters.send_and_record(&output_tx, batch, pkt_count, total_bytes).await {
                                 info!(tun = %tun_name, "TUN RX: router channel closed, shutting down");
                                 return Ok(());
@@ -501,7 +500,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Metrics(counters.snapshot(None, None))).is_err() {
+                    if !counters.emit(&events_tx, None, None) {
                         return Ok(()); // Events channel closed during shutdown
                     }
                 }
@@ -564,7 +563,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Metrics(counters.snapshot(None, None))).is_err() {
+                    if !counters.emit(&events_tx, None, None) {
                         return Ok(()); // Events channel closed during shutdown
                     }
                 }

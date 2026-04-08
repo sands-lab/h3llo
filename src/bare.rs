@@ -7,6 +7,7 @@ use crate::actor::ActorExitResult;
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
 use crate::config::{Tuning, UdpEndpoint};
 use crate::events::{BareConnectedEvent, DialContext, Endpoint, Event};
+use crate::helpers::batch_stats;
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::udp;
 use std::collections::HashSet;
@@ -107,8 +108,7 @@ fn spawn_bare_filter(
                         info!("bare RX: UDP channel closed, shutting down");
                         return Ok(());
                     };
-                    let count = batch.len() as u64;
-                    let bytes: u64 = batch.iter().map(|p| p.len() as u64).sum();
+                    let (count, bytes) = batch_stats(&batch);
                     if !accepted_sources.contains(&remote.ip()) {
                         counters.record_drop(DropReason::DisallowedSource, count, bytes);
                         continue;
@@ -128,7 +128,7 @@ fn spawn_bare_filter(
                     accepted_sources = update;
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Metrics(counters.snapshot(None, None))).is_err() {
+                    if !counters.emit(&events_tx, None, None) {
                         return Ok(());
                     }
                 }
@@ -219,8 +219,7 @@ pub(crate) fn spawn_bare_tx(
                         return Ok(());
                     };
                     if packets.is_empty() { continue; }
-                    let count = packets.len() as u64;
-                    let bytes: u64 = packets.iter().map(|p| p.len() as u64).sum();
+                    let (count, bytes) = batch_stats(&packets);
                     // Record success AFTER send — avoids inflating metrics on channel close.
                     match udp_tx.send((destination, packets)).await {
                         Ok(()) => counters.record_success(count, bytes),
@@ -231,9 +230,7 @@ pub(crate) fn spawn_bare_tx(
                     }
                 }
                 _ = ticker.tick() => {
-                    if events_tx.send(Event::Metrics(
-                        counters.snapshot(Some(&peer_id), Some(destination))
-                    )).is_err() {
+                    if !counters.emit(&events_tx, Some(&peer_id), Some(destination)) {
                         return Ok(());
                     }
                 }
