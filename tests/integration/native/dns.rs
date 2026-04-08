@@ -16,7 +16,7 @@ const RESOLVER_TIMEOUT: Duration = Duration::from_secs(5);
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 use h3llo::actor::ActorExitResult;
-use h3llo::config::{LocalDns, Tuning};
+use h3llo::config::{DnsTuning, LocalDns, Tuning};
 use h3llo::dns::{make_dns, spawn_dns, DnsCommand};
 use h3llo::events::Event;
 use h3llo::test_utils::FakeRouteProbe;
@@ -101,7 +101,10 @@ async fn spawn_resolver(
 
     let probe = FakeRouteProbe::noop();
     let tuning = Tuning {
-        dns_query_timeout: timeout,
+        dns: DnsTuning {
+            dns_query_timeout: timeout,
+            ..DnsTuning::default()
+        },
         ..Tuning::default()
     };
     let dns_actor = make_dns(&local_dns, None, &tuning, &probe)
