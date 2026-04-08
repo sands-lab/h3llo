@@ -101,7 +101,7 @@ fn validate_server_auth(
 
 /// Creates a quiche QUIC server configuration with TLS credentials.
 fn make_server_quiche_config(
-    h3: &H3Tuning,
+    h3_tuning: &H3Tuning,
     max_udp_payload: usize,
     cert_path: &Path,
     key_path: &Path,
@@ -122,7 +122,7 @@ fn make_server_quiche_config(
                 .ok_or_else(|| ServerError::Config("invalid key path encoding".into()))?,
         )
         .map_err(|e| ServerError::Config(format!("key: {e}")))?;
-    apply_transport_config(&mut config, h3, max_udp_payload)
+    apply_transport_config(&mut config, h3_tuning, max_udp_payload)
         .map_err(|e| ServerError::Config(format!("transport config: {e}")))?;
     Ok(config)
 }
