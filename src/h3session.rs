@@ -297,7 +297,7 @@ fn decode_qsi(buf: &[u8]) -> Option<(u64, usize)> {
 /// builders used by h3dialer and h3listener integration tests.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::config::{H3Endpoint, PeerH3, Tuning};
+    use crate::config::{H3Endpoint, H3Tuning, PeerH3, Tuning};
     use std::net::SocketAddr;
 
     /// Test certificate bundle with temporary files.
@@ -346,8 +346,11 @@ pub(crate) mod test_support {
     /// Returns `Tuning` with `h3_insecure_skip_verify: true` for tests.
     pub fn insecure_tuning() -> Tuning {
         Tuning {
-            h3_insecure_skip_verify: true,
-            ..Default::default()
+            h3: H3Tuning {
+                h3_insecure_skip_verify: true,
+                ..H3Tuning::default()
+            },
+            ..Tuning::default()
         }
     }
 

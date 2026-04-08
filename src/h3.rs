@@ -49,12 +49,12 @@ fn make_quic_settings(tuning: &Tuning, tun_mtu: u16) -> QuicSettings {
     let quic_udp_payload_size = tun_mtu as usize + CONNECT_IP_OVERHEAD;
     let mut s = QuicSettings::default();
     s.enable_dgram = true;
-    s.handshake_timeout = Some(tuning.h3_handshake_timeout);
-    s.max_idle_timeout = Some(tuning.h3_max_idle_timeout);
+    s.handshake_timeout = Some(tuning.h3.h3_handshake_timeout);
+    s.max_idle_timeout = Some(tuning.h3.h3_max_idle_timeout);
     s.max_send_udp_payload_size = quic_udp_payload_size;
     s.max_recv_udp_payload_size = quic_udp_payload_size;
-    s.cc_algorithm = tuning.h3_cc_algorithm.clone();
-    s.enable_pacing = tuning.h3_enable_pacing;
+    s.cc_algorithm = tuning.h3.h3_cc_algorithm.clone();
+    s.enable_pacing = tuning.h3.h3_enable_pacing;
     s
 }
 
@@ -494,7 +494,7 @@ pub async fn dial_h3<P: RouteProbe>(
         tun_if,
         peer_h3.bindif.as_deref(),
         probe,
-        tuning.socket_buffer_bytes(),
+        tuning.io.socket_buffer_bytes(),
     )
     .await
     .map_err(|e| DialError::Socket(e.to_string()))?;
@@ -502,7 +502,7 @@ pub async fn dial_h3<P: RouteProbe>(
     // Configure QUIC settings
     let mut quic_settings = make_quic_settings(tuning, tun_mtu);
     // Only disable verification when explicitly requested (testing only)
-    if !tuning.h3_insecure_skip_verify {
+    if !tuning.h3.h3_insecure_skip_verify {
         quic_settings.verify_peer = true;
     }
 
@@ -528,7 +528,7 @@ pub async fn dial_h3<P: RouteProbe>(
         .map_err(|e: std::io::Error| DialError::Socket(e.to_string()))?;
     // Enable GSO/GRO on Linux for better UDP throughput when configured.
     #[cfg(target_os = "linux")]
-    if tuning.udp_enable_offload {
+    if tuning.io.udp_enable_offload {
         socket.apply_max_capabilities();
     }
 
@@ -570,7 +570,7 @@ pub async fn dial_h3<P: RouteProbe>(
     }
 
     // Wait for response headers and NewFlow event with timeout
-    let handshake_result = match time::timeout(tuning.h3_handshake_timeout, async {
+    let handshake_result = match time::timeout(tuning.h3.h3_handshake_timeout, async {
         // These three fields are kept as separate Options (rather than a single
         // Option<(_, _, _)>) because the NewFlow delivery may not be atomic —
         // per-field errors aid debugging when a partial state is observed.
@@ -669,7 +669,7 @@ pub async fn dial_h3<P: RouteProbe>(
         }
         Err(_) => {
             close_quic_connection(&quic_cmd_tx);
-            return Err(DialError::Timeout(tuning.h3_handshake_timeout));
+            return Err(DialError::Timeout(tuning.h3.h3_handshake_timeout));
         }
     };
 
@@ -1110,14 +1110,14 @@ pub fn spawn_h3_listener(
         .try_into()
         .expect("infallible: already-bound socket -> QuicListener");
     #[cfg(target_os = "linux")]
-    if tuning.udp_enable_offload {
+    if tuning.io.udp_enable_offload {
         quic_listener.apply_max_capabilities();
     }
     let mut listeners = listen_with_capabilities([quic_listener], conn_params, DefaultMetrics)
         .expect("infallible: listen on already-bound socket");
 
     let mut accept_stream = listeners.remove(0);
-    let h3_handshake_timeout = tuning.h3_handshake_timeout;
+    let h3_handshake_timeout = tuning.h3.h3_handshake_timeout;
 
     let handle = tokio::spawn(async move {
         loop {
@@ -1206,7 +1206,7 @@ mod tests {
     use super::*;
     use crate::auth::generate_bearer_auth;
     use crate::bind::test_support::FakeRouteProbe;
-    use crate::config::default_mtu;
+    use crate::config::{default_mtu, H3Tuning};
     use test_support::{await_server_connection, insecure_tuning, test_peer_h3, TestCertBundle};
 
     // ========== Auth Helper Tests ==========
@@ -1307,7 +1307,10 @@ mod tests {
     #[test]
     fn make_quic_settings_applies_handshake_timeout() {
         let tuning = Tuning {
-            h3_handshake_timeout: Duration::from_secs(7),
+            h3: H3Tuning {
+                h3_handshake_timeout: Duration::from_secs(7),
+                ..H3Tuning::default()
+            },
             ..Tuning::default()
         };
 

@@ -152,7 +152,7 @@ pub(crate) fn make_h3_dispatcher(
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
 ) -> Result<(H3Dispatcher, SocketAddr), ServerError> {
-    let std_socket = make_server_udp_socket(listen_addr, tuning.socket_buffer_bytes())
+    let std_socket = make_server_udp_socket(listen_addr, tuning.io.socket_buffer_bytes())
         .map_err(|e| ServerError::Socket(e.to_string()))?;
     let bound_addr = std_socket
         .local_addr()
@@ -162,7 +162,7 @@ pub(crate) fn make_h3_dispatcher(
 
     let (udp_rx, udp_tx) = {
         let _guard = udp_rt.enter();
-        udp::make_udp(std_socket, max_udp_payload, tuning.udp_enable_offload)
+        udp::make_udp(std_socket, max_udp_payload, tuning.io.udp_enable_offload)
             .map_err(|e| ServerError::Socket(format!("make_udp: {e}")))?
     };
 
@@ -490,7 +490,7 @@ impl DispatcherRuntime {
         );
 
         // Create per-connection channels.
-        let depth = self.tuning.packet_queue_depth;
+        let depth = self.tuning.io.packet_queue_depth;
         let (packet_tx, packet_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(depth);
 
         // Register CIDs before spawning actor so subsequent packets route correctly.
@@ -501,7 +501,7 @@ impl DispatcherRuntime {
         let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(depth);
         let channels = self.io.clone();
         let peer_tokens = peer_tokens.clone();
-        let handshake_timeout = self.tuning.h3_handshake_timeout;
+        let handshake_timeout = self.tuning.h3.h3_handshake_timeout;
 
         let mut engine = H3Engine {
             conn,
@@ -520,8 +520,8 @@ impl DispatcherRuntime {
                 max_udp_payload: self.max_udp_payload,
             },
             run_state: RunState::new(),
-            metrics_interval: self.tuning.metrics_push_interval,
-            keepalive_interval: self.tuning.h3_keepalive_interval,
+            metrics_interval: self.tuning.io.metrics_push_interval,
+            keepalive_interval: self.tuning.h3.h3_keepalive_interval,
             origin: ConnOrigin::Server,
             udp_cancel: None,
         };
@@ -603,10 +603,10 @@ pub fn spawn_h3_dispatcher(
     let (udp_recv_rx, udp_send_tx) = {
         let _guard = udp_rt.enter();
         let (udp_recv_tx, udp_recv_rx) =
-            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
+            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
         let cancel = CancellationToken::new();
         let _recv_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx, cancel);
-        let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth);
+        let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.io.packet_queue_depth);
         (udp_recv_rx, udp_send_tx)
     };
 

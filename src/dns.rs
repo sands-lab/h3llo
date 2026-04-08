@@ -236,7 +236,7 @@ pub async fn make_dns<P: RouteProbe>(
         tun_if,
         local_dns.bindif.as_deref(),
         probe,
-        tuning.socket_buffer_bytes(),
+        tuning.io.socket_buffer_bytes(),
     )
     .await
     .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
@@ -246,11 +246,11 @@ pub async fn make_dns<P: RouteProbe>(
     Ok(DnsActor {
         server,
         socket,
-        timeout: tuning.dns_query_timeout,
-        refresh_interval: tuning.dns_refresh_interval,
-        snapshot_delay: tuning.dns_snapshot_delay,
-        min_ttl: tuning.dns_min_ttl,
-        query_interval: tuning.dns_query_interval,
+        timeout: tuning.dns.dns_query_timeout,
+        refresh_interval: tuning.dns.dns_refresh_interval,
+        snapshot_delay: tuning.dns.dns_snapshot_delay,
+        min_ttl: tuning.dns.dns_min_ttl,
+        query_interval: tuning.dns.dns_query_interval,
     })
 }
 

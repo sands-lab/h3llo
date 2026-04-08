@@ -509,8 +509,8 @@ impl Orchestrator {
             let _guard = tun_rt.handle().enter();
             tun::make_tun(
                 &config.local.tun,
-                tuning.tun_tx_queue_len,
-                tuning.tun_enable_offload,
+                tuning.io.tun_tx_queue_len,
+                tuning.io.tun_enable_offload,
             )
             .await
             .map_err(|err| OrchestratorError::Tun(err.to_string()))?
@@ -536,8 +536,8 @@ impl Orchestrator {
             tun::spawn_tun_tx(
                 tun_writer,
                 events_tx.clone(),
-                tuning.metrics_push_interval,
-                tuning.packet_queue_depth,
+                tuning.io.metrics_push_interval,
+                tuning.io.packet_queue_depth,
             )
         };
 
@@ -548,8 +548,8 @@ impl Orchestrator {
                 routing,
                 input_tx.clone(),
                 events_tx.clone(),
-                tuning.metrics_push_interval,
-                tuning.packet_queue_depth,
+                tuning.io.metrics_push_interval,
+                tuning.io.packet_queue_depth,
             )
         };
 
@@ -560,7 +560,7 @@ impl Orchestrator {
                 tun_reader,
                 output_tx,
                 events_tx.clone(),
-                tuning.metrics_push_interval,
+                tuning.io.metrics_push_interval,
             )
         };
 

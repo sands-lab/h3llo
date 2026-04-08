@@ -41,8 +41,8 @@ pub fn make_bare_rx(
     udp_rt: &RuntimeHandle,
 ) -> Result<udp::UdpRx, UdpError> {
     let _guard = udp_rt.enter();
-    let socket = make_server_udp_socket(listen_addr, tuning.socket_buffer_bytes())?;
-    let (udp_rx, _udp_tx) = udp::make_udp(socket, tun_mtu, tuning.udp_enable_offload)?;
+    let socket = make_server_udp_socket(listen_addr, tuning.io.socket_buffer_bytes())?;
+    let (udp_rx, _udp_tx) = udp::make_udp(socket, tun_mtu, tuning.io.udp_enable_offload)?;
     Ok(udp_rx)
 }
 
@@ -93,9 +93,9 @@ fn spawn_bare_filter(
     JoinHandle<ActorExitResult>,
 ) {
     let (input_tx, mut udp_rx) =
-        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
+        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-    let interval = tuning.metrics_push_interval;
+    let interval = tuning.io.metrics_push_interval;
 
     let handle = tokio::spawn(async move {
         info!("bare RX filter actor started");
@@ -160,14 +160,14 @@ pub(crate) async fn dial_bare_tx<P: RouteProbe>(
         Some(ctx.tun_if.as_str()),
         bindif,
         probe,
-        ctx.tuning.socket_buffer_bytes(),
+        ctx.tuning.io.socket_buffer_bytes(),
     )
     .await?;
 
     let (udp_send_tx, udp_tx_handle) = {
         let _guard = ctx.udp_rt.enter();
-        let (_rx, tx) = udp::make_udp(std_socket, ctx.tun_mtu, ctx.tuning.udp_enable_offload)?;
-        udp::spawn_udp_tx(tx, ctx.tuning.packet_queue_depth)
+        let (_rx, tx) = udp::make_udp(std_socket, ctx.tun_mtu, ctx.tuning.io.udp_enable_offload)?;
+        udp::spawn_udp_tx(tx, ctx.tuning.io.packet_queue_depth)
     };
     let (egress_tx, bare_tx_handle) = {
         let _guard = ctx.crypto_rt.enter();
@@ -203,8 +203,8 @@ pub(crate) fn spawn_bare_tx(
     events_tx: mpsc::UnboundedSender<Event>,
     tuning: &Tuning,
 ) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
-    let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.packet_queue_depth);
-    let metrics_interval = tuning.metrics_push_interval;
+    let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.io.packet_queue_depth);
+    let metrics_interval = tuning.io.metrics_push_interval;
 
     let handle = tokio::spawn(async move {
         info!(peer = %peer_id, dest = %destination, "bare TX actor started");
@@ -244,6 +244,7 @@ pub(crate) fn spawn_bare_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IoTuning;
     use crate::events::Event;
     use crate::metrics::Direction;
     use std::net::Ipv4Addr;
@@ -252,8 +253,11 @@ mod tests {
 
     fn test_tuning(interval: Duration) -> Tuning {
         Tuning {
-            metrics_push_interval: interval,
-            packet_queue_depth: 4,
+            io: IoTuning {
+                metrics_push_interval: interval,
+                packet_queue_depth: 4,
+                ..IoTuning::default()
+            },
             ..Tuning::default()
         }
     }
