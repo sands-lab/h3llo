@@ -16,7 +16,7 @@ Findings are grouped into batches ordered by priority and dependency. Each batch
 | **1** | **Critical bug fixes**: ~~TUN RX infinite loop~~, ~~H3v2Connected silent drop~~, ~~auth log level~~ (§1.2 auth timing, §1.4 stale routes: skipped) | §1.2–1.6 | ✅ |
 | **2** | **Observability**: ~~bare.rs + udp.rs zero tracing~~, ~~logging level fixes~~, ~~silent drop handling~~ (router.rs send_and_record: kept as-is, already tracked via metrics) | §1.7, §4.1, §4.2 | ✅ |
 | **3** | **Cleanup**: ~~visibility narrowing~~ (14 items), ~~redundant derives~~, ~~stale docs~~ (§2.1 H3v2→H3 rename: deferred to batch 6) | §6, §9, §10 | ✅ |
-| **4** | **Type-level refinements**: `PeerTransport` enum, `CcAlgorithm` enum, `ConnectState` enum, `ConnParams` removal, other type/API fixes | §2.2, §2.11, §2.12, §2.14, §7 | ⬚ |
+| **4** | **Type-level refinements**: ~~`PeerTransport` enum~~, ~~`ConnParams` removal~~, ~~`AuthError` enum~~, ~~`RouteProbe` IpAddr~~ (§2.11 CcAlgorithm, §2.12 ConnectState: skipped) | §2.2, §2.14, §7 | ✅ |
 | **5** | **Code extraction & dedup**: metrics_encode.rs, buf.rs, serde macro, validation helper, TUN dedup, cross-file dedup patterns | §2.3, §2.4, §2.9, §2.10, §2.15, §2.16, §3 | ⬚ |
 | **6** | **h3.rs deletion**: migrate interop tests, delete 2228-LOC deprecated module, remove duplicated header validation | §1.1, §2.13, §11.1 | ⬚ |
 | **7** | **Structural refactoring**: config.rs split, Tuning sub-structs, ActorChannels, ConnectContext, handshake loop dedup, other §2.17 items | §2.5–2.8, §2.17, §11.2–11.5, §12, §14 | ⬚ |

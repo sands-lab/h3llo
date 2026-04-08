@@ -7,7 +7,7 @@
 //! Retained only for interop tests; will be deleted once tests are migrated.
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::auth::{generate_bearer_auth, validate_connect_auth};
+use crate::auth::{generate_bearer_auth, validate_connect_auth, AuthError};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::{ConnOrigin, Event, H3ConnectedEvent};
@@ -71,7 +71,7 @@ const H3_RX_BATCH_SIZE: usize = 128;
 fn extract_and_validate_auth(
     headers: &[Header],
     tokens: &HashMap<String, String>,
-) -> Result<String, &'static str> {
+) -> Result<String, AuthError> {
     let auth_header = headers
         .iter()
         .find(|h| h.name().eq_ignore_ascii_case(b"authorization"))
@@ -1255,7 +1255,7 @@ mod tests {
 
     #[test]
     fn pooled_buf_headroom_encode_prepends_context_id() {
-        use crate::tun::alloc_packet_buf;
+        use crate::helpers::alloc_packet_buf;
 
         let payload = b"test payload";
         let mut buf = alloc_packet_buf(payload);
@@ -1290,7 +1290,7 @@ mod tests {
 
     #[test]
     fn pooled_buf_roundtrip_encode_decode() {
-        use crate::tun::alloc_packet_buf;
+        use crate::helpers::alloc_packet_buf;
 
         let original = b"ip packet data";
         let mut buf = alloc_packet_buf(original);
@@ -1886,7 +1886,7 @@ mod tests {
             spawn_h3_rx(server_rx, server_router_tx, events_tx, metrics_interval);
 
         // Send test packet (allocate with headroom for H3 TX encoding)
-        use crate::tun::alloc_packet_buf;
+        use crate::helpers::alloc_packet_buf;
         let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
         let pkt = alloc_packet_buf(&test_packet);
         client_egress_tx.send(vec![pkt]).await.expect("send failed");
@@ -1951,7 +1951,7 @@ mod tests {
         // Split client connection
         let (client_rx, client_tx) = client_conn.into_actors();
 
-        use crate::tun::alloc_packet_buf;
+        use crate::helpers::alloc_packet_buf;
 
         // Client TX -> Server RX
         let (client_send_tx, _) = spawn_h3_tx(
@@ -2084,7 +2084,7 @@ mod tests {
     #[tokio::test]
     async fn h3_tx_batch_counting_try_send() {
         use crate::events::Event;
-        use crate::tun::alloc_packet_buf;
+        use crate::helpers::alloc_packet_buf;
         use tokio_util::sync::PollSender;
 
         // Large capacity ensures all try_send calls succeed without backpressure.
@@ -2148,7 +2148,7 @@ mod tests {
     #[tokio::test]
     async fn h3_tx_backpressure_splits_batch() {
         use crate::events::Event;
-        use crate::tun::alloc_packet_buf;
+        use crate::helpers::alloc_packet_buf;
         use tokio_util::sync::PollSender;
 
         // Channel capacity = 1 to guarantee backpressure on batch of 3.

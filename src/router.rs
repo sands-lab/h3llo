@@ -532,9 +532,9 @@ async fn handle_ingress_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{PeerBare, PeerTun, UdpEndpoint};
+    use crate::config::{PeerBare, PeerTransport, PeerTun, UdpEndpoint};
+    use crate::helpers::alloc_packet_buf;
     use crate::helpers::test_packets::{make_ipv4_packet, make_ipv4_with_ttl, make_ipv6_packet};
-    use crate::tun::alloc_packet_buf;
     use ipnet::IpNet;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use tokio::sync::mpsc;
@@ -561,8 +561,7 @@ mod tests {
     fn bare_peer(id: &str, allowed: &[&str]) -> Peer {
         Peer {
             id: id.to_string(),
-            h3: None,
-            bare: Some(PeerBare {
+            transport: PeerTransport::Bare(PeerBare {
                 endpoint: UdpEndpoint {
                     host: "127.0.0.1".to_string(),
                     port: 5353,

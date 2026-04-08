@@ -97,20 +97,73 @@ pub struct LocalTun {
     pub mtu: u16,
 }
 
+/// Peer transport selection: exactly one of H3 or BareUDP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerTransport {
+    /// HTTP/3 transport.
+    H3(PeerH3),
+    /// BareUDP transport.
+    Bare(PeerBare),
+}
+
 /// Peer configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawPeer", into = "RawPeer")]
 pub struct Peer {
     /// Remote node identifier.
     pub id: String,
-    /// HTTP/3 transport options.
-    #[serde(default)]
-    pub h3: Option<PeerH3>,
-    /// BareUDP transport options.
-    #[serde(default)]
-    pub bare: Option<PeerBare>,
+    /// Transport configuration (exactly one of H3 or BareUDP).
+    pub transport: PeerTransport,
     /// Peer routing details.
     pub tun: PeerTun,
+}
+
+/// Wire format for [`Peer`] serde (de)serialization.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPeer {
+    id: String,
+    #[serde(default)]
+    h3: Option<PeerH3>,
+    #[serde(default)]
+    bare: Option<PeerBare>,
+    tun: PeerTun,
+}
+
+impl TryFrom<RawPeer> for Peer {
+    type Error = String;
+    fn try_from(raw: RawPeer) -> Result<Self, String> {
+        let transport = match (raw.h3, raw.bare) {
+            (Some(h3), None) => PeerTransport::H3(h3),
+            (None, Some(bare)) => PeerTransport::Bare(bare),
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(format!(
+                    "peer '{}' must configure exactly one of h3 or bare",
+                    raw.id
+                ));
+            }
+        };
+        Ok(Peer {
+            id: raw.id,
+            transport,
+            tun: raw.tun,
+        })
+    }
+}
+
+impl From<Peer> for RawPeer {
+    fn from(peer: Peer) -> Self {
+        let (h3, bare) = match peer.transport {
+            PeerTransport::H3(h3) => (Some(h3), None),
+            PeerTransport::Bare(bare) => (None, Some(bare)),
+        };
+        RawPeer {
+            id: peer.id,
+            h3,
+            bare,
+            tun: peer.tun,
+        }
+    }
 }
 
 /// HTTP/3 options per peer.
@@ -155,7 +208,7 @@ pub struct PeerTun {
 ///
 /// All fields have sensible defaults. The entire section is optional in YAML.
 /// When partially specified, unset fields use their defaults.
-/// Duration fields are serialized as integer seconds in YAML unless noted otherwise.
+/// Duration fields use human-readable strings (e.g. `"3s"`, `"500ms"`, `"2m"`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Tuning {
@@ -204,54 +257,54 @@ pub struct Tuning {
     ///
     /// Controls how often the orchestrator prunes stale bounds and attempts
     /// reconnections for uncovered IPs.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub reconcile_interval: Duration,
     /// Minimum backoff duration between reconnection attempts per IP (default: 3s).
     ///
     /// The backoff grows exponentially from this base value after each failed attempt.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub reconnect_backoff_min: Duration,
     /// Maximum backoff duration between reconnection attempts per IP (default: 60s).
     ///
     /// The exponential backoff is capped at this ceiling.
     /// Must be greater than or equal to `reconnect_backoff_min`.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub reconnect_backoff_max: Duration,
-    /// Metrics push interval in milliseconds (default: 1000ms).
-    #[serde(with = "serde_duration_millis")]
+    /// Metrics push interval (default: `"1s"`).
+    #[serde(with = "humantime_serde")]
     pub metrics_push_interval: Duration,
     /// Metrics log interval in seconds (default: 3s).
     ///
     /// Controls how often the orchestrator logs QUIC and transport metrics at
     /// `debug!` level. Independent of `metrics_push_interval`, which controls
     /// how often actors emit metrics events.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub metrics_log_interval: Duration,
     /// DNS query timeout (default: 2s).
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub dns_query_timeout: Duration,
     /// DNS refresh interval; 0 disables (default: 120s).
     ///
     /// **Warning:** `dns_min_ttl` should be at least `2 × dns_refresh_interval`.
     /// Otherwise, cached IPs may expire before the next refresh re-queries them,
     /// causing connections to be pruned and re-established in a loop.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub dns_refresh_interval: Duration,
     /// Delay before emitting a DNS snapshot after the first state change (default: 100ms).
     ///
     /// After a DNS reply marks the state dirty, the resolver waits this duration
     /// before emitting a snapshot to the orchestrator. Subsequent replies within
     /// the window are coalesced into the same snapshot.
-    #[serde(with = "serde_duration_millis")]
+    #[serde(with = "humantime_serde")]
     pub dns_snapshot_delay: Duration,
     /// Minimum interval between consecutive DNS query sends (default: 50ms).
     ///
     /// Serializes outbound DNS queries to avoid triggering rate limits on
     /// public resolvers (e.g., Cloudflare 1.1.1.1). A sleep of this duration
     /// is inserted before each outbound query send.
-    #[serde(with = "serde_duration_millis")]
+    #[serde(with = "humantime_serde")]
     pub dns_query_interval: Duration,
-    /// Minimum TTL floor in seconds for DNS records (default: 300).
+    /// Minimum TTL floor for DNS records (default: `"5m"`).
     ///
     /// DNS responses with TTL below this value are raised to this floor
     /// to prevent excessive re-queries. Recursive DNS servers return the
@@ -262,15 +315,16 @@ pub struct Tuning {
     ///
     /// **Warning:** Should be at least `2 × dns_refresh_interval` to
     /// guarantee that every refresh cycle renews the TTL before expiry.
-    pub dns_min_ttl: u32,
+    #[serde(with = "humantime_serde")]
+    pub dns_min_ttl: Duration,
     /// HTTP/3 handshake timeout (default: 5s).
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub h3_handshake_timeout: Duration,
     /// HTTP/3 max idle timeout (default: 60s).
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub h3_max_idle_timeout: Duration,
     /// HTTP/3 keepalive interval (default: 20s). Sends QUIC PING frames to prevent idle timeout.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub h3_keepalive_interval: Duration,
     /// QUIC congestion control algorithm (default: `"none"`).
     ///
@@ -314,7 +368,7 @@ impl Default for Tuning {
             dns_refresh_interval: Duration::from_secs(120),
             dns_snapshot_delay: Duration::from_millis(100),
             dns_query_interval: Duration::from_millis(50),
-            dns_min_ttl: 300,
+            dns_min_ttl: Duration::from_secs(300),
             h3_handshake_timeout: Duration::from_secs(5),
             h3_max_idle_timeout: Duration::from_secs(60),
             h3_keepalive_interval: Duration::from_secs(20),
@@ -330,36 +384,6 @@ impl Tuning {
     /// Returns socket buffer size in bytes, or 0 to skip configuration.
     pub fn socket_buffer_bytes(&self) -> usize {
         self.socket_buffer_size.saturating_mul(1024 * 1024)
-    }
-}
-
-/// Serde helper: serializes `Duration` as integer seconds in YAML.
-mod serde_duration_secs {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::time::Duration;
-
-    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u64(d.as_secs())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
-        let secs = u64::deserialize(d)?;
-        Ok(Duration::from_secs(secs))
-    }
-}
-
-/// Serde helper: serializes `Duration` as integer milliseconds in YAML.
-mod serde_duration_millis {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::time::Duration;
-
-    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u64(d.as_millis() as u64)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
-        let millis = u64::deserialize(d)?;
-        Ok(Duration::from_millis(millis))
     }
 }
 
@@ -397,91 +421,40 @@ impl std::error::Error for ValidationErrors {}
 /// Individual validation error.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
-    /// `tuning.packet_queue_depth` must be > 0 (mpsc::channel(0) panics).
-    #[error("tuning.packet_queue_depth must be greater than 0")]
-    TuningPacketQueueDepthZero,
-    /// A tuning Duration field must be greater than zero.
-    ///
-    /// Zero values cause `tokio::time::interval` panics or semantically
-    /// broken behavior (instant timeouts, no debouncing).
-    #[error("tuning.{field} must be greater than 0")]
-    TuningDurationZero {
-        /// The field name (e.g., "reconcile_interval").
+    /// A field that must be positive is zero.
+    #[error("{field} must be greater than 0")]
+    FieldMustBePositive { field: &'static str },
+    /// Two or more fields have conflicting values.
+    #[error("field conflict: {description}")]
+    FieldConflict { description: String },
+    /// A required field is empty (after trimming whitespace) or has no entries.
+    #[error("{context}: {field} must not be empty")]
+    FieldEmpty {
+        context: String,
         field: &'static str,
     },
-    /// `tuning.h3_keepalive_interval` must be strictly less than `tuning.h3_max_idle_timeout`.
-    #[error(
-        "tuning.h3_keepalive_interval ({keepalive:?}) must be less than \
-         tuning.h3_max_idle_timeout ({idle_timeout:?})"
-    )]
-    H3KeepaliveExceedsIdleTimeout {
-        /// Configured keepalive interval.
-        keepalive: Duration,
-        /// Configured idle timeout.
-        idle_timeout: Duration,
+    /// A string field has leading or trailing whitespace.
+    #[error("{context}: {field} must not have leading or trailing whitespace")]
+    FieldHasWhitespace {
+        context: String,
+        field: &'static str,
     },
-    /// `local.h3.cert` and `local.h3.key` must not be empty when `local.h3` is set.
-    #[error("local.h3.cert and local.h3.key must not be empty when local.h3 is configured")]
-    LocalH3CredentialsMissing,
-    /// TUN addresses are missing.
-    #[error("local.tun.addrs must include at least one address")]
-    MissingLocalTunAddrs,
-    /// Peer identifier is empty.
-    #[error("peer id must not be empty")]
-    PeerIdEmpty { peer_id: String },
-    /// Peer identifier has leading or trailing whitespace.
-    #[error("peer id '{peer_id}' must not have leading or trailing whitespace")]
-    PeerIdHasWhitespace { peer_id: String },
-    /// Duplicate peer identifier.
-    #[error("duplicate peer id '{peer_id}'")]
-    DuplicatePeerId { peer_id: String },
+    /// A field value is duplicated where uniqueness is required.
+    #[error("{context}: duplicate {field} '{value}'")]
+    DuplicateValue {
+        context: String,
+        field: &'static str,
+        value: String,
+    },
     /// Peer token missing or too short.
     #[error("peer '{peer_id}' requires h3.token of at least 12 characters when h3 is configured")]
     PeerTokenTooShort { peer_id: String },
-    /// Peer token has leading or trailing whitespace.
-    #[error("peer '{peer_id}' h3.token must not have leading or trailing whitespace")]
-    PeerTokenHasWhitespace { peer_id: String },
-    /// Duplicate peer token.
-    #[error("duplicate peer token for peer '{peer_id}'")]
-    DuplicatePeerToken { peer_id: String },
-    /// Peer SNI is empty.
-    #[error("peer '{peer_id}' h3.sni must not be empty")]
-    PeerSniEmpty { peer_id: String },
-    /// Peer SNI has leading or trailing whitespace.
-    #[error("peer '{peer_id}' h3.sni must not have leading or trailing whitespace")]
-    PeerSniHasWhitespace { peer_id: String },
-    /// Peer bindif has leading or trailing whitespace.
-    #[error("peer '{peer_id}' h3.bindif must not have leading or trailing whitespace")]
-    PeerBindifHasWhitespace { peer_id: String },
-    /// Peer transport fields conflict.
-    #[error("peer '{peer_id}' must configure exactly one of h3 or bare")]
-    PeerTransportConflict { peer_id: String },
-    /// Allowed IP list missing.
-    #[error("peer '{peer_id}' must include at least one allowed_ips entry")]
-    PeerMissingAllowedIps { peer_id: String },
-    /// Allowed IP entry duplicates another entry on the same peer.
-    #[error("peer '{peer_id}' has duplicate allowed_ips entry '{cidr}'")]
-    PeerDuplicateAllowedIp { peer_id: String, cidr: String },
     /// `tuning.h3_cc_algorithm` is not a recognized congestion control algorithm.
     #[error(
         "tuning.h3_cc_algorithm '{algorithm}' is not recognized \
          (accepted: reno, cubic, bbr, bbr2, none)"
     )]
-    InvalidCcAlgorithm {
-        /// The unrecognized algorithm name.
-        algorithm: String,
-    },
-    /// `reconnect_backoff_min` must not exceed `reconnect_backoff_max`.
-    #[error(
-        "tuning.reconnect_backoff_min ({min:?}) must not exceed \
-         tuning.reconnect_backoff_max ({max:?})"
-    )]
-    BackoffMinExceedsMax {
-        /// Configured minimum.
-        min: Duration,
-        /// Configured maximum.
-        max: Duration,
-    },
+    InvalidCcAlgorithm { algorithm: String },
 }
 
 impl Config {
@@ -505,34 +478,60 @@ impl Config {
 
         // Tuning validation
         if self.tuning.packet_queue_depth == 0 {
-            errors.push(ValidationError::TuningPacketQueueDepthZero);
+            errors.push(ValidationError::FieldMustBePositive {
+                field: "tuning.packet_queue_depth",
+            });
         }
 
         // Duration fields that must be strictly positive.
         // dns_refresh_interval is intentionally excluded: zero disables periodic refresh.
-        let duration_checks: &[(&str, Duration)] = &[
-            ("reconcile_interval", self.tuning.reconcile_interval),
-            ("reconnect_backoff_min", self.tuning.reconnect_backoff_min),
-            ("reconnect_backoff_max", self.tuning.reconnect_backoff_max),
-            ("metrics_push_interval", self.tuning.metrics_push_interval),
-            ("metrics_log_interval", self.tuning.metrics_log_interval),
-            ("dns_query_timeout", self.tuning.dns_query_timeout),
-            ("dns_snapshot_delay", self.tuning.dns_snapshot_delay),
-            ("dns_query_interval", self.tuning.dns_query_interval),
-            ("h3_handshake_timeout", self.tuning.h3_handshake_timeout),
-            ("h3_max_idle_timeout", self.tuning.h3_max_idle_timeout),
-            ("h3_keepalive_interval", self.tuning.h3_keepalive_interval),
+        let duration_checks: &[(&'static str, Duration)] = &[
+            ("tuning.reconcile_interval", self.tuning.reconcile_interval),
+            (
+                "tuning.reconnect_backoff_min",
+                self.tuning.reconnect_backoff_min,
+            ),
+            (
+                "tuning.reconnect_backoff_max",
+                self.tuning.reconnect_backoff_max,
+            ),
+            (
+                "tuning.metrics_push_interval",
+                self.tuning.metrics_push_interval,
+            ),
+            (
+                "tuning.metrics_log_interval",
+                self.tuning.metrics_log_interval,
+            ),
+            ("tuning.dns_query_timeout", self.tuning.dns_query_timeout),
+            ("tuning.dns_snapshot_delay", self.tuning.dns_snapshot_delay),
+            ("tuning.dns_query_interval", self.tuning.dns_query_interval),
+            (
+                "tuning.h3_handshake_timeout",
+                self.tuning.h3_handshake_timeout,
+            ),
+            (
+                "tuning.h3_max_idle_timeout",
+                self.tuning.h3_max_idle_timeout,
+            ),
+            (
+                "tuning.h3_keepalive_interval",
+                self.tuning.h3_keepalive_interval,
+            ),
         ];
         for &(field, dur) in duration_checks {
             if dur.is_zero() {
-                errors.push(ValidationError::TuningDurationZero { field });
+                errors.push(ValidationError::FieldMustBePositive { field });
             }
         }
 
         if self.tuning.h3_keepalive_interval >= self.tuning.h3_max_idle_timeout {
-            errors.push(ValidationError::H3KeepaliveExceedsIdleTimeout {
-                keepalive: self.tuning.h3_keepalive_interval,
-                idle_timeout: self.tuning.h3_max_idle_timeout,
+            errors.push(ValidationError::FieldConflict {
+                description: format!(
+                    "tuning.h3_keepalive_interval ({:?}) must be less than \
+                     tuning.h3_max_idle_timeout ({:?})",
+                    self.tuning.h3_keepalive_interval, self.tuning.h3_max_idle_timeout,
+                ),
             });
         }
 
@@ -546,7 +545,10 @@ impl Config {
         }
 
         // H3-peer-conditional warnings (non-fatal best-practice checks).
-        let has_h3_peers = self.peers.iter().any(|p| p.h3.is_some());
+        let has_h3_peers = self
+            .peers
+            .iter()
+            .any(|p| matches!(p.transport, PeerTransport::H3(_)));
         if has_h3_peers {
             if self.local.tun.mtu > MAX_H3_IPV4_MTU {
                 tracing::warn!(
@@ -569,12 +571,12 @@ impl Config {
         // DNS TTL floor vs refresh interval: if min_ttl < 2× refresh, IPs can
         // expire between refresh cycles, causing repeated connection churn.
         if !self.tuning.dns_refresh_interval.is_zero() {
-            let min_safe_ttl = self.tuning.dns_refresh_interval.as_secs().saturating_mul(2);
-            if (self.tuning.dns_min_ttl as u64) < min_safe_ttl {
+            let min_safe_ttl = self.tuning.dns_refresh_interval.saturating_mul(2);
+            if self.tuning.dns_min_ttl < min_safe_ttl {
                 tracing::warn!(
-                    dns_min_ttl = self.tuning.dns_min_ttl,
-                    dns_refresh_interval = self.tuning.dns_refresh_interval.as_secs(),
-                    recommended_min_ttl = min_safe_ttl,
+                    dns_min_ttl = ?self.tuning.dns_min_ttl,
+                    dns_refresh_interval = ?self.tuning.dns_refresh_interval,
+                    recommended_min_ttl = ?min_safe_ttl,
                     "tuning.dns_min_ttl should be at least 2× tuning.dns_refresh_interval; \
                      otherwise cached IPs may expire before the next refresh, \
                      causing repeated connection pruning and reconnection"
@@ -583,22 +585,27 @@ impl Config {
         }
 
         if self.tuning.reconnect_backoff_min > self.tuning.reconnect_backoff_max {
-            errors.push(ValidationError::BackoffMinExceedsMax {
-                min: self.tuning.reconnect_backoff_min,
-                max: self.tuning.reconnect_backoff_max,
+            errors.push(ValidationError::FieldConflict {
+                description: format!(
+                    "tuning.reconnect_backoff_min ({:?}) must not exceed \
+                     tuning.reconnect_backoff_max ({:?})",
+                    self.tuning.reconnect_backoff_min, self.tuning.reconnect_backoff_max,
+                ),
             });
         }
 
         // H3 validation: cert/key must not be empty when local.h3 is set
         if let Some(h3) = self.local.h3.as_ref() {
-            if h3.cert.trim().is_empty() || h3.key.trim().is_empty() {
-                errors.push(ValidationError::LocalH3CredentialsMissing);
-            }
+            check_trimmed(&h3.cert, "local.h3", "cert", true, &mut errors);
+            check_trimmed(&h3.key, "local.h3", "key", true, &mut errors);
         }
 
-        if self.local.tun.addrs.is_empty() {
-            errors.push(ValidationError::MissingLocalTunAddrs);
-        }
+        check_not_empty(
+            self.local.tun.addrs.is_empty(),
+            "local.tun",
+            "addrs",
+            &mut errors,
+        );
 
         if let Err(ValidationErrors(peer_errors)) = validate_peers(&self.peers) {
             errors.extend(peer_errors);
@@ -612,6 +619,61 @@ impl Config {
     }
 }
 
+/// Pushes a `FieldEmpty` error if the collection/field is empty.
+fn check_not_empty(
+    is_empty: bool,
+    context: &str,
+    field: &'static str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if is_empty {
+        errors.push(ValidationError::FieldEmpty {
+            context: context.to_string(),
+            field,
+        });
+    }
+}
+
+/// Pushes a `DuplicateValue` error if `value` is already in `seen`.
+fn check_unique<T: Eq + std::hash::Hash + Clone + ToString>(
+    seen: &mut HashSet<T>,
+    value: &T,
+    context: &str,
+    field: &'static str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !seen.insert(value.clone()) {
+        errors.push(ValidationError::DuplicateValue {
+            context: context.to_string(),
+            field,
+            value: value.to_string(),
+        });
+    }
+}
+
+/// Validates a string field for emptiness and leading/trailing whitespace.
+fn check_trimmed(
+    value: &str,
+    context: &str,
+    field: &'static str,
+    check_empty: bool,
+    errors: &mut Vec<ValidationError>,
+) {
+    if check_empty && value.trim().is_empty() {
+        errors.push(ValidationError::FieldEmpty {
+            context: context.to_string(),
+            field,
+        });
+        return;
+    }
+    if value != value.trim() {
+        errors.push(ValidationError::FieldHasWhitespace {
+            context: context.to_string(),
+            field,
+        });
+    }
+}
+
 /// Validates a peer list in isolation (ID, token, transport, allowed_ips).
 pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
     let mut errors = Vec::new();
@@ -619,81 +681,45 @@ pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
     let mut seen_peer_tokens = HashSet::new();
 
     for peer in peers {
-        // Peer ID validation: must be non-empty and have no leading/trailing whitespace
-        if peer.id.trim().is_empty() {
-            errors.push(ValidationError::PeerIdEmpty {
-                peer_id: peer.id.clone(),
-            });
-        } else if peer.id != peer.id.trim() {
-            errors.push(ValidationError::PeerIdHasWhitespace {
-                peer_id: peer.id.clone(),
-            });
-        }
+        let ctx = format!("peer '{}'", peer.id);
 
-        if !seen_peer_ids.insert(peer.id.clone()) {
-            errors.push(ValidationError::DuplicatePeerId {
-                peer_id: peer.id.clone(),
-            });
-        }
+        check_trimmed(&peer.id, &ctx, "id", true, &mut errors);
+        check_unique(&mut seen_peer_ids, &peer.id, &ctx, "id", &mut errors);
 
-        if let Some(h3) = peer.h3.as_ref() {
-            // Token validation: must be >= 12 chars and have no leading/trailing whitespace
+        if let PeerTransport::H3(h3) = &peer.transport {
             if h3.token.len() < 12 {
                 errors.push(ValidationError::PeerTokenTooShort {
                     peer_id: peer.id.clone(),
                 });
-            } else if h3.token != h3.token.trim() {
-                errors.push(ValidationError::PeerTokenHasWhitespace {
-                    peer_id: peer.id.clone(),
-                });
+            } else {
+                check_trimmed(&h3.token, &ctx, "h3.token", false, &mut errors);
             }
+            check_unique(
+                &mut seen_peer_tokens,
+                &h3.token,
+                &ctx,
+                "h3.token",
+                &mut errors,
+            );
 
-            if !seen_peer_tokens.insert(h3.token.clone()) {
-                errors.push(ValidationError::DuplicatePeerToken {
-                    peer_id: peer.id.clone(),
-                });
-            }
             if let Some(sni) = &h3.sni {
-                if sni.trim().is_empty() {
-                    errors.push(ValidationError::PeerSniEmpty {
-                        peer_id: peer.id.clone(),
-                    });
-                } else if sni != sni.trim() {
-                    errors.push(ValidationError::PeerSniHasWhitespace {
-                        peer_id: peer.id.clone(),
-                    });
-                }
+                check_trimmed(sni, &ctx, "h3.sni", true, &mut errors);
             }
-
             if let Some(bindif) = &h3.bindif {
-                if bindif != bindif.trim() {
-                    errors.push(ValidationError::PeerBindifHasWhitespace {
-                        peer_id: peer.id.clone(),
-                    });
-                }
+                check_trimmed(bindif, &ctx, "h3.bindif", false, &mut errors);
             }
         }
 
-        if peer.h3.is_some() == peer.bare.is_some() {
-            errors.push(ValidationError::PeerTransportConflict {
-                peer_id: peer.id.clone(),
-            });
-        }
-
-        if peer.tun.allowed_ips.is_empty() {
-            errors.push(ValidationError::PeerMissingAllowedIps {
-                peer_id: peer.id.clone(),
-            });
-        }
+        check_not_empty(
+            peer.tun.allowed_ips.is_empty(),
+            &ctx,
+            "tun.allowed_ips",
+            &mut errors,
+        );
 
         let mut seen_allowed = HashSet::new();
         for net in &peer.tun.allowed_ips {
-            if !seen_allowed.insert(*net) {
-                errors.push(ValidationError::PeerDuplicateAllowedIp {
-                    peer_id: peer.id.clone(),
-                    cidr: net.to_string(),
-                });
-            }
+            check_unique(&mut seen_allowed, net, &ctx, "tun.allowed_ips", &mut errors);
         }
     }
 
@@ -764,24 +790,34 @@ pub struct UdpEndpoint {
     pub port: u16,
 }
 
-impl<'de> Deserialize<'de> for UdpEndpoint {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        parse_udp_uri(&s).map_err(de::Error::custom)
-    }
+/// Implements `Serialize`/`Deserialize` for a URI-based endpoint type.
+macro_rules! impl_uri_serde {
+    ($ty:ty, $parse_fn:path, $format_fn:expr) => {
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let s = String::deserialize(deserializer)?;
+                $parse_fn(&s).map_err(de::Error::custom)
+            }
+        }
+
+        impl Serialize for $ty {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&$format_fn(self))
+            }
+        }
+    };
 }
 
-impl Serialize for UdpEndpoint {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&format!("udp://{}:{}", self.host, self.port))
-    }
-}
+impl_uri_serde!(UdpEndpoint, parse_udp_uri, |ep: &UdpEndpoint| format!(
+    "udp://{}:{}",
+    ep.host, ep.port
+));
 
 /// Represents an HTTP/3 endpoint parsed from an `https://` URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -794,29 +830,13 @@ pub struct H3Endpoint {
     pub path: String,
 }
 
-impl<'de> Deserialize<'de> for H3Endpoint {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        parse_h3_uri(&s).map_err(de::Error::custom)
+impl_uri_serde!(H3Endpoint, parse_h3_uri, |ep: &H3Endpoint| {
+    if ep.port == 443 {
+        format!("https://{}{}", ep.host, ep.path)
+    } else {
+        format!("https://{}:{}{}", ep.host, ep.port, ep.path)
     }
-}
-
-impl Serialize for H3Endpoint {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let uri = if self.port == 443 {
-            format!("https://{}{}", self.host, self.path)
-        } else {
-            format!("https://{}:{}{}", self.host, self.port, self.path)
-        };
-        serializer.serialize_str(&uri)
-    }
-}
+});
 
 /// Management API settings for the local node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -837,26 +857,11 @@ pub struct ApiEndpoint {
     pub path: String,
 }
 
-impl<'de> Deserialize<'de> for ApiEndpoint {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        parse_api_uri(&s).map_err(de::Error::custom)
-    }
-}
-
-impl Serialize for ApiEndpoint {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        // Always include the port to avoid round-trip bugs (HTTP default is 80, not 9090).
-        let uri = format!("http://{}:{}{}", self.host, self.port, self.path);
-        serializer.serialize_str(&uri)
-    }
-}
+// Always include the port to avoid round-trip bugs (HTTP default is 80, not 9090).
+impl_uri_serde!(ApiEndpoint, parse_api_uri, |ep: &ApiEndpoint| format!(
+    "http://{}:{}{}",
+    ep.host, ep.port, ep.path
+));
 
 /// Parses a scheme-specific endpoint URI into host/port/path components.
 ///
@@ -992,7 +997,7 @@ mod tests {
             tuning: Tuning::default(),
             peers: vec![Peer {
                 id: "example-node-2".to_string(),
-                h3: Some(PeerH3 {
+                transport: PeerTransport::H3(PeerH3 {
                     token: "example-node-2-token".to_string(), // >= 12 chars
                     endpoint: Some(H3Endpoint {
                         host: "peer.example.com".to_string(),
@@ -1002,7 +1007,6 @@ mod tests {
                     bindif: None,
                     sni: None,
                 }),
-                bare: None,
                 tun: PeerTun {
                     allowed_ips: vec!["192.168.180.2/32".parse().unwrap()],
                 },
@@ -1024,7 +1028,7 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerIdEmpty { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "id", .. }))
         ));
     }
 
@@ -1042,7 +1046,7 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerIdHasWhitespace { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "id", .. }))
         ));
     }
 
@@ -1053,7 +1057,7 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerIdHasWhitespace { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "id", .. }))
         ));
     }
 
@@ -1073,7 +1077,7 @@ mod tests {
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.contains(&ValidationError::LocalH3CredentialsMissing)
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "cert", .. }))
         ));
     }
 
@@ -1093,7 +1097,7 @@ mod tests {
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.contains(&ValidationError::LocalH3CredentialsMissing)
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "key", .. }))
         ));
     }
 
@@ -1110,26 +1114,29 @@ local:
     }
 
     #[test]
-    fn rejects_peer_transport_conflict() {
-        let mut config = sample_h3_config();
-        config.peers[0].bare = Some(PeerBare {
-            endpoint: UdpEndpoint {
-                host: "peer.example.com".to_string(),
-                port: 6635,
-            },
-            bindif: None,
-        });
-        let err = config.validate().unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerTransportConflict { .. }))
-        ));
+    fn rejects_peer_transport_conflict_at_deserialization() {
+        let yaml = r#"
+local:
+  tun:
+    addrs:
+      - 192.168.180.1/32
+peers:
+  - id: bad-peer
+    h3:
+      token: "long-enough-token"
+    bare:
+      endpoint: udp://127.0.0.1:5353
+    tun:
+      allowed_ips:
+        - 10.0.0.0/24
+"#;
+        assert!(Config::load_from_str(yaml).is_err());
     }
 
     #[test]
     fn rejects_short_peer_token() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.token = "short".to_string(); // < 12 chars
         }
         let err = config.validate().unwrap_err();
@@ -1142,7 +1149,7 @@ local:
     #[test]
     fn accepts_12_char_peer_token() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.token = "123456789012".to_string(); // Exactly 12 chars
         }
         assert!(config.validate().is_ok());
@@ -1151,26 +1158,26 @@ local:
     #[test]
     fn rejects_token_with_leading_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.token = " 123456789012".to_string(); // 13 chars but has leading space
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerTokenHasWhitespace { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.token", .. }))
         ));
     }
 
     #[test]
     fn rejects_token_with_trailing_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.token = "123456789012 ".to_string(); // 13 chars but has trailing space
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerTokenHasWhitespace { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.token", .. }))
         ));
     }
 
@@ -1178,12 +1185,14 @@ local:
     fn rejects_duplicate_peer_ids() {
         let mut config = sample_h3_config();
         let mut peer2 = config.peers[0].clone();
-        peer2.h3.as_mut().unwrap().token = "different-token-123".to_string();
+        if let PeerTransport::H3(h3) = &mut peer2.transport {
+            h3.token = "different-token-123".to_string();
+        }
         config.peers.push(peer2);
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::DuplicatePeerId { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::DuplicateValue { field: "id", .. }))
         ));
     }
 
@@ -1196,7 +1205,7 @@ local:
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::DuplicatePeerToken { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::DuplicateValue { field: "h3.token", .. }))
         ));
     }
 
@@ -1276,7 +1285,7 @@ peers:
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
-            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::PeerMissingAllowedIps { .. }))
+            ConfigError::Validation(ValidationErrors(ref errs)) if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "tun.allowed_ips", .. }))
         ));
     }
 
@@ -1308,13 +1317,11 @@ peers:
         assert_eq!(cfg.local.dns.bindif, None);
         assert_eq!(cfg.local.tun.ifname, "h3llo0");
         assert_eq!(cfg.local.tun.mtu, 1291);
-        assert!(cfg.peers[0].h3.is_some());
-        if let Some(h3) = cfg.peers[0].h3.as_ref() {
-            assert!(h3.endpoint.is_none());
-            assert!(h3.bindif.is_none());
-        } else {
-            panic!("peer h3 should be present");
-        }
+        let PeerTransport::H3(h3) = &cfg.peers[0].transport else {
+            panic!("peer should be H3");
+        };
+        assert!(h3.endpoint.is_none());
+        assert!(h3.bindif.is_none());
     }
 
     #[test]
@@ -1341,7 +1348,9 @@ peers:
             cfg.local.dns.server,
             "8.8.8.8:53".parse::<SocketAddr>().unwrap()
         );
-        let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
+        let PeerTransport::H3(h3) = &cfg.peers[0].transport else {
+            panic!("should be H3")
+        };
         let endpoint = h3.endpoint.as_ref().expect("endpoint should be present");
         assert_eq!(endpoint.host, "peer.example.com");
         assert_eq!(endpoint.port, 443);
@@ -1352,7 +1361,7 @@ peers:
     #[test]
     fn accepts_peer_h3_with_bindif() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.bindif = Some("eth0".to_string());
         }
         assert!(config.validate().is_ok());
@@ -1361,7 +1370,7 @@ peers:
     #[test]
     fn accepts_peer_h3_with_sni() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.sni = Some("custom-sni.example.com".to_string());
         }
         assert!(config.validate().is_ok());
@@ -1370,91 +1379,94 @@ peers:
     #[test]
     fn accepts_peer_h3_without_sni() {
         let config = sample_h3_config();
-        assert!(config.peers[0].h3.as_ref().unwrap().sni.is_none());
+        let PeerTransport::H3(h3) = &config.peers[0].transport else {
+            panic!("should be H3")
+        };
+        assert!(h3.sni.is_none());
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn rejects_empty_sni() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.sni = Some("".to_string());
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniEmpty { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "h3.sni", .. }))
         ));
     }
 
     #[test]
     fn rejects_whitespace_only_sni() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.sni = Some("   ".to_string());
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniEmpty { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldEmpty { field: "h3.sni", .. }))
         ));
     }
 
     #[test]
     fn rejects_sni_with_leading_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.sni = Some(" leading".to_string());
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniHasWhitespace { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.sni", .. }))
         ));
     }
 
     #[test]
     fn rejects_sni_with_trailing_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.sni = Some("trailing ".to_string());
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerSniHasWhitespace { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.sni", .. }))
         ));
     }
 
     #[test]
     fn rejects_bindif_with_leading_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.bindif = Some(" eth0".to_string());
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerBindifHasWhitespace { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.bindif", .. }))
         ));
     }
 
     #[test]
     fn rejects_bindif_with_trailing_whitespace() {
         let mut config = sample_h3_config();
-        if let Some(h3) = config.peers[0].h3.as_mut() {
+        if let PeerTransport::H3(h3) = &mut config.peers[0].transport {
             h3.bindif = Some("eth0 ".to_string());
         }
         let err = config.validate().unwrap_err();
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::PeerBindifHasWhitespace { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldHasWhitespace { field: "h3.bindif", .. }))
         ));
     }
 
@@ -1471,7 +1483,7 @@ peers:
             ConfigError::Validation(ValidationErrors(ref errs))
                 if errs
                     .iter()
-                    .any(|e| matches!(e, ValidationError::PeerDuplicateAllowedIp { .. }))
+                    .any(|e| matches!(e, ValidationError::DuplicateValue { field: "tun.allowed_ips", .. }))
         ));
     }
 
@@ -1675,7 +1687,9 @@ peers:
       - 192.168.180.2/32
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
-        let h3 = cfg.peers[0].h3.as_ref().expect("h3 should be present");
+        let PeerTransport::H3(h3) = &cfg.peers[0].transport else {
+            panic!("should be H3")
+        };
         assert_eq!(h3.bindif, Some("eth0".to_string()));
     }
 
@@ -1972,7 +1986,7 @@ peers:
         assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(120));
         assert_eq!(cfg.tuning.dns_snapshot_delay, Duration::from_millis(100));
         assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(50));
-        assert_eq!(cfg.tuning.dns_min_ttl, 300);
+        assert_eq!(cfg.tuning.dns_min_ttl, Duration::from_secs(300));
         assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(5));
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
         assert_eq!(cfg.tuning.h3_keepalive_interval, Duration::from_secs(20));
@@ -2049,7 +2063,7 @@ local:
       - 192.168.180.1/32
 tuning:
   packet_queue_depth: 512
-  h3_max_idle_timeout: 120
+  h3_max_idle_timeout: 120s
 peers:
 - id: example-node-2
   h3:
@@ -2093,7 +2107,7 @@ peers:
         assert!(matches!(
             result,
             Err(ConfigError::Validation(ValidationErrors(ref errs)))
-                if errs.contains(&ValidationError::TuningPacketQueueDepthZero)
+                if errs.contains(&ValidationError::FieldMustBePositive { field: "tuning.packet_queue_depth" })
         ));
     }
 
@@ -2106,7 +2120,7 @@ peers:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::H3KeepaliveExceedsIdleTimeout { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldConflict { .. }))
         ));
     }
 
@@ -2119,7 +2133,7 @@ peers:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::H3KeepaliveExceedsIdleTimeout { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldConflict { .. }))
         ));
     }
 
@@ -2237,7 +2251,7 @@ local:
     addrs:
       - 192.168.180.1/32
 tuning:
-  dns_query_interval: 100
+  dns_query_interval: 100ms
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(100));
@@ -2255,7 +2269,7 @@ local:
     addrs:
       - 192.168.180.1/32
 tuning:
-  metrics_push_interval: 500
+  metrics_push_interval: 500ms
 peers:
 - id: example-node-2
   h3:
@@ -2362,10 +2376,11 @@ peers:
                     ConfigError::Validation(ValidationErrors(ref errs))
                         if errs.iter().any(|e| matches!(
                             e,
-                            ValidationError::TuningDurationZero { field } if *field == field_name
+                            ValidationError::FieldMustBePositive { field }
+                                if field.ends_with(field_name)
                         ))
                 ),
-                "expected TuningDurationZero for field '{field_name}'"
+                "expected FieldMustBePositive for field '{field_name}'"
             );
         }
     }
@@ -2382,7 +2397,7 @@ local:
     addrs:
       - 192.168.180.1/32
 tuning:
-  metrics_log_interval: 5
+  metrics_log_interval: 5s
 peers:
 - id: example-node-2
   h3:
@@ -2473,8 +2488,7 @@ tuning:
     fn no_mtu_warning_without_h3_peers() {
         let mut config = sample_h3_config();
         config.local.tun.mtu = 1500;
-        config.peers[0].h3 = None;
-        config.peers[0].bare = Some(PeerBare {
+        config.peers[0].transport = PeerTransport::Bare(PeerBare {
             endpoint: UdpEndpoint {
                 host: "peer.example.com".to_string(),
                 port: 6635,
@@ -2520,8 +2534,7 @@ tuning:
         let mut config = sample_h3_config();
         config.tuning.reconnect_backoff_min = Duration::from_secs(1);
         config.tuning.h3_handshake_timeout = Duration::from_secs(5);
-        config.peers[0].h3 = None;
-        config.peers[0].bare = Some(PeerBare {
+        config.peers[0].transport = PeerTransport::Bare(PeerBare {
             endpoint: UdpEndpoint {
                 host: "peer.example.com".to_string(),
                 port: 6635,
@@ -2553,7 +2566,7 @@ tuning:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::BackoffMinExceedsMax { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldConflict { .. }))
         ));
     }
 }

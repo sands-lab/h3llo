@@ -369,7 +369,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tun::alloc_packet_buf;
+    use crate::helpers::alloc_packet_buf;
     use tokio_quiche::buf_factory::BufFactory;
 
     #[test]

@@ -150,7 +150,7 @@ local:
     listen: "udp://0.0.0.0:5353"
 peers:
 {peers_yaml}tuning:
-  dns_refresh_interval: 1
+  dns_refresh_interval: 1s
 "#
     )
 }

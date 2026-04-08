@@ -18,7 +18,7 @@ use crate::h3engine::{
 };
 use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
-use crate::tun::alloc_uninit_packet_buf;
+use crate::helpers::alloc_uninit_packet_buf;
 use crate::udp;
 use quiche::h3::NameValue;
 use rand::Rng;
@@ -174,12 +174,7 @@ pub(crate) fn make_h3_dispatcher(
         udp_tx,
         ingress_tx,
         events_tx,
-        conn_params: ConnParams {
-            handshake_timeout: tuning.h3_handshake_timeout,
-            packet_queue_depth: tuning.packet_queue_depth,
-            metrics_interval: tuning.metrics_push_interval,
-            keepalive_interval: tuning.h3_keepalive_interval,
-        },
+        tuning: tuning.clone(),
     };
 
     info!(%listen_addr, %bound_addr, "h3 dispatcher created");
@@ -351,14 +346,6 @@ struct DispatchIo {
     events_tx: mpsc::UnboundedSender<Event>,
 }
 
-/// Per-connection parameters extracted from [`Tuning`].
-struct ConnParams {
-    handshake_timeout: Duration,
-    packet_queue_depth: usize,
-    metrics_interval: Duration,
-    keepalive_interval: Duration,
-}
-
 /// H3 dispatcher state created by [`make_h3_dispatcher`].
 ///
 /// Contains all resources needed to run the dispatcher. Spawned infallibly
@@ -372,7 +359,7 @@ pub struct H3Dispatcher {
     udp_tx: udp::UdpTx,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
-    conn_params: ConnParams,
+    tuning: Tuning,
 }
 
 /// Runtime state for the CID-routing dispatcher loop.
@@ -384,7 +371,7 @@ struct DispatcherRuntime {
     config: quiche::Config,
     max_udp_payload: usize,
     io: DispatchIo,
-    conn_params: ConnParams,
+    tuning: Tuning,
     /// Maps each registered CID directly to the per-connection packet sender.
     cid_table: HashMap<Vec<u8>, mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>>,
 }
@@ -503,7 +490,7 @@ impl DispatcherRuntime {
         );
 
         // Create per-connection channels.
-        let depth = self.conn_params.packet_queue_depth;
+        let depth = self.tuning.packet_queue_depth;
         let (packet_tx, packet_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(depth);
 
         // Register CIDs before spawning actor so subsequent packets route correctly.
@@ -514,7 +501,7 @@ impl DispatcherRuntime {
         let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(depth);
         let channels = self.io.clone();
         let peer_tokens = peer_tokens.clone();
-        let handshake_timeout = self.conn_params.handshake_timeout;
+        let handshake_timeout = self.tuning.h3_handshake_timeout;
 
         let mut engine = H3Engine {
             conn,
@@ -533,8 +520,8 @@ impl DispatcherRuntime {
                 max_udp_payload: self.max_udp_payload,
             },
             run_state: RunState::new(),
-            metrics_interval: self.conn_params.metrics_interval,
-            keepalive_interval: self.conn_params.keepalive_interval,
+            metrics_interval: self.tuning.metrics_push_interval,
+            keepalive_interval: self.tuning.h3_keepalive_interval,
             origin: ConnOrigin::Server,
             udp_cancel: None,
         };
@@ -606,7 +593,7 @@ pub fn spawn_h3_dispatcher(
         udp_tx,
         ingress_tx,
         events_tx,
-        conn_params,
+        tuning,
     } = dispatcher;
 
     // Spawn UDP actors on udp_rt.
@@ -616,10 +603,10 @@ pub fn spawn_h3_dispatcher(
     let (udp_recv_rx, udp_send_tx) = {
         let _guard = udp_rt.enter();
         let (udp_recv_tx, udp_recv_rx) =
-            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(conn_params.packet_queue_depth);
+            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.packet_queue_depth);
         let cancel = CancellationToken::new();
         let _recv_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx, cancel);
-        let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, conn_params.packet_queue_depth);
+        let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.packet_queue_depth);
         (udp_recv_rx, udp_send_tx)
     };
 
@@ -635,7 +622,7 @@ pub fn spawn_h3_dispatcher(
                 ingress_tx,
                 events_tx,
             },
-            conn_params,
+            tuning,
             cid_table: HashMap::new(),
         };
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
@@ -772,8 +759,8 @@ mod tests {
     use crate::h3::{dial_h3, spawn_h3_rx, spawn_h3_tx, DialError as OldDialError, H3Connection};
     use crate::h3dialer::{dial_h3_client, DialError};
     use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
+    use crate::helpers::alloc_packet_buf;
     use crate::helpers::test_packets::make_ipv4_packet;
-    use crate::tun::alloc_packet_buf;
     use std::net::Ipv4Addr;
     use test_support::await_h3v2_connection;
     use tokio_quiche::buf_factory::PooledBuf;

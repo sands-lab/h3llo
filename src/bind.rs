@@ -220,7 +220,7 @@ pub(crate) async fn select_bind_interface<P: RouteProbe>(
     preferred_if: Option<&str>,
     probe: &P,
 ) -> Option<String> {
-    let interfaces = match probe.probe_interfaces(&target.to_string(), tun_if).await {
+    let interfaces = match probe.probe_interfaces(target, tun_if).await {
         Ok(ifaces) => ifaces,
         Err(err) => {
             warn!(error = %err, "route probe failed, socket will remain unbound");
@@ -312,7 +312,7 @@ pub trait RouteProbe {
     /// A future resolving to interface names ordered by preference, or a `RouteProbeError`.
     fn probe_interfaces(
         &self,
-        target: &str,
+        target: IpAddr,
         tun_if: Option<&str>,
     ) -> impl std::future::Future<Output = Result<Vec<String>, RouteProbeError>> + Send;
 }
@@ -327,7 +327,7 @@ pub struct DefaultRouteProbe;
 impl RouteProbe for DefaultRouteProbe {
     async fn probe_interfaces(
         &self,
-        target: &str,
+        target: IpAddr,
         tun_if: Option<&str>,
     ) -> Result<Vec<String>, RouteProbeError> {
         probe_interfaces_impl(target, tun_if).await
@@ -340,9 +340,6 @@ impl RouteProbe for DefaultRouteProbe {
 /// Surface parse failures, route lookups, interface lookups, or unsupported platforms from probing.
 #[derive(Debug, Error, Clone)]
 pub enum RouteProbeError {
-    /// Target address could not be parsed.
-    #[error("invalid target {target}: {error}")]
-    InvalidTarget { target: String, error: String },
     /// Route lookup failed.
     #[error("route probe failed: {0}")]
     Probe(String),
@@ -432,16 +429,9 @@ fn bind_to_device_impl(socket: &Socket, domain: Domain, interface: &str) -> io::
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 /// Probes outbound route candidates using `route_manager`, excluding the provided TUN interface.
 async fn probe_interfaces_impl(
-    target: &str,
+    target: IpAddr,
     tun_if: Option<&str>,
 ) -> Result<Vec<String>, RouteProbeError> {
-    let target_ip = target
-        .parse::<IpAddr>()
-        .map_err(|err| RouteProbeError::InvalidTarget {
-            target: target.to_string(),
-            error: err.to_string(),
-        })?;
-
     let tun_index = tun_if.and_then(lookup_ifindex);
 
     let routes = {
@@ -454,7 +444,7 @@ async fn probe_interfaces_impl(
     };
 
     let mut names = Vec::new();
-    for ifindex in matching_route_indexes(&routes, target_ip, tun_index) {
+    for ifindex in matching_route_indexes(&routes, target, tun_index) {
         let name = ifindex_to_name(ifindex).map_err(|err| RouteProbeError::InterfaceLookup {
             ifindex,
             error: err.to_string(),
@@ -468,7 +458,7 @@ async fn probe_interfaces_impl(
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 /// Signals unsupported probing on platforms without a `route_manager` backend.
 async fn probe_interfaces_impl(
-    _target: &str,
+    _target: IpAddr,
     _tun_if: Option<&str>,
 ) -> Result<Vec<String>, RouteProbeError> {
     Err(RouteProbeError::UnsupportedPlatform {
@@ -647,6 +637,7 @@ fn ifindex_to_name(ifindex: u32) -> io::Result<String> {
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support {
     use super::{RouteProbe, RouteProbeError};
+    use std::net::IpAddr;
 
     /// Test double that returns a fixed probe result.
     ///
@@ -693,7 +684,7 @@ pub mod test_support {
     impl RouteProbe for FakeRouteProbe {
         async fn probe_interfaces(
             &self,
-            _target: &str,
+            _target: IpAddr,
             _tun_if: Option<&str>,
         ) -> Result<Vec<String>, RouteProbeError> {
             self.result.clone()

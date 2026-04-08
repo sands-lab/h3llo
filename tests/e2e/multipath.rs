@@ -76,7 +76,7 @@ peers:
       allowed_ips:
         - 10.0.1.0/24
 tuning:
-  dns_refresh_interval: 1
+  dns_refresh_interval: 1s
   h3_insecure_skip_verify: true
 "#
     )

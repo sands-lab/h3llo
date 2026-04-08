@@ -8,7 +8,32 @@
 //! All token comparisons use constant-time operations via the `subtle` crate
 //! to prevent timing attacks.
 
+use std::fmt;
 use subtle::ConstantTimeEq;
+
+/// Authentication failure reasons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthError {
+    /// No `Authorization` header was present.
+    MissingHeader,
+    /// Header did not use `Bearer` scheme.
+    NotBearer,
+    /// Bearer token was empty.
+    EmptyToken,
+    /// Token did not match any configured peer.
+    InvalidToken,
+}
+
+impl fmt::Display for AuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingHeader => f.write_str("missing Authorization header"),
+            Self::NotBearer => f.write_str("not Bearer auth"),
+            Self::EmptyToken => f.write_str("empty token"),
+            Self::InvalidToken => f.write_str("unknown peer or invalid token"),
+        }
+    }
+}
 
 /// Generates HTTP Bearer Token Authorization header value.
 ///
@@ -29,16 +54,16 @@ pub fn generate_bearer_auth(token: &str) -> String {
 /// Uses constant-time comparison to prevent timing attacks.
 ///
 /// # Returns
-/// The peer ID if authentication succeeds, or an error description.
+/// The peer ID if authentication succeeds, or an [`AuthError`].
 pub fn validate_connect_auth<'a>(
     header_value: Option<&str>,
     peer_tokens: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> Result<String, &'static str> {
-    let header = header_value.ok_or("missing Authorization header")?;
-    let token = header.strip_prefix("Bearer ").ok_or("not Bearer auth")?;
+) -> Result<String, AuthError> {
+    let header = header_value.ok_or(AuthError::MissingHeader)?;
+    let token = header.strip_prefix("Bearer ").ok_or(AuthError::NotBearer)?;
 
     if token.is_empty() {
-        return Err("empty token");
+        return Err(AuthError::EmptyToken);
     }
 
     for (peer_id, peer_token) in peer_tokens {
@@ -48,7 +73,7 @@ pub fn validate_connect_auth<'a>(
             return Ok(peer_id.to_string());
         }
     }
-    Err("unknown peer or invalid token")
+    Err(AuthError::InvalidToken)
 }
 
 #[cfg(test)]
@@ -74,21 +99,20 @@ mod tests {
         let header = generate_bearer_auth("wrong-token");
         let tokens = [("peer1", "correct-token")];
         let result = validate_connect_auth(Some(&header), tokens);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "unknown peer or invalid token");
+        assert_eq!(result, Err(AuthError::InvalidToken));
     }
 
     #[test]
     fn validate_connect_auth_missing_header() {
         let tokens = [("peer1", "token1")];
         let result = validate_connect_auth(None, tokens);
-        assert_eq!(result, Err("missing Authorization header"));
+        assert_eq!(result, Err(AuthError::MissingHeader));
     }
 
     #[test]
     fn validate_connect_auth_rejects_basic_auth() {
         let result = validate_connect_auth(Some("Basic dXNlcjpwYXNz"), [("p", "s")]);
-        assert_eq!(result, Err("not Bearer auth"));
+        assert_eq!(result, Err(AuthError::NotBearer));
     }
 
     #[test]
@@ -102,6 +126,6 @@ mod tests {
     #[test]
     fn validate_connect_auth_empty_token() {
         let result = validate_connect_auth(Some("Bearer "), [("peer", "token")]);
-        assert_eq!(result, Err("empty token"));
+        assert_eq!(result, Err(AuthError::EmptyToken));
     }
 }
