@@ -453,12 +453,12 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
     output_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
-    io: &IoTuning,
+    io_tuning: &IoTuning,
 ) -> JoinHandle<ActorExitResult> {
     let tun_name = tun.name().to_string();
     let batch_size = tun.batch_size();
     let scratch_buf_size = tun.scratch_buf_size();
-    let metrics_push_interval = io.metrics_push_interval;
+    let metrics_push_interval = io_tuning.metrics_push_interval;
 
     tokio::spawn(async move {
         let mut counters = Counters::new(Source::Tun, Direction::Rx);
@@ -516,12 +516,12 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
 pub(crate) fn spawn_tun_tx<T: TunTx>(
     mut tun: T,
     events_tx: mpsc::UnboundedSender<Event>,
-    io: &IoTuning,
+    io_tuning: &IoTuning,
 ) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
     // Actor creates and owns its data-plane channel receiver
-    let (input_tx, mut input_rx) = mpsc::channel::<Vec<PooledBuf>>(io.packet_queue_depth);
+    let (input_tx, mut input_rx) = mpsc::channel::<Vec<PooledBuf>>(io_tuning.packet_queue_depth);
     let tun_name = tun.name().to_string();
-    let metrics_push_interval = io.metrics_push_interval;
+    let metrics_push_interval = io_tuning.metrics_push_interval;
 
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();

@@ -147,23 +147,23 @@ pub(crate) fn make_h3_dispatcher(
     cert_path: &Path,
     key_path: &Path,
     tun_mtu: u16,
-    io: &IoTuning,
-    h3: &H3Tuning,
+    io_tuning: &IoTuning,
+    h3_tuning: &H3Tuning,
     udp_rt: &RuntimeHandle,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
 ) -> Result<(H3Dispatcher, SocketAddr), ServerError> {
-    let std_socket = make_server_udp_socket(listen_addr, io.socket_buffer_bytes())
+    let std_socket = make_server_udp_socket(listen_addr, io_tuning.socket_buffer_bytes())
         .map_err(|e| ServerError::Socket(e.to_string()))?;
     let bound_addr = std_socket
         .local_addr()
         .map_err(|e| ServerError::Socket(format!("local_addr: {e}")))?;
     let max_udp_payload = tun_mtu as usize + CONNECT_IP_OVERHEAD;
-    let config = make_server_quiche_config(h3, max_udp_payload, cert_path, key_path)?;
+    let config = make_server_quiche_config(h3_tuning, max_udp_payload, cert_path, key_path)?;
 
     let (udp_rx, udp_tx) = {
         let _guard = udp_rt.enter();
-        udp::make_udp(std_socket, max_udp_payload, io.udp_enable_offload)
+        udp::make_udp(std_socket, max_udp_payload, io_tuning.udp_enable_offload)
             .map_err(|e| ServerError::Socket(format!("make_udp: {e}")))?
     };
 
@@ -175,8 +175,8 @@ pub(crate) fn make_h3_dispatcher(
         udp_tx,
         ingress_tx,
         events_tx,
-        io: io.clone(),
-        h3: h3.clone(),
+        io_tuning: io_tuning.clone(),
+        h3_tuning: h3_tuning.clone(),
     };
 
     info!(%listen_addr, %bound_addr, "h3 dispatcher created");
@@ -361,8 +361,8 @@ pub struct H3Dispatcher {
     udp_tx: udp::UdpTx,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
-    io: IoTuning,
-    h3: H3Tuning,
+    io_tuning: IoTuning,
+    h3_tuning: H3Tuning,
 }
 
 /// Runtime state for the CID-routing dispatcher loop.
@@ -373,9 +373,9 @@ struct DispatcherRuntime {
     bound_addr: SocketAddr,
     config: quiche::Config,
     max_udp_payload: usize,
-    dispatch_io: DispatchIo,
-    io: IoTuning,
-    h3: H3Tuning,
+    io: DispatchIo,
+    io_tuning: IoTuning,
+    h3_tuning: H3Tuning,
     /// Maps each registered CID directly to the per-connection packet sender.
     cid_table: HashMap<Vec<u8>, mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>>,
 }
@@ -462,12 +462,7 @@ impl DispatcherRuntime {
                 &mut pkt,
             ) {
                 pkt.truncate(len);
-                if self
-                    .dispatch_io
-                    .udp_send_tx
-                    .try_send((remote, vec![pkt]))
-                    .is_err()
-                {
+                if self.io.udp_send_tx.try_send((remote, vec![pkt])).is_err() {
                     debug!(%remote, "dispatcher: failed to send version negotiation");
                 }
             }
@@ -499,7 +494,7 @@ impl DispatcherRuntime {
         );
 
         // Create per-connection channels.
-        let depth = self.io.packet_queue_depth;
+        let depth = self.io_tuning.packet_queue_depth;
         let (packet_tx, packet_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(depth);
 
         // Register CIDs before spawning actor so subsequent packets route correctly.
@@ -508,9 +503,9 @@ impl DispatcherRuntime {
             self.cid_table.insert(cid, packet_tx.clone());
         }
         let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(depth);
-        let channels = self.dispatch_io.clone();
+        let channels = self.io.clone();
         let peer_tokens = peer_tokens.clone();
-        let handshake_timeout = self.h3.h3_handshake_timeout;
+        let handshake_timeout = self.h3_tuning.h3_handshake_timeout;
 
         let mut engine = H3Engine {
             conn,
@@ -529,8 +524,8 @@ impl DispatcherRuntime {
                 max_udp_payload: self.max_udp_payload,
             },
             run_state: RunState::new(),
-            metrics_interval: self.io.metrics_push_interval,
-            keepalive_interval: self.h3.h3_keepalive_interval,
+            metrics_interval: self.io_tuning.metrics_push_interval,
+            keepalive_interval: self.h3_tuning.h3_keepalive_interval,
             origin: ConnOrigin::Server,
             udp_cancel: None,
         };
@@ -602,8 +597,8 @@ pub fn spawn_h3_dispatcher(
         udp_tx,
         ingress_tx,
         events_tx,
-        io,
-        h3,
+        io_tuning,
+        h3_tuning,
     } = dispatcher;
 
     // Spawn UDP actors on udp_rt.
@@ -613,10 +608,10 @@ pub fn spawn_h3_dispatcher(
     let (udp_recv_rx, udp_send_tx) = {
         let _guard = udp_rt.enter();
         let (udp_recv_tx, udp_recv_rx) =
-            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(io.packet_queue_depth);
+            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(io_tuning.packet_queue_depth);
         let cancel = CancellationToken::new();
         let _recv_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx, cancel);
-        let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, io.packet_queue_depth);
+        let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, io_tuning.packet_queue_depth);
         (udp_recv_rx, udp_send_tx)
     };
 
@@ -627,13 +622,13 @@ pub fn spawn_h3_dispatcher(
             bound_addr,
             config,
             max_udp_payload,
-            dispatch_io: DispatchIo {
+            io: DispatchIo {
                 udp_send_tx,
                 ingress_tx,
                 events_tx,
             },
-            io,
-            h3,
+            io_tuning,
+            h3_tuning,
             cid_table: HashMap::new(),
         };
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await

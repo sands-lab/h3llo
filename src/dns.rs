@@ -201,7 +201,7 @@ pub enum ResolveInitError {
 pub struct DnsActor {
     server: SocketAddr,
     socket: UdpSocket,
-    dns: DnsTuning,
+    dns_tuning: DnsTuning,
 }
 
 /// Creates a DNS resolver actor state from configuration.
@@ -242,7 +242,7 @@ pub async fn make_dns<P: RouteProbe>(
     Ok(DnsActor {
         server,
         socket,
-        dns: tuning.dns.clone(),
+        dns_tuning: tuning.dns.clone(),
     })
 }
 
@@ -268,7 +268,7 @@ pub fn spawn_dns(
     let DnsActor {
         server,
         socket,
-        dns,
+        dns_tuning: dns,
     } = actor;
 
     let server_str = server.to_string();
