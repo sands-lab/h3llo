@@ -517,57 +517,40 @@ fn encode_counter_family(
     Ok(())
 }
 
-/// Label set for packet/byte counter families.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct PacketLabelSet {
-    source: Source,
-    direction: Direction,
-    peer_id: String,
-    remote_addr: String,
-    outcome: String,
-}
-
-impl PacketLabelSet {
-    fn from_metrics(m: &Metrics, outcome: &str) -> Self {
-        Self {
-            source: m.labels.source,
-            direction: m.labels.direction,
-            peer_id: m.labels.peer_id.clone().unwrap_or_default(),
-            remote_addr: m
-                .labels
-                .remote_addr
-                .map(|a| a.to_string())
-                .unwrap_or_default(),
-            outcome: outcome.to_string(),
+/// Generates a Prometheus label set struct with 4 common metric labels
+/// (`source`, `direction`, `peer_id`, `remote_addr`) plus one extra field.
+macro_rules! label_set {
+    ($name:ident, $field:ident: $ty:ty) => {
+        #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+        struct $name {
+            source: Source,
+            direction: Direction,
+            peer_id: String,
+            remote_addr: String,
+            $field: $ty,
         }
-    }
-}
 
-/// Label set for drop-reason counter families.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct DropLabelSet {
-    source: Source,
-    direction: Direction,
-    peer_id: String,
-    remote_addr: String,
-    reason: DropReason,
-}
-
-impl DropLabelSet {
-    fn from_metrics(m: &Metrics, reason: DropReason) -> Self {
-        Self {
-            source: m.labels.source,
-            direction: m.labels.direction,
-            peer_id: m.labels.peer_id.clone().unwrap_or_default(),
-            remote_addr: m
-                .labels
-                .remote_addr
-                .map(|a| a.to_string())
-                .unwrap_or_default(),
-            reason,
+        impl $name {
+            fn from_metrics(m: &Metrics, $field: impl Into<$ty>) -> Self {
+                Self {
+                    source: m.labels.source,
+                    direction: m.labels.direction,
+                    peer_id: m.labels.peer_id.clone().unwrap_or_default(),
+                    remote_addr: m
+                        .labels
+                        .remote_addr
+                        .map(|a| a.to_string())
+                        .unwrap_or_default(),
+                    $field: $field.into(),
+                }
+            }
         }
-    }
+    };
 }
+
+label_set!(PacketLabelSet, outcome: String);
+label_set!(DropLabelSet, reason: DropReason);
+label_set!(CongestionLabelSet, event: String);
 
 impl EncodeLabelValue for Source {
     fn encode(
@@ -594,32 +577,6 @@ impl EncodeLabelValue for Direction {
             Direction::Tx => "tx",
         };
         EncodeLabelValue::encode(&s, encoder)
-    }
-}
-
-/// Label set for congestion counter families with `event` dimension.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct CongestionLabelSet {
-    source: Source,
-    direction: Direction,
-    peer_id: String,
-    remote_addr: String,
-    event: String,
-}
-
-impl CongestionLabelSet {
-    fn from_metrics(m: &Metrics, event: &str) -> Self {
-        Self {
-            source: m.labels.source,
-            direction: m.labels.direction,
-            peer_id: m.labels.peer_id.clone().unwrap_or_default(),
-            remote_addr: m
-                .labels
-                .remote_addr
-                .map(|a| a.to_string())
-                .unwrap_or_default(),
-            event: event.to_string(),
-        }
     }
 }
 
