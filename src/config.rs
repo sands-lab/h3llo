@@ -208,7 +208,7 @@ pub struct PeerTun {
 ///
 /// All fields have sensible defaults. The entire section is optional in YAML.
 /// When partially specified, unset fields use their defaults.
-/// Duration fields are serialized as integer seconds in YAML unless noted otherwise.
+/// Duration fields use human-readable strings (e.g. `"3s"`, `"500ms"`, `"2m"`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Tuning {
@@ -257,54 +257,54 @@ pub struct Tuning {
     ///
     /// Controls how often the orchestrator prunes stale bounds and attempts
     /// reconnections for uncovered IPs.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub reconcile_interval: Duration,
     /// Minimum backoff duration between reconnection attempts per IP (default: 3s).
     ///
     /// The backoff grows exponentially from this base value after each failed attempt.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub reconnect_backoff_min: Duration,
     /// Maximum backoff duration between reconnection attempts per IP (default: 60s).
     ///
     /// The exponential backoff is capped at this ceiling.
     /// Must be greater than or equal to `reconnect_backoff_min`.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub reconnect_backoff_max: Duration,
-    /// Metrics push interval in milliseconds (default: 1000ms).
-    #[serde(with = "serde_duration_millis")]
+    /// Metrics push interval (default: `"1s"`).
+    #[serde(with = "humantime_serde")]
     pub metrics_push_interval: Duration,
     /// Metrics log interval in seconds (default: 3s).
     ///
     /// Controls how often the orchestrator logs QUIC and transport metrics at
     /// `debug!` level. Independent of `metrics_push_interval`, which controls
     /// how often actors emit metrics events.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub metrics_log_interval: Duration,
     /// DNS query timeout (default: 2s).
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub dns_query_timeout: Duration,
     /// DNS refresh interval; 0 disables (default: 120s).
     ///
     /// **Warning:** `dns_min_ttl` should be at least `2 × dns_refresh_interval`.
     /// Otherwise, cached IPs may expire before the next refresh re-queries them,
     /// causing connections to be pruned and re-established in a loop.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub dns_refresh_interval: Duration,
     /// Delay before emitting a DNS snapshot after the first state change (default: 100ms).
     ///
     /// After a DNS reply marks the state dirty, the resolver waits this duration
     /// before emitting a snapshot to the orchestrator. Subsequent replies within
     /// the window are coalesced into the same snapshot.
-    #[serde(with = "serde_duration_millis")]
+    #[serde(with = "humantime_serde")]
     pub dns_snapshot_delay: Duration,
     /// Minimum interval between consecutive DNS query sends (default: 50ms).
     ///
     /// Serializes outbound DNS queries to avoid triggering rate limits on
     /// public resolvers (e.g., Cloudflare 1.1.1.1). A sleep of this duration
     /// is inserted before each outbound query send.
-    #[serde(with = "serde_duration_millis")]
+    #[serde(with = "humantime_serde")]
     pub dns_query_interval: Duration,
-    /// Minimum TTL floor in seconds for DNS records (default: 300).
+    /// Minimum TTL floor for DNS records (default: `"5m"`).
     ///
     /// DNS responses with TTL below this value are raised to this floor
     /// to prevent excessive re-queries. Recursive DNS servers return the
@@ -315,15 +315,16 @@ pub struct Tuning {
     ///
     /// **Warning:** Should be at least `2 × dns_refresh_interval` to
     /// guarantee that every refresh cycle renews the TTL before expiry.
-    pub dns_min_ttl: u32,
+    #[serde(with = "humantime_serde")]
+    pub dns_min_ttl: Duration,
     /// HTTP/3 handshake timeout (default: 5s).
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub h3_handshake_timeout: Duration,
     /// HTTP/3 max idle timeout (default: 60s).
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub h3_max_idle_timeout: Duration,
     /// HTTP/3 keepalive interval (default: 20s). Sends QUIC PING frames to prevent idle timeout.
-    #[serde(with = "serde_duration_secs")]
+    #[serde(with = "humantime_serde")]
     pub h3_keepalive_interval: Duration,
     /// QUIC congestion control algorithm (default: `"none"`).
     ///
@@ -367,7 +368,7 @@ impl Default for Tuning {
             dns_refresh_interval: Duration::from_secs(120),
             dns_snapshot_delay: Duration::from_millis(100),
             dns_query_interval: Duration::from_millis(50),
-            dns_min_ttl: 300,
+            dns_min_ttl: Duration::from_secs(300),
             h3_handshake_timeout: Duration::from_secs(5),
             h3_max_idle_timeout: Duration::from_secs(60),
             h3_keepalive_interval: Duration::from_secs(20),
@@ -383,36 +384,6 @@ impl Tuning {
     /// Returns socket buffer size in bytes, or 0 to skip configuration.
     pub fn socket_buffer_bytes(&self) -> usize {
         self.socket_buffer_size.saturating_mul(1024 * 1024)
-    }
-}
-
-/// Serde helper: serializes `Duration` as integer seconds in YAML.
-mod serde_duration_secs {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::time::Duration;
-
-    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u64(d.as_secs())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
-        let secs = u64::deserialize(d)?;
-        Ok(Duration::from_secs(secs))
-    }
-}
-
-/// Serde helper: serializes `Duration` as integer milliseconds in YAML.
-mod serde_duration_millis {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::time::Duration;
-
-    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u64(d.as_millis() as u64)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
-        let millis = u64::deserialize(d)?;
-        Ok(Duration::from_millis(millis))
     }
 }
 
@@ -600,12 +571,12 @@ impl Config {
         // DNS TTL floor vs refresh interval: if min_ttl < 2× refresh, IPs can
         // expire between refresh cycles, causing repeated connection churn.
         if !self.tuning.dns_refresh_interval.is_zero() {
-            let min_safe_ttl = self.tuning.dns_refresh_interval.as_secs().saturating_mul(2);
-            if (self.tuning.dns_min_ttl as u64) < min_safe_ttl {
+            let min_safe_ttl = self.tuning.dns_refresh_interval.saturating_mul(2);
+            if self.tuning.dns_min_ttl < min_safe_ttl {
                 tracing::warn!(
-                    dns_min_ttl = self.tuning.dns_min_ttl,
-                    dns_refresh_interval = self.tuning.dns_refresh_interval.as_secs(),
-                    recommended_min_ttl = min_safe_ttl,
+                    dns_min_ttl = ?self.tuning.dns_min_ttl,
+                    dns_refresh_interval = ?self.tuning.dns_refresh_interval,
+                    recommended_min_ttl = ?min_safe_ttl,
                     "tuning.dns_min_ttl should be at least 2× tuning.dns_refresh_interval; \
                      otherwise cached IPs may expire before the next refresh, \
                      causing repeated connection pruning and reconnection"
@@ -2015,7 +1986,7 @@ peers:
         assert_eq!(cfg.tuning.dns_refresh_interval, Duration::from_secs(120));
         assert_eq!(cfg.tuning.dns_snapshot_delay, Duration::from_millis(100));
         assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(50));
-        assert_eq!(cfg.tuning.dns_min_ttl, 300);
+        assert_eq!(cfg.tuning.dns_min_ttl, Duration::from_secs(300));
         assert_eq!(cfg.tuning.h3_handshake_timeout, Duration::from_secs(5));
         assert_eq!(cfg.tuning.h3_max_idle_timeout, Duration::from_secs(60));
         assert_eq!(cfg.tuning.h3_keepalive_interval, Duration::from_secs(20));
@@ -2092,7 +2063,7 @@ local:
       - 192.168.180.1/32
 tuning:
   packet_queue_depth: 512
-  h3_max_idle_timeout: 120
+  h3_max_idle_timeout: 120s
 peers:
 - id: example-node-2
   h3:
@@ -2280,7 +2251,7 @@ local:
     addrs:
       - 192.168.180.1/32
 tuning:
-  dns_query_interval: 100
+  dns_query_interval: 100ms
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.tuning.dns_query_interval, Duration::from_millis(100));
@@ -2298,7 +2269,7 @@ local:
     addrs:
       - 192.168.180.1/32
 tuning:
-  metrics_push_interval: 500
+  metrics_push_interval: 500ms
 peers:
 - id: example-node-2
   h3:
@@ -2426,7 +2397,7 @@ local:
     addrs:
       - 192.168.180.1/32
 tuning:
-  metrics_log_interval: 5
+  metrics_log_interval: 5s
 peers:
 - id: example-node-2
   h3:

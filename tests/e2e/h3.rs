@@ -98,7 +98,7 @@ peers:
       allowed_ips:
         - {peer_allowed_ip}
 tuning:
-  dns_refresh_interval: 1
+  dns_refresh_interval: 1s
   h3_insecure_skip_verify: true
 "#
     )

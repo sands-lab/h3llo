@@ -80,8 +80,8 @@ struct DnsState {
     hostnames: HashMap<String, HostnameState>,
     /// True if state changed since last snapshot emission.
     dirty: bool,
-    /// Minimum TTL floor in seconds to prevent excessive refresh.
-    min_ttl_secs: u32,
+    /// Minimum TTL floor to prevent excessive refresh.
+    min_ttl: Duration,
 }
 
 impl DnsState {
@@ -113,11 +113,12 @@ impl DnsState {
         let Some(entry) = self.hostnames.get_mut(host) else {
             return;
         };
-        let effective_ttl = ttl.max(self.min_ttl_secs);
-        let expires_at = Instant::now() + Duration::from_secs(effective_ttl as u64);
+        let record_ttl = Duration::from_secs(ttl as u64);
+        let effective_ttl = record_ttl.max(self.min_ttl);
+        let expires_at = Instant::now() + effective_ttl;
         if entry.ips.insert(ip, expires_at).is_none() {
             self.dirty = true;
-            info!(host = %host, ip = %ip, ttl = effective_ttl, "dns: new IP resolved");
+            info!(host = %host, ip = %ip, ttl = ?effective_ttl, "dns: new IP resolved");
         }
     }
 
@@ -203,7 +204,7 @@ pub struct DnsActor {
     timeout: Duration,
     refresh_interval: Duration,
     snapshot_delay: Duration,
-    min_ttl_secs: u32,
+    min_ttl: Duration,
     query_interval: Duration,
 }
 
@@ -248,7 +249,7 @@ pub async fn make_dns<P: RouteProbe>(
         timeout: tuning.dns_query_timeout,
         refresh_interval: tuning.dns_refresh_interval,
         snapshot_delay: tuning.dns_snapshot_delay,
-        min_ttl_secs: tuning.dns_min_ttl,
+        min_ttl: tuning.dns_min_ttl,
         query_interval: tuning.dns_query_interval,
     })
 }
@@ -278,7 +279,7 @@ pub fn spawn_dns(
         timeout,
         refresh_interval,
         snapshot_delay,
-        min_ttl_secs,
+        min_ttl,
         query_interval,
     } = actor;
 
@@ -287,7 +288,7 @@ pub fn spawn_dns(
     info!(
         server = %server,
         refresh_interval = ?refresh_interval,
-        min_ttl = min_ttl_secs,
+        min_ttl = ?min_ttl,
         "dns: resolver started"
     );
 
@@ -295,7 +296,7 @@ pub fn spawn_dns(
         let mut state = DnsState {
             hostnames: HashMap::new(),
             dirty: false,
-            min_ttl_secs,
+            min_ttl,
         };
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
@@ -1189,7 +1190,7 @@ mod tests {
         let mut state = DnsState {
             hostnames: HashMap::new(),
             dirty: false,
-            min_ttl_secs: 300,
+            min_ttl: Duration::from_secs(300),
         };
         let mut hosts = HashSet::new();
         hosts.insert("example.com".to_string());
@@ -1211,7 +1212,7 @@ mod tests {
         let mut state = DnsState {
             hostnames: HashMap::new(),
             dirty: false,
-            min_ttl_secs: 300,
+            min_ttl: Duration::from_secs(300),
         };
         let mut entry = HostnameState::default();
         entry.pending.insert(RecordType::A, (42, Instant::now()));

@@ -27,19 +27,19 @@ tuning: # optional, all fields have defaults
   tun_tx_queue_len: 1000 # optional, default: 1000 (packets; Linux only)
   tun_enable_offload: false # optional, default: false (TUN GSO/GRO; Linux only)
   udp_enable_offload: false # optional, default: false (UDP TX GSO; RX GRO always active; Linux only)
-  reconcile_interval: 10 # optional, default: 10 (seconds)
-  reconnect_backoff_min: 3 # optional, default: 3 (seconds)
-  reconnect_backoff_max: 60 # optional, default: 60 (seconds)
-  metrics_push_interval: 1000 # optional, default: 1000 (milliseconds)
-  metrics_log_interval: 3 # optional, default: 3 (seconds)
-  dns_query_timeout: 2 # optional, default: 2 (seconds)
-  dns_refresh_interval: 120 # optional, default: 120 (seconds; 0 disables)
-  dns_snapshot_delay: 100 # optional, default: 100 (milliseconds)
-  dns_min_ttl: 300 # optional, default: 300 (seconds; should be >= 2× dns_refresh_interval)
-  dns_query_interval: 50 # optional, default: 50 (milliseconds; minimum delay between DNS query sends)
-  h3_handshake_timeout: 5 # optional, default: 5 (seconds)
-  h3_max_idle_timeout: 60 # optional, default: 60 (seconds)
-  h3_keepalive_interval: 20 # optional, default: 20 (seconds; must be < h3_max_idle_timeout)
+  reconcile_interval: 10s # optional, default: 10s
+  reconnect_backoff_min: 3s # optional, default: 3s
+  reconnect_backoff_max: 60s # optional, default: 60s
+  metrics_push_interval: 1s # optional, default: 1s
+  metrics_log_interval: 3s # optional, default: 3s
+  dns_query_timeout: 2s # optional, default: 2s
+  dns_refresh_interval: 2m # optional, default: 2m (0s disables)
+  dns_snapshot_delay: 100ms # optional, default: 100ms
+  dns_min_ttl: 5m # optional, default: 5m (should be >= 2× dns_refresh_interval)
+  dns_query_interval: 50ms # optional, default: 50ms (minimum delay between DNS query sends)
+  h3_handshake_timeout: 5s # optional, default: 5s
+  h3_max_idle_timeout: 60s # optional, default: 60s
+  h3_keepalive_interval: 20s # optional, default: 20s (must be < h3_max_idle_timeout)
   h3_cc_algorithm: none # optional, default: none (accepted: none, reno, cubic, bbr, bbr2)
   h3_enable_pacing: false # optional, default: false
   h3_insecure_skip_verify: false # optional, default: false (skip TLS verification; testing only)
@@ -80,19 +80,19 @@ peers: # optional, default: []
 - `tuning.tun_tx_queue_len` (default `1000`): TUN interface transmit queue length in packets. Controls how many packets the kernel queues for transmission. Applied on Linux only; ignored on other platforms.
 - `tuning.tun_enable_offload` (default `false`): Enable GSO/GRO offload on the TUN device for batched I/O. When disabled, TUN reads and writes fall back to single-packet operations. Linux only; ignored on other platforms. Disabled by default due to compatibility issues with certain kernel versions and virtualization layers. Enable for better performance and verify with thorough testing.
 - `tuning.udp_enable_offload` (default `false`): Enable UDP offload for transports. Effect varies by transport: **BareUDP TX** — controls GSO; when enabled, batches packets into a single `sendmsg` via `UDP_SEGMENT`; when disabled, per-packet sends. **BareUDP RX** — no effect; GRO is always active (quinn-udp unconditionally enables `UDP_GRO`, and the receive buffer is always sized for coalesced datagrams). **HTTP/3** (client and listener) — controls both GSO and GRO via `apply_max_capabilities()`. Linux only; ignored on other platforms. Disabled by default due to compatibility issues with certain NIC drivers and platforms — e.g., incorrect checksums (see [troubleshooting](troubleshoot.md#bareudp-checksum-errors-with-nic-tx-offload)) or GSO `EINVAL` on aarch64 (see [troubleshooting](troubleshoot.md#gso-udp_segment-sendto-einval-on-aarch64)). Enable for better performance and verify with thorough testing.
-- `tuning.reconcile_interval` (default `10`): Seconds between periodic reconciliation cycles (prune stale bounds + attempt reconnection). Controls how often the orchestrator scans all peers for stale bounds and uncovered IPs.
-- `tuning.reconnect_backoff_min` (default `3`): Minimum backoff duration in seconds between reconnection attempts for a specific IP. The backoff grows exponentially from this base value after each failed attempt. When H3 peers are configured, a warning is emitted if this value is not greater than `tuning.h3_handshake_timeout` (default `5`) to prevent overlapping handshake attempts.
-- `tuning.reconnect_backoff_max` (default `60`): Maximum backoff duration in seconds for reconnection attempts per IP. The exponential backoff is capped at this ceiling. Must be greater than or equal to `reconnect_backoff_min`.
-- `tuning.metrics_push_interval` (default `1000`): Milliseconds between periodic metric push emissions from actors to the orchestrator.
-- `tuning.metrics_log_interval` (default `3`): Seconds between periodic `debug!`-level logging of QUIC and transport metrics by the orchestrator. Independent of `metrics_push_interval`, which controls actor emission cadence.
-- `tuning.dns_query_timeout` (default `2`): Seconds before a DNS query is considered timed out and retried.
-- `tuning.dns_refresh_interval` (default `120`): DNS refresh timer in seconds (`0` disables). The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)). **Warning:** `dns_min_ttl` should be at least `2× dns_refresh_interval`; otherwise cached IPs may expire before the next refresh cycle re-queries them, causing repeated connection pruning and reconnection.
-- `tuning.dns_snapshot_delay` (default `100`): Milliseconds to wait after the first DNS state change before emitting a snapshot to the orchestrator. Coalesces bursts of DNS replies into a single event.
-- `tuning.dns_min_ttl` (default `300`): Minimum TTL floor in seconds for DNS records. Responses with shorter TTL are raised to this value. Recursive DNS servers return the *remaining* cache TTL, which can be near zero when the upstream record is about to expire; without a sufficient floor the IP expires locally before the next refresh cycle, triggering connection churn. **Warning:** Should be at least `2× dns_refresh_interval` (a warning is emitted at startup when this invariant is violated).
-- `tuning.dns_query_interval` (default `50`): Interval in milliseconds between consecutive outbound DNS query sends. Serializes queries to prevent public DNS resolvers (e.g., 1.1.1.1) from rate-limiting or truncating responses due to query bursts. Applies globally across all hostnames and record types.
-- `tuning.h3_handshake_timeout` (default `5`): Seconds to wait for an HTTP/3 handshake to complete.
-- `tuning.h3_max_idle_timeout` (default `60`): QUIC idle timeout in seconds; connections idle longer than this are closed.
-- `tuning.h3_keepalive_interval` (default `20`): QUIC keepalive interval in seconds; sends PING frames to prevent idle timeout. Must be less than `h3_max_idle_timeout`.
+- `tuning.reconcile_interval` (default `10s`): Interval between periodic reconciliation cycles (prune stale bounds + attempt reconnection). Controls how often the orchestrator scans all peers for stale bounds and uncovered IPs.
+- `tuning.reconnect_backoff_min` (default `3s`): Minimum backoff duration between reconnection attempts for a specific IP. The backoff grows exponentially from this base value after each failed attempt. When H3 peers are configured, a warning is emitted if this value is not greater than `tuning.h3_handshake_timeout` (default `5s`) to prevent overlapping handshake attempts.
+- `tuning.reconnect_backoff_max` (default `60s`): Maximum backoff duration for reconnection attempts per IP. The exponential backoff is capped at this ceiling. Must be greater than or equal to `reconnect_backoff_min`.
+- `tuning.metrics_push_interval` (default `1s`): Interval between periodic metric push emissions from actors to the orchestrator.
+- `tuning.metrics_log_interval` (default `3s`): Interval between periodic `debug!`-level logging of QUIC and transport metrics by the orchestrator. Independent of `metrics_push_interval`, which controls actor emission cadence.
+- `tuning.dns_query_timeout` (default `2s`): Timeout before a DNS query is considered failed and retried.
+- `tuning.dns_refresh_interval` (default `2m`): DNS refresh interval (`0s` disables). The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)). **Warning:** `dns_min_ttl` should be at least `2× dns_refresh_interval`; otherwise cached IPs may expire before the next refresh cycle re-queries them, causing repeated connection pruning and reconnection.
+- `tuning.dns_snapshot_delay` (default `100ms`): Delay after the first DNS state change before emitting a snapshot to the orchestrator. Coalesces bursts of DNS replies into a single event.
+- `tuning.dns_min_ttl` (default `5m`): Minimum TTL floor for DNS records. Responses with shorter TTL are raised to this value. Recursive DNS servers return the *remaining* cache TTL, which can be near zero when the upstream record is about to expire; without a sufficient floor the IP expires locally before the next refresh cycle, triggering connection churn. **Warning:** Should be at least `2× dns_refresh_interval` (a warning is emitted at startup when this invariant is violated).
+- `tuning.dns_query_interval` (default `50ms`): Interval between consecutive outbound DNS query sends. Serializes queries to prevent public DNS resolvers (e.g., 1.1.1.1) from rate-limiting or truncating responses due to query bursts. Applies globally across all hostnames and record types.
+- `tuning.h3_handshake_timeout` (default `5s`): Timeout for an HTTP/3 handshake to complete.
+- `tuning.h3_max_idle_timeout` (default `60s`): QUIC idle timeout; connections idle longer than this are closed.
+- `tuning.h3_keepalive_interval` (default `20s`): QUIC keepalive interval; sends PING frames to prevent idle timeout. Must be less than `h3_max_idle_timeout`.
 - `tuning.h3_cc_algorithm` (default `none`): QUIC congestion control algorithm. Accepted values: `none`, `reno`, `cubic`, `bbr`, `bbr2`. Applied to both client (dial) and server (listener) QUIC connections.
 - `tuning.h3_enable_pacing` (default `false`): Enable QUIC packet pacing to smooth bursty sends. Requires OS-level support (e.g., `SO_TXTIME` on Linux). Applied to both client and server QUIC connections.
 - `tuning.h3_insecure_skip_verify` (default `false`): Skip TLS certificate verification globally for all H3 connections. Intended for testing with self-signed certificates only. **Not recommended for production.**
