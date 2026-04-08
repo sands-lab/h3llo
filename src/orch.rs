@@ -1608,7 +1608,7 @@ mod tests {
 
         let snapshot = reply_rx.await.expect("should receive metrics snapshot");
         assert_eq!(snapshot.len(), 2);
-        let text = api::encode_metrics_snapshot(snapshot);
+        let text = crate::metrics::encode_metrics_snapshot(snapshot);
         assert!(
             text.contains("h3llo_transport_packets_total"),
             "missing packets metric: {text}"
