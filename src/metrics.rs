@@ -425,28 +425,30 @@ impl Collector for SnapshotCollector {
         }
 
         // Drop-reason counter families.
-        encode_family(
-            &mut encoder,
-            "h3llo_transport_drops",
-            "Cumulative drop count by reason.",
-            s.values().flat_map(|m| {
-                m.stats
-                    .drop_reasons
-                    .iter()
-                    .map(move |(&reason, c)| (DropLabelSet::from_metrics(m, reason), c.packets))
-            }),
-        )?;
-        encode_family(
-            &mut encoder,
-            "h3llo_transport_drop_bytes",
-            "Cumulative drop bytes by reason.",
-            s.values().flat_map(|m| {
-                m.stats
-                    .drop_reasons
-                    .iter()
-                    .map(move |(&reason, c)| (DropLabelSet::from_metrics(m, reason), c.bytes))
-            }),
-        )?;
+        for (name, help, field) in [
+            (
+                "h3llo_transport_drops",
+                "Cumulative drop count by reason.",
+                (|c: &PktCounters| c.packets) as fn(&PktCounters) -> u64,
+            ),
+            (
+                "h3llo_transport_drop_bytes",
+                "Cumulative drop bytes by reason.",
+                |c| c.bytes,
+            ),
+        ] {
+            encode_family(
+                &mut encoder,
+                name,
+                help,
+                s.values().flat_map(|m| {
+                    m.stats
+                        .drop_reasons
+                        .iter()
+                        .map(move |(&reason, c)| (DropLabelSet::from_metrics(m, reason), field(c)))
+                }),
+            )?;
+        }
 
         // Congestion counter families.
         encode_family(
