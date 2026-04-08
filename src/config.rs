@@ -453,15 +453,9 @@ pub enum ValidationError {
     /// A field that must be positive is zero.
     #[error("{field} must be greater than 0")]
     FieldMustBePositive { field: &'static str },
-    /// `tuning.h3_keepalive_interval` must be strictly less than `tuning.h3_max_idle_timeout`.
-    #[error(
-        "tuning.h3_keepalive_interval ({keepalive:?}) must be less than \
-         tuning.h3_max_idle_timeout ({idle_timeout:?})"
-    )]
-    H3KeepaliveExceedsIdleTimeout {
-        keepalive: Duration,
-        idle_timeout: Duration,
-    },
+    /// Two or more fields have conflicting values.
+    #[error("field conflict: {description}")]
+    FieldConflict { description: String },
     /// A required field is empty (after trimming whitespace) or has no entries.
     #[error("{context}: {field} must not be empty")]
     FieldEmpty {
@@ -490,12 +484,6 @@ pub enum ValidationError {
          (accepted: reno, cubic, bbr, bbr2, none)"
     )]
     InvalidCcAlgorithm { algorithm: String },
-    /// `reconnect_backoff_min` must not exceed `reconnect_backoff_max`.
-    #[error(
-        "tuning.reconnect_backoff_min ({min:?}) must not exceed \
-         tuning.reconnect_backoff_max ({max:?})"
-    )]
-    BackoffMinExceedsMax { min: Duration, max: Duration },
 }
 
 impl Config {
@@ -567,9 +555,12 @@ impl Config {
         }
 
         if self.tuning.h3_keepalive_interval >= self.tuning.h3_max_idle_timeout {
-            errors.push(ValidationError::H3KeepaliveExceedsIdleTimeout {
-                keepalive: self.tuning.h3_keepalive_interval,
-                idle_timeout: self.tuning.h3_max_idle_timeout,
+            errors.push(ValidationError::FieldConflict {
+                description: format!(
+                    "tuning.h3_keepalive_interval ({:?}) must be less than \
+                     tuning.h3_max_idle_timeout ({:?})",
+                    self.tuning.h3_keepalive_interval, self.tuning.h3_max_idle_timeout,
+                ),
             });
         }
 
@@ -623,9 +614,12 @@ impl Config {
         }
 
         if self.tuning.reconnect_backoff_min > self.tuning.reconnect_backoff_max {
-            errors.push(ValidationError::BackoffMinExceedsMax {
-                min: self.tuning.reconnect_backoff_min,
-                max: self.tuning.reconnect_backoff_max,
+            errors.push(ValidationError::FieldConflict {
+                description: format!(
+                    "tuning.reconnect_backoff_min ({:?}) must not exceed \
+                     tuning.reconnect_backoff_max ({:?})",
+                    self.tuning.reconnect_backoff_min, self.tuning.reconnect_backoff_max,
+                ),
             });
         }
 
@@ -2155,7 +2149,7 @@ peers:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::H3KeepaliveExceedsIdleTimeout { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldConflict { .. }))
         ));
     }
 
@@ -2168,7 +2162,7 @@ peers:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::H3KeepaliveExceedsIdleTimeout { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldConflict { .. }))
         ));
     }
 
@@ -2601,7 +2595,7 @@ tuning:
         assert!(matches!(
             err,
             ConfigError::Validation(ValidationErrors(ref errs))
-                if errs.iter().any(|e| matches!(e, ValidationError::BackoffMinExceedsMax { .. }))
+                if errs.iter().any(|e| matches!(e, ValidationError::FieldConflict { .. }))
         ));
     }
 }
