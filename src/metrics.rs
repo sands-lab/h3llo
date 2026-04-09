@@ -421,20 +421,19 @@ impl Collector for SnapshotCollector {
             (
                 "h3llo_transport_packets",
                 "Cumulative packet count.",
-                (|m: &Metrics| (m.stats.succeeded.packets, m.stats.dropped.packets))
-                    as fn(&Metrics) -> (u64, u64),
+                (|s: &Stats| (s.succeeded.packets, s.dropped.packets)) as fn(&Stats) -> (u64, u64),
             ),
-            ("h3llo_transport_bytes", "Cumulative byte count.", |m| {
-                (m.stats.succeeded.bytes, m.stats.dropped.bytes)
+            ("h3llo_transport_bytes", "Cumulative byte count.", |s| {
+                (s.succeeded.bytes, s.dropped.bytes)
             }),
             (
                 "h3llo_transport_batches",
                 "Cumulative batch count (record() invocations for GSO/GRO tracking).",
-                |m| (m.stats.succeeded.batches, m.stats.dropped.batches),
+                |s| (s.succeeded.batches, s.dropped.batches),
             ),
         ] {
             self.encode_family(&mut encoder, name, help, |m| {
-                let (ok, drop) = extractor(m);
+                let (ok, drop) = extractor(&m.stats);
                 [
                     (PacketLabelSet::from_metrics(m, "succeeded"), ok),
                     (PacketLabelSet::from_metrics(m, "dropped"), drop),
