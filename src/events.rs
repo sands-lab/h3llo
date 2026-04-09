@@ -115,8 +115,8 @@ impl std::fmt::Debug for H3v2ConnectedEvent {
 
 /// Carries high-level events emitted by modules to the orchestrator.
 pub enum Event {
-    /// Cumulative metrics snapshot from any source.
-    Metrics(Metrics),
+    /// Cumulative metrics snapshot from any source (boxed to reduce enum size).
+    Metrics(Box<Metrics>),
     /// HTTP/3 connection established, ready for actor spawning.
     H3Connected(H3ConnectedEvent),
     /// HTTP/3 engine-based connection established (inbound or outbound).

@@ -6,6 +6,7 @@
 //! and provides formatting helpers for periodic metrics logging and
 //! QUIC-level metrics collection via `foundations`.
 
+use enum_map::{Enum, EnumMap};
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{
     DescriptorEncoder, EncodeCounterValue, EncodeLabelSet, EncodeLabelValue, EncodeMetric,
@@ -47,7 +48,9 @@ pub enum Direction {
 }
 
 /// Enumerates reasons for packet drops.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Derives [`Enum`] for O(1) [`EnumMap`] counter lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Enum)]
 pub enum DropReason {
     /// Packet exceeded the MTU.
     Oversize,
@@ -111,7 +114,7 @@ impl CongestionStats {
 }
 
 /// Aggregates packet counters by outcome.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PktCounters {
     /// Number of batch operations (`record()` invocations).
     pub batches: u64,
@@ -141,8 +144,8 @@ pub struct Stats {
     pub succeeded: PktCounters,
     /// Dropped packet counters.
     pub dropped: PktCounters,
-    /// Drop counters keyed by reason.
-    pub drop_reasons: HashMap<DropReason, PktCounters>,
+    /// Drop counters indexed by [`DropReason`] variant (O(1) lookup).
+    pub drop_reasons: EnumMap<DropReason, PktCounters>,
     /// Backpressure and I/O congestion wait counters.
     pub congestion: CongestionStats,
 }
@@ -202,11 +205,7 @@ impl Counters {
     /// For single-packet recording, pass `count = 1`.
     pub(crate) fn record_drop(&mut self, reason: DropReason, count: u64, total_bytes: u64) {
         self.stats.dropped.record(count, total_bytes);
-        self.stats
-            .drop_reasons
-            .entry(reason)
-            .or_default()
-            .record(count, total_bytes);
+        self.stats.drop_reasons[reason].record(count, total_bytes);
     }
 
     /// Records a queue-full congestion event with the elapsed wait duration.
@@ -250,9 +249,9 @@ impl Counters {
         remote_addr: Option<SocketAddr>,
     ) -> bool {
         events_tx
-            .send(crate::events::Event::Metrics(
+            .send(crate::events::Event::Metrics(Box::new(
                 self.snapshot(peer_id, remote_addr),
-            ))
+            )))
             .is_ok()
     }
 
@@ -462,7 +461,7 @@ impl Collector for SnapshotCollector {
                 m.stats
                     .drop_reasons
                     .iter()
-                    .map(move |(&reason, c)| (DropLabelSet::from_metrics(m, reason), field(c)))
+                    .map(move |(reason, c)| (DropLabelSet::from_metrics(m, reason), field(c)))
             })?;
         }
 
@@ -703,11 +702,7 @@ mod tests {
         let mut stats = Stats::default();
         stats.succeeded.record(10, 5000);
         stats.dropped.record(2, 300);
-        stats
-            .drop_reasons
-            .entry(DropReason::DisallowedSource)
-            .or_default()
-            .record(2, 300);
+        stats.drop_reasons[DropReason::DisallowedSource].record(2, 300);
 
         let metrics = Metrics {
             labels: Labels {
@@ -752,13 +747,8 @@ mod tests {
         assert_eq!(snap.stats.succeeded.packets, 0);
         assert_eq!(snap.stats.dropped.packets, 3);
         assert_eq!(snap.stats.dropped.bytes, 300);
-        assert_eq!(
-            snap.stats
-                .drop_reasons
-                .get(&DropReason::ChannelClosed)
-                .map(|c| (c.packets, c.bytes)),
-            Some((3, 300))
-        );
+        let c = &snap.stats.drop_reasons[DropReason::ChannelClosed];
+        assert_eq!((c.packets, c.bytes), (3, 300));
     }
 
     #[tokio::test]
@@ -812,7 +802,7 @@ mod tests {
                     bytes: 128,
                     ..Default::default()
                 },
-                drop_reasons: HashMap::new(),
+                drop_reasons: EnumMap::default(),
                 ..Default::default()
             },
         };
@@ -836,15 +826,12 @@ mod tests {
 
     #[test]
     fn encode_snapshot_includes_drop_reasons() {
-        let mut drop_reasons = HashMap::new();
-        drop_reasons.insert(
-            DropReason::Oversize,
-            PktCounters {
-                packets: 3,
-                bytes: 4500,
-                ..Default::default()
-            },
-        );
+        let mut drop_reasons = EnumMap::default();
+        drop_reasons[DropReason::Oversize] = PktCounters {
+            packets: 3,
+            bytes: 4500,
+            ..Default::default()
+        };
         let mut snapshot = HashMap::new();
         let metrics = Metrics {
             labels: Labels {
@@ -923,7 +910,7 @@ mod tests {
                     ..Default::default()
                 },
                 dropped: PktCounters::default(),
-                drop_reasons: HashMap::new(),
+                drop_reasons: EnumMap::default(),
                 ..Default::default()
             },
         };

@@ -919,7 +919,8 @@ impl Orchestrator {
             Event::Api(api_event) => {
                 self.handle_api_event(api_event);
             }
-            Event::Metrics(metrics) => {
+            Event::Metrics(boxed) => {
+                let metrics = *boxed;
                 let labels = &metrics.labels;
 
                 let (Some(pid), Some(addr)) = (labels.peer_id.as_deref(), labels.remote_addr)
@@ -1375,7 +1376,7 @@ mod tests {
     }
 
     fn make_metrics_event() -> Event {
-        Event::Metrics(Metrics {
+        Event::Metrics(Box::new(Metrics {
             labels: Labels {
                 source: Source::Tun,
                 direction: Direction::Rx,
@@ -1383,7 +1384,7 @@ mod tests {
                 remote_addr: None,
             },
             stats: Stats::default(),
-        })
+        }))
     }
 
     #[test]
@@ -1532,7 +1533,7 @@ mod tests {
         assert_eq!(orch.non_peer_metrics.len(), 1);
 
         // Push again with different values but same labels
-        let event = Event::Metrics(Metrics {
+        let event = Event::Metrics(Box::new(Metrics {
             labels: Labels {
                 source: Source::Tun,
                 direction: Direction::Rx,
@@ -1546,7 +1547,7 @@ mod tests {
                 },
                 ..Default::default()
             },
-        });
+        }));
         orch.handle_event(event);
         assert_eq!(orch.non_peer_metrics.len(), 1);
         let stored = orch.non_peer_metrics.values().next().unwrap();
@@ -1560,7 +1561,7 @@ mod tests {
         direction: Direction,
         packets: u64,
     ) -> Event {
-        Event::Metrics(Metrics {
+        Event::Metrics(Box::new(Metrics {
             labels: Labels {
                 source: Source::BareUdp,
                 direction,
@@ -1574,7 +1575,7 @@ mod tests {
                 },
                 ..Default::default()
             },
-        })
+        }))
     }
 
     #[tokio::test]

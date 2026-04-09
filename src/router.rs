@@ -767,11 +767,7 @@ mod tests {
         assert_eq!(expired_batch.len(), 1);
 
         let snap = counters.snapshot(None, None);
-        assert!(snap
-            .stats
-            .drop_reasons
-            .get(&DropReason::TtlExpired)
-            .is_some_and(|c| c.packets == 1));
+        assert_eq!(snap.stats.drop_reasons[DropReason::TtlExpired].packets, 1);
     }
 
     #[tokio::test]
@@ -835,11 +831,7 @@ mod tests {
         assert_eq!(expired_batch.len(), 1);
 
         let snap = counters.snapshot(None, None);
-        assert!(snap
-            .stats
-            .drop_reasons
-            .get(&DropReason::TtlExpired)
-            .is_some_and(|c| c.packets == 1));
+        assert_eq!(snap.stats.drop_reasons[DropReason::TtlExpired].packets, 1);
     }
 
     #[tokio::test]
