@@ -293,8 +293,8 @@ impl RunState {
         let tx = self
             .tx_counters
             .snapshot(Some(&meta.peer_id), Some(meta.remote_addr));
-        let _ = events_tx.send(Event::Metrics(rx));
-        let _ = events_tx.send(Event::Metrics(tx));
+        let _ = events_tx.send(Event::Metrics(Box::new(rx)));
+        let _ = events_tx.send(Event::Metrics(Box::new(tx)));
     }
 }
 

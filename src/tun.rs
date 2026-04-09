@@ -858,14 +858,8 @@ mod tests {
         assert_eq!(metrics.stats.dropped.batches, 1);
         assert_eq!(metrics.stats.dropped.packets, 1);
         assert_eq!(metrics.stats.dropped.bytes, 6);
-        assert_eq!(
-            metrics
-                .stats
-                .drop_reasons
-                .get(&DropReason::Oversize)
-                .map(|c| (c.packets, c.bytes)),
-            Some((1, 6))
-        );
+        let c = &metrics.stats.drop_reasons[DropReason::Oversize];
+        assert_eq!((c.packets, c.bytes), (1, 6));
     }
 
     #[tokio::test]

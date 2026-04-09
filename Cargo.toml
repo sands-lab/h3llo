@@ -40,6 +40,7 @@ http-body-util = "0.1"
 rand = "0.10"
 tokio-util = "0.7"
 humantime-serde = "1.1.1"
+enum-map = "2.7.3"
 
 # Use mimalloc for musl targets to avoid musl's slow default allocator.
 # Purge tuning is done via MIMALLOC_PURGE_DELAY=0 env var in the Dockerfile.

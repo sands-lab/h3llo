@@ -38,7 +38,7 @@ use tokio_quiche::settings::{
     CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
 };
 use tokio_quiche::socket::QuicListener;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Builds common `QuicSettings` from `Tuning` and TUN MTU.
 ///
@@ -200,26 +200,24 @@ async fn handle_h3_connection(
     let quic_cmd_tx = controller.cmd_sender();
 
     let handshake = async {
-        // State for auth/flow handshake. Each handshake expects exactly one
-        // Headers event and one NewFlow event. Duplicates are detected via
-        // Option presence and cause immediate connection rejection.
-        let mut pending_auth: Option<String> = None;
+        // Each handshake expects exactly one Headers event and one NewFlow
+        // event. Duplicates are detected via Option presence and cause
+        // immediate connection rejection. Auth + response sender always
+        // arrive together from Headers, so they share one Option.
+        let mut pending_headers: Option<(String, OutboundFrameSender)> = None;
         let mut pending_flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
-        let mut pending_sender: Option<OutboundFrameSender> = None;
 
         while let Some(event) = controller.event_receiver_mut().recv().await {
             match event {
                 ServerH3Event::Headers {
                     incoming_headers, ..
                 } => {
-                    // Reject duplicate Headers event - use Option presence check
-                    if pending_auth.is_some() || pending_sender.is_some() {
+                    if pending_headers.is_some() {
                         warn!(%remote_addr, "duplicate Headers event, rejecting connection");
                         close_quic_connection(&quic_cmd_tx);
                         return;
                     }
 
-                    // Validate CONNECT-IP protocol headers per RFC 9484
                     if let Err(reason) = validate_connect_ip_headers(&incoming_headers.headers) {
                         warn!(%remote_addr, %reason, "CONNECT-IP protocol validation failed");
                         let mut sender = incoming_headers.send;
@@ -238,8 +236,7 @@ async fn handle_h3_connection(
 
                     match extract_and_validate_auth(&incoming_headers.headers, &tokens) {
                         Ok(peer_id) => {
-                            pending_auth = Some(peer_id);
-                            pending_sender = Some(incoming_headers.send);
+                            pending_headers = Some((peer_id, incoming_headers.send));
                         }
                         Err(reason) => {
                             warn!(%remote_addr, %reason, "CONNECT-IP auth rejected");
@@ -263,7 +260,6 @@ async fn handle_h3_connection(
                     send,
                     recv,
                 }) => {
-                    // Reject duplicate NewFlow event - use Option presence check
                     if pending_flow.is_some() {
                         warn!(%remote_addr, "duplicate NewFlow event, rejecting connection");
                         close_quic_connection(&quic_cmd_tx);
@@ -274,7 +270,10 @@ async fn handle_h3_connection(
                 }
                 ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => return,
                 ServerH3Event::Core(H3Event::ConnectionError(e)) => {
-                    let peer = pending_auth.as_deref().unwrap_or("unknown");
+                    let peer = pending_headers
+                        .as_ref()
+                        .map(|(id, _)| id.as_str())
+                        .unwrap_or("unknown");
                     warn!(%remote_addr, peer, error = ?e, "H3 connection error during handshake");
                     return;
                 }
@@ -288,22 +287,11 @@ async fn handle_h3_connection(
                 }
             }
 
-            // Check if all pieces ready to establish connection.
-            // Must check references first, because take() in pattern matching
-            // would consume values even if the whole pattern doesn't match.
-            if matches!(
-                (&pending_auth, &pending_flow, &pending_sender),
-                (Some(_), Some(_), Some(_))
-            ) {
-                let (Some(peer_id), Some((dgram_tx, dgram_rx, flow_id)), Some(mut sender)) = (
-                    pending_auth.take(),
-                    pending_flow.take(),
-                    pending_sender.take(),
-                ) else {
-                    error!(%remote_addr, "internal error: handshake state inconsistent");
-                    close_quic_connection(&quic_cmd_tx);
-                    return;
-                };
+            // Both pieces present — safe to take (guarded by is_some checks).
+            if pending_headers.is_some() && pending_flow.is_some() {
+                let (peer_id, mut sender) = pending_headers.take().expect("headers present");
+                let (dgram_tx, dgram_rx, flow_id) = pending_flow.take().expect("flow present");
+
                 if send_response_headers(&mut sender, b"200").await.is_err() {
                     warn!(%remote_addr, "failed to send 200 response");
                     close_quic_connection(&quic_cmd_tx);
@@ -334,7 +322,7 @@ async fn handle_h3_connection(
         }
 
         // Event stream closed before handshake completed
-        if pending_auth.is_some() || pending_flow.is_some() {
+        if pending_headers.is_some() || pending_flow.is_some() {
             warn!(%remote_addr, "H3 handshake incomplete: connection closed before completion");
             close_quic_connection(&quic_cmd_tx);
         }
@@ -571,18 +559,13 @@ pub async fn dial_h3<P: RouteProbe>(
 
     // Wait for response headers and NewFlow event with timeout
     let handshake_result = match time::timeout(tuning.h3.h3_handshake_timeout, async {
-        // These three fields are kept as separate Options (rather than a single
-        // Option<(_, _, _)>) because the NewFlow delivery may not be atomic —
-        // per-field errors aid debugging when a partial state is observed.
-        let mut datagram_tx: Option<OutboundFrameSender> = None;
-        let mut datagram_rx: Option<InboundFrameStream> = None;
-        let mut flow_id: Option<u64> = None;
+        // NewFlow fields arrive atomically as a single enum variant.
+        let mut new_flow: Option<(OutboundFrameSender, InboundFrameStream, u64)> = None;
         let mut status_validated = false;
 
         while let Some(event) = controller.event_receiver_mut().recv().await {
             match event {
                 ClientH3Event::Core(H3Event::IncomingHeaders(incoming)) => {
-                    // Check status code
                     let status = incoming
                         .headers
                         .iter()
@@ -600,7 +583,6 @@ pub async fn dial_h3<P: RouteProbe>(
                         return Err(DialError::Rejected(code_num));
                     }
 
-                    // Validate capsule-protocol header per RFC 9484
                     if find_header_value(&incoming.headers, b"capsule-protocol") != Some(b"?1") {
                         warn!(%remote_addr, "server response missing capsule-protocol: ?1");
                         return Err(DialError::Handshake(
@@ -610,20 +592,16 @@ pub async fn dial_h3<P: RouteProbe>(
 
                     info!(%remote_addr, "CONNECT-IP accepted");
                     status_validated = true;
-                    // If NewFlow already arrived, we can exit
-                    if datagram_tx.is_some() {
+                    if new_flow.is_some() {
                         break;
                     }
                 }
                 ClientH3Event::Core(H3Event::NewFlow {
-                    flow_id: fid,
+                    flow_id,
                     send,
                     recv,
                 }) => {
-                    datagram_tx = Some(send);
-                    datagram_rx = Some(recv);
-                    flow_id = Some(fid);
-                    // Only break if status was already validated
+                    new_flow = Some((send, recv, flow_id));
                     if status_validated {
                         break;
                     }
@@ -651,12 +629,8 @@ pub async fn dial_h3<P: RouteProbe>(
             ));
         }
 
-        let datagram_tx = datagram_tx
-            .ok_or_else(|| DialError::Handshake("no datagram_tx from NewFlow".to_string()))?;
-        let datagram_rx = datagram_rx
-            .ok_or_else(|| DialError::Handshake("no datagram_rx from NewFlow".to_string()))?;
-        let flow_id =
-            flow_id.ok_or_else(|| DialError::Handshake("no flow_id from NewFlow".to_string()))?;
+        let (datagram_tx, datagram_rx, flow_id) = new_flow
+            .ok_or_else(|| DialError::Handshake("no NewFlow event received".to_string()))?;
 
         Ok((datagram_tx, datagram_rx, flow_id))
     })
@@ -767,7 +741,7 @@ pub fn spawn_h3_rx(
                 }
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), Some(remote_addr));
-                    if events_tx.send(Event::Metrics(metrics)).is_err() {
+                    if events_tx.send(Event::Metrics(Box::new(metrics))).is_err() {
                         return Ok(());
                     }
                 }
@@ -948,7 +922,7 @@ pub fn spawn_h3_tx(
                         .await
                         .map_err(|_| {
                             counters.record_drop(
-                                DropReason::SendError, 1, len as u64,
+                                DropReason::ChannelClosed, 1, len as u64,
                             );
                             ActorError::H3TxSend {
                                 peer_id: peer.clone(),
@@ -964,7 +938,7 @@ pub fn spawn_h3_tx(
                 }
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), Some(remote_addr));
-                    if events_tx.send(Event::Metrics(metrics)).is_err() {
+                    if events_tx.send(Event::Metrics(Box::new(metrics))).is_err() {
                         return Ok(());
                     }
                 }

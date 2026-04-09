@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
-use crate::actor::ActorExitResult;
+use crate::actor::{ActorExitResult, H3ActorHandles};
 use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
 use crate::h3::H3Connection;
 use crate::metrics::{Labels, Metrics};
@@ -97,10 +97,10 @@ pub struct H3v2ConnectedEvent {
     pub origin: ConnOrigin,
     /// Actor join handles for lifecycle tracking.
     ///
-    /// Outbound connections carry engine + UDP actor handles for JoinSet
-    /// registration. Inbound connections are managed by the dispatcher
-    /// and carry no handles (empty Vec).
-    pub handles: Vec<JoinHandle<ActorExitResult>>,
+    /// Outbound (client) connections carry (engine, udp_rx, udp_tx) handles
+    /// for JoinSet registration. Inbound (server) connections are managed
+    /// by the dispatcher (`None`).
+    pub handles: Option<H3ActorHandles>,
 }
 
 impl std::fmt::Debug for H3v2ConnectedEvent {
@@ -115,8 +115,8 @@ impl std::fmt::Debug for H3v2ConnectedEvent {
 
 /// Carries high-level events emitted by modules to the orchestrator.
 pub enum Event {
-    /// Cumulative metrics snapshot from any source.
-    Metrics(Metrics),
+    /// Cumulative metrics snapshot from any source (boxed to reduce enum size).
+    Metrics(Box<Metrics>),
     /// HTTP/3 connection established, ready for actor spawning.
     H3Connected(H3ConnectedEvent),
     /// HTTP/3 engine-based connection established (inbound or outbound).
