@@ -6,7 +6,7 @@ use crate::bind::{make_client_udp_socket, RouteProbe, UdpError};
 use crate::config::{DnsTuning, LocalDns, Tuning};
 use crate::events::{DnsEvent, Event};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rand::RngExt;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -508,7 +508,7 @@ fn handle_decoded_packet(
         if let Some(got) = message
             .answers()
             .iter()
-            .map(hickory_proto::rr::Record::record_type)
+            .map(Record::record_type)
             .find(|&rt| rt != record_type)
         {
             warn!(
@@ -603,7 +603,6 @@ mod tests {
     use super::*;
     use crate::bind::test_support::FakeRouteProbe;
     use hickory_proto::rr::rdata::A;
-    use hickory_proto::rr::Record;
     use std::net::Ipv4Addr;
 
     /// Starts a resolver coroutine wired to the provided server socket.

@@ -205,11 +205,7 @@ impl Drop for DedicatedRuntime {
                 let msg = payload
                     .downcast_ref::<&str>()
                     .copied()
-                    .or_else(|| {
-                        payload
-                            .downcast_ref::<String>()
-                            .map(std::string::String::as_str)
-                    })
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("<non-string panic>");
                 error!("dedicated runtime thread panicked: {msg}");
             }
