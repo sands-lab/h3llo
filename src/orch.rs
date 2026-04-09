@@ -232,54 +232,22 @@ impl PeerEntry {
                 events_tx: events_tx.clone(),
             };
 
+            let probe = DefaultRouteProbe;
             match &self.config.transport {
                 PeerTransport::Bare(bare) => {
-                    let destination = SocketAddr::new(dial_ip, bare.endpoint.port);
-                    let bindif = bare.bindif.clone();
-                    let endpoint = bare.endpoint.clone();
+                    let bare = bare.clone();
                     tokio::spawn(async move {
-                        let probe = DefaultRouteProbe;
-                        match dial_bare_tx(endpoint, destination, &ctx, &probe, bindif.as_deref())
-                            .await
-                        {
-                            Ok(event) => {
-                                let _ = ctx.events_tx.send(Event::Connected(event));
-                            }
-                            Err(err) => {
-                                warn!(peer = %ctx.peer_id, addr = %destination, error = %err, "bare dial failed");
-                                let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
-                                    peer_id: ctx.peer_id,
-                                    ip: dial_ip,
-                                }));
-                            }
-                        }
+                        let result = dial_bare_tx(&bare, dial_ip, &ctx, &probe).await;
+                        report_dial(result, ctx, dial_ip, "bare");
                     });
                 }
                 PeerTransport::H3(h3) => {
-                    let Some(h3_endpoint) = h3.endpoint.as_ref() else {
-                        self.dials.remove(ip);
-                        continue;
-                    };
-                    let destination = SocketAddr::new(dial_ip, h3_endpoint.port);
                     let peer_h3 = h3.clone();
                     let ingress_tx = ingress_tx.clone();
-
                     tokio::spawn(async move {
-                        let probe = DefaultRouteProbe;
-                        match dial_h3_client(&peer_h3, destination, &ctx, &probe, ingress_tx).await
-                        {
-                            Ok(event) => {
-                                info!(peer = %event.peer_id, addr = %event.remote_addr, "H3 connected");
-                                let _ = ctx.events_tx.send(Event::Connected(event));
-                            }
-                            Err(e) => {
-                                warn!(peer = %ctx.peer_id, addr = %destination, error = %e, "H3 dial failed");
-                                let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
-                                    peer_id: ctx.peer_id,
-                                    ip: dial_ip,
-                                }));
-                            }
-                        }
+                        let result =
+                            dial_h3_client(&peer_h3, dial_ip, &ctx, &probe, ingress_tx).await;
+                        report_dial(result, ctx, dial_ip, "H3");
                     });
                 }
             }
@@ -295,6 +263,31 @@ fn peer_dns_hostname(peer: &Peer) -> Option<&str> {
     match &peer.transport {
         PeerTransport::Bare(bare) => Some(&bare.endpoint.host),
         PeerTransport::H3(h3) => h3.endpoint.as_ref().map(|ep| strip_ipv6_brackets(&ep.host)),
+    }
+}
+
+/// Reports a dial outcome to the orchestrator via the event channel.
+///
+/// Logs the result and sends [`Event::Connected`] on success or
+/// [`Event::DialFailed`] on failure.
+fn report_dial<E: std::fmt::Display>(
+    result: Result<ConnectedEvent, E>,
+    ctx: DialContext,
+    dial_ip: IpAddr,
+    protocol: &str,
+) {
+    match result {
+        Ok(event) => {
+            info!(peer = %event.peer_id, addr = %event.remote_addr, protocol, "connected");
+            let _ = ctx.events_tx.send(Event::Connected(event));
+        }
+        Err(err) => {
+            warn!(peer = %ctx.peer_id, ip = %dial_ip, error = %err, protocol, "dial failed");
+            let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
+                peer_id: ctx.peer_id,
+                ip: dial_ip,
+            }));
+        }
     }
 }
 

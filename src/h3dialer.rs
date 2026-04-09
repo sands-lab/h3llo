@@ -15,7 +15,7 @@ use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction,
 use crate::udp;
 use quiche::h3::NameValue;
 use rand::Rng;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -218,11 +218,11 @@ fn make_client_quiche_config(
 
 /// Establishes an outbound H3 client CONNECT-IP connection.
 ///
-/// On success, returns [`ConnectedEvent`] with origin `Client`.
-/// The caller is responsible for sending the event and handling errors.
+/// On success, returns [`ConnectedEvent`]. The caller is responsible for
+/// sending the event and handling errors.
 pub(crate) async fn dial_h3_client<P: RouteProbe>(
     peer_h3: &PeerH3,
-    remote_addr: SocketAddr,
+    dial_ip: IpAddr,
     ctx: &DialContext,
     probe: &P,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
@@ -239,7 +239,8 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     let endpoint = peer_h3
         .endpoint
         .as_ref()
-        .ok_or_else(|| DialError::Socket("peer_h3.endpoint is None".into()))?;
+        .ok_or_else(|| DialError::Socket("endpoint is None".into()))?;
+    let remote_addr = SocketAddr::new(dial_ip, endpoint.port);
 
     let server_name = peer_h3.sni.as_deref().unwrap_or(&endpoint.host);
 
@@ -502,7 +503,7 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let ctx = DialContext::test(peer_id, tuning, events_tx);
 
-        let event = dial_h3_client(&peer_h3, bound_addr, &ctx, &probe, ingress_tx)
+        let event = dial_h3_client(&peer_h3, bound_addr.ip(), &ctx, &probe, ingress_tx)
             .await
             .expect("dial_h3_client failed");
 
@@ -549,7 +550,8 @@ mod tests {
 
         let ctx = DialContext::test(peer_id, tuning, events_tx);
 
-        let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
+        let result =
+            dial_h3_client(&peer_h3, server.bound_addr.ip(), &ctx, &probe, ingress_tx).await;
 
         assert!(
             matches!(result, Err(DialError::Rejected(_))),
@@ -778,7 +780,7 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let ctx = DialContext::test(peer_id, tuning, events_tx);
 
-        let event = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx)
+        let event = dial_h3_client(&peer_h3, server.bound_addr.ip(), &ctx, &probe, ingress_tx)
             .await
             .expect("dial with trusted CA should succeed");
 
@@ -805,7 +807,8 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let ctx = DialContext::test(peer_id, tuning, events_tx);
 
-        let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
+        let result =
+            dial_h3_client(&peer_h3, server.bound_addr.ip(), &ctx, &probe, ingress_tx).await;
 
         let err =
             result.expect_err("handshake with self-signed cert and no trusted CA should fail");
