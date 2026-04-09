@@ -1,4 +1,4 @@
-//! DNS resolver coroutine: consumes SetHostnames commands, manages IP lifecycle with TTL-based expiration,
+//! DNS resolver coroutine: consumes `SetHostnames` commands, manages IP lifecycle with TTL-based expiration,
 //! and emits state snapshot events on resolution changes.
 
 use crate::actor::{ActorError, ActorExitResult};
@@ -36,7 +36,7 @@ pub enum DnsCommand {
 ///
 /// Wire-decoded names are always marked as FQDN, so `to_ascii()` includes a
 /// trailing dot (e.g., `"example.com."`). This function strips it to match
-/// the hostname format used as HashMap keys throughout the DNS module.
+/// the hostname format used as `HashMap` keys throughout the DNS module.
 fn normalize_dns_name(name: &Name) -> String {
     let s = name.to_ascii();
     s.strip_suffix('.').unwrap_or(&s).to_ascii_lowercase()
@@ -52,7 +52,7 @@ fn normalize_dns_name(name: &Name) -> String {
 struct HostnameState {
     /// Resolved IPs with TTL-based expiration times.
     ips: HashMap<IpAddr, Instant>,
-    /// Pending queries keyed by record type: (transaction_id, last_sent_time).
+    /// Pending queries keyed by record type: (`transaction_id`, `last_sent_time`).
     pending: HashMap<RecordType, (u16, Instant)>,
     /// Earliest time at which `trigger_refresh` should re-query this hostname.
     next_refresh_at: Instant,
@@ -112,7 +112,7 @@ impl DnsState {
         let Some(entry) = self.hostnames.get_mut(host) else {
             return;
         };
-        let record_ttl = Duration::from_secs(ttl as u64);
+        let record_ttl = Duration::from_secs(u64::from(ttl));
         let effective_ttl = record_ttl.max(self.min_ttl);
         let expires_at = Instant::now() + effective_ttl;
         if entry.ips.insert(ip, expires_at).is_none() {
@@ -124,7 +124,7 @@ impl DnsState {
     /// Removes expired IPs.
     fn expire_stale(&mut self) {
         let now = Instant::now();
-        for (host, entry) in self.hostnames.iter_mut() {
+        for (host, entry) in &mut self.hostnames {
             let expired: Vec<IpAddr> = entry
                 .ips
                 .extract_if(|_, exp| *exp <= now)
@@ -153,7 +153,7 @@ impl DnsState {
         }
     }
 
-    /// Validates and clears a pending query matching (hostname, record_type, txid).
+    /// Validates and clears a pending query matching (hostname, `record_type`, txid).
     ///
     /// Returns `true` if a matching pending query was found and cleared. Performs
     /// dual validation: hostname must be registered, record type must have a
@@ -346,7 +346,7 @@ pub fn spawn_dns(
     (cmd_tx, handle)
 }
 
-/// Handles the SetHostnames command: diffs against current state,
+/// Handles the `SetHostnames` command: diffs against current state,
 /// records IP literals, emits a snapshot, and triggers refresh.
 async fn handle_set_hostnames(
     new_hosts: HashSet<String>,
@@ -455,7 +455,7 @@ async fn send_query(
 /// Parses a DNS response and updates state via O(1) hostname lookup.
 ///
 /// Extracts the queried hostname from the response's question section
-/// (RFC 1035 §4.1.1) for direct HashMap lookup. Validates both hostname
+/// (RFC 1035 §4.1.1) for direct `HashMap` lookup. Validates both hostname
 /// and txid before processing.
 fn handle_packet(data: &[u8], state: &mut DnsState) {
     let message = match Message::from_vec(data) {
@@ -490,25 +490,25 @@ fn handle_packet(data: &[u8], state: &mut DnsState) {
         return;
     }
 
-    handle_decoded_packet(message, &hostname, record_type, state);
+    handle_decoded_packet(&message, &hostname, record_type, state);
 }
 
 /// Handles a parsed DNS packet that matches a pending request.
 fn handle_decoded_packet(
-    message: Message,
+    message: &Message,
     host: &str,
     record_type: RecordType,
     state: &mut DnsState,
 ) {
-    log_response_warnings(&message, host);
+    log_response_warnings(message, host);
 
-    let records = extract_records(&message, record_type);
+    let records = extract_records(message, record_type);
 
     if message.response_code() == ResponseCode::NoError && records.is_empty() {
         if let Some(got) = message
             .answers()
             .iter()
-            .map(|a| a.record_type())
+            .map(hickory_proto::rr::Record::record_type)
             .find(|&rt| rt != record_type)
         {
             warn!(

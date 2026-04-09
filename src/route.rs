@@ -1,4 +1,4 @@
-//! System route synchronization using route_manager.
+//! System route synchronization using `route_manager`.
 //!
 //! Provides both the core route sync logic (`sync_tun_routes`) and the route
 //! actor (`make_route` / `spawn_route`) that serializes system route updates.
@@ -176,6 +176,11 @@ pub enum RouteSyncError {
 /// - Any other route on the TUN interface is considered stale and will be deleted.
 /// - If a desired prefix already exists on another interface, a conflict warning is logged.
 /// - Failures when adding or deleting are logged as warnings.
+///
+/// # Errors
+///
+/// Returns [`RouteError`] if the TUN interface index cannot be resolved
+/// or the system route listing fails.
 pub async fn sync_tun_routes<H: RouteHandle, R: IfIndexResolver>(
     tun_if: &str,
     tun_addrs: &[IpNet],
@@ -314,6 +319,7 @@ fn is_ipv6_kernel_route(net: &IpNet) -> bool {
 }
 
 /// Converts a `route_manager::Route` into `IpNet` when the address family is supported.
+#[must_use]
 pub fn ipnet_from_route(route: &Route) -> Option<IpNet> {
     IpNet::new(route.destination(), route.prefix()).ok()
 }

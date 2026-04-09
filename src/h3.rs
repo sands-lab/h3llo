@@ -53,7 +53,7 @@ fn make_quic_settings(tuning: &Tuning, tun_mtu: u16) -> QuicSettings {
     s.max_idle_timeout = Some(tuning.h3.h3_max_idle_timeout);
     s.max_send_udp_payload_size = quic_udp_payload_size;
     s.max_recv_udp_payload_size = quic_udp_payload_size;
-    s.cc_algorithm = tuning.h3.h3_cc_algorithm.clone();
+    s.cc_algorithm.clone_from(&tuning.h3.h3_cc_algorithm);
     s.enable_pacing = tuning.h3.h3_enable_pacing;
     s
 }
@@ -94,7 +94,7 @@ fn find_header_value<'a>(headers: &'a [Header], name: &[u8]) -> Option<&'a [u8]>
     headers
         .iter()
         .find(|h| h.name().eq_ignore_ascii_case(name))
-        .map(|h| h.value())
+        .map(quiche::h3::NameValue::value)
 }
 
 /// Type-erased callback for issuing QUIC control commands.
@@ -118,7 +118,7 @@ fn close_quic_connection<C: From<QuicCommand> + Send + 'static>(
     }));
 }
 
-/// Sends HTTP/3 response headers via the OutboundFrameSender.
+/// Sends HTTP/3 response headers via the `OutboundFrameSender`.
 ///
 /// Per RFC 9297 Section 2.1, the `capsule-protocol` header MUST only be included
 /// on 2xx (Successful) responses. Error responses (400, 401, etc.) MUST NOT
@@ -185,9 +185,9 @@ fn validate_connect_ip_headers(headers: &[Header]) -> Result<(), &'static str> {
 
 /// Handles a single inbound H3 CONNECT-IP connection handshake.
 ///
-/// Waits for exactly one Headers event and one NewFlow event (in either order),
+/// Waits for exactly one Headers event and one `NewFlow` event (in either order),
 /// then sends 200 OK and emits the established connection. Rejects duplicate
-/// Headers or NewFlow events by closing the connection immediately. Times out
+/// Headers or `NewFlow` events by closing the connection immediately. Times out
 /// after `h3_handshake_timeout` to prevent resource exhaustion from stalled clients.
 async fn handle_h3_connection(
     mut controller: tokio_quiche::http3::driver::ServerH3Controller,
@@ -272,18 +272,16 @@ async fn handle_h3_connection(
                 ServerH3Event::Core(H3Event::ConnectionError(e)) => {
                     let peer = pending_headers
                         .as_ref()
-                        .map(|(id, _)| id.as_str())
-                        .unwrap_or("unknown");
+                        .map_or("unknown", |(id, _)| id.as_str());
                     warn!(%remote_addr, peer, error = ?e, "H3 connection error during handshake");
                     return;
                 }
-                other => {
+                other @ ServerH3Event::Core(_) => {
                     debug!(
                         %remote_addr,
                         event = ?other,
                         "ignoring unhandled H3 server event during handshake"
                     );
-                    continue;
                 }
             }
 
@@ -406,6 +404,7 @@ impl H3Connection {
     ///
     /// Consumes the connection, returning state structs suitable for
     /// `spawn_h3_rx` and `spawn_h3_tx`.
+    #[must_use]
     pub fn into_actors(self) -> (H3Rx, H3Tx) {
         let rx = H3Rx {
             peer_id: self.peer_id.clone(),
@@ -520,7 +519,7 @@ pub async fn dial_h3<P: RouteProbe>(
     let _quic_conn =
         tokio_quiche::quic::connect_with_config(socket, Some(server_name), &params, h3_driver)
             .await
-            .map_err(|e| DialError::Handshake(format!("QUIC connect failed: {}", e)))?;
+            .map_err(|e| DialError::Handshake(format!("QUIC connect failed: {e}")))?;
 
     // Build auth header
     let auth_header = generate_bearer_auth(&peer_h3.token);
@@ -548,10 +547,7 @@ pub async fn dial_h3<P: RouteProbe>(
         body_writer: Some(body_tx),
     }) {
         close_quic_connection(&quic_cmd_tx);
-        return Err(DialError::Handshake(format!(
-            "send CONNECT failed: {:?}",
-            e
-        )));
+        return Err(DialError::Handshake(format!("send CONNECT failed: {e:?}")));
     }
 
     // Wait for response headers and NewFlow event with timeout
@@ -567,7 +563,7 @@ pub async fn dial_h3<P: RouteProbe>(
                         .headers
                         .iter()
                         .find(|h| h.name() == b":status")
-                        .map(|h| h.value());
+                        .map(quiche::h3::NameValue::value);
                     let Some(s) = status else {
                         return Err(DialError::Handshake("missing status".to_string()));
                     };
@@ -604,7 +600,7 @@ pub async fn dial_h3<P: RouteProbe>(
                     }
                 }
                 ClientH3Event::Core(H3Event::ConnectionError(e)) => {
-                    return Err(DialError::Handshake(format!("H3 error: {:?}", e)));
+                    return Err(DialError::Handshake(format!("H3 error: {e:?}")));
                 }
                 ClientH3Event::Core(H3Event::ConnectionShutdown(_)) => {
                     return Err(DialError::Handshake("connection shutdown".to_string()));
@@ -615,7 +611,6 @@ pub async fn dial_h3<P: RouteProbe>(
                         event = ?other,
                         "ignoring unhandled H3 client event during handshake"
                     );
-                    continue;
                 }
             }
         }
@@ -683,10 +678,11 @@ pub struct H3Rx {
 ///
 /// # Arguments
 ///
-/// * `rx` - H3 receive state (peer_id and datagram_rx).
+/// * `rx` - H3 receive state (`peer_id` and `datagram_rx`).
 /// * `ingress_tx` - Bounded channel to push received packets to the router actor.
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
 /// * `interval` - Metrics emission interval.
+#[must_use]
 pub fn spawn_h3_rx(
     rx: H3Rx,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
@@ -829,9 +825,10 @@ impl std::fmt::Debug for H3Tx {
 ///
 /// # Arguments
 ///
-/// * `tx` - H3 transmit state (peer_id, datagram_tx, flow_id).
+/// * `tx` - H3 transmit state (`peer_id`, `datagram_tx`, `flow_id`).
 /// * `events_tx` - Unbounded channel for emitting transmit metrics.
 /// * `interval` - Metrics emission interval.
+#[must_use]
 pub fn spawn_h3_tx(
     tx: H3Tx,
     events_tx: mpsc::UnboundedSender<Event>,
@@ -991,7 +988,7 @@ pub enum H3ListenerCommand {
 /// * `listen_addr` - Address to listen on.
 /// * `cert_path` - Path to TLS certificate.
 /// * `key_path` - Path to TLS private key.
-/// * `socket_buffer_bytes` - SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
+/// * `socket_buffer_bytes` - `SO_RCVBUF/SO_SNDBUF` size in bytes; 0 skips configuration.
 ///
 /// # Errors
 ///
@@ -1008,7 +1005,7 @@ pub fn make_h3_listener(
 
     let bound_addr = socket
         .local_addr()
-        .map_err(|e| ListenerError::Bind(format!("failed to get local addr: {}", e)))?;
+        .map_err(|e| ListenerError::Bind(format!("failed to get local addr: {e}")))?;
 
     // Validate and convert paths to owned strings
     let cert_str = cert_path
@@ -1041,6 +1038,10 @@ pub fn make_h3_listener(
 /// * `peer_tokens` - Map of peer ID to expected token for authentication.
 /// * `tun_mtu` - TUN interface MTU for deriving QUIC payload size.
 /// * `events_tx` - Unbounded channel for emitting events to orchestrator.
+///
+/// # Panics
+///
+/// Panics if the bound socket cannot be converted to a `QuicListener` (infallible in practice).
 pub fn spawn_h3_listener(
     listener: H3Listener,
     mut peer_tokens: HashMap<String, String>,
@@ -1072,7 +1073,7 @@ pub fn spawn_h3_listener(
 
     let quic_settings = make_quic_settings(tuning, tun_mtu);
 
-    let conn_params = ConnectionParams::new_server(quic_settings, tls_config, Default::default());
+    let conn_params = ConnectionParams::new_server(quic_settings, tls_config, Hooks::default());
 
     // Convert to QuicListener and conditionally enable GSO/GRO offload.
     // Using listen_with_capabilities avoids the implicit apply_max_capabilities

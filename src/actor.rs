@@ -15,10 +15,10 @@ use tracing::error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorKind {
     /// Critical actors whose failure should exit h3llo.
-    /// Includes: tun_rx, tun_tx, udp_rx, dns_resolver
+    /// Includes: `tun_rx`, `tun_tx`, `udp_rx`, `dns_resolver`
     Critical,
     /// Restartable actors that could be reconnected on failure.
-    /// Includes: udp_tx, h3_tx, h3_rx
+    /// Includes: `udp_tx`, `h3_tx`, `h3_rx`
     /// Note: Reconnection logic is not yet implemented.
     Restartable,
 }
@@ -117,19 +117,20 @@ pub enum ActorError {
 
 impl ActorError {
     /// Returns the supervision classification for this error type.
+    #[must_use]
     pub fn kind(&self) -> ActorKind {
         match self {
             // Critical actors - failure exits h3llo
-            ActorError::TunRxRecv { .. } => ActorKind::Critical,
-            ActorError::TunTxSend { .. } => ActorKind::Critical,
-            ActorError::UdpRxRecv { .. } => ActorKind::Critical,
-            ActorError::DnsRecv { .. } => ActorKind::Critical,
-            ActorError::ApiServer { .. } => ActorKind::Critical,
-            ActorError::RouterFailed { .. } => ActorKind::Critical,
+            ActorError::TunRxRecv { .. }
+            | ActorError::TunTxSend { .. }
+            | ActorError::UdpRxRecv { .. }
+            | ActorError::DnsRecv { .. }
+            | ActorError::ApiServer { .. }
+            | ActorError::RouterFailed { .. } => ActorKind::Critical,
             // Restartable actors - could be reconnected (future work)
-            ActorError::UdpTxSend { .. } => ActorKind::Restartable,
-            ActorError::H3TxSend { .. } => ActorKind::Restartable,
-            ActorError::H3Engine { .. } => ActorKind::Restartable,
+            ActorError::UdpTxSend { .. }
+            | ActorError::H3TxSend { .. }
+            | ActorError::H3Engine { .. } => ActorKind::Restartable,
         }
     }
 }
@@ -204,7 +205,11 @@ impl Drop for DedicatedRuntime {
                 let msg = payload
                     .downcast_ref::<&str>()
                     .copied()
-                    .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<String>()
+                            .map(std::string::String::as_str)
+                    })
                     .unwrap_or("<non-string panic>");
                 error!("dedicated runtime thread panicked: {msg}");
             }

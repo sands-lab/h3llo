@@ -244,10 +244,10 @@ async fn handle_delete_config(
     }
 }
 
-/// Handles `GET /metrics` — returns OpenMetrics text format.
+/// Handles `GET /metrics` — returns `OpenMetrics` text format.
 ///
 /// Requests a raw metrics snapshot from the orchestrator via event channel,
-/// then renders OpenMetrics text locally using `prometheus-client`.
+/// then renders `OpenMetrics` text locally using `prometheus-client`.
 async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Response<Full<Bytes>> {
     match send_and_await(events_tx, |reply_tx| {
         Event::Api(ApiEvent::GetMetricsSnapshot { reply_tx })

@@ -36,7 +36,7 @@ pub struct Local {
     /// HTTP/3 server options and credentials.
     #[serde(default)]
     pub h3: Option<LocalH3>,
-    /// BareUDP listener options.
+    /// `BareUDP` listener options.
     #[serde(default)]
     pub bare: Option<LocalBare>,
     /// Management API server options.
@@ -58,11 +58,11 @@ pub struct LocalH3 {
     pub key: String,
 }
 
-/// BareUDP settings for the local node.
+/// `BareUDP` settings for the local node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LocalBare {
-    /// BareUDP listen address (required when BareUDP is configured).
+    /// `BareUDP` listen address (required when `BareUDP` is configured).
     pub listen: UdpEndpoint,
 }
 
@@ -97,12 +97,12 @@ pub struct LocalTun {
     pub mtu: u16,
 }
 
-/// Peer transport selection: exactly one of H3 or BareUDP.
+/// Peer transport selection: exactly one of H3 or `BareUDP`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerTransport {
     /// HTTP/3 transport.
     H3(PeerH3),
-    /// BareUDP transport.
+    /// `BareUDP` transport.
     Bare(PeerBare),
 }
 
@@ -112,7 +112,7 @@ pub enum PeerTransport {
 pub struct Peer {
     /// Remote node identifier.
     pub id: String,
-    /// Transport configuration (exactly one of H3 or BareUDP).
+    /// Transport configuration (exactly one of H3 or `BareUDP`).
     pub transport: PeerTransport,
     /// Peer routing details.
     pub tun: PeerTun,
@@ -186,13 +186,13 @@ pub struct PeerH3 {
     pub sni: Option<String>,
 }
 
-/// BareUDP options per peer.
+/// `BareUDP` options per peer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PeerBare {
-    /// BareUDP dialing endpoint (required when BareUDP is configured).
+    /// `BareUDP` dialing endpoint (required when `BareUDP` is configured).
     pub endpoint: UdpEndpoint,
-    /// Optional interface binding for BareUDP dialing.
+    /// Optional interface binding for `BareUDP` dialing.
     pub bindif: Option<String>,
 }
 
@@ -252,14 +252,14 @@ pub struct Tuning {
 
 /// I/O and data-plane tuning shared across transport actors.
 ///
-/// Used by TUN, BareUDP, and H3 actors for channel sizing, socket
+/// Used by TUN, `BareUDP`, and H3 actors for channel sizing, socket
 /// configuration, and offload settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct IoTuning {
     /// Data-plane packet queue depth for bounded backpressure channels (default: 256).
     pub packet_queue_depth: usize,
-    /// Socket buffer size in megabytes for SO_RCVBUF and SO_SNDBUF (default: 16).
+    /// Socket buffer size in megabytes for `SO_RCVBUF` and `SO_SNDBUF` (default: 16).
     ///
     /// Applied to all UDP sockets. Set to 0 to skip buffer configuration and use
     /// system defaults. Actual kernel buffer may be clamped by OS limits.
@@ -283,11 +283,11 @@ pub struct IoTuning {
     ///
     /// Effect varies by transport:
     ///
-    /// - **UDP TX** (BareUDP and the current H3 data plane): controls GSO
+    /// - **UDP TX** (`BareUDP` and the current H3 data plane): controls GSO
     ///   segment count. When `true`, batches multiple packets into a single
     ///   `sendmsg` via `UDP_SEGMENT`. When `false`, segment count is capped
     ///   to 1 (per-packet sends).
-    /// - **UDP RX** (BareUDP and the current H3 data plane): **no effect**.
+    /// - **UDP RX** (`BareUDP` and the current H3 data plane): **no effect**.
     ///   quinn-udp's `UdpSocketState::new()` unconditionally enables
     ///   `UDP_GRO`; the receive buffer is always sized for the socket's
     ///   actual GRO capability to prevent silent truncation of coalesced
@@ -305,6 +305,7 @@ pub struct IoTuning {
 
 impl IoTuning {
     /// Returns socket buffer size in bytes, or 0 to skip configuration.
+    #[must_use]
     pub fn socket_buffer_bytes(&self) -> usize {
         self.socket_buffer_size.saturating_mul(1024 * 1024)
     }
@@ -516,6 +517,10 @@ pub enum ValidationError {
 
 impl Config {
     /// Loads configuration from a YAML reader and validates it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] on YAML parse failure or validation errors.
     pub fn load_from_reader<R: Read>(reader: R) -> Result<Self, ConfigError> {
         let config: Config = serde_yaml::from_reader(reader)?;
         config.validate()?;
@@ -523,6 +528,10 @@ impl Config {
     }
 
     /// Loads configuration from a YAML string and validates it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] on YAML parse failure or validation errors.
     pub fn load_from_str(contents: &str) -> Result<Self, ConfigError> {
         let config: Config = serde_yaml::from_str(contents)?;
         config.validate()?;
@@ -530,6 +539,10 @@ impl Config {
     }
 
     /// Validates structural and semantic constraints.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] if any structural or semantic constraint is violated.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut errors = Vec::new();
 
@@ -603,8 +616,9 @@ impl Config {
 
         // Subset of quiche::CongestionControlAlgorithm::from_str();
         // excludes internal aliases (bbr2_gcongestion).
-        const VALID_CC_ALGORITHMS: &[&str] = &["reno", "cubic", "bbr", "bbr2", "none"];
-        if !VALID_CC_ALGORITHMS.contains(&self.tuning.h3.h3_cc_algorithm.as_str()) {
+        if !["reno", "cubic", "bbr", "bbr2", "none"]
+            .contains(&self.tuning.h3.h3_cc_algorithm.as_str())
+        {
             errors.push(ValidationError::InvalidCcAlgorithm {
                 algorithm: self.tuning.h3.h3_cc_algorithm.clone(),
             });
@@ -740,7 +754,11 @@ fn check_trimmed(
     }
 }
 
-/// Validates a peer list in isolation (ID, token, transport, allowed_ips).
+/// Validates a peer list in isolation (ID, token, transport, `allowed_ips`).
+///
+/// # Errors
+///
+/// Returns [`ValidationErrors`] if any peer has invalid configuration.
 pub fn validate_peers(peers: &[Peer]) -> Result<(), ValidationErrors> {
     let mut errors = Vec::new();
     let mut seen_peer_ids = HashSet::new();
@@ -819,6 +837,7 @@ fn default_ifname() -> String {
 ///
 /// `max_udp_payload_size` (1350) − CONNECT-IP overhead (59) = 1291.
 /// The limit is configurable in quiche.
+#[must_use]
 pub fn default_mtu() -> u16 {
     1291
 }

@@ -52,6 +52,7 @@ const IPV6_MIN_LEN: usize = 40;
 /// IPv6 has no header checksum. Only the hop limit (byte 7) is decremented.
 ///
 /// [RFC 1624]: https://www.rfc-editor.org/rfc/rfc1624
+#[allow(clippy::cast_possible_truncation)] // Intentional: checksum fold guarantees sum fits u16.
 fn decrement_ttl(packet: &mut [u8]) -> Option<u8> {
     let version = packet.first().map(|b| b >> 4)?;
     match version {
@@ -70,7 +71,7 @@ fn decrement_ttl(packet: &mut [u8]) -> Option<u8> {
                 packet[IPV4_CHECKSUM_OFFSET],
                 packet[IPV4_CHECKSUM_OFFSET + 1],
             ]);
-            let mut sum = old_check as u32 + 0x0100;
+            let mut sum = u32::from(old_check) + 0x0100;
             sum = (sum & 0xFFFF) + (sum >> 16);
             sum = (sum & 0xFFFF) + (sum >> 16);
             // Handle -0 edge case (RFC 1624 Section 4).
@@ -186,6 +187,7 @@ impl Default for RoutingTable {
 
 impl RoutingTable {
     /// Creates an empty routing table.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             trie: IpnetTrie::new(),
@@ -486,7 +488,7 @@ async fn handle_ingress_batch(
             let mut expired = Vec::new();
             for mut pkt in group {
                 match decrement_ttl(&mut pkt) {
-                    Some(0) | Some(1) => {
+                    Some(0 | 1) => {
                         // TTL expired (was 0 or 1); forward to TUN for ICMP.
                         expired.push(pkt);
                     }

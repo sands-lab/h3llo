@@ -19,7 +19,7 @@ use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
-/// Headroom reserved in every datapath PooledBuf.
+/// Headroom reserved in every datapath `PooledBuf`.
 ///
 use crate::helpers::{alloc_packet_buf, alloc_uninit_packet_buf, batch_stats, HEADROOM};
 
@@ -34,7 +34,7 @@ const _: () = assert!(
 /// Zero-copy wrapper around [`PooledBuf`] for TUN I/O (RX and TX).
 ///
 /// RX: [`TunBuf::alloc_uninit`] allocates with headroom; [`into_pooled`](Self::into_pooled) truncates.
-/// TX: `From<PooledBuf>` constructs; [`TunTx::send_batch`] prepends virtio_net_hdr.
+/// TX: `From<PooledBuf>` constructs; [`TunTx::send_batch`] prepends `virtio_net_hdr`.
 pub struct TunBuf(PooledBuf);
 
 impl TunBuf {
@@ -46,11 +46,13 @@ impl TunBuf {
     /// # Arguments
     ///
     /// * `mtu` - Expected maximum payload size (excluding headroom).
+    #[must_use]
     pub fn alloc_uninit(mtu: usize) -> Self {
         Self(alloc_uninit_packet_buf(mtu))
     }
 
     /// Truncates to `len` bytes and returns the underlying [`PooledBuf`].
+    #[must_use]
     pub fn into_pooled(mut self, len: usize) -> PooledBuf {
         debug_assert!(
             len <= self.0.len(),
@@ -78,7 +80,7 @@ impl TunBuf {
         }
     }
 
-    /// Prepends a zeroed virtio_net_hdr using headroom when available,
+    /// Prepends a zeroed `virtio_net_hdr` using headroom when available,
     /// falling back to alloc + copy otherwise. Called by `send_batch`
     /// implementations, not by the TUN TX actor.
     #[cfg(target_os = "linux")]
@@ -218,7 +220,7 @@ pub trait TunTx: Send + 'static {
 /// # Errors
 ///
 /// Returns `TunError::DeviceBuild` when device creation or address assignment fails.
-pub async fn make_tun(
+pub fn make_tun(
     local_tun: &LocalTun,
     tx_queue_len: Option<u32>,
     enable_offload: bool,
@@ -278,13 +280,13 @@ pub async fn make_tun(
         warn!(error = %e, configured = %local_tun.ifname, "TUN: could not read device name, using config value");
         local_tun.ifname.clone()
     });
-    let mtu = device
-        .mtu()
-        .map(|m| m as usize)
-        .unwrap_or_else(|e| {
+    let mtu = device.mtu().map_or_else(
+        |e| {
             warn!(error = %e, configured = local_tun.mtu, "TUN: could not read device MTU, using config value");
             local_tun.mtu as usize
-        });
+        },
+        |m| m as usize,
+    );
 
     #[cfg(target_os = "linux")]
     info!(
@@ -493,7 +495,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                                 return Ok(());
                             }
                         }
-                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {},
                         Err(err) => {
                             return Err(ActorError::TunRxRecv { name: tun_name, source: err });
                         }

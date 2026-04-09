@@ -1,4 +1,4 @@
-//! BareUDP protocol actors: source-IP filtering (RX) and destination stamping (TX).
+//! `BareUDP` protocol actors: source-IP filtering (RX) and destination stamping (TX).
 //!
 //! These actors sit between the generic UDP I/O layer ([`crate::udp`]) and the
 //! router, adding BareUDP-specific behavior without touching sockets directly.
@@ -20,20 +20,24 @@ use tokio_quiche::buf_factory::PooledBuf;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-/// Commands accepted by the BareUDP receive loop.
+/// Commands accepted by the `BareUDP` receive loop.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BareUdpRxCommand {
     /// Replace the accepted source IP filter set.
     ///
     /// "Accepted sources" controls which source IPs are permitted for inbound
-    /// BareUDP packets, distinct from TUN's "allowed IPs" (routing prefixes).
+    /// `BareUDP` packets, distinct from TUN's "allowed IPs" (routing prefixes).
     UpdateAcceptedSources(HashSet<IpAddr>),
 }
 
-/// Creates the BareUDP listen socket and UDP RX state.
+/// Creates the `BareUDP` listen socket and UDP RX state.
 ///
 /// Performs fallible I/O: socket binding and quinn-udp initialization.
 /// The returned [`udp::UdpRx`] is consumed by [`spawn_bare_rx`].
+///
+/// # Errors
+///
+/// Returns [`UdpError`] if the UDP socket cannot be bound or configured.
 pub fn make_bare_rx(
     listen_addr: SocketAddr,
     tun_mtu: usize,
@@ -46,7 +50,7 @@ pub fn make_bare_rx(
     Ok(udp_rx)
 }
 
-/// Spawns the BareUDP receive pipeline: UDP RX actor + source-filter actor.
+/// Spawns the `BareUDP` receive pipeline: UDP RX actor + source-filter actor.
 ///
 /// The UDP RX actor runs on `udp_rt`, the filter actor on `crypto_rt`.
 /// Returns command sender and both join handles for orchestrator supervision.
@@ -77,7 +81,7 @@ pub fn spawn_bare_rx(
     (cmd_tx, bare_rx_handle, udp_rx_handle)
 }
 
-/// Spawns the BareUDP source-filter actor on `crypto_rt`.
+/// Spawns the `BareUDP` source-filter actor on `crypto_rt`.
 ///
 /// Internal building block for [`spawn_bare_rx`]. Creates its own input
 /// channel and returns the `Sender` for the upstream UDP RX actor.
@@ -139,9 +143,9 @@ fn spawn_bare_filter(
     (input_tx, cmd_tx, handle)
 }
 
-/// Spawns a BareUDP transmit adapter actor.
+/// Spawns a `BareUDP` transmit adapter actor.
 ///
-/// Creates a BareUDP outbound TX path: socket → UDP TX actor → bare TX actor.
+/// Creates a `BareUDP` outbound TX path: socket → UDP TX actor → bare TX actor.
 ///
 /// Returns a [`ConnectedEvent`] on success. The caller is responsible
 /// for sending the event and handling errors.
@@ -191,7 +195,7 @@ pub(crate) async fn dial_bare_tx<P: RouteProbe>(
     })
 }
 
-/// Spawns the BareUDP destination-stamping transmit actor.
+/// Spawns the `BareUDP` destination-stamping transmit actor.
 ///
 /// Receives `Vec<PooledBuf>` from the router, stamps each batch with the
 /// peer's destination address, and forwards to the UDP TX actor.
@@ -222,12 +226,9 @@ pub(crate) fn spawn_bare_tx(
                     if packets.is_empty() { continue; }
                     let (count, bytes) = batch_stats(&packets);
                     // Record success AFTER send — avoids inflating metrics on channel close.
-                    match udp_tx.send((destination, packets)).await {
-                        Ok(()) => counters.record_success(count, bytes),
-                        Err(_) => {
-                            info!(peer = %peer_id, "bare TX: UDP channel closed, shutting down");
-                            return Ok(());
-                        }
+                    if let Ok(()) = udp_tx.send((destination, packets)).await { counters.record_success(count, bytes) } else {
+                        info!(peer = %peer_id, "bare TX: UDP channel closed, shutting down");
+                        return Ok(());
                     }
                 }
                 _ = ticker.tick() => {
