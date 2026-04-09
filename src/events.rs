@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use crate::actor::ActorExitResult;
+use crate::bind::RouteProbe;
 use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
 use crate::h3::H3Connection;
 use crate::metrics::{Labels, Metrics};
@@ -28,15 +29,19 @@ pub enum Endpoint {
 ///
 /// Shared by [`crate::h3dialer::dial_h3_client`] and
 /// [`crate::bare::dial_bare_tx`] to avoid parameter duplication.
-pub(crate) struct DialContext {
+pub(crate) struct DialContext<P: RouteProbe> {
     /// Peer identifier from configuration.
     pub peer_id: String,
+    /// Target IP address for this dial attempt.
+    pub dial_ip: IpAddr,
     /// TUN interface name (for route-probe exclusion).
     pub tun_if: String,
     /// TUN MTU in bytes.
     pub tun_mtu: u16,
     /// Tuning parameters (timeouts, buffers, congestion control).
     pub tuning: Tuning,
+    /// Route probe for interface selection.
+    pub probe: P,
     /// Runtime handle for UDP I/O actors.
     pub udp_rt: RuntimeHandle,
     /// Runtime handle for crypto / protocol actors.
@@ -46,14 +51,22 @@ pub(crate) struct DialContext {
 }
 
 #[cfg(test)]
-impl DialContext {
+impl<P: RouteProbe> DialContext<P> {
     /// Creates a `DialContext` for tests with minimal boilerplate.
-    pub fn test(peer_id: &str, tuning: Tuning, events_tx: mpsc::UnboundedSender<Event>) -> Self {
+    pub fn test(
+        peer_id: &str,
+        dial_ip: IpAddr,
+        tuning: Tuning,
+        events_tx: mpsc::UnboundedSender<Event>,
+        probe: P,
+    ) -> Self {
         Self {
             peer_id: peer_id.to_string(),
+            dial_ip,
             tun_if: String::new(),
             tun_mtu: crate::config::default_mtu().into(),
             tuning,
+            probe,
             udp_rt: tokio::runtime::Handle::current(),
             crypto_rt: tokio::runtime::Handle::current(),
             events_tx,

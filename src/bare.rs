@@ -154,16 +154,14 @@ fn spawn_bare_filter(
 /// `ctx.crypto_rt` is used for the bare TX adapter actor.
 pub(crate) async fn dial_bare_tx<P: RouteProbe>(
     bare: &PeerBare,
-    dial_ip: IpAddr,
-    ctx: &DialContext,
-    probe: &P,
+    ctx: &DialContext<P>,
 ) -> Result<ConnectedEvent, UdpError> {
-    let destination = SocketAddr::new(dial_ip, bare.endpoint.port);
+    let destination = SocketAddr::new(ctx.dial_ip, bare.endpoint.port);
     let std_socket = make_unbound_udp_socket(
         destination,
         Some(ctx.tun_if.as_str()),
         bare.bindif.as_deref(),
-        probe,
+        &ctx.probe,
         ctx.tuning.io.socket_buffer_bytes(),
     )
     .await?;

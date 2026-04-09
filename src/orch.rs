@@ -3,7 +3,7 @@
 use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
 use crate::api;
 use crate::bare::{dial_bare_tx, make_bare_rx, spawn_bare_rx, BareUdpRxCommand};
-use crate::bind::DefaultRouteProbe;
+use crate::bind::{DefaultRouteProbe, RouteProbe};
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, PeerTransport, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
@@ -221,33 +221,32 @@ impl PeerEntry {
                 .or_insert_with(DialState::new_in_flight);
             info!(peer = %self.config.id, ip = %ip, attempt, "dialing peer");
 
-            let dial_ip = *ip;
             let ctx = DialContext {
                 peer_id: peer_id.clone(),
+                dial_ip: *ip,
                 tun_if: tun_if.to_string(),
                 tun_mtu,
                 tuning: tuning.clone(),
+                probe: DefaultRouteProbe,
                 udp_rt: udp_handle.clone(),
                 crypto_rt: crypto_handle.clone(),
                 events_tx: events_tx.clone(),
             };
 
-            let probe = DefaultRouteProbe;
             match &self.config.transport {
                 PeerTransport::Bare(bare) => {
                     let bare = bare.clone();
                     tokio::spawn(async move {
-                        let result = dial_bare_tx(&bare, dial_ip, &ctx, &probe).await;
-                        report_dial(result, ctx, dial_ip, "bare");
+                        let result = dial_bare_tx(&bare, &ctx).await;
+                        report_dial(result, ctx, "bare");
                     });
                 }
                 PeerTransport::H3(h3) => {
                     let peer_h3 = h3.clone();
                     let ingress_tx = ingress_tx.clone();
                     tokio::spawn(async move {
-                        let result =
-                            dial_h3_client(&peer_h3, dial_ip, &ctx, &probe, ingress_tx).await;
-                        report_dial(result, ctx, dial_ip, "H3");
+                        let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;
+                        report_dial(result, ctx, "H3");
                     });
                 }
             }
@@ -270,10 +269,9 @@ fn peer_dns_hostname(peer: &Peer) -> Option<&str> {
 ///
 /// Logs the result and sends [`Event::Connected`] on success or
 /// [`Event::DialFailed`] on failure.
-fn report_dial<E: std::fmt::Display>(
+fn report_dial<E: std::fmt::Display, P: RouteProbe>(
     result: Result<ConnectedEvent, E>,
-    ctx: DialContext,
-    dial_ip: IpAddr,
+    ctx: DialContext<P>,
     protocol: &str,
 ) {
     match result {
@@ -282,10 +280,10 @@ fn report_dial<E: std::fmt::Display>(
             let _ = ctx.events_tx.send(Event::Connected(event));
         }
         Err(err) => {
-            warn!(peer = %ctx.peer_id, ip = %dial_ip, error = %err, protocol, "dial failed");
+            warn!(peer = %ctx.peer_id, ip = %ctx.dial_ip, error = %err, protocol, "dial failed");
             let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
                 peer_id: ctx.peer_id,
-                ip: dial_ip,
+                ip: ctx.dial_ip,
             }));
         }
     }
