@@ -53,8 +53,10 @@ pub enum DropReason {
     Oversize,
     /// Packet failed allowlist checks (e.g., source IP).
     DisallowedSource,
-    /// Sending the packet failed.
+    /// OS-level send/write failed (e.g., TUN write error).
     SendError,
+    /// QUIC protocol error from quiche (recv or dgram_send failed).
+    QuicError,
     /// Packet could not be forwarded because the channel closed.
     ChannelClosed,
     /// Packet has unknown or invalid IP version.
@@ -67,7 +69,9 @@ pub enum DropReason {
     NoPeerChannel,
     /// PooledBuf lacked headroom for datagram prefix insertion.
     NoHeadroom,
-    /// QUIC DATAGRAM queue is full (direction distinguished by rx/tx counters).
+    /// QUIC DATAGRAM queue is full. TX: precise (dgram_send returned Done).
+    /// RX: heuristic — may over-count when non-datagram packets arrive while
+    /// the queue is full, since not every `conn.recv()` adds a datagram.
     QueueFull,
     /// Packet's TTL/hop limit reached zero (forwarded to TUN for ICMP generation).
     TtlExpired,
@@ -389,62 +393,114 @@ pub(crate) fn encode_metrics_snapshot(snapshot: HashMap<Labels, Metrics>) -> Str
     text
 }
 
+impl SnapshotCollector {
+    /// Encodes a counter family by applying `entry_fn` to each metric in the snapshot.
+    fn encode_family<'a, L, N, I>(
+        &'a self,
+        encoder: &mut DescriptorEncoder,
+        name: &str,
+        help: &str,
+        entry_fn: impl Fn(&'a Metrics) -> I,
+    ) -> Result<(), fmt::Error>
+    where
+        L: EncodeLabelSet,
+        N: EncodeCounterValue + Default,
+        I: IntoIterator<Item = (L, N)>,
+    {
+        let counter = ConstCounter::new(N::default());
+        let mut enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+        for m in self.0.values() {
+            for (labels, value) in entry_fn(m) {
+                ConstCounter::new(value).encode(enc.encode_family(&labels)?)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Collector for SnapshotCollector {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
-        encode_counter_family(
-            &mut encoder,
-            "h3llo_transport_packets",
-            "Cumulative packet count.",
-            &self.0,
-            |m| (m.stats.succeeded.packets, m.stats.dropped.packets),
-        )?;
-        encode_counter_family(
-            &mut encoder,
-            "h3llo_transport_bytes",
-            "Cumulative byte count.",
-            &self.0,
-            |m| (m.stats.succeeded.bytes, m.stats.dropped.bytes),
-        )?;
-        encode_counter_family(
-            &mut encoder,
-            "h3llo_transport_batches",
-            "Cumulative batch count (record() invocations for GSO/GRO tracking).",
-            &self.0,
-            |m| (m.stats.succeeded.batches, m.stats.dropped.batches),
-        )?;
+        // Succeeded/dropped counter families.
+        for (name, help, extractor) in [
+            (
+                "h3llo_transport_packets",
+                "Cumulative packet count.",
+                (|s: &Stats| (s.succeeded.packets, s.dropped.packets)) as fn(&Stats) -> (u64, u64),
+            ),
+            ("h3llo_transport_bytes", "Cumulative byte count.", |s| {
+                (s.succeeded.bytes, s.dropped.bytes)
+            }),
+            (
+                "h3llo_transport_batches",
+                "Cumulative batch count (record() invocations for GSO/GRO tracking).",
+                |s| (s.succeeded.batches, s.dropped.batches),
+            ),
+        ] {
+            self.encode_family(&mut encoder, name, help, |m| {
+                let (ok, drop) = extractor(&m.stats);
+                [
+                    (PacketLabelSet::from_metrics(m, "succeeded"), ok),
+                    (PacketLabelSet::from_metrics(m, "dropped"), drop),
+                ]
+            })?;
+        }
 
-        encode_drop_counter_family(
-            &mut encoder,
-            "h3llo_transport_drops",
-            "Cumulative drop count by reason.",
-            &self.0,
-            |c| c.packets,
-        )?;
-        encode_drop_counter_family(
-            &mut encoder,
-            "h3llo_transport_drop_bytes",
-            "Cumulative drop bytes by reason.",
-            &self.0,
-            |c| c.bytes,
-        )?;
+        // Drop-reason counter families.
+        for (name, help, field) in [
+            (
+                "h3llo_transport_drops",
+                "Cumulative drop count by reason.",
+                (|c: &PktCounters| c.packets) as fn(&PktCounters) -> u64,
+            ),
+            (
+                "h3llo_transport_drop_bytes",
+                "Cumulative drop bytes by reason.",
+                |c| c.bytes,
+            ),
+        ] {
+            self.encode_family(&mut encoder, name, help, |m| {
+                m.stats
+                    .drop_reasons
+                    .iter()
+                    .map(move |(&reason, c)| (DropLabelSet::from_metrics(m, reason), field(c)))
+            })?;
+        }
 
-        encode_congestion_family(
+        // Congestion counter families.
+        self.encode_family(
             &mut encoder,
             "h3llo_transport_congestion",
             "Cumulative congestion event count.",
-            &self.0,
-            |cg| (cg.queue_full_count, cg.would_block_count),
+            |m| {
+                let cg = &m.stats.congestion;
+                [
+                    (
+                        CongestionLabelSet::from_metrics(m, "queue_full"),
+                        cg.queue_full_count,
+                    ),
+                    (
+                        CongestionLabelSet::from_metrics(m, "would_block"),
+                        cg.would_block_count,
+                    ),
+                ]
+            },
         )?;
-        encode_congestion_family(
+        self.encode_family(
             &mut encoder,
             "h3llo_transport_congestion_wait_milliseconds",
             "Cumulative congestion wait time in milliseconds.",
-            &self.0,
-            |cg| {
-                (
-                    cg.queue_full_duration.as_secs_f64() * 1000.0,
-                    cg.would_block_duration.as_secs_f64() * 1000.0,
-                )
+            |m| {
+                let cg = &m.stats.congestion;
+                [
+                    (
+                        CongestionLabelSet::from_metrics(m, "queue_full"),
+                        cg.queue_full_duration.as_secs_f64() * 1000.0,
+                    ),
+                    (
+                        CongestionLabelSet::from_metrics(m, "would_block"),
+                        cg.would_block_duration.as_secs_f64() * 1000.0,
+                    ),
+                ]
             },
         )?;
 
@@ -452,133 +508,47 @@ impl Collector for SnapshotCollector {
     }
 }
 
-/// Encodes a per-reason drop counter family, reducing duplication between drops and drop_bytes.
-fn encode_drop_counter_family(
-    encoder: &mut DescriptorEncoder,
-    name: &str,
-    help: &str,
-    store: &HashMap<Labels, Metrics>,
-    field: fn(&PktCounters) -> u64,
-) -> Result<(), fmt::Error> {
-    let counter = ConstCounter::new(0u64);
-    let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
-    for m in store.values() {
-        for (reason, counters) in &m.stats.drop_reasons {
-            let labels = DropLabelSet::from_metrics(m, *reason);
-            ConstCounter::new(field(counters)).encode(metric_enc.encode_family(&labels)?)?;
+/// Generates a Prometheus label set struct with 4 common metric labels
+/// (`source`, `direction`, `peer_id`, `remote_addr`) plus one extra field.
+macro_rules! label_set {
+    ($name:ident, $field:ident: $ty:ty) => {
+        #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+        struct $name {
+            source: Source,
+            direction: Direction,
+            peer_id: String,
+            remote_addr: String,
+            $field: $ty,
         }
-    }
-    Ok(())
-}
 
-/// Encodes a congestion counter family with `event` label (queue_full / would_block).
-///
-/// Generic over the counter value type (`u64` for counts, `f64` for durations).
-fn encode_congestion_family<N, F>(
-    encoder: &mut DescriptorEncoder,
-    name: &str,
-    help: &str,
-    store: &HashMap<Labels, Metrics>,
-    extractor: F,
-) -> Result<(), fmt::Error>
-where
-    N: EncodeCounterValue + Default,
-    F: Fn(&CongestionStats) -> (N, N),
-{
-    let counter = ConstCounter::new(N::default());
-    let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
-    for m in store.values() {
-        let (queue_full, would_block) = extractor(&m.stats.congestion);
-        for (event, value) in [("queue_full", queue_full), ("would_block", would_block)] {
-            let labels = CongestionLabelSet::from_metrics(m, event);
-            ConstCounter::new(value).encode(metric_enc.encode_family(&labels)?)?;
+        impl $name {
+            fn from_metrics(m: &Metrics, $field: impl Into<$ty>) -> Self {
+                Self {
+                    source: m.labels.source,
+                    direction: m.labels.direction,
+                    peer_id: m.labels.peer_id.clone().unwrap_or_default(),
+                    remote_addr: m
+                        .labels
+                        .remote_addr
+                        .map(|a| a.to_string())
+                        .unwrap_or_default(),
+                    $field: $field.into(),
+                }
+            }
         }
-    }
-    Ok(())
+    };
 }
 
-/// Encodes a succeeded/dropped counter family, reducing duplication.
-fn encode_counter_family(
-    encoder: &mut DescriptorEncoder,
-    name: &str,
-    help: &str,
-    store: &HashMap<Labels, Metrics>,
-    extractor: fn(&Metrics) -> (u64, u64),
-) -> Result<(), fmt::Error> {
-    let counter = ConstCounter::new(0u64);
-    let mut metric_enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
-    for m in store.values() {
-        let (succeeded, dropped) = extractor(m);
-        let labels = PacketLabelSet::from_metrics(m, "succeeded");
-        ConstCounter::new(succeeded).encode(metric_enc.encode_family(&labels)?)?;
-        let labels = PacketLabelSet::from_metrics(m, "dropped");
-        ConstCounter::new(dropped).encode(metric_enc.encode_family(&labels)?)?;
-    }
-    Ok(())
-}
+label_set!(PacketLabelSet, outcome: String);
+label_set!(DropLabelSet, reason: DropReason);
+label_set!(CongestionLabelSet, event: String);
 
-/// Label set for packet/byte counter families.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct PacketLabelSet {
-    source: SourceLabel,
-    direction: DirectionLabel,
-    peer_id: String,
-    remote_addr: String,
-    outcome: String,
-}
-
-impl PacketLabelSet {
-    fn from_metrics(m: &Metrics, outcome: &str) -> Self {
-        Self {
-            source: SourceLabel(m.labels.source),
-            direction: DirectionLabel(m.labels.direction),
-            peer_id: m.labels.peer_id.clone().unwrap_or_default(),
-            remote_addr: m
-                .labels
-                .remote_addr
-                .map(|a| a.to_string())
-                .unwrap_or_default(),
-            outcome: outcome.to_string(),
-        }
-    }
-}
-
-/// Label set for drop-reason counter families.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct DropLabelSet {
-    source: SourceLabel,
-    direction: DirectionLabel,
-    peer_id: String,
-    remote_addr: String,
-    reason: DropReasonLabel,
-}
-
-impl DropLabelSet {
-    fn from_metrics(m: &Metrics, reason: DropReason) -> Self {
-        Self {
-            source: SourceLabel(m.labels.source),
-            direction: DirectionLabel(m.labels.direction),
-            peer_id: m.labels.peer_id.clone().unwrap_or_default(),
-            remote_addr: m
-                .labels
-                .remote_addr
-                .map(|a| a.to_string())
-                .unwrap_or_default(),
-            reason: DropReasonLabel(reason),
-        }
-    }
-}
-
-/// Prometheus label value for packet source.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct SourceLabel(Source);
-
-impl EncodeLabelValue for SourceLabel {
+impl EncodeLabelValue for Source {
     fn encode(
         &self,
         encoder: &mut prometheus_client::encoding::LabelValueEncoder,
     ) -> Result<(), fmt::Error> {
-        let s = match self.0 {
+        let s = match self {
             Source::Tun => "tun",
             Source::BareUdp => "bare_udp",
             Source::Http3 => "http3",
@@ -588,16 +558,12 @@ impl EncodeLabelValue for SourceLabel {
     }
 }
 
-/// Prometheus label value for direction.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct DirectionLabel(Direction);
-
-impl EncodeLabelValue for DirectionLabel {
+impl EncodeLabelValue for Direction {
     fn encode(
         &self,
         encoder: &mut prometheus_client::encoding::LabelValueEncoder,
     ) -> Result<(), fmt::Error> {
-        let s = match self.0 {
+        let s = match self {
             Direction::Rx => "rx",
             Direction::Tx => "tx",
         };
@@ -605,45 +571,16 @@ impl EncodeLabelValue for DirectionLabel {
     }
 }
 
-/// Label set for congestion counter families with `event` dimension.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct CongestionLabelSet {
-    source: SourceLabel,
-    direction: DirectionLabel,
-    peer_id: String,
-    remote_addr: String,
-    event: String,
-}
-
-impl CongestionLabelSet {
-    fn from_metrics(m: &Metrics, event: &str) -> Self {
-        Self {
-            source: SourceLabel(m.labels.source),
-            direction: DirectionLabel(m.labels.direction),
-            peer_id: m.labels.peer_id.clone().unwrap_or_default(),
-            remote_addr: m
-                .labels
-                .remote_addr
-                .map(|a| a.to_string())
-                .unwrap_or_default(),
-            event: event.to_string(),
-        }
-    }
-}
-
-/// Prometheus label value for drop reason.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct DropReasonLabel(DropReason);
-
-impl EncodeLabelValue for DropReasonLabel {
+impl EncodeLabelValue for DropReason {
     fn encode(
         &self,
         encoder: &mut prometheus_client::encoding::LabelValueEncoder,
     ) -> Result<(), fmt::Error> {
-        let s = match self.0 {
+        let s = match self {
             DropReason::Oversize => "oversize",
             DropReason::DisallowedSource => "disallowed_source",
             DropReason::SendError => "send_error",
+            DropReason::QuicError => "quic_error",
             DropReason::ChannelClosed => "channel_closed",
             DropReason::InvalidIpVersion => "invalid_ip_version",
             DropReason::InvalidFraming => "invalid_framing",

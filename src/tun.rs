@@ -448,7 +448,7 @@ fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
 /// * `tun` - TUN device reader.
 /// * `output_tx` - Bounded sender to the router actor's outbound channel.
 /// * `events_tx` - Unbounded channel for emitting receive metrics.
-/// * `io` - I/O tuning parameters (uses `metrics_push_interval`).
+/// * `io_tuning` - I/O tuning parameters (uses `metrics_push_interval`).
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
     output_tx: mpsc::Sender<Vec<PooledBuf>>,
