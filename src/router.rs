@@ -483,44 +483,45 @@ async fn handle_ingress_batch(
             counters
                 .send_and_record(route.tx, group, group_count, group_bytes)
                 .await;
-        } else {
-            // Single-pass: decrement TTL, partition expired vs forward.
-            let mut forward = Vec::with_capacity(group.len());
-            let mut expired = Vec::new();
-            for mut pkt in group {
-                match decrement_ttl(&mut pkt) {
-                    Some(0 | 1) => {
-                        // TTL expired (was 0 or 1); forward to TUN for ICMP.
-                        expired.push(pkt);
-                    }
-                    Some(_) => {
-                        forward.push(pkt);
-                    }
-                    None => {
-                        counters.record_drop(DropReason::InvalidIpVersion, 1, pkt.len() as u64);
-                    }
+            continue;
+        }
+
+        // Single-pass: decrement TTL, partition expired vs forward.
+        let mut forward = Vec::with_capacity(group.len());
+        let mut expired = Vec::new();
+        for mut pkt in group {
+            match decrement_ttl(&mut pkt) {
+                Some(0 | 1) => {
+                    // TTL expired (was 0 or 1); forward to TUN for ICMP.
+                    expired.push(pkt);
+                }
+                Some(_) => {
+                    forward.push(pkt);
+                }
+                None => {
+                    counters.record_drop(DropReason::InvalidIpVersion, 1, pkt.len() as u64);
                 }
             }
+        }
 
-            if !forward.is_empty() {
-                let (fwd_count, fwd_bytes) = batch_stats(&forward);
-                counters
-                    .send_and_record(route.tx, forward, fwd_count, fwd_bytes)
-                    .await;
-            }
+        if !forward.is_empty() {
+            let (fwd_count, fwd_bytes) = batch_stats(&forward);
+            counters
+                .send_and_record(route.tx, forward, fwd_count, fwd_bytes)
+                .await;
+        }
 
-            if !expired.is_empty() {
-                let (exp_count, exp_bytes) = batch_stats(&expired);
-                counters.record_drop(DropReason::TtlExpired, exp_count, exp_bytes);
-                if send_with_backpressure(input_tx, expired, |event| match event {
-                    SendEvent::Waited(waited) => counters.record_queue_full(waited),
-                    SendEvent::Fast | SendEvent::Full => {}
-                })
-                .await
-                .is_err()
-                {
-                    counters.record_drop(DropReason::ChannelClosed, exp_count, exp_bytes);
-                }
+        if !expired.is_empty() {
+            let (exp_count, exp_bytes) = batch_stats(&expired);
+            counters.record_drop(DropReason::TtlExpired, exp_count, exp_bytes);
+            if send_with_backpressure(input_tx, expired, |event| match event {
+                SendEvent::Waited(waited) => counters.record_queue_full(waited),
+                SendEvent::Fast | SendEvent::Full => {}
+            })
+            .await
+            .is_err()
+            {
+                counters.record_drop(DropReason::ChannelClosed, exp_count, exp_bytes);
             }
         }
     }
