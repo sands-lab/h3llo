@@ -605,7 +605,7 @@ impl Orchestrator {
             // spawn: infallible task creation
             // Initial peer tokens are empty; sync_peers_to_actors() populates them
             // immediately after construction.
-            let (cmd_tx, dispatcher_handle, _) = spawn_h3_dispatcher(
+            let (cmd_tx, dispatcher_handle, udp_rx_handle, udp_tx_handle, _) = spawn_h3_dispatcher(
                 dispatcher,
                 HashMap::new(),
                 udp_rt.handle(),
@@ -613,6 +613,8 @@ impl Orchestrator {
             );
 
             join_set.spawn(dispatcher_handle);
+            join_set.spawn(udp_rx_handle);
+            join_set.spawn(udp_tx_handle);
             Some(cmd_tx)
         } else {
             None

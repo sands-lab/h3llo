@@ -587,6 +587,8 @@ pub fn spawn_h3_dispatcher(
 ) -> (
     mpsc::UnboundedSender<DispatcherCommand>,
     JoinHandle<ActorExitResult>,
+    JoinHandle<ActorExitResult>,
+    JoinHandle<ActorExitResult>,
     SocketAddr,
 ) {
     let H3Dispatcher {
@@ -602,17 +604,14 @@ pub fn spawn_h3_dispatcher(
     } = dispatcher;
 
     // Spawn UDP actors on udp_rt.
-    // TODO: Return UDP actor JoinHandles for orchestrator supervision.
-    // Currently dropped — if a UDP actor exits unexpectedly the dispatcher
-    // keeps running without visibility, silently breaking the listener.
-    let (udp_recv_rx, udp_send_tx) = {
+    let (udp_recv_rx, udp_send_tx, udp_rx_handle, udp_tx_handle) = {
         let _guard = udp_rt.enter();
         let (udp_recv_tx, udp_recv_rx) =
             mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(io_tuning.packet_queue_depth);
         let cancel = CancellationToken::new();
-        let _recv_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx, cancel);
-        let (udp_send_tx, _tx_handle) = udp::spawn_udp_tx(udp_tx, io_tuning.packet_queue_depth);
-        (udp_recv_rx, udp_send_tx)
+        let rx_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx, cancel);
+        let (udp_send_tx, tx_handle) = udp::spawn_udp_tx(udp_tx, io_tuning.packet_queue_depth);
+        (udp_recv_rx, udp_send_tx, rx_handle, tx_handle)
     };
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -634,7 +633,7 @@ pub fn spawn_h3_dispatcher(
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
     });
 
-    (cmd_tx, handle, bound_addr)
+    (cmd_tx, handle, udp_rx_handle, udp_tx_handle, bound_addr)
 }
 
 /// Shared test utilities for H3v2 listener integration tests across modules.
@@ -808,7 +807,7 @@ mod tests {
             )
             .expect("make_h3_dispatcher");
 
-            let (cmd_tx, handle, _) = spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
+            let (cmd_tx, handle, _, _, _) = spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
 
             // Give dispatcher time to start accepting.
             tokio::time::sleep(Duration::from_millis(50)).await;
