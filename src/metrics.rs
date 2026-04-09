@@ -53,8 +53,10 @@ pub enum DropReason {
     Oversize,
     /// Packet failed allowlist checks (e.g., source IP).
     DisallowedSource,
-    /// Sending the packet failed.
+    /// OS-level send/write failed (e.g., TUN write error).
     SendError,
+    /// QUIC protocol error from quiche (recv or dgram_send failed).
+    QuicError,
     /// Packet could not be forwarded because the channel closed.
     ChannelClosed,
     /// Packet has unknown or invalid IP version.
@@ -67,7 +69,9 @@ pub enum DropReason {
     NoPeerChannel,
     /// PooledBuf lacked headroom for datagram prefix insertion.
     NoHeadroom,
-    /// QUIC DATAGRAM queue is full (direction distinguished by rx/tx counters).
+    /// QUIC DATAGRAM queue is full. TX: precise (dgram_send returned Done).
+    /// RX: heuristic — may over-count when non-datagram packets arrive while
+    /// the queue is full, since not every `conn.recv()` adds a datagram.
     QueueFull,
     /// Packet's TTL/hop limit reached zero (forwarded to TUN for ICMP generation).
     TtlExpired,
@@ -576,6 +580,7 @@ impl EncodeLabelValue for DropReason {
             DropReason::Oversize => "oversize",
             DropReason::DisallowedSource => "disallowed_source",
             DropReason::SendError => "send_error",
+            DropReason::QuicError => "quic_error",
             DropReason::ChannelClosed => "channel_closed",
             DropReason::InvalidIpVersion => "invalid_ip_version",
             DropReason::InvalidFraming => "invalid_framing",

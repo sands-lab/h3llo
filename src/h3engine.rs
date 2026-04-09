@@ -67,8 +67,9 @@ pub(crate) fn handle_udp_recv(
     mut rx_counters: Option<&mut Counters>,
 ) {
     for mut pkt in batch {
-        // quiche silently drops the oldest datagram when the recv queue is
-        // full (pop-oldest-then-push). Record so metrics can surface it.
+        // quiche silently evicts the oldest datagram when the recv queue is
+        // full (pop-oldest-then-push). This heuristic may over-count: not
+        // every recv() adds a datagram (ACKs, stream data, etc.).
         if conn.is_dgram_recv_queue_full() {
             if let Some(c) = rx_counters.as_deref_mut() {
                 c.record_drop(DropReason::QueueFull, 1, 0);
@@ -76,7 +77,12 @@ pub(crate) fn handle_udp_recv(
         }
         match conn.recv(&mut pkt, info) {
             Ok(_) | Err(quiche::Error::Done) => {}
-            Err(e) => debug!(error = ?e, "quiche recv (non-fatal)"),
+            Err(e) => {
+                debug!(error = ?e, "quiche recv (non-fatal)");
+                if let Some(c) = rx_counters.as_deref_mut() {
+                    c.record_drop(DropReason::QuicError, 1, pkt.len() as u64);
+                }
+            }
         }
     }
 }
@@ -216,7 +222,7 @@ pub(crate) fn handle_router_egress(
             }
             Err(e) => {
                 warn!(error = ?e, "dgram_send failed; dropping packet");
-                counters.record_drop(DropReason::SendError, 1, pkt_len);
+                counters.record_drop(DropReason::QuicError, 1, pkt_len);
             }
         }
     }
