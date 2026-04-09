@@ -52,7 +52,6 @@ const IPV6_MIN_LEN: usize = 40;
 /// IPv6 has no header checksum. Only the hop limit (byte 7) is decremented.
 ///
 /// [RFC 1624]: https://www.rfc-editor.org/rfc/rfc1624
-#[allow(clippy::cast_possible_truncation)] // Intentional: checksum fold guarantees sum fits u16.
 fn decrement_ttl(packet: &mut [u8]) -> Option<u8> {
     let version = packet.first().map(|b| b >> 4)?;
     match version {
@@ -75,6 +74,8 @@ fn decrement_ttl(packet: &mut [u8]) -> Option<u8> {
             sum = (sum & 0xFFFF) + (sum >> 16);
             sum = (sum & 0xFFFF) + (sum >> 16);
             // Handle -0 edge case (RFC 1624 Section 4).
+            // Truncation is intentional: checksum fold guarantees sum fits u16.
+            #[allow(clippy::cast_possible_truncation)]
             let new_check = if sum as u16 == 0xFFFF {
                 0u16
             } else {

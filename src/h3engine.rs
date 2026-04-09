@@ -48,10 +48,9 @@ pub(crate) fn apply_transport_config(
     config.set_initial_max_streams_uni(100);
     // Enable QUIC DATAGRAM with a queue of 1024 send and 1024 recv slots.
     config.enable_dgram(true, 1024, 1024);
-    config.set_max_idle_timeout(
-        u64::try_from(h3_tuning.h3_max_idle_timeout.as_millis())
-            .expect("idle timeout exceeds u64::MAX ms"),
-    );
+    // Saturate to u64::MAX (~584 million years) for absurdly large durations.
+    let idle_ms = u64::try_from(h3_tuning.h3_max_idle_timeout.as_millis()).unwrap_or(u64::MAX);
+    config.set_max_idle_timeout(idle_ms);
     config.set_cc_algorithm_name(&h3_tuning.h3_cc_algorithm)?;
     config.enable_pacing(h3_tuning.h3_enable_pacing);
     Ok(())
