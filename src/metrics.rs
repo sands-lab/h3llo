@@ -389,10 +389,33 @@ pub(crate) fn encode_metrics_snapshot(snapshot: HashMap<Labels, Metrics>) -> Str
     text
 }
 
+impl SnapshotCollector {
+    /// Encodes a counter family by applying `entry_fn` to each metric in the snapshot.
+    fn encode_family<'a, L, N, I>(
+        &'a self,
+        encoder: &mut DescriptorEncoder,
+        name: &str,
+        help: &str,
+        entry_fn: impl Fn(&'a Metrics) -> I,
+    ) -> Result<(), fmt::Error>
+    where
+        L: EncodeLabelSet,
+        N: EncodeCounterValue + Default,
+        I: IntoIterator<Item = (L, N)>,
+    {
+        let counter = ConstCounter::new(N::default());
+        let mut enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
+        for m in self.0.values() {
+            for (labels, value) in entry_fn(m) {
+                ConstCounter::new(value).encode(enc.encode_family(&labels)?)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Collector for SnapshotCollector {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
-        let s = &self.0;
-
         // Succeeded/dropped counter families.
         for (name, help, extractor) in [
             (
@@ -410,18 +433,13 @@ impl Collector for SnapshotCollector {
                 |m| (m.stats.succeeded.batches, m.stats.dropped.batches),
             ),
         ] {
-            encode_family(
-                &mut encoder,
-                name,
-                help,
-                s.values().flat_map(move |m| {
-                    let (ok, drop) = extractor(m);
-                    [
-                        (PacketLabelSet::from_metrics(m, "succeeded"), ok),
-                        (PacketLabelSet::from_metrics(m, "dropped"), drop),
-                    ]
-                }),
-            )?;
+            self.encode_family(&mut encoder, name, help, |m| {
+                let (ok, drop) = extractor(m);
+                [
+                    (PacketLabelSet::from_metrics(m, "succeeded"), ok),
+                    (PacketLabelSet::from_metrics(m, "dropped"), drop),
+                ]
+            })?;
         }
 
         // Drop-reason counter families.
@@ -437,25 +455,20 @@ impl Collector for SnapshotCollector {
                 |c| c.bytes,
             ),
         ] {
-            encode_family(
-                &mut encoder,
-                name,
-                help,
-                s.values().flat_map(|m| {
-                    m.stats
-                        .drop_reasons
-                        .iter()
-                        .map(move |(&reason, c)| (DropLabelSet::from_metrics(m, reason), field(c)))
-                }),
-            )?;
+            self.encode_family(&mut encoder, name, help, |m| {
+                m.stats
+                    .drop_reasons
+                    .iter()
+                    .map(move |(&reason, c)| (DropLabelSet::from_metrics(m, reason), field(c)))
+            })?;
         }
 
         // Congestion counter families.
-        encode_family(
+        self.encode_family(
             &mut encoder,
             "h3llo_transport_congestion",
             "Cumulative congestion event count.",
-            s.values().flat_map(|m| {
+            |m| {
                 let cg = &m.stats.congestion;
                 [
                     (
@@ -467,13 +480,13 @@ impl Collector for SnapshotCollector {
                         cg.would_block_count,
                     ),
                 ]
-            }),
+            },
         )?;
-        encode_family(
+        self.encode_family(
             &mut encoder,
             "h3llo_transport_congestion_wait_milliseconds",
             "Cumulative congestion wait time in milliseconds.",
-            s.values().flat_map(|m| {
+            |m| {
                 let cg = &m.stats.congestion;
                 [
                     (
@@ -485,30 +498,11 @@ impl Collector for SnapshotCollector {
                         cg.would_block_duration.as_secs_f64() * 1000.0,
                     ),
                 ]
-            }),
+            },
         )?;
 
         Ok(())
     }
-}
-
-/// Encodes a counter family from an iterator of `(label_set, value)` pairs.
-fn encode_family<L, N>(
-    encoder: &mut DescriptorEncoder,
-    name: &str,
-    help: &str,
-    entries: impl IntoIterator<Item = (L, N)>,
-) -> Result<(), fmt::Error>
-where
-    L: EncodeLabelSet,
-    N: EncodeCounterValue + Default,
-{
-    let counter = ConstCounter::new(N::default());
-    let mut enc = encoder.encode_descriptor(name, help, None, counter.metric_type())?;
-    for (labels, value) in entries {
-        ConstCounter::new(value).encode(enc.encode_family(&labels)?)?;
-    }
-    Ok(())
 }
 
 /// Generates a Prometheus label set struct with 4 common metric labels
