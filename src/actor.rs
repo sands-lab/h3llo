@@ -11,8 +11,6 @@ use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot;
 use tracing::error;
 
-use crate::events::ConnOrigin;
-
 /// Classifies actors by their supervision policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorKind {
@@ -30,13 +28,6 @@ pub enum ActorKind {
 /// - `Ok(())` indicates graceful shutdown (e.g., command channel closed).
 /// - `Err(ActorError)` indicates an error exit requiring orchestrator action.
 pub type ActorExitResult = Result<(), ActorError>;
-
-/// Three actor join handles spawned for an H3 connection (engine/dispatcher + UDP RX + UDP TX).
-pub type H3ActorHandles = (
-    tokio::task::JoinHandle<ActorExitResult>,
-    tokio::task::JoinHandle<ActorExitResult>,
-    tokio::task::JoinHandle<ActorExitResult>,
-);
 
 /// Unified actor error type for orchestrator supervision.
 ///
@@ -98,11 +89,9 @@ pub enum ActorError {
         reason: String,
     },
 
-    /// H3 engine (client or server) actor exited with error.
-    #[error("h3_{origin}[{peer_id}]: {reason}")]
+    /// H3 engine actor exited with error.
+    #[error("h3[{peer_id}]: {reason}")]
     H3Engine {
-        /// Which side created the connection.
-        origin: ConnOrigin,
         /// Peer identifier.
         peer_id: String,
         /// Failure reason.
@@ -333,14 +322,12 @@ mod tests {
     #[test]
     fn actor_kind_restartable_for_h3_engine() {
         let err = ActorError::H3Engine {
-            origin: ConnOrigin::Server,
             peer_id: "client-1".into(),
             reason: "connection reset".into(),
         };
         assert_eq!(err.kind(), ActorKind::Restartable);
         let msg = err.to_string();
-        assert!(msg.contains("h3_server"));
-        assert!(msg.contains("client-1"));
+        assert!(msg.contains("h3[client-1]"));
     }
 
     #[tokio::test]

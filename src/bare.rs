@@ -6,7 +6,7 @@
 use crate::actor::ActorExitResult;
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
 use crate::config::{Tuning, UdpEndpoint};
-use crate::events::{BareConnectedEvent, DialContext, Endpoint, Event};
+use crate::events::{ConnectedEvent, DialContext, Endpoint, Event};
 use crate::helpers::batch_stats;
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::udp;
@@ -143,7 +143,7 @@ fn spawn_bare_filter(
 ///
 /// Creates a BareUDP outbound TX path: socket → UDP TX actor → bare TX actor.
 ///
-/// Returns a [`BareConnectedEvent`] on success. The caller is responsible
+/// Returns a [`ConnectedEvent`] on success. The caller is responsible
 /// for sending the event and handling errors.
 ///
 /// `ctx.udp_rt` is used for socket registration and the UDP TX actor;
@@ -154,7 +154,7 @@ pub(crate) async fn dial_bare_tx<P: RouteProbe>(
     ctx: &DialContext,
     probe: &P,
     bindif: Option<&str>,
-) -> Result<BareConnectedEvent, UdpError> {
+) -> Result<ConnectedEvent, UdpError> {
     let std_socket = make_unbound_udp_socket(
         destination,
         Some(ctx.tun_if.as_str()),
@@ -180,13 +180,14 @@ pub(crate) async fn dial_bare_tx<P: RouteProbe>(
         )
     };
 
-    Ok(BareConnectedEvent {
+    Ok(ConnectedEvent {
         peer_id: ctx.peer_id.clone(),
-        endpoint: Endpoint::Udp(endpoint),
-        dest: destination,
+        remote_addr: destination,
         tx: egress_tx,
-        tx_handle: bare_tx_handle,
-        udp_tx_handle,
+        endpoint: Some(Endpoint::Udp(endpoint)),
+        main_handle: Some(bare_tx_handle),
+        udp_tx_handle: Some(udp_tx_handle),
+        udp_rx_handle: None,
     })
 }
 

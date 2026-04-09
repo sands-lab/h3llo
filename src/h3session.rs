@@ -82,11 +82,6 @@ impl H3Session {
         self.datagram_codec = ConnectIpDatagramCodec::new(stream_id);
     }
 
-    /// Marks the CONNECT-IP request as accepted.
-    pub(crate) fn mark_connect_accepted(&mut self) {
-        self.connect_accepted = true;
-    }
-
     /// Returns `true` when the CONNECT-IP session is fully ready for datagram forwarding.
     ///
     /// Only checks `connect_accepted` (CONNECT-IP 200 OK exchanged) and
@@ -142,7 +137,7 @@ impl H3Session {
                             peer_id: pid,
                         } => {
                             self.bind_connect_stream(sid);
-                            self.mark_connect_accepted();
+                            self.connect_accepted = true;
                             self.accepted_peer_id = pid;
                         }
                         HeaderAction::Ignore => {}

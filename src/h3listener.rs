@@ -8,12 +8,11 @@
 //!
 //! See [`make_h3_dispatcher`] + [`spawn_h3_dispatcher`] for the public entry points.
 
-use crate::actor::H3ActorHandles;
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::validate_connect_auth;
 use crate::bind::make_server_udp_socket;
 use crate::config::{H3Tuning, IoTuning};
-use crate::events::{ConnOrigin, Event, H3v2ConnectedEvent};
+use crate::events::{ConnectedEvent, Event};
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, H3Engine, RunState,
 };
@@ -526,7 +525,6 @@ impl DispatcherRuntime {
             run_state: RunState::new(),
             metrics_interval: self.io_tuning.metrics_push_interval,
             keepalive_interval: self.h3_tuning.h3_keepalive_interval,
-            origin: ConnOrigin::Server,
             udp_cancel: None,
         };
 
@@ -553,12 +551,14 @@ impl DispatcherRuntime {
             if engine
                 .io
                 .events_tx
-                .send(Event::H3v2Connected(H3v2ConnectedEvent {
+                .send(Event::H3v2Connected(ConnectedEvent {
                     peer_id: engine.meta.peer_id.clone(),
                     remote_addr: remote,
                     tx: egress_tx,
-                    origin: ConnOrigin::Server,
-                    handles: None,
+                    endpoint: None,
+                    main_handle: None,
+                    udp_tx_handle: None,
+                    udp_rx_handle: None,
                 }))
                 .is_err()
             {
@@ -586,7 +586,9 @@ pub fn spawn_h3_dispatcher(
     crypto_rt: &RuntimeHandle,
 ) -> (
     mpsc::UnboundedSender<DispatcherCommand>,
-    H3ActorHandles,
+    tokio::task::JoinHandle<ActorExitResult>,
+    tokio::task::JoinHandle<ActorExitResult>,
+    tokio::task::JoinHandle<ActorExitResult>,
     SocketAddr,
 ) {
     let H3Dispatcher {
@@ -631,21 +633,21 @@ pub fn spawn_h3_dispatcher(
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
     });
 
-    (cmd_tx, (handle, udp_rx_handle, udp_tx_handle), bound_addr)
+    (cmd_tx, handle, udp_rx_handle, udp_tx_handle, bound_addr)
 }
 
 /// Shared test utilities for H3v2 listener integration tests across modules.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::events::{Event, H3v2ConnectedEvent};
+    use crate::events::{ConnectedEvent, Event};
 
-    /// Waits for an `H3v2ConnectedEvent` on the events channel, with timeout.
+    /// Waits for an `ConnectedEvent` on the events channel, with timeout.
     ///
     /// Skips non-H3v2Connected events (e.g. metrics). Panics on timeout or if
     /// the channel closes before an H3v2Connected event arrives.
     pub async fn await_h3v2_connection(
         events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
-    ) -> H3v2ConnectedEvent {
+    ) -> ConnectedEvent {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
                 if let Event::H3v2Connected(connected) = event {
@@ -805,8 +807,7 @@ mod tests {
             )
             .expect("make_h3_dispatcher");
 
-            let (cmd_tx, (handle, _, _), _) =
-                spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
+            let (cmd_tx, handle, _, _, _) = spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
 
             // Give dispatcher time to start accepting.
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -848,7 +849,7 @@ mod tests {
         bound_addr: SocketAddr,
         token: &str,
         peer_id: &str,
-    ) -> (H3v2ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
+    ) -> (ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
         let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
         let tuning = insecure_tuning();
@@ -1074,7 +1075,6 @@ mod tests {
 
         // Verify event fields carry correct connection metadata.
         assert_eq!(event.peer_id, peer_id);
-        assert_eq!(event.origin, ConnOrigin::Server);
 
         // Send test packet from server.
         let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
@@ -1230,10 +1230,17 @@ mod tests {
         let _event = await_h3v2_connection(&mut server.events_rx).await;
 
         // Drop the egress sender to trigger client shutdown.
-        let H3v2ConnectedEvent { tx, handles, .. } = cli_event;
+        let ConnectedEvent {
+            tx,
+            main_handle,
+            udp_rx_handle,
+            udp_tx_handle,
+            ..
+        } = cli_event;
         drop(tx);
-        let (engine_handle, udp_rx_handle, udp_tx_handle) =
-            handles.expect("client handles present");
+        let engine_handle = main_handle.expect("client main_handle present");
+        let udp_rx_handle = udp_rx_handle.expect("client udp_rx_handle present");
+        let udp_tx_handle = udp_tx_handle.expect("client udp_tx_handle present");
 
         // Engine handle should terminate cleanly within a reasonable timeout.
         let engine_result = tokio::time::timeout(Duration::from_secs(5), engine_handle)

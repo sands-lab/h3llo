@@ -6,7 +6,7 @@
 use crate::auth::generate_bearer_auth;
 use crate::bind::{make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
-use crate::events::{ConnOrigin, DialContext, H3v2ConnectedEvent};
+use crate::events::{ConnectedEvent, DialContext, Endpoint};
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, H3Engine, RunState,
 };
@@ -88,7 +88,10 @@ impl H3Engine {
                         // QUIC packet before the CONNECT-IP request so the
                         // server's H3 driver processes SETTINGS first, avoiding
                         // a ControllerWentAway race in tokio-quiche.
-                        Self::start_h3_session(&mut self.conn, &mut self.session)?;
+                        self.session = Some(
+                            H3Session::with_transport(&mut self.conn)
+                                .map_err(DialError::Handshake)?,
+                        );
                         self.flush_send();
                         Self::send_connect_request(
                             &mut self.conn,
@@ -155,19 +158,6 @@ impl H3Engine {
         }
     }
 
-    /// Creates the H3 connection, queuing SETTINGS on the control stream.
-    ///
-    /// The caller should flush after this and before [`Self::send_connect_request`]
-    /// so that the server processes SETTINGS before the CONNECT-IP request.
-    fn start_h3_session(
-        conn: &mut quiche::Connection,
-        session: &mut Option<H3Session>,
-    ) -> Result<(), DialError> {
-        *session = Some(H3Session::with_transport(conn).map_err(DialError::Handshake)?);
-
-        Ok(())
-    }
-
     /// Sends the CONNECT-IP request on the session's H3 connection.
     fn send_connect_request(
         conn: &mut quiche::Connection,
@@ -228,7 +218,7 @@ fn make_client_quiche_config(
 
 /// Establishes an outbound H3 client CONNECT-IP connection.
 ///
-/// On success, returns [`H3v2ConnectedEvent`] with origin `Client`.
+/// On success, returns [`ConnectedEvent`] with origin `Client`.
 /// The caller is responsible for sending the event and handling errors.
 pub(crate) async fn dial_h3_client<P: RouteProbe>(
     peer_h3: &PeerH3,
@@ -236,7 +226,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     ctx: &DialContext,
     probe: &P,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-) -> Result<H3v2ConnectedEvent, DialError> {
+) -> Result<ConnectedEvent, DialError> {
     let DialContext {
         peer_id,
         tun_if,
@@ -338,7 +328,6 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
 
         metrics_interval: tuning.io.metrics_push_interval,
         keepalive_interval: tuning.h3.h3_keepalive_interval,
-        origin: ConnOrigin::Client,
         udp_cancel: Some(udp_cancel),
     };
 
@@ -359,12 +348,14 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
 
     let engine_handle = crypto_rt.spawn(engine.run());
 
-    Ok(H3v2ConnectedEvent {
+    Ok(ConnectedEvent {
         peer_id: peer_id.to_string(),
         remote_addr,
         tx: egress_tx,
-        origin: ConnOrigin::Client,
-        handles: Some((engine_handle, udp_rx_handle, udp_tx_handle)),
+        endpoint: peer_h3.endpoint.as_ref().map(|ep| Endpoint::H3(ep.clone())),
+        main_handle: Some(engine_handle),
+        udp_tx_handle: Some(udp_tx_handle),
+        udp_rx_handle: Some(udp_rx_handle),
     })
 }
 
@@ -374,7 +365,7 @@ mod tests {
     use crate::actor::ActorExitResult;
     use crate::bind::test_support::FakeRouteProbe;
     use crate::config::{default_mtu, H3Tuning};
-    use crate::events::{ConnOrigin, Event, H3v2ConnectedEvent};
+    use crate::events::{ConnectedEvent, Event};
     use crate::h3::test_support::await_server_connection;
     use crate::h3::{
         make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
@@ -502,7 +493,7 @@ mod tests {
         bound_addr: SocketAddr,
         token: &str,
         peer_id: &str,
-    ) -> (H3v2ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
+    ) -> (ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
         let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();
         let tuning = insecure_tuning();
@@ -536,7 +527,6 @@ mod tests {
         // Server should emit H3Connected with correct peer_id.
         let server_event = await_server_connection(&mut server.events_rx).await;
         assert_eq!(server_event.connection.peer_id, peer_id);
-        assert_eq!(server_event.origin, ConnOrigin::Server);
 
         drop(server.cmd_tx);
     }
@@ -725,10 +715,17 @@ mod tests {
         let _server_event = await_server_connection(&mut server.events_rx).await;
 
         // Drop the egress sender to trigger client shutdown.
-        let H3v2ConnectedEvent { tx, handles, .. } = event;
+        let ConnectedEvent {
+            tx,
+            main_handle,
+            udp_rx_handle,
+            udp_tx_handle,
+            ..
+        } = event;
         drop(tx);
-        let (engine_handle, udp_rx_handle, udp_tx_handle) =
-            handles.expect("client handles present");
+        let engine_handle = main_handle.expect("client main_handle present");
+        let udp_rx_handle = udp_rx_handle.expect("client udp_rx_handle present");
+        let udp_tx_handle = udp_tx_handle.expect("client udp_tx_handle present");
 
         // Engine handle should terminate cleanly within a reasonable timeout.
         let engine_result = tokio::time::timeout(Duration::from_secs(5), engine_handle)

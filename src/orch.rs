@@ -7,8 +7,7 @@ use crate::bind::DefaultRouteProbe;
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, PeerTransport, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
-    ApiEvent, BareConnectedEvent, ConnOrigin, DialContext, DialFailedEvent, DnsEvent, Endpoint,
-    Event, H3v2ConnectedEvent,
+    ApiEvent, ConnectedEvent, DialContext, DialFailedEvent, DnsEvent, Endpoint, Event,
 };
 use crate::h3dialer::dial_h3_client;
 use crate::h3listener::{make_h3_dispatcher, spawn_h3_dispatcher, DispatcherCommand};
@@ -605,13 +604,12 @@ impl Orchestrator {
             // spawn: infallible task creation
             // Initial peer tokens are empty; sync_peers_to_actors() populates them
             // immediately after construction.
-            let (cmd_tx, (dispatcher_handle, udp_rx_handle, udp_tx_handle), _) =
-                spawn_h3_dispatcher(
-                    dispatcher,
-                    HashMap::new(),
-                    udp_rt.handle(),
-                    crypto_rt.handle(),
-                );
+            let (cmd_tx, dispatcher_handle, udp_rx_handle, udp_tx_handle, _) = spawn_h3_dispatcher(
+                dispatcher,
+                HashMap::new(),
+                udp_rt.handle(),
+                crypto_rt.handle(),
+            );
 
             join_set.spawn(dispatcher_handle);
             join_set.spawn(udp_rx_handle);
@@ -958,7 +956,7 @@ impl Orchestrator {
                 // Deprecated: old h3.rs path no longer used in production.
                 // Kept for compilation compatibility while h3.rs exists.
                 error!(
-                    origin = ?event.origin,
+                    peer_id = %event.connection.peer_id,
                     "received old-style H3Connected event (h3.rs path); ignoring"
                 );
             }
@@ -1047,19 +1045,8 @@ impl Orchestrator {
     ///
     /// Unconditionally registers the TX actor JoinHandle for lifecycle
     /// monitoring, then attempts to bind the peer via [`update_bound`].
-    fn handle_bare_connection(&mut self, event: BareConnectedEvent) {
-        let BareConnectedEvent {
-            peer_id,
-            endpoint,
-            dest,
-            tx,
-            tx_handle,
-            udp_tx_handle,
-        } = event;
-        // Always register: actors are already running, must be supervised
-        self.join_set.spawn(tx_handle);
-        self.join_set.spawn(udp_tx_handle);
-        self.update_bound(&peer_id, Some(endpoint), dest, tx);
+    fn handle_bare_connection(&mut self, event: ConnectedEvent) {
+        self.handle_connected(event);
     }
 
     /// Handles a dial failure event: clears in-flight flag and updates backoff.
@@ -1092,34 +1079,35 @@ impl Orchestrator {
 
     /// Handles an H3v2 engine-based connection event (inbound or outbound).
     ///
-    /// H3Engine handles RX/TX internally — no separate actor spawning needed.
-    /// Registers the TX bound and adds actor join handles to JoinSet.
-    fn handle_h3v2_connected(&mut self, event: H3v2ConnectedEvent) {
-        let H3v2ConnectedEvent {
+    /// Delegates to [`handle_connected`] which spawns actor handles and
+    /// registers the TX bound.
+    fn handle_h3v2_connected(&mut self, event: ConnectedEvent) {
+        self.handle_connected(event);
+    }
+
+    /// Shared handler for both H3v2 and BareUDP connected events.
+    ///
+    /// Spawns all present actor join handles into the [`JoinSet`] for
+    /// lifecycle monitoring, then registers the TX bound via [`update_bound`].
+    fn handle_connected(&mut self, event: ConnectedEvent) {
+        let ConnectedEvent {
             peer_id,
             remote_addr,
             tx,
-            origin,
-            handles,
+            endpoint,
+            main_handle,
+            udp_tx_handle,
+            udp_rx_handle,
         } = event;
 
-        let Some(entry) = self.peers.get(&peer_id) else {
-            warn!(peer = %peer_id, addr = %remote_addr, origin = ?origin, "H3v2 connection from unknown peer");
-            return;
-        };
-
-        let endpoint = match origin {
-            ConnOrigin::Client => match &entry.config.transport {
-                PeerTransport::H3(h3) => h3.endpoint.as_ref().map(|ep| Endpoint::H3(ep.clone())),
-                PeerTransport::Bare(_) => None,
-            },
-            ConnOrigin::Server => None,
-        };
-
-        if let Some((h1, h2, h3)) = handles {
-            self.join_set.spawn(h1);
-            self.join_set.spawn(h2);
-            self.join_set.spawn(h3);
+        if let Some(h) = main_handle {
+            self.join_set.spawn(h);
+        }
+        if let Some(h) = udp_tx_handle {
+            self.join_set.spawn(h);
+        }
+        if let Some(h) = udp_rx_handle {
+            self.join_set.spawn(h);
         }
 
         self.update_bound(&peer_id, endpoint, remote_addr, tx);
@@ -2169,16 +2157,17 @@ mod tests {
         let tx_handle = tokio::spawn(async { Ok(()) });
         let udp_tx_handle = tokio::spawn(async { Ok(()) });
 
-        let event = BareConnectedEvent {
+        let event = ConnectedEvent {
             peer_id: "unknown-peer".to_string(),
-            endpoint: Endpoint::Udp(UdpEndpoint {
+            endpoint: Some(Endpoint::Udp(UdpEndpoint {
                 host: "example.com".to_string(),
                 port: 5353,
-            }),
-            dest: "1.2.3.4:5353".parse().unwrap(),
+            })),
+            remote_addr: "1.2.3.4:5353".parse().unwrap(),
             tx,
-            tx_handle,
-            udp_tx_handle,
+            main_handle: Some(tx_handle),
+            udp_tx_handle: Some(udp_tx_handle),
+            udp_rx_handle: None,
         };
 
         orch.handle_bare_connection(event);
@@ -2202,16 +2191,17 @@ mod tests {
         let tx_handle = tokio::spawn(async { Ok(()) });
         let udp_tx_handle = tokio::spawn(async { Ok(()) });
 
-        let event = BareConnectedEvent {
+        let event = ConnectedEvent {
             peer_id: "peer1".to_string(),
-            endpoint: Endpoint::Udp(UdpEndpoint {
+            endpoint: Some(Endpoint::Udp(UdpEndpoint {
                 host: "example.com".to_string(),
                 port: 5353,
-            }),
-            dest: "5.6.7.8:5353".parse().unwrap(),
+            })),
+            remote_addr: "5.6.7.8:5353".parse().unwrap(),
             tx,
-            tx_handle,
-            udp_tx_handle,
+            main_handle: Some(tx_handle),
+            udp_tx_handle: Some(udp_tx_handle),
+            udp_rx_handle: None,
         };
 
         orch.handle_bare_connection(event);
@@ -2239,16 +2229,17 @@ mod tests {
         let tx_handle = tokio::spawn(async { Ok(()) });
         let udp_tx_handle = tokio::spawn(async { Ok(()) });
 
-        let event = BareConnectedEvent {
+        let event = ConnectedEvent {
             peer_id: "peer1".to_string(),
-            endpoint: Endpoint::Udp(UdpEndpoint {
+            endpoint: Some(Endpoint::Udp(UdpEndpoint {
                 host: "example.com".to_string(),
                 port: 5353,
-            }),
-            dest: "1.2.3.4:5353".parse().unwrap(),
+            })),
+            remote_addr: "1.2.3.4:5353".parse().unwrap(),
             tx,
-            tx_handle,
-            udp_tx_handle,
+            main_handle: Some(tx_handle),
+            udp_tx_handle: Some(udp_tx_handle),
+            udp_rx_handle: None,
         };
 
         orch.handle_bare_connection(event);

@@ -10,7 +10,7 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{generate_bearer_auth, validate_connect_auth, AuthError};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
-use crate::events::{ConnOrigin, Event, H3ConnectedEvent};
+use crate::events::{Event, H3ConnectedEvent};
 use crate::helpers::{send_with_backpressure, SendEvent};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use futures_util::sink::SinkExt;
@@ -309,10 +309,7 @@ async fn handle_h3_connection(
                     flow_id,
                     quic_cmd_send,
                 };
-                let event = Event::H3Connected(H3ConnectedEvent {
-                    connection: conn,
-                    origin: ConnOrigin::Server,
-                });
+                let event = Event::H3Connected(H3ConnectedEvent { connection: conn });
                 if events_tx.send(event).is_err() {
                     debug!(%remote_addr, "events channel closed");
                     close_quic_connection(&quic_cmd_tx);
@@ -1532,8 +1529,6 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_success() {
-        use crate::events::ConnOrigin;
-
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -1580,7 +1575,6 @@ mod tests {
         // Server should emit an H3Connected event
         let server_event = await_server_connection(&mut events_rx).await;
         assert_eq!(server_event.connection.peer_id, peer_id);
-        assert_eq!(server_event.origin, ConnOrigin::Server);
 
         // Clean shutdown
         drop(cmd_tx);
@@ -1588,8 +1582,6 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_success_with_sni_override() {
-        use crate::events::ConnOrigin;
-
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
@@ -1638,7 +1630,6 @@ mod tests {
         // Server should emit an H3Connected event
         let server_event = await_server_connection(&mut events_rx).await;
         assert_eq!(server_event.connection.peer_id, peer_id);
-        assert_eq!(server_event.origin, ConnOrigin::Server);
 
         drop(cmd_tx);
     }

@@ -17,10 +17,10 @@ Findings are grouped into batches ordered by priority and dependency. Each batch
 | **2** | **Observability**: ~~bare.rs + udp.rs zero tracing~~, ~~logging level fixes~~, ~~silent drop handling~~ (router.rs send_and_record: kept as-is, already tracked via metrics) | §1.7, §4.1, §4.2 | ✅ |
 | **3** | **Cleanup**: ~~visibility narrowing~~ (14 items), ~~redundant derives~~, ~~stale docs~~ (§2.1 H3v2→H3 rename: deferred to batch 6) | §6, §9, §10 | ✅ |
 | **4** | **Type-level refinements**: ~~`PeerTransport` enum~~, ~~`ConnParams` removal~~, ~~`AuthError` enum~~, ~~`RouteProbe` IpAddr~~ (§2.11 CcAlgorithm, §2.12 ConnectState: skipped) | §2.2, §2.14, §7 | ✅ |
-| **5** | **Code extraction & dedup**: metrics_encode.rs, buf.rs, serde macro, validation helper, TUN dedup, cross-file dedup patterns | §2.3, §2.4, §2.9, §2.10, §2.15, §2.16, §3 | ⬚ |
+| **5** | **Code extraction & dedup**: ~~metrics encoding to metrics.rs~~, ~~serde macro~~, ~~validation helpers~~, ~~TUN cfg dedup~~, ~~label_set! macro~~, ~~encode_family unification~~, ~~table-driven families~~ (§2.15 TunReader/TunWriter dedup: deferred) | §2.3, §2.4, §2.9, §2.10, §2.15, §2.16, §3 | ✅ |
 | **6** | **h3.rs deletion**: migrate interop tests, delete 2228-LOC deprecated module, remove duplicated header validation | §1.1, §2.13, §11.1 | ⬚ |
-| **7** | **Structural refactoring**: config.rs split, Tuning sub-structs, ActorChannels, ConnectContext, handshake loop dedup, other §2.17 items | §2.5–2.8, §2.17, §11.2–11.5, §12, §14 | ⬚ |
-| **8** | **Polish**: naming/expression clarity, magic numbers, test quality, type-level enforcement | §4.3, §5, §8, §13 | ⬚ |
+| **7** | **Structural refactoring**: ~~Tuning sub-structs (IoTuning/DnsTuning/H3Tuning)~~, ~~humantime-serde~~, ~~FieldConflict~~, ~~LoopExit/ResolveInitError removal~~, ~~label newtype removal~~, ~~EnumMap drop_reasons~~, ~~H3ActorHandles~~, ~~Vec→Option/array~~, ~~UDP handle tracking~~, ~~h3.rs Option consolidation~~, ~~QuicError drop reason~~ (§11.2 handshake dedup, §13.1 CcAlgorithm enum, §13.3 typestate, §14.3 param bundling: skipped) | §2.5–2.8, §11.2–11.5, §12, §13, §14 | ✅ |
+| **8** | **Polish**: naming/expression clarity, magic numbers, test quality | §4.3, §5, §8 | ⬚ |
 
 Legend: ⬚ = pending, 🔨 = in progress, ✅ = done, ⊘ = skipped
 

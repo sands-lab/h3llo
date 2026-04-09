@@ -9,7 +9,7 @@
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::H3Tuning;
-use crate::events::{ConnOrigin, Event};
+use crate::events::Event;
 use crate::h3session::{
     ConnectIpDatagramCodec, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT,
 };
@@ -314,7 +314,6 @@ pub(crate) struct H3Engine {
 
     pub(crate) metrics_interval: Duration,
     pub(crate) keepalive_interval: Duration,
-    pub(crate) origin: ConnOrigin,
 
     /// Cancels associated UDP actors when the engine finishes.
     ///
@@ -355,7 +354,6 @@ impl H3Engine {
             mut run_state,
             metrics_interval,
             keepalive_interval,
-            origin,
             udp_cancel,
         } = self;
         let mut session = session.expect("session present after establish/accept");
@@ -494,7 +492,6 @@ impl H3Engine {
             token.cancel();
         }
         exit.map_err(|reason| ActorError::H3Engine {
-            origin,
             peer_id: meta.peer_id.clone(),
             reason,
         })

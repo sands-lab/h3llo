@@ -567,12 +567,8 @@ fn extract_records(message: &Message, expected: RecordType) -> Vec<(IpAddr, u32)
 
     for answer in message.answers() {
         let (ip, ttl) = match answer.data() {
-            RData::A(addr) if expected == RecordType::A => {
-                (IpAddr::V4(ipv4_from_rdata(addr)), answer.ttl())
-            }
-            RData::AAAA(addr) if expected == RecordType::AAAA => {
-                (IpAddr::V6(ipv6_from_rdata(addr)), answer.ttl())
-            }
+            RData::A(addr) if expected == RecordType::A => (IpAddr::V4(addr.0), answer.ttl()),
+            RData::AAAA(addr) if expected == RecordType::AAAA => (IpAddr::V6(addr.0), answer.ttl()),
             _ => continue,
         };
 
@@ -600,16 +596,6 @@ fn log_response_warnings(message: &Message, host: &str) {
     if !message.recursion_available() {
         warn!(host = %host, "dns: recursion unavailable");
     }
-}
-
-/// Converts Hickory's IPv4 RDATA to `Ipv4Addr`.
-fn ipv4_from_rdata(data: &hickory_proto::rr::rdata::A) -> std::net::Ipv4Addr {
-    data.0
-}
-
-/// Converts Hickory's IPv6 RDATA to `Ipv6Addr`.
-fn ipv6_from_rdata(data: &hickory_proto::rr::rdata::AAAA) -> std::net::Ipv6Addr {
-    data.0
 }
 
 #[cfg(test)]
