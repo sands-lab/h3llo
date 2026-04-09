@@ -922,7 +922,7 @@ pub fn spawn_h3_tx(
                         .await
                         .map_err(|_| {
                             counters.record_drop(
-                                DropReason::SendError, 1, len as u64,
+                                DropReason::ChannelClosed, 1, len as u64,
                             );
                             ActorError::H3TxSend {
                                 peer_id: peer.clone(),
