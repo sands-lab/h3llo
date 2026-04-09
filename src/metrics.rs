@@ -460,6 +460,7 @@ impl Collector for SnapshotCollector {
                 m.stats
                     .drop_reasons
                     .iter()
+                    .filter(move |(_, c)| field(c) > 0)
                     .map(move |(reason, c)| (DropLabelSet::from_metrics(m, reason), field(c)))
             })?;
         }

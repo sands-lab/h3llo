@@ -2091,7 +2091,7 @@ mod tests {
             .expect("routing update always sent");
     }
 
-    // ========== BareConnected event handling tests ==========
+    // ========== Connected event handling tests ==========
 
     #[tokio::test]
     async fn handle_dns_snapshot_does_not_block_on_bare_tx() {
