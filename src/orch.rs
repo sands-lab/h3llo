@@ -956,7 +956,7 @@ impl Orchestrator {
                 // Deprecated: old h3.rs path no longer used in production.
                 // Kept for compilation compatibility while h3.rs exists.
                 error!(
-                    origin = ?event.origin,
+                    peer_id = %event.connection.peer_id,
                     "received old-style H3Connected event (h3.rs path); ignoring"
                 );
             }

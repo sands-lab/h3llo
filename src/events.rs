@@ -61,26 +61,6 @@ impl DialContext {
     }
 }
 
-/// Which side created a connection: `Client` (we dialed) or `Server` (we accepted).
-///
-/// Distinct from `Direction` (Rx/Tx) which describes data flow for metrics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnOrigin {
-    /// We acted as client and dialed this connection.
-    Client,
-    /// We acted as server and accepted this connection.
-    Server,
-}
-
-impl std::fmt::Display for ConnOrigin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Client => f.write_str("client"),
-            Self::Server => f.write_str("server"),
-        }
-    }
-}
-
 /// Transport connection established event (H3 or BareUDP).
 ///
 /// Emitted by H3 listener/dialer or BareUDP dial task when connection
@@ -212,8 +192,6 @@ pub struct DialFailedEvent {
 pub struct H3ConnectedEvent {
     /// The established connection.
     pub connection: H3Connection,
-    /// Whether we acted as client or server for this connection.
-    pub origin: ConnOrigin,
 }
 
 /// DNS resolution state change notification.

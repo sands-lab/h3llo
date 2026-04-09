@@ -6,7 +6,7 @@
 use crate::auth::generate_bearer_auth;
 use crate::bind::{make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
-use crate::events::{ConnOrigin, ConnectedEvent, DialContext, Endpoint};
+use crate::events::{ConnectedEvent, DialContext, Endpoint};
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, H3Engine, RunState,
 };
@@ -328,7 +328,6 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
 
         metrics_interval: tuning.io.metrics_push_interval,
         keepalive_interval: tuning.h3.h3_keepalive_interval,
-        origin: ConnOrigin::Client,
         udp_cancel: Some(udp_cancel),
     };
 
@@ -366,7 +365,7 @@ mod tests {
     use crate::actor::ActorExitResult;
     use crate::bind::test_support::FakeRouteProbe;
     use crate::config::{default_mtu, H3Tuning};
-    use crate::events::{ConnOrigin, ConnectedEvent, Event};
+    use crate::events::{ConnectedEvent, Event};
     use crate::h3::test_support::await_server_connection;
     use crate::h3::{
         make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
@@ -528,7 +527,6 @@ mod tests {
         // Server should emit H3Connected with correct peer_id.
         let server_event = await_server_connection(&mut server.events_rx).await;
         assert_eq!(server_event.connection.peer_id, peer_id);
-        assert_eq!(server_event.origin, ConnOrigin::Server);
 
         drop(server.cmd_tx);
     }

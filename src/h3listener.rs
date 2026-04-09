@@ -12,7 +12,7 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::validate_connect_auth;
 use crate::bind::make_server_udp_socket;
 use crate::config::{H3Tuning, IoTuning};
-use crate::events::{ConnOrigin, ConnectedEvent, Event};
+use crate::events::{ConnectedEvent, Event};
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, H3Engine, RunState,
 };
@@ -525,7 +525,6 @@ impl DispatcherRuntime {
             run_state: RunState::new(),
             metrics_interval: self.io_tuning.metrics_push_interval,
             keepalive_interval: self.h3_tuning.h3_keepalive_interval,
-            origin: ConnOrigin::Server,
             udp_cancel: None,
         };
 
