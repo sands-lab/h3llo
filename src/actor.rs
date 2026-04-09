@@ -31,6 +31,13 @@ pub enum ActorKind {
 /// - `Err(ActorError)` indicates an error exit requiring orchestrator action.
 pub type ActorExitResult = Result<(), ActorError>;
 
+/// Three actor join handles spawned for an H3 connection (engine/dispatcher + UDP RX + UDP TX).
+pub type H3ActorHandles = (
+    tokio::task::JoinHandle<ActorExitResult>,
+    tokio::task::JoinHandle<ActorExitResult>,
+    tokio::task::JoinHandle<ActorExitResult>,
+);
+
 /// Unified actor error type for orchestrator supervision.
 ///
 /// Captures the actor identity and exit reason. Designed to be simple

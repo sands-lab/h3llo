@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
-use crate::actor::ActorExitResult;
+use crate::actor::{ActorExitResult, H3ActorHandles};
 use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
 use crate::h3::H3Connection;
 use crate::metrics::{Labels, Metrics};
@@ -100,11 +100,7 @@ pub struct H3v2ConnectedEvent {
     /// Outbound (client) connections carry (engine, udp_rx, udp_tx) handles
     /// for JoinSet registration. Inbound (server) connections are managed
     /// by the dispatcher (`None`).
-    pub handles: Option<(
-        JoinHandle<ActorExitResult>,
-        JoinHandle<ActorExitResult>,
-        JoinHandle<ActorExitResult>,
-    )>,
+    pub handles: Option<H3ActorHandles>,
 }
 
 impl std::fmt::Debug for H3v2ConnectedEvent {

@@ -8,6 +8,7 @@
 //!
 //! See [`make_h3_dispatcher`] + [`spawn_h3_dispatcher`] for the public entry points.
 
+use crate::actor::H3ActorHandles;
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::validate_connect_auth;
 use crate::bind::make_server_udp_socket;
@@ -28,7 +29,6 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
 use tokio_util::sync::CancellationToken;
@@ -586,9 +586,7 @@ pub fn spawn_h3_dispatcher(
     crypto_rt: &RuntimeHandle,
 ) -> (
     mpsc::UnboundedSender<DispatcherCommand>,
-    JoinHandle<ActorExitResult>,
-    JoinHandle<ActorExitResult>,
-    JoinHandle<ActorExitResult>,
+    H3ActorHandles,
     SocketAddr,
 ) {
     let H3Dispatcher {
@@ -633,7 +631,7 @@ pub fn spawn_h3_dispatcher(
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
     });
 
-    (cmd_tx, handle, udp_rx_handle, udp_tx_handle, bound_addr)
+    (cmd_tx, (handle, udp_rx_handle, udp_tx_handle), bound_addr)
 }
 
 /// Shared test utilities for H3v2 listener integration tests across modules.
@@ -781,7 +779,7 @@ mod tests {
         ingress_rx: mpsc::Receiver<Vec<PooledBuf>>,
         bound_addr: SocketAddr,
         _certs: TestCertBundle,
-        _handle: JoinHandle<ActorExitResult>,
+        _handle: tokio::task::JoinHandle<ActorExitResult>,
     }
 
     impl TestH3Server {
@@ -807,7 +805,8 @@ mod tests {
             )
             .expect("make_h3_dispatcher");
 
-            let (cmd_tx, handle, _, _, _) = spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
+            let (cmd_tx, (handle, _, _), _) =
+                spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
 
             // Give dispatcher time to start accepting.
             tokio::time::sleep(Duration::from_millis(50)).await;
