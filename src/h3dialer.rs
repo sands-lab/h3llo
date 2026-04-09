@@ -88,7 +88,10 @@ impl H3Engine {
                         // QUIC packet before the CONNECT-IP request so the
                         // server's H3 driver processes SETTINGS first, avoiding
                         // a ControllerWentAway race in tokio-quiche.
-                        Self::start_h3_session(&mut self.conn, &mut self.session)?;
+                        self.session = Some(
+                            H3Session::with_transport(&mut self.conn)
+                                .map_err(DialError::Handshake)?,
+                        );
                         self.flush_send();
                         Self::send_connect_request(
                             &mut self.conn,
@@ -153,19 +156,6 @@ impl H3Engine {
                 ));
             }
         }
-    }
-
-    /// Creates the H3 connection, queuing SETTINGS on the control stream.
-    ///
-    /// The caller should flush after this and before [`Self::send_connect_request`]
-    /// so that the server processes SETTINGS before the CONNECT-IP request.
-    fn start_h3_session(
-        conn: &mut quiche::Connection,
-        session: &mut Option<H3Session>,
-    ) -> Result<(), DialError> {
-        *session = Some(H3Session::with_transport(conn).map_err(DialError::Handshake)?);
-
-        Ok(())
     }
 
     /// Sends the CONNECT-IP request on the session's H3 connection.
