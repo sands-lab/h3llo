@@ -97,10 +97,14 @@ pub struct H3v2ConnectedEvent {
     pub origin: ConnOrigin,
     /// Actor join handles for lifecycle tracking.
     ///
-    /// Outbound connections carry engine + UDP actor handles for JoinSet
-    /// registration. Inbound connections are managed by the dispatcher
-    /// and carry no handles (empty Vec).
-    pub handles: Vec<JoinHandle<ActorExitResult>>,
+    /// Outbound (client) connections carry (engine, udp_rx, udp_tx) handles
+    /// for JoinSet registration. Inbound (server) connections are managed
+    /// by the dispatcher (`None`).
+    pub handles: Option<(
+        JoinHandle<ActorExitResult>,
+        JoinHandle<ActorExitResult>,
+        JoinHandle<ActorExitResult>,
+    )>,
 }
 
 impl std::fmt::Debug for H3v2ConnectedEvent {

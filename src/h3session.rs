@@ -226,28 +226,34 @@ impl ConnectFailure {
 /// CONNECT-IP DATAGRAM framing codec bound to one CONNECT request stream.
 pub(crate) struct ConnectIpDatagramCodec {
     expected_qsi: u64,
-    qsi_bytes: Vec<u8>,
+    qsi_buf: [u8; 8],
+    qsi_len: usize,
 }
 
 impl ConnectIpDatagramCodec {
     pub(crate) fn new(connect_stream_id: u64) -> Self {
         let expected_qsi = connect_stream_id / 4;
-        let qsi_bytes = encode_qsi(expected_qsi);
+        let (qsi_buf, qsi_len) = encode_qsi(expected_qsi);
         Self {
             expected_qsi,
-            qsi_bytes,
+            qsi_buf,
+            qsi_len,
         }
     }
 
+    fn qsi_bytes(&self) -> &[u8] {
+        &self.qsi_buf[..self.qsi_len]
+    }
+
     pub(crate) fn prepend(&self, packet: &mut PooledBuf) -> bool {
-        packet.add_prefix(&[CONTEXT_ID_IP]) && packet.add_prefix(&self.qsi_bytes)
+        packet.add_prefix(&[CONTEXT_ID_IP]) && packet.add_prefix(self.qsi_bytes())
     }
 
     pub(crate) fn strip(&self, packet: &mut PooledBuf) -> bool {
         let Some((qsi, qsi_len)) = decode_qsi(packet) else {
             return false;
         };
-        if qsi != self.expected_qsi || qsi_len != self.qsi_bytes.len() {
+        if qsi != self.expected_qsi || qsi_len != self.qsi_len {
             return false;
         }
 
@@ -267,13 +273,13 @@ impl ConnectIpDatagramCodec {
 // ========== QSI Helpers ==========
 
 /// Encodes a Quarter Stream ID as a QUIC varint byte sequence.
-fn encode_qsi(qsi: u64) -> Vec<u8> {
+fn encode_qsi(qsi: u64) -> ([u8; 8], usize) {
     let len = varint_len(qsi);
     let mut buf = [0u8; 8];
     OctetsMut::with_slice(&mut buf)
         .put_varint(qsi)
         .expect("qsi fits varint");
-    buf[..len].to_vec()
+    (buf, len)
 }
 
 /// Decodes a Quarter Stream ID varint from the start of a buffer.
@@ -380,11 +386,11 @@ mod tests {
     #[test]
     fn datagram_framing_encode_decode() {
         let ip_payload = b"test ip packet";
-        let qsi_bytes = encode_qsi(0);
+        let (qsi_buf, qsi_len) = encode_qsi(0);
 
         let mut buf = alloc_packet_buf(ip_payload);
         assert!(buf.add_prefix(&[CONTEXT_ID_IP]));
-        assert!(buf.add_prefix(&qsi_bytes));
+        assert!(buf.add_prefix(&qsi_buf[..qsi_len]));
 
         let data = &buf[..];
         let (qsi, qsi_len) = decode_qsi(data).expect("valid QSI");
@@ -401,12 +407,12 @@ mod tests {
 
     #[test]
     fn encode_qsi_roundtrip() {
-        assert_eq!(encode_qsi(0), vec![0x00]);
-        assert_eq!(encode_qsi(1), vec![0x01]);
-        assert_eq!(encode_qsi(63).len(), 1);
-        let encoded = encode_qsi(64);
-        assert_eq!(encoded.len(), 2);
-        let parsed = Octets::with_slice(&encoded).get_varint().unwrap();
+        assert_eq!(encode_qsi(0), ([0x00, 0, 0, 0, 0, 0, 0, 0], 1));
+        assert_eq!(encode_qsi(1), ([0x01, 0, 0, 0, 0, 0, 0, 0], 1));
+        assert_eq!(encode_qsi(63).1, 1);
+        let (buf, len) = encode_qsi(64);
+        assert_eq!(len, 2);
+        let parsed = Octets::with_slice(&buf[..len]).get_varint().unwrap();
         assert_eq!(parsed, 64);
     }
 
@@ -418,8 +424,8 @@ mod tests {
         assert_eq!(decode_qsi(&[0x3f]), Some((63, 1)));
 
         // Two-byte varint via QSI roundtrip.
-        let encoded = encode_qsi(64);
-        assert_eq!(decode_qsi(&encoded), Some((64, 2)));
+        let (buf, len) = encode_qsi(64);
+        assert_eq!(decode_qsi(&buf[..len]), Some((64, 2)));
 
         // Empty buffer.
         assert_eq!(decode_qsi(&[]), None);
@@ -437,8 +443,13 @@ mod tests {
         {
             let codec = ConnectIpDatagramCodec::new(stream_id);
             assert_eq!(codec.expected_qsi, expect_qsi, "sid={stream_id}");
-            assert_eq!(codec.qsi_bytes, encode_qsi(expect_qsi), "sid={stream_id}");
-            assert_eq!(codec.qsi_bytes.len() + 1, expect_prefix, "sid={stream_id}");
+            let (expect_buf, expect_len) = encode_qsi(expect_qsi);
+            assert_eq!(
+                codec.qsi_bytes(),
+                &expect_buf[..expect_len],
+                "sid={stream_id}"
+            );
+            assert_eq!(codec.qsi_len + 1, expect_prefix, "sid={stream_id}");
         }
     }
 

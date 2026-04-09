@@ -558,7 +558,7 @@ impl DispatcherRuntime {
                     remote_addr: remote,
                     tx: egress_tx,
                     origin: ConnOrigin::Server,
-                    handles: Vec::new(),
+                    handles: None,
                 }))
                 .is_err()
             {
@@ -1234,10 +1234,8 @@ mod tests {
         // Drop the egress sender to trigger client shutdown.
         let H3v2ConnectedEvent { tx, handles, .. } = cli_event;
         drop(tx);
-        let mut handles = handles.into_iter();
-        let engine_handle = handles.next().unwrap();
-        let udp_rx_handle = handles.next().unwrap();
-        let udp_tx_handle = handles.next().unwrap();
+        let (engine_handle, udp_rx_handle, udp_tx_handle) =
+            handles.expect("client handles present");
 
         // Engine handle should terminate cleanly within a reasonable timeout.
         let engine_result = tokio::time::timeout(Duration::from_secs(5), engine_handle)

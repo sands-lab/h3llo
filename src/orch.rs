@@ -1113,8 +1113,10 @@ impl Orchestrator {
             ConnOrigin::Server => None,
         };
 
-        for handle in handles {
-            self.join_set.spawn(handle);
+        if let Some((h1, h2, h3)) = handles {
+            self.join_set.spawn(h1);
+            self.join_set.spawn(h2);
+            self.join_set.spawn(h3);
         }
 
         self.update_bound(&peer_id, endpoint, remote_addr, tx);
