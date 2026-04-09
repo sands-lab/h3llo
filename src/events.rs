@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
-use crate::actor::{ActorExitResult, H3ActorHandles};
+use crate::actor::ActorExitResult;
 use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
 use crate::h3::H3Connection;
 use crate::metrics::{Labels, Metrics};
@@ -81,34 +81,34 @@ impl std::fmt::Display for ConnOrigin {
     }
 }
 
-/// HTTP/3 engine-based connection established event.
+/// Transport connection established event (H3 or BareUDP).
 ///
-/// Emitted by the H3v2 listener dispatcher (inbound) or dial task (outbound)
-/// when QUIC + CONNECT-IP handshake completes. Carries the per-connection
-/// egress channel and optional join handles for orchestrator registration.
-pub struct H3v2ConnectedEvent {
-    /// Authenticated peer identifier (from Bearer token validation).
+/// Emitted by H3 listener/dialer or BareUDP dial task when connection
+/// setup completes. Carries the per-connection egress channel, optional
+/// endpoint, and actor join handles for orchestrator registration.
+pub struct ConnectedEvent {
+    /// Authenticated peer identifier.
     pub peer_id: String,
-    /// Remote client socket address.
+    /// Remote socket address.
     pub remote_addr: SocketAddr,
-    /// Channel for sending IP packets to the connected client.
+    /// Channel for sending IP packet batches to the peer.
     pub tx: mpsc::Sender<Vec<PooledBuf>>,
-    /// Server (listener-accepted) or Client (dialer-established).
-    pub origin: ConnOrigin,
-    /// Actor join handles for lifecycle tracking.
-    ///
-    /// Outbound (client) connections carry (engine, udp_rx, udp_tx) handles
-    /// for JoinSet registration. Inbound (server) connections are managed
-    /// by the dispatcher (`None`).
-    pub handles: Option<H3ActorHandles>,
+    /// Configured endpoint (present for client connections, absent for server).
+    pub endpoint: Option<Endpoint>,
+    /// Primary actor handle (H3 engine or Bare TX adapter).
+    pub main_handle: Option<JoinHandle<ActorExitResult>>,
+    /// UDP TX I/O actor handle.
+    pub udp_tx_handle: Option<JoinHandle<ActorExitResult>>,
+    /// UDP RX I/O actor handle (H3 client only).
+    pub udp_rx_handle: Option<JoinHandle<ActorExitResult>>,
 }
 
-impl std::fmt::Debug for H3v2ConnectedEvent {
+impl std::fmt::Debug for ConnectedEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("H3v2ConnectedEvent")
+        f.debug_struct("ConnectedEvent")
             .field("peer_id", &self.peer_id)
             .field("remote_addr", &self.remote_addr)
-            .field("origin", &self.origin)
+            .field("endpoint", &self.endpoint)
             .finish_non_exhaustive()
     }
 }
@@ -120,9 +120,9 @@ pub enum Event {
     /// HTTP/3 connection established, ready for actor spawning.
     H3Connected(H3ConnectedEvent),
     /// HTTP/3 engine-based connection established (inbound or outbound).
-    H3v2Connected(H3v2ConnectedEvent),
+    H3v2Connected(ConnectedEvent),
     /// BareUDP TX connection established, ready for bound registration.
-    BareConnected(BareConnectedEvent),
+    BareConnected(ConnectedEvent),
     /// A dial attempt failed; orchestrator should clear in-flight state and update backoff.
     DialFailed(DialFailedEvent),
     /// Events originating from DNS resolution.
@@ -202,36 +202,6 @@ pub struct DialFailedEvent {
     pub peer_id: String,
     /// The IP address that failed to connect.
     pub ip: IpAddr,
-}
-
-/// BareUDP TX connection established event.
-///
-/// Emitted by the async connection task when `udp::make_udp` +
-/// `udp::spawn_udp_tx` + `spawn_bare_tx` succeed. Carries the TX channel
-/// sender and actor JoinHandles for orchestrator registration.
-pub struct BareConnectedEvent {
-    /// Peer identifier from configuration.
-    pub peer_id: String,
-    /// Configured endpoint that originated this connection.
-    pub endpoint: Endpoint,
-    /// Destination socket address.
-    pub dest: SocketAddr,
-    /// TX channel for sending packet batches to the bare TX actor.
-    pub tx: mpsc::Sender<Vec<PooledBuf>>,
-    /// Join handle for the spawned bare TX adapter actor.
-    pub tx_handle: JoinHandle<ActorExitResult>,
-    /// Join handle for the underlying UDP TX I/O actor.
-    pub udp_tx_handle: JoinHandle<ActorExitResult>,
-}
-
-impl std::fmt::Debug for BareConnectedEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BareConnectedEvent")
-            .field("peer_id", &self.peer_id)
-            .field("dest", &self.dest)
-            .field("endpoint", &self.endpoint)
-            .finish_non_exhaustive()
-    }
 }
 
 /// HTTP/3 connection established event with full connection object.
