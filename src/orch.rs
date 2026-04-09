@@ -816,16 +816,14 @@ impl Orchestrator {
     /// Only includes metrics from currently live connections — pruned bounds are absent.
     fn collect_metrics_snapshot(&self) -> HashMap<Labels, Metrics> {
         let mut snapshot = self.non_peer_metrics.clone();
-        for entry in self.peers.values() {
-            for bound in &entry.bounds {
-                if let Some(ref m) = bound.rx_metrics {
-                    snapshot.insert(m.labels.clone(), m.clone());
-                }
-                if let Some(ref m) = bound.tx_metrics {
-                    snapshot.insert(m.labels.clone(), m.clone());
-                }
-            }
-        }
+        snapshot.extend(
+            self.peers
+                .values()
+                .flat_map(|e| &e.bounds)
+                .flat_map(|b| [&b.rx_metrics, &b.tx_metrics])
+                .flatten()
+                .map(|m| (m.labels.clone(), m.clone())),
+        );
         snapshot
     }
 
@@ -893,14 +891,13 @@ impl Orchestrator {
 
     /// Handles DELETE /config — remove peers by ID.
     fn handle_delete_config(&mut self, peer_ids: &[String]) {
-        let mut changed = false;
+        let before = self.peers.len();
         for id in peer_ids {
             if self.peers.remove(id).is_some() {
-                changed = true;
                 info!(peer = %id, "API: peer removed");
             }
         }
-        if changed {
+        if self.peers.len() < before {
             self.sync_peers_to_actors();
         }
     }

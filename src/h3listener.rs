@@ -392,8 +392,8 @@ impl DispatcherRuntime {
 
         loop {
             tokio::select! {
-                maybe_pkt = udp_recv_rx.recv() => {
-                    let Some((remote, batch)) = maybe_pkt else {
+                maybe_batch = udp_recv_rx.recv() => {
+                    let Some((remote, batch)) = maybe_batch else {
                         return Err(ActorError::UdpRxRecv {
                             addr: self.bound_addr.to_string(),
                             source: std::io::Error::other("recv actor closed"),
