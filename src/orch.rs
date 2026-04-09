@@ -1,6 +1,6 @@
 //! Runtime orchestration for `BareUDP` and HTTP/3 transports.
 
-use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
+use crate::actor::{ActorError, ActorExitResult, DedicatedRuntime, SupervisionPolicy};
 use crate::api;
 use crate::bare::{dial_bare_tx, make_bare_rx, spawn_bare_rx, BareUdpRxCommand};
 use crate::bind::{DefaultRouteProbe, RouteProbe};
@@ -31,7 +31,7 @@ use tracing::{debug, error, info, warn};
 
 /// A single active connection bound to a peer.
 #[derive(Debug)]
-struct BoundState {
+struct ActiveConn {
     /// Configured endpoint that originated this connection.
     ///
     /// `None` for listener-originated (inbound) connections.
@@ -88,7 +88,7 @@ struct PeerEntry {
     /// Peer configuration (read-only after creation).
     config: Peer,
     /// Active connections for this peer, ordered by preference (first = preferred TX).
-    bounds: Vec<BoundState>,
+    bounds: Vec<ActiveConn>,
     /// Current DNS-resolved IPs for this peer's endpoint.
     resolved_ips: HashSet<IpAddr>,
     /// Per-IP dial tracking: in-flight status, attempt count, and backoff timing.
@@ -359,7 +359,7 @@ pub struct Orchestrator {
 
     /// Metrics from non-peer-scoped actors (TUN RX/TX, `BareUDP` RX).
     ///
-    /// At most 3 entries. Peer-scoped metrics live in `BoundState`.
+    /// At most 3 entries. Peer-scoped metrics live in `ActiveConn`.
     non_peer_metrics: HashMap<Labels, Metrics>,
 
     /// Dedicated runtime for TUN Tx/Rx actors (thread: `h3llo-tun`).
@@ -775,11 +775,11 @@ impl Orchestrator {
                 self.reconcile();
             }
             Err(actor_error) => match actor_error.kind() {
-                ActorKind::Critical => {
+                SupervisionPolicy::Critical => {
                     error!("critical actor failed: {}", actor_error);
                     return ControlFlow::Break(Err(OrchestratorError::ActorError(actor_error)));
                 }
-                ActorKind::Restartable => {
+                SupervisionPolicy::Restartable => {
                     warn!("peer actor failed: {}; reconciling", actor_error);
                     self.reconcile();
                 }
@@ -810,7 +810,7 @@ impl Orchestrator {
         }
     }
 
-    /// Collects all transport metrics from `BoundState` and non-peer sources into a snapshot.
+    /// Collects all transport metrics from `ActiveConn` and non-peer sources into a snapshot.
     ///
     /// Called on Prometheus scrape (`GetMetricsSnapshot`) and periodic metrics logging.
     /// Only includes metrics from currently live connections — pruned bounds are absent.
@@ -1013,7 +1013,7 @@ impl Orchestrator {
             .map_or(0, |s| s.attempt);
         info!(peer = %peer_id, addr = %dest, retries, inbound = endpoint.is_none(), "connected");
         let was_empty = entry.bounds.is_empty();
-        entry.bounds.push(BoundState {
+        entry.bounds.push(ActiveConn {
             endpoint,
             dest,
             tx,
@@ -1201,7 +1201,7 @@ mod test_support {
         ) -> Self {
             if let Some(entry) = self.peers.get_mut(peer_id) {
                 let endpoint = entry.config_endpoint();
-                entry.bounds.push(BoundState {
+                entry.bounds.push(ActiveConn {
                     endpoint,
                     dest,
                     tx,
@@ -1850,7 +1850,7 @@ mod tests {
             .get_mut("peer1")
             .unwrap()
             .bounds
-            .push(BoundState {
+            .push(ActiveConn {
                 endpoint: None,
                 dest,
                 tx,
@@ -2244,7 +2244,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(1);
         let ep = entry.config_endpoint();
-        entry.bounds.push(BoundState {
+        entry.bounds.push(ActiveConn {
             endpoint: ep,
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx,
@@ -2270,7 +2270,7 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(1);
         let ep = entry.config_endpoint();
-        entry.bounds.push(BoundState {
+        entry.bounds.push(ActiveConn {
             endpoint: ep,
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx,
@@ -2293,14 +2293,14 @@ mod tests {
         let (tx1, rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         let ep = entry.config_endpoint();
-        entry.bounds.push(BoundState {
+        entry.bounds.push(ActiveConn {
             endpoint: ep.clone(),
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx: tx1,
             rx_metrics: None,
             tx_metrics: None,
         });
-        entry.bounds.push(BoundState {
+        entry.bounds.push(ActiveConn {
             endpoint: ep,
             dest: "5.6.7.8:5353".parse().unwrap(),
             tx: tx2,
@@ -2330,14 +2330,14 @@ mod tests {
         let (tx1, rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         let ep = entry.config_endpoint();
-        entry.bounds.push(BoundState {
+        entry.bounds.push(ActiveConn {
             endpoint: ep.clone(),
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx: tx1,
             rx_metrics: None,
             tx_metrics: None,
         });
-        entry.bounds.push(BoundState {
+        entry.bounds.push(ActiveConn {
             endpoint: ep,
             dest: "1.2.3.4:5353".parse().unwrap(),
             tx: tx2,
@@ -2360,7 +2360,7 @@ mod tests {
         // resolved_ips is EMPTY -- but inbound bounds (endpoint: None) should survive
 
         let (tx, _rx) = mpsc::channel(1);
-        entry.bounds.push(BoundState {
+        entry.bounds.push(ActiveConn {
             endpoint: None,
             dest: "9.8.7.6:12345".parse().unwrap(),
             tx,
