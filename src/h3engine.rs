@@ -262,28 +262,6 @@ impl EngineMeta {
     }
 }
 
-/// Exit reason for the established-phase event loop.
-///
-/// Carried out of the loop via `break` so that QUIC close + UDP flush
-/// happen exactly once, after the loop.
-pub(crate) enum LoopExit {
-    Ok,
-    Err { reason: String },
-}
-
-impl LoopExit {
-    pub(crate) fn into_result(self, meta: &EngineMeta, origin: ConnOrigin) -> ActorExitResult {
-        match self {
-            Self::Ok => Ok(()),
-            Self::Err { reason } => Err(ActorError::H3Engine {
-                origin,
-                peer_id: meta.peer_id.clone(),
-                reason,
-            }),
-        }
-    }
-}
-
 /// Established-phase mutable state that does not own transport resources.
 pub(crate) struct RunState {
     pub(crate) rx_counters: Counters,
@@ -383,7 +361,7 @@ impl H3Engine {
         let timer = time::sleep(conn.timeout().unwrap_or(MAX_TIMEOUT));
         tokio::pin!(timer);
 
-        let exit: LoopExit = loop {
+        let exit: Result<(), String> = loop {
             let ingress_pending = run_state.pending_ingress.is_some();
             let send_pending = run_state.pending_send.is_some();
 
@@ -392,7 +370,7 @@ impl H3Engine {
                     if !ingress_pending =>
                 {
                     let Some((remote, packets)) = maybe_batch else {
-                        break LoopExit::Ok;
+                        break Ok(());
                     };
 
                     handle_udp_recv(&mut conn, packets, meta.recv_info(remote), Some(&mut run_state.rx_counters));
@@ -405,9 +383,7 @@ impl H3Engine {
                         &mut |_, _, _, _| Ok(HeaderAction::Ignore),
                     ) {
                         Ok(ConnectProgress::Pending | ConnectProgress::Ready) => {}
-                        Err(err) => break LoopExit::Err {
-                            reason: err.into_actor_reason(),
-                        },
+                        Err(err) => break Err(err.into_actor_reason()),
                     }
 
                     let batch = collect_router_ingress(
@@ -420,7 +396,7 @@ impl H3Engine {
                         run_state.pending_ingress = match ingress_tx.try_send(batch) {
                             Ok(()) => None,
                             Err(mpsc::error::TrySendError::Full(b)) => Some(PendingBatch::new(b)),
-                            Err(mpsc::error::TrySendError::Closed(_)) => break LoopExit::Ok,
+                            Err(mpsc::error::TrySendError::Closed(_)) => break Ok(()),
                         };
                     }
                 }
@@ -434,13 +410,13 @@ impl H3Engine {
                             run_state.rx_counters.record_queue_full(pending.since.elapsed());
                             permit.send(pending.batch);
                         }
-                        Err(_) => break LoopExit::Ok,
+                        Err(_) => break Ok(()),
                     }
                 }
 
                 maybe_batch = egress_rx.recv() => {
                     let Some(packets) = maybe_batch else {
-                        break LoopExit::Ok;
+                        break Ok(());
                     };
 
                     handle_router_egress(
@@ -461,7 +437,7 @@ impl H3Engine {
                             run_state.tx_counters.record_queue_full(pending.since.elapsed());
                             permit.send((dest, pending.batch));
                         }
-                        Err(_) => break LoopExit::Ok,
+                        Err(_) => break Ok(()),
                     }
                 }
 
@@ -486,9 +462,7 @@ impl H3Engine {
                             run_state.pending_send = Some((dest, PendingBatch::new(b)));
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            break LoopExit::Err {
-                                reason: "UDP TX channel closed".into(),
-                            }
+                            break Err("UDP TX channel closed".into())
                         }
                     }
                 }
@@ -496,9 +470,7 @@ impl H3Engine {
             reset_timer(timer.as_mut(), &conn);
 
             if conn.is_closed() {
-                break LoopExit::Err {
-                    reason: "QUIC connection closed".into(),
-                };
+                break Err("QUIC connection closed".into());
             }
         };
 
@@ -515,15 +487,17 @@ impl H3Engine {
         if let Some(token) = udp_cancel {
             token.cancel();
         }
-        exit.into_result(&meta, origin)
+        exit.map_err(|reason| ActorError::H3Engine {
+            origin,
+            peer_id: meta.peer_id.clone(),
+            reason,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::ActorKind;
-
     #[test]
     fn apply_transport_config_valid() {
         let h3_tuning = H3Tuning::default();
@@ -550,44 +524,6 @@ mod tests {
             peer_id: "peer-x".into(),
             max_udp_payload: 1400,
         }
-    }
-
-    #[test]
-    fn loop_exit_into_result_ok() {
-        let exit = LoopExit::Ok;
-        assert!(exit.into_result(&test_meta(), ConnOrigin::Client).is_ok());
-    }
-
-    #[test]
-    fn loop_exit_into_result_err_client() {
-        let exit = LoopExit::Err {
-            reason: "QUIC connection closed".into(),
-        };
-        let err = exit
-            .into_result(&test_meta(), ConnOrigin::Client)
-            .unwrap_err();
-        assert!(
-            matches!(&err, ActorError::H3Engine { origin: ConnOrigin::Client, peer_id, reason }
-                if peer_id == "peer-x" && reason == "QUIC connection closed"
-            )
-        );
-        assert_eq!(err.kind(), ActorKind::Restartable);
-    }
-
-    #[test]
-    fn loop_exit_into_result_err_server() {
-        let exit = LoopExit::Err {
-            reason: "auth failed".into(),
-        };
-        let err = exit
-            .into_result(&test_meta(), ConnOrigin::Server)
-            .unwrap_err();
-        assert!(
-            matches!(&err, ActorError::H3Engine { origin: ConnOrigin::Server, peer_id, reason }
-                if peer_id == "peer-x" && reason == "auth failed"
-            )
-        );
-        assert_eq!(err.kind(), ActorKind::Restartable);
     }
 
     #[test]

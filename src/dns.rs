@@ -2,7 +2,7 @@
 //! and emits state snapshot events on resolution changes.
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::bind::{make_client_udp_socket, RouteProbe};
+use crate::bind::{make_client_udp_socket, RouteProbe, UdpError};
 use crate::config::{DnsTuning, LocalDns, Tuning};
 use crate::events::{DnsEvent, Event};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -12,7 +12,6 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
-use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -186,14 +185,6 @@ impl DnsState {
     }
 }
 
-/// Describes resolver initialization failures.
-#[derive(Debug, Error)]
-pub enum ResolveInitError {
-    /// DNS socket could not be prepared.
-    #[error("dns resolver failed to initialize: {0}")]
-    Socket(String),
-}
-
 /// DNS resolver actor state.
 ///
 /// Created by `make_dns()`, consumed by `spawn_dns()`.
@@ -218,13 +209,13 @@ pub struct DnsActor {
 ///
 /// # Errors
 ///
-/// Returns `ResolveInitError::Socket` when socket creation, binding, or connect fails.
+/// Returns [`UdpError`] when socket creation, binding, or connect fails.
 pub async fn make_dns<P: RouteProbe>(
     local_dns: &LocalDns,
     tun_if: Option<&str>,
     tuning: &Tuning,
     probe: &P,
-) -> Result<DnsActor, ResolveInitError> {
+) -> Result<DnsActor, UdpError> {
     let server = local_dns.server;
 
     let socket = make_client_udp_socket(
@@ -234,10 +225,8 @@ pub async fn make_dns<P: RouteProbe>(
         probe,
         tuning.io.socket_buffer_bytes(),
     )
-    .await
-    .map_err(|e| ResolveInitError::Socket(e.to_string()))?;
-    let socket =
-        UdpSocket::from_std(socket).map_err(|e| ResolveInitError::Socket(e.to_string()))?;
+    .await?;
+    let socket = UdpSocket::from_std(socket).map_err(|e| UdpError::Socket(e.to_string()))?;
 
     Ok(DnsActor {
         server,
