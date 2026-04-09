@@ -551,7 +551,7 @@ impl DispatcherRuntime {
             if engine
                 .io
                 .events_tx
-                .send(Event::H3v2Connected(ConnectedEvent {
+                .send(Event::Connected(ConnectedEvent {
                     peer_id: engine.meta.peer_id.clone(),
                     remote_addr: remote,
                     tx: egress_tx,
@@ -650,7 +650,7 @@ pub(crate) mod test_support {
     ) -> ConnectedEvent {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::H3v2Connected(connected) = event {
+                if let Event::Connected(connected) = event {
                     return connected;
                 }
             }

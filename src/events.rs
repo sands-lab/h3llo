@@ -99,10 +99,8 @@ pub enum Event {
     Metrics(Box<Metrics>),
     /// HTTP/3 connection established, ready for actor spawning.
     H3Connected(H3ConnectedEvent),
-    /// HTTP/3 engine-based connection established (inbound or outbound).
-    H3v2Connected(ConnectedEvent),
-    /// `BareUDP` TX connection established, ready for bound registration.
-    BareConnected(ConnectedEvent),
+    /// Transport connection established (H3 or BareUDP).
+    Connected(ConnectedEvent),
     /// A dial attempt failed; orchestrator should clear in-flight state and update backoff.
     DialFailed(DialFailedEvent),
     /// Events originating from DNS resolution.
@@ -116,8 +114,7 @@ impl std::fmt::Debug for Event {
         match self {
             Self::Metrics(m) => f.debug_tuple("Metrics").field(m).finish(),
             Self::H3Connected(e) => f.debug_tuple("H3Connected").field(e).finish(),
-            Self::H3v2Connected(e) => f.debug_tuple("H3v2Connected").field(e).finish(),
-            Self::BareConnected(e) => f.debug_tuple("BareConnected").field(e).finish(),
+            Self::Connected(e) => f.debug_tuple("Connected").field(e).finish(),
             Self::DialFailed(e) => f.debug_tuple("DialFailed").field(e).finish(),
             Self::Dns(e) => f.debug_tuple("Dns").field(e).finish(),
             Self::Api(e) => f.debug_tuple("Api").field(e).finish(),
