@@ -131,16 +131,14 @@ impl H3Session {
                             .ok();
                         continue;
                     }
-                    match on_headers(&mut self.h3_conn, conn, stream_id, &list)? {
-                        HeaderAction::Accept {
-                            stream_id: sid,
-                            peer_id: pid,
-                        } => {
-                            self.bind_connect_stream(sid);
-                            self.connect_accepted = true;
-                            self.accepted_peer_id = pid;
-                        }
-                        HeaderAction::Ignore => {}
+                    if let HeaderAction::Accept {
+                        stream_id: sid,
+                        peer_id: pid,
+                    } = on_headers(&mut self.h3_conn, conn, stream_id, &list)?
+                    {
+                        self.bind_connect_stream(sid);
+                        self.connect_accepted = true;
+                        self.accepted_peer_id = pid;
                     }
                 }
 

@@ -462,15 +462,13 @@ pub struct ValidationErrors(pub Vec<ValidationError>);
 
 impl fmt::Display for ValidationErrors {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut first = true;
-        for err in &self.0 {
-            if !first {
-                write!(f, "; ")?;
-            }
-            first = false;
-            write!(f, "{err}")?;
-        }
-        Ok(())
+        let joined = self
+            .0
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        f.write_str(&joined)
     }
 }
 

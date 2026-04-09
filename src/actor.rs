@@ -11,9 +11,9 @@ use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot;
 use tracing::error;
 
-/// Classifies actors by their supervision policy.
+/// Determines how the orchestrator handles an actor failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActorKind {
+pub enum SupervisionPolicy {
     /// Critical actors whose failure should exit h3llo.
     /// Includes: `tun_rx`, `tun_tx`, `udp_rx`, `dns_resolver`
     Critical,
@@ -118,7 +118,7 @@ pub enum ActorError {
 impl ActorError {
     /// Returns the supervision classification for this error type.
     #[must_use]
-    pub fn kind(&self) -> ActorKind {
+    pub fn kind(&self) -> SupervisionPolicy {
         match self {
             // Critical actors - failure exits h3llo
             ActorError::TunRxRecv { .. }
@@ -126,11 +126,11 @@ impl ActorError {
             | ActorError::UdpRxRecv { .. }
             | ActorError::DnsRecv { .. }
             | ActorError::ApiServer { .. }
-            | ActorError::RouterFailed { .. } => ActorKind::Critical,
+            | ActorError::RouterFailed { .. } => SupervisionPolicy::Critical,
             // Restartable actors - could be reconnected (future work)
             ActorError::UdpTxSend { .. }
             | ActorError::H3TxSend { .. }
-            | ActorError::H3Engine { .. } => ActorKind::Restartable,
+            | ActorError::H3Engine { .. } => SupervisionPolicy::Restartable,
         }
     }
 }
@@ -244,7 +244,7 @@ mod tests {
         for err in errors {
             assert_eq!(
                 err.kind(),
-                ActorKind::Critical,
+                SupervisionPolicy::Critical,
                 "expected Critical for {}",
                 err
             );
@@ -266,7 +266,7 @@ mod tests {
         for err in errors {
             assert_eq!(
                 err.kind(),
-                ActorKind::Restartable,
+                SupervisionPolicy::Restartable,
                 "expected Restartable for {}",
                 err
             );
@@ -326,7 +326,7 @@ mod tests {
             peer_id: "client-1".into(),
             reason: "connection reset".into(),
         };
-        assert_eq!(err.kind(), ActorKind::Restartable);
+        assert_eq!(err.kind(), SupervisionPolicy::Restartable);
         let msg = err.to_string();
         assert!(msg.contains("h3[client-1]"));
     }

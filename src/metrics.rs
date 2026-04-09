@@ -457,10 +457,10 @@ impl Collector for SnapshotCollector {
             ),
         ] {
             self.encode_family(&mut encoder, name, help, |m| {
-                m.stats
-                    .drop_reasons
-                    .iter()
-                    .map(move |(reason, c)| (DropLabelSet::from_metrics(m, reason), field(c)))
+                m.stats.drop_reasons.iter().filter_map(move |(reason, c)| {
+                    let v = field(c);
+                    (v > 0).then(|| (DropLabelSet::from_metrics(m, reason), v))
+                })
             })?;
         }
 

@@ -43,7 +43,7 @@ impl fmt::Display for AuthError {
 /// # Returns
 /// Header value: `Bearer <token>`
 #[must_use]
-pub fn generate_bearer_auth(token: &str) -> String {
+pub fn bearer_auth_header(token: &str) -> String {
     format!("Bearer {token}")
 }
 
@@ -84,14 +84,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_bearer_auth_format() {
-        let header = generate_bearer_auth("my-secret-token");
+    fn bearer_auth_header_format() {
+        let header = bearer_auth_header("my-secret-token");
         assert_eq!(header, "Bearer my-secret-token");
     }
 
     #[test]
     fn validate_connect_auth_success() {
-        let header = generate_bearer_auth("token-for-peer1");
+        let header = bearer_auth_header("token-for-peer1");
         let tokens = [("peer1", "token-for-peer1"), ("peer2", "token-for-peer2")];
         let result = validate_connect_auth(Some(&header), tokens);
         assert_eq!(result, Ok("peer1".to_string()));
@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn validate_connect_auth_wrong_token() {
-        let header = generate_bearer_auth("wrong-token");
+        let header = bearer_auth_header("wrong-token");
         let tokens = [("peer1", "correct-token")];
         let result = validate_connect_auth(Some(&header), tokens);
         assert_eq!(result, Err(AuthError::InvalidToken));
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn validate_connect_auth_accepts_second_peer() {
-        let header = generate_bearer_auth("token-b");
+        let header = bearer_auth_header("token-b");
         let tokens = [("peer-a", "token-a"), ("peer-b", "token-b")];
         let result = validate_connect_auth(Some(&header), tokens);
         assert_eq!(result, Ok("peer-b".to_string()));

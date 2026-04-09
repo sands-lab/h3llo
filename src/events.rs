@@ -86,7 +86,7 @@ pub struct ConnectedEvent {
     pub remote_addr: SocketAddr,
     /// Channel for sending IP packet batches to the peer.
     pub tx: mpsc::Sender<Vec<PooledBuf>>,
-    /// Configured endpoint (present for client connections, absent for server).
+    /// Configured endpoint (present for outbound connections, absent for inbound).
     pub endpoint: Option<Endpoint>,
     /// Primary actor handle (H3 engine or Bare TX adapter).
     pub main_handle: Option<JoinHandle<ActorExitResult>>,

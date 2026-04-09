@@ -3,7 +3,7 @@
 //! Uses a hand-rolled quiche event loop with separated UDP I/O actors.
 //! See [`dial_h3_client`] for the public entry point.
 
-use crate::auth::generate_bearer_auth;
+use crate::auth::bearer_auth_header;
 use crate::bind::{make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::{ConnectedEvent, DialContext, Endpoint};
@@ -251,7 +251,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     };
 
     let connect_path = endpoint.path.clone();
-    let auth_header = generate_bearer_auth(&peer_h3.token);
+    let auth_header = bearer_auth_header(&peer_h3.token);
 
     // Create unconnected UDP socket, then register and spawn actors on udp_rt.
     let std_socket = make_unbound_udp_socket(

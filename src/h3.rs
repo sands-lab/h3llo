@@ -7,7 +7,7 @@
 //! Retained only for interop tests; will be deleted once tests are migrated.
 
 use crate::actor::{ActorError, ActorExitResult};
-use crate::auth::{generate_bearer_auth, validate_connect_auth, AuthError};
+use crate::auth::{bearer_auth_header, validate_connect_auth, AuthError};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::{Event, H3ConnectedEvent};
@@ -522,7 +522,7 @@ pub async fn dial_h3<P: RouteProbe>(
             .map_err(|e| DialError::Handshake(format!("QUIC connect failed: {e}")))?;
 
     // Build auth header
-    let auth_header = generate_bearer_auth(&peer_h3.token);
+    let auth_header = bearer_auth_header(&peer_h3.token);
 
     // Build Extended CONNECT request headers per RFC 9484 / protocol.md
     let headers = vec![
@@ -1176,7 +1176,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::generate_bearer_auth;
+    use crate::auth::bearer_auth_header;
     use crate::bind::test_support::FakeRouteProbe;
     use crate::config::{default_mtu, H3Tuning};
     use test_support::{await_server_connection, insecure_tuning, test_peer_h3, TestCertBundle};
@@ -1185,7 +1185,7 @@ mod tests {
 
     #[test]
     fn extract_and_validate_auth_accepts_valid() {
-        let auth_header = generate_bearer_auth("token-for-peer1");
+        let auth_header = bearer_auth_header("token-for-peer1");
         let headers = vec![
             Header::new(b":method", b"CONNECT"),
             Header::new(b"authorization", auth_header.as_bytes()),
@@ -1213,7 +1213,7 @@ mod tests {
 
     #[test]
     fn extract_and_validate_auth_rejects_wrong_token() {
-        let auth_header = generate_bearer_auth("wrong-token");
+        let auth_header = bearer_auth_header("wrong-token");
         let headers = vec![Header::new(b"authorization", auth_header.as_bytes())];
         let tokens: HashMap<String, String> = [("peer1".to_string(), "correct-token".to_string())]
             .into_iter()

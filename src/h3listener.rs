@@ -392,8 +392,8 @@ impl DispatcherRuntime {
 
         loop {
             tokio::select! {
-                maybe_pkt = udp_recv_rx.recv() => {
-                    let Some((remote, batch)) = maybe_pkt else {
+                maybe_batch = udp_recv_rx.recv() => {
+                    let Some((remote, batch)) = maybe_batch else {
                         return Err(ActorError::UdpRxRecv {
                             addr: self.bound_addr.to_string(),
                             source: std::io::Error::other("recv actor closed"),
@@ -578,7 +578,7 @@ impl DispatcherRuntime {
 /// Consumes the [`H3Dispatcher`] state from [`make_h3_dispatcher`], spawns
 /// UDP RX/TX actors, then spawns the CID-routing dispatcher loop.
 ///
-/// Returns command sender, dispatcher join handle, and bound address.
+/// Returns command sender, dispatcher/UDP-RX/UDP-TX join handles, and bound address.
 pub fn spawn_h3_dispatcher(
     dispatcher: H3Dispatcher,
     peer_tokens: HashMap<String, String>,
@@ -641,11 +641,11 @@ pub fn spawn_h3_dispatcher(
 pub(crate) mod test_support {
     use crate::events::{ConnectedEvent, Event};
 
-    /// Waits for an `ConnectedEvent` on the events channel, with timeout.
+    /// Waits for a [`ConnectedEvent`] on the events channel, with timeout.
     ///
-    /// Skips non-H3v2Connected events (e.g. metrics). Panics on timeout or if
-    /// the channel closes before an H3v2Connected event arrives.
-    pub async fn await_h3v2_connection(
+    /// Skips non-Connected events (e.g. metrics). Panics on timeout or if
+    /// the channel closes before a Connected event arrives.
+    pub async fn await_connected(
         events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     ) -> ConnectedEvent {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -654,10 +654,10 @@ pub(crate) mod test_support {
                     return connected;
                 }
             }
-            panic!("events channel closed without H3v2Connected");
+            panic!("events channel closed without Connected event");
         })
         .await
-        .expect("timeout waiting for H3v2Connected event")
+        .expect("timeout waiting for Connected event")
     }
 }
 
@@ -769,7 +769,7 @@ mod tests {
     use crate::helpers::alloc_packet_buf;
     use crate::helpers::test_packets::make_ipv4_packet;
     use std::net::Ipv4Addr;
-    use test_support::await_h3v2_connection;
+    use test_support::await_connected;
     use tokio_quiche::buf_factory::PooledBuf;
 
     // ========== Test Harness ==========
@@ -1042,7 +1042,7 @@ mod tests {
 
         let mut server = TestH3Server::start(peer_tokens).await;
         let conn = dial_old_client(server.bound_addr, token, peer_id).await;
-        let event = await_h3v2_connection(&mut server.events_rx).await;
+        let event = await_connected(&mut server.events_rx).await;
 
         // Set up old client RX actor.
         let (client_rx, _client_tx) = conn.into_actors();
@@ -1080,7 +1080,7 @@ mod tests {
 
         let mut server = TestH3Server::start(peer_tokens).await;
         let (_cli_event, mut ingress_rx) = dial_new_client(server.bound_addr, token, peer_id).await;
-        let event = await_h3v2_connection(&mut server.events_rx).await;
+        let event = await_connected(&mut server.events_rx).await;
 
         // Verify event fields carry correct connection metadata.
         assert_eq!(event.peer_id, peer_id);
@@ -1112,7 +1112,7 @@ mod tests {
 
         let mut server = TestH3Server::start(peer_tokens).await;
         let conn = dial_old_client(server.bound_addr, token, peer_id).await;
-        let event = await_h3v2_connection(&mut server.events_rx).await;
+        let event = await_connected(&mut server.events_rx).await;
 
         let (client_rx, client_tx) = conn.into_actors();
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
@@ -1167,7 +1167,7 @@ mod tests {
 
         let mut server = TestH3Server::start(peer_tokens).await;
         let (cli_event, mut ingress_rx) = dial_new_client(server.bound_addr, token, peer_id).await;
-        let event = await_h3v2_connection(&mut server.events_rx).await;
+        let event = await_connected(&mut server.events_rx).await;
 
         // Client → Server
         let packet_c2s = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
@@ -1236,7 +1236,7 @@ mod tests {
         let mut server = TestH3Server::start(peer_tokens).await;
         let (cli_event, _ingress_rx) = dial_new_client(server.bound_addr, token, peer_id).await;
 
-        let _event = await_h3v2_connection(&mut server.events_rx).await;
+        let _event = await_connected(&mut server.events_rx).await;
 
         // Drop the egress sender to trigger client shutdown.
         let ConnectedEvent {

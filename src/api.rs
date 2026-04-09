@@ -117,7 +117,7 @@ async fn handle_request(
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let path = req.uri().path();
     let base = api_path.trim_end_matches('/');
-    let relative = if base.is_empty() || base == "/" {
+    let relative = if base.is_empty() {
         path.to_string()
     } else {
         match path.strip_prefix(base) {
