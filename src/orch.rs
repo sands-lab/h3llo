@@ -177,7 +177,7 @@ impl PeerEntry {
         &mut self,
         events_tx: &mpsc::UnboundedSender<Event>,
         tun_if: &str,
-        tun_mtu: usize,
+        tun_mtu: u16,
         tuning: &Tuning,
         udp_handle: &Handle,
         crypto_handle: &Handle,
@@ -345,7 +345,7 @@ pub struct Orchestrator {
 
     // Runtime state
     tun_if: String,
-    tun_mtu: usize,
+    tun_mtu: u16,
     /// Tuning parameters from config.
     tuning: Tuning,
     /// Unified peer state: config + active bound.
@@ -489,7 +489,7 @@ impl Orchestrator {
     pub async fn new(config: Config) -> Result<Self, OrchestratorError> {
         let tuning = &config.tuning;
         let tun_if = config.local.tun.ifname.clone();
-        let tun_mtu = config.local.tun.mtu as usize;
+        let tun_mtu = config.local.tun.mtu;
         let manage_routes = config.local.table;
 
         // Create dedicated current_thread runtimes for data-plane actors.
@@ -595,7 +595,7 @@ impl Orchestrator {
                 listen_addr,
                 cert_path,
                 key_path,
-                u16::try_from(tun_mtu).expect("tun_mtu originated from u16"),
+                tun_mtu,
                 &tuning.io,
                 &tuning.h3,
                 udp_rt.handle(),
@@ -1184,7 +1184,7 @@ mod test_support {
     /// to enable isolated unit testing of event handling logic.
     pub struct TestableOrchestratorBuilder {
         tun_if: String,
-        tun_mtu: usize,
+        tun_mtu: u16,
         peers: HashMap<String, PeerEntry>,
         local: Option<Local>,
     }
@@ -1193,7 +1193,7 @@ mod test_support {
         fn default() -> Self {
             Self {
                 tun_if: "test0".to_string(),
-                tun_mtu: default_mtu() as usize,
+                tun_mtu: default_mtu(),
                 peers: HashMap::new(),
                 local: None,
             }

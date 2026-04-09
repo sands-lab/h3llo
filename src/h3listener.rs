@@ -157,7 +157,7 @@ pub(crate) fn make_h3_dispatcher(
     let bound_addr = std_socket
         .local_addr()
         .map_err(|e| ServerError::Socket(format!("local_addr: {e}")))?;
-    let max_udp_payload = tun_mtu as usize + CONNECT_IP_OVERHEAD;
+    let max_udp_payload = usize::from(tun_mtu) + CONNECT_IP_OVERHEAD;
     let config = make_server_quiche_config(h3_tuning, max_udp_payload, cert_path, key_path)?;
 
     let (udp_rx, udp_tx) = {

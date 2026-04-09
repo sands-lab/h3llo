@@ -34,7 +34,7 @@ pub(crate) struct DialContext {
     /// TUN interface name (for route-probe exclusion).
     pub tun_if: String,
     /// TUN MTU in bytes.
-    pub tun_mtu: usize,
+    pub tun_mtu: u16,
     /// Tuning parameters (timeouts, buffers, congestion control).
     pub tuning: Tuning,
     /// Runtime handle for UDP I/O actors.

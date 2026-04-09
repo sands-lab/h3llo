@@ -40,13 +40,13 @@ pub enum BareUdpRxCommand {
 /// Returns [`UdpError`] if the UDP socket cannot be bound or configured.
 pub fn make_bare_rx(
     listen_addr: SocketAddr,
-    tun_mtu: usize,
+    tun_mtu: u16,
     tuning: &Tuning,
     udp_rt: &RuntimeHandle,
 ) -> Result<udp::UdpRx, UdpError> {
     let _guard = udp_rt.enter();
     let socket = make_server_udp_socket(listen_addr, tuning.io.socket_buffer_bytes())?;
-    let (udp_rx, _udp_tx) = udp::make_udp(socket, tun_mtu, tuning.io.udp_enable_offload)?;
+    let (udp_rx, _udp_tx) = udp::make_udp(socket, tun_mtu.into(), tuning.io.udp_enable_offload)?;
     Ok(udp_rx)
 }
 
@@ -170,7 +170,11 @@ pub(crate) async fn dial_bare_tx<P: RouteProbe>(
 
     let (udp_send_tx, udp_tx_handle) = {
         let _guard = ctx.udp_rt.enter();
-        let (_rx, tx) = udp::make_udp(std_socket, ctx.tun_mtu, ctx.tuning.io.udp_enable_offload)?;
+        let (_rx, tx) = udp::make_udp(
+            std_socket,
+            ctx.tun_mtu.into(),
+            ctx.tuning.io.udp_enable_offload,
+        )?;
         udp::spawn_udp_tx(tx, ctx.tuning.io.packet_queue_depth)
     };
     let (egress_tx, bare_tx_handle) = {

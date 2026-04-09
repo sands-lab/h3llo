@@ -271,7 +271,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
         let local_addr = std_socket
             .local_addr()
             .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
-        let max_udp_payload = *tun_mtu + CONNECT_IP_OVERHEAD;
+        let max_udp_payload = usize::from(*tun_mtu) + CONNECT_IP_OVERHEAD;
         let (udp_rx, udp_tx) =
             udp::make_udp(std_socket, max_udp_payload, tuning.io.udp_enable_offload)
                 .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
