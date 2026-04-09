@@ -5,7 +5,7 @@
 
 use crate::actor::ActorExitResult;
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
-use crate::config::{Tuning, UdpEndpoint};
+use crate::config::{PeerBare, Tuning};
 use crate::events::{ConnectedEvent, DialContext, Endpoint, Event};
 use crate::helpers::batch_stats;
 use crate::metrics::{Counters, Direction, DropReason, Source};
@@ -153,17 +153,15 @@ fn spawn_bare_filter(
 /// `ctx.udp_rt` is used for socket registration and the UDP TX actor;
 /// `ctx.crypto_rt` is used for the bare TX adapter actor.
 pub(crate) async fn dial_bare_tx<P: RouteProbe>(
-    endpoint: UdpEndpoint,
-    destination: SocketAddr,
-    ctx: &DialContext,
-    probe: &P,
-    bindif: Option<&str>,
+    bare: &PeerBare,
+    ctx: &DialContext<P>,
 ) -> Result<ConnectedEvent, UdpError> {
+    let destination = SocketAddr::new(ctx.dial_ip, bare.endpoint.port);
     let std_socket = make_unbound_udp_socket(
         destination,
         Some(ctx.tun_if.as_str()),
-        bindif,
-        probe,
+        bare.bindif.as_deref(),
+        &ctx.probe,
         ctx.tuning.io.socket_buffer_bytes(),
     )
     .await?;
@@ -192,7 +190,7 @@ pub(crate) async fn dial_bare_tx<P: RouteProbe>(
         peer_id: ctx.peer_id.clone(),
         remote_addr: destination,
         tx: egress_tx,
-        endpoint: Some(Endpoint::Udp(endpoint)),
+        endpoint: Some(Endpoint::Udp(bare.endpoint.clone())),
         main_handle: Some(bare_tx_handle),
         udp_tx_handle: Some(udp_tx_handle),
         udp_rx_handle: None,

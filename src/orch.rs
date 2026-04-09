@@ -3,7 +3,7 @@
 use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
 use crate::api;
 use crate::bare::{dial_bare_tx, make_bare_rx, spawn_bare_rx, BareUdpRxCommand};
-use crate::bind::DefaultRouteProbe;
+use crate::bind::{DefaultRouteProbe, RouteProbe};
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, PeerTransport, Tuning};
 use crate::dns::{make_dns, spawn_dns, DnsCommand};
 use crate::events::{
@@ -221,12 +221,13 @@ impl PeerEntry {
                 .or_insert_with(DialState::new_in_flight);
             info!(peer = %self.config.id, ip = %ip, attempt, "dialing peer");
 
-            let dial_ip = *ip;
             let ctx = DialContext {
                 peer_id: peer_id.clone(),
+                dial_ip: *ip,
                 tun_if: tun_if.to_string(),
                 tun_mtu,
                 tuning: tuning.clone(),
+                probe: DefaultRouteProbe,
                 udp_rt: udp_handle.clone(),
                 crypto_rt: crypto_handle.clone(),
                 events_tx: events_tx.clone(),
@@ -234,52 +235,18 @@ impl PeerEntry {
 
             match &self.config.transport {
                 PeerTransport::Bare(bare) => {
-                    let destination = SocketAddr::new(dial_ip, bare.endpoint.port);
-                    let bindif = bare.bindif.clone();
-                    let endpoint = bare.endpoint.clone();
+                    let bare = bare.clone();
                     tokio::spawn(async move {
-                        let probe = DefaultRouteProbe;
-                        match dial_bare_tx(endpoint, destination, &ctx, &probe, bindif.as_deref())
-                            .await
-                        {
-                            Ok(event) => {
-                                let _ = ctx.events_tx.send(Event::BareConnected(event));
-                            }
-                            Err(err) => {
-                                warn!(peer = %ctx.peer_id, addr = %destination, error = %err, "bare dial failed");
-                                let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
-                                    peer_id: ctx.peer_id,
-                                    ip: dial_ip,
-                                }));
-                            }
-                        }
+                        let result = dial_bare_tx(&bare, &ctx).await;
+                        report_dial(result, ctx, "bare");
                     });
                 }
                 PeerTransport::H3(h3) => {
-                    let Some(h3_endpoint) = h3.endpoint.as_ref() else {
-                        self.dials.remove(ip);
-                        continue;
-                    };
-                    let destination = SocketAddr::new(dial_ip, h3_endpoint.port);
                     let peer_h3 = h3.clone();
                     let ingress_tx = ingress_tx.clone();
-
                     tokio::spawn(async move {
-                        let probe = DefaultRouteProbe;
-                        match dial_h3_client(&peer_h3, destination, &ctx, &probe, ingress_tx).await
-                        {
-                            Ok(event) => {
-                                info!(peer = %event.peer_id, addr = %event.remote_addr, "H3 connected");
-                                let _ = ctx.events_tx.send(Event::H3v2Connected(event));
-                            }
-                            Err(e) => {
-                                warn!(peer = %ctx.peer_id, addr = %destination, error = %e, "H3 dial failed");
-                                let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
-                                    peer_id: ctx.peer_id,
-                                    ip: dial_ip,
-                                }));
-                            }
-                        }
+                        let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;
+                        report_dial(result, ctx, "H3");
                     });
                 }
             }
@@ -295,6 +262,30 @@ fn peer_dns_hostname(peer: &Peer) -> Option<&str> {
     match &peer.transport {
         PeerTransport::Bare(bare) => Some(&bare.endpoint.host),
         PeerTransport::H3(h3) => h3.endpoint.as_ref().map(|ep| strip_ipv6_brackets(&ep.host)),
+    }
+}
+
+/// Reports a dial outcome to the orchestrator via the event channel.
+///
+/// Logs the result and sends [`Event::Connected`] on success or
+/// [`Event::DialFailed`] on failure.
+fn report_dial<E: std::fmt::Display, P: RouteProbe>(
+    result: Result<ConnectedEvent, E>,
+    ctx: DialContext<P>,
+    protocol: &str,
+) {
+    match result {
+        Ok(event) => {
+            info!(peer = %event.peer_id, addr = %event.remote_addr, protocol, "connected");
+            let _ = ctx.events_tx.send(Event::Connected(event));
+        }
+        Err(err) => {
+            warn!(peer = %ctx.peer_id, ip = %ctx.dial_ip, error = %err, protocol, "dial failed");
+            let _ = ctx.events_tx.send(Event::DialFailed(DialFailedEvent {
+                peer_id: ctx.peer_id,
+                ip: ctx.dial_ip,
+            }));
+        }
     }
 }
 
@@ -960,11 +951,8 @@ impl Orchestrator {
                     "received old-style H3Connected event (h3.rs path); ignoring"
                 );
             }
-            Event::H3v2Connected(event) => {
-                self.handle_h3v2_connected(event);
-            }
-            Event::BareConnected(event) => {
-                self.handle_bare_connection(event);
+            Event::Connected(event) => {
+                self.handle_connected(event);
             }
             Event::DialFailed(event) => {
                 self.handle_dial_failed(&event);
@@ -1045,10 +1033,6 @@ impl Orchestrator {
     ///
     /// Unconditionally registers the TX actor `JoinHandle` for lifecycle
     /// monitoring, then attempts to bind the peer via [`update_bound`].
-    fn handle_bare_connection(&mut self, event: ConnectedEvent) {
-        self.handle_connected(event);
-    }
-
     /// Handles a dial failure event: clears in-flight flag and updates backoff.
     fn handle_dial_failed(&mut self, event: &DialFailedEvent) {
         let Some(entry) = self.peers.get_mut(&event.peer_id) else {
@@ -1077,15 +1061,7 @@ impl Orchestrator {
         }
     }
 
-    /// Handles an H3v2 engine-based connection event (inbound or outbound).
-    ///
-    /// Delegates to [`handle_connected`] which spawns actor handles and
-    /// registers the TX bound.
-    fn handle_h3v2_connected(&mut self, event: ConnectedEvent) {
-        self.handle_connected(event);
-    }
-
-    /// Shared handler for both H3v2 and `BareUDP` connected events.
+    /// Handles a transport connection event (H3 or BareUDP).
     ///
     /// Spawns all present actor join handles into the [`JoinSet`] for
     /// lifecycle monitoring, then registers the TX bound via [`update_bound`].
@@ -2149,7 +2125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_bare_connection_rejects_unknown_peer() {
+    async fn handle_connected_rejects_unknown_peer() {
         let (mut orch, _handles) = TestableOrchestratorBuilder::default()
             .with_peers(vec![])
             .build();
@@ -2171,12 +2147,12 @@ mod tests {
             udp_rx_handle: None,
         };
 
-        orch.handle_bare_connection(event);
+        orch.handle_connected(event);
         assert!(!orch.peers.contains_key("unknown-peer"));
     }
 
     #[tokio::test]
-    async fn handle_bare_connection_appends_second_bound() {
+    async fn handle_connected_appends_second_bound() {
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
         let (existing_tx, _existing_rx) = mpsc::channel(1);
 
@@ -2205,7 +2181,7 @@ mod tests {
             udp_rx_handle: None,
         };
 
-        orch.handle_bare_connection(event);
+        orch.handle_connected(event);
 
         // Both bounds should exist
         assert_eq!(orch.peers.get("peer1").unwrap().bounds.len(), 2);
@@ -2217,7 +2193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_bare_connection_sets_bound_and_updates_routing() {
+    async fn handle_connected_sets_bound_and_updates_routing() {
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
 
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
@@ -2243,7 +2219,7 @@ mod tests {
             udp_rx_handle: None,
         };
 
-        orch.handle_bare_connection(event);
+        orch.handle_connected(event);
 
         // Bound should be set
         assert!(!orch.peers.get("peer1").unwrap().bounds.is_empty());

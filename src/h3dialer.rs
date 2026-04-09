@@ -218,20 +218,20 @@ fn make_client_quiche_config(
 
 /// Establishes an outbound H3 client CONNECT-IP connection.
 ///
-/// On success, returns [`ConnectedEvent`] with origin `Client`.
-/// The caller is responsible for sending the event and handling errors.
+/// On success, returns [`ConnectedEvent`]. The caller is responsible for
+/// sending the event and handling errors.
 pub(crate) async fn dial_h3_client<P: RouteProbe>(
     peer_h3: &PeerH3,
-    remote_addr: SocketAddr,
-    ctx: &DialContext,
-    probe: &P,
+    ctx: &DialContext<P>,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
 ) -> Result<ConnectedEvent, DialError> {
     let DialContext {
         peer_id,
+        dial_ip,
         tun_if,
         tun_mtu,
         tuning,
+        probe,
         udp_rt,
         crypto_rt,
         events_tx,
@@ -239,7 +239,8 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     let endpoint = peer_h3
         .endpoint
         .as_ref()
-        .ok_or_else(|| DialError::Socket("peer_h3.endpoint is None".into()))?;
+        .ok_or_else(|| DialError::Socket("endpoint is None".into()))?;
+    let remote_addr = SocketAddr::new(*dial_ip, endpoint.port);
 
     let server_name = peer_h3.sni.as_deref().unwrap_or(&endpoint.host);
 
@@ -495,14 +496,19 @@ mod tests {
         peer_id: &str,
     ) -> (ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
         let peer_h3 = test_peer_h3(bound_addr, token);
-        let probe = FakeRouteProbe::noop();
         let tuning = insecure_tuning();
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = DialContext::test(peer_id, tuning, events_tx);
+        let ctx = DialContext::test(
+            peer_id,
+            bound_addr.ip(),
+            tuning,
+            events_tx,
+            FakeRouteProbe::noop(),
+        );
 
-        let event = dial_h3_client(&peer_h3, bound_addr, &ctx, &probe, ingress_tx)
+        let event = dial_h3_client(&peer_h3, &ctx, ingress_tx)
             .await
             .expect("dial_h3_client failed");
 
@@ -541,15 +547,19 @@ mod tests {
         let server = TestServer::start(peer_tokens).await;
 
         let peer_h3 = test_peer_h3(server.bound_addr, wrong_token);
-        let probe = FakeRouteProbe::noop();
         let tuning = insecure_tuning();
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let ctx = DialContext::test(
+            peer_id,
+            server.bound_addr.ip(),
+            tuning,
+            events_tx,
+            FakeRouteProbe::noop(),
+        );
 
-        let ctx = DialContext::test(peer_id, tuning, events_tx);
-
-        let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
+        let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;
 
         assert!(
             matches!(result, Err(DialError::Rejected(_))),
@@ -776,9 +786,9 @@ mod tests {
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = DialContext::test(peer_id, tuning, events_tx);
+        let ctx = DialContext::test(peer_id, server.bound_addr.ip(), tuning, events_tx, probe);
 
-        let event = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx)
+        let event = dial_h3_client(&peer_h3, &ctx, ingress_tx)
             .await
             .expect("dial with trusted CA should succeed");
 
@@ -798,14 +808,19 @@ mod tests {
         // The server uses a self-signed cert not in the system trust store,
         // so the handshake should fail with a TLS verification error.
         let peer_h3 = test_peer_h3(server.bound_addr, token);
-        let probe = FakeRouteProbe::noop();
         let tuning = Tuning::default();
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = DialContext::test(peer_id, tuning, events_tx);
+        let ctx = DialContext::test(
+            peer_id,
+            server.bound_addr.ip(),
+            tuning,
+            events_tx,
+            FakeRouteProbe::noop(),
+        );
 
-        let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
+        let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;
 
         let err =
             result.expect_err("handshake with self-signed cert and no trusted CA should fail");

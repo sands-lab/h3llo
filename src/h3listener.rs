@@ -551,7 +551,7 @@ impl DispatcherRuntime {
             if engine
                 .io
                 .events_tx
-                .send(Event::H3v2Connected(ConnectedEvent {
+                .send(Event::Connected(ConnectedEvent {
                     peer_id: engine.meta.peer_id.clone(),
                     remote_addr: remote,
                     tx: egress_tx,
@@ -650,7 +650,7 @@ pub(crate) mod test_support {
     ) -> ConnectedEvent {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(event) = events_rx.recv().await {
-                if let Event::H3v2Connected(connected) = event {
+                if let Event::Connected(connected) = event {
                     return connected;
                 }
             }
@@ -851,14 +851,19 @@ mod tests {
         peer_id: &str,
     ) -> (ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
         let peer_h3 = test_peer_h3(bound_addr, token);
-        let probe = FakeRouteProbe::noop();
         let tuning = insecure_tuning();
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = DialContext::test(peer_id, tuning, events_tx);
+        let ctx = DialContext::test(
+            peer_id,
+            bound_addr.ip(),
+            tuning,
+            events_tx,
+            FakeRouteProbe::noop(),
+        );
 
-        let event = dial_h3_client(&peer_h3, bound_addr, &ctx, &probe, ingress_tx)
+        let event = dial_h3_client(&peer_h3, &ctx, ingress_tx)
             .await
             .expect("dial_h3_client failed");
 
@@ -979,15 +984,19 @@ mod tests {
         let server = TestH3Server::start(peer_tokens).await;
 
         let peer_h3 = test_peer_h3(server.bound_addr, wrong_token);
-        let probe = FakeRouteProbe::noop();
         let tuning = insecure_tuning();
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let ctx = DialContext::test(
+            peer_id,
+            server.bound_addr.ip(),
+            tuning,
+            events_tx,
+            FakeRouteProbe::noop(),
+        );
 
-        let ctx = DialContext::test(peer_id, tuning, events_tx);
-
-        let result = dial_h3_client(&peer_h3, server.bound_addr, &ctx, &probe, ingress_tx).await;
+        let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;
 
         assert!(
             matches!(result, Err(DialError::Rejected(_))),

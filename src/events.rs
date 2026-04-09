@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use crate::actor::ActorExitResult;
+use crate::bind::RouteProbe;
 use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
 use crate::h3::H3Connection;
 use crate::metrics::{Labels, Metrics};
@@ -28,15 +29,19 @@ pub enum Endpoint {
 ///
 /// Shared by [`crate::h3dialer::dial_h3_client`] and
 /// [`crate::bare::dial_bare_tx`] to avoid parameter duplication.
-pub(crate) struct DialContext {
+pub(crate) struct DialContext<P: RouteProbe> {
     /// Peer identifier from configuration.
     pub peer_id: String,
+    /// Target IP address for this dial attempt.
+    pub dial_ip: IpAddr,
     /// TUN interface name (for route-probe exclusion).
     pub tun_if: String,
     /// TUN MTU in bytes.
     pub tun_mtu: u16,
     /// Tuning parameters (timeouts, buffers, congestion control).
     pub tuning: Tuning,
+    /// Route probe for interface selection.
+    pub probe: P,
     /// Runtime handle for UDP I/O actors.
     pub udp_rt: RuntimeHandle,
     /// Runtime handle for crypto / protocol actors.
@@ -46,14 +51,22 @@ pub(crate) struct DialContext {
 }
 
 #[cfg(test)]
-impl DialContext {
+impl<P: RouteProbe> DialContext<P> {
     /// Creates a `DialContext` for tests with minimal boilerplate.
-    pub fn test(peer_id: &str, tuning: Tuning, events_tx: mpsc::UnboundedSender<Event>) -> Self {
+    pub fn test(
+        peer_id: &str,
+        dial_ip: IpAddr,
+        tuning: Tuning,
+        events_tx: mpsc::UnboundedSender<Event>,
+        probe: P,
+    ) -> Self {
         Self {
             peer_id: peer_id.to_string(),
+            dial_ip,
             tun_if: String::new(),
             tun_mtu: crate::config::default_mtu().into(),
             tuning,
+            probe,
             udp_rt: tokio::runtime::Handle::current(),
             crypto_rt: tokio::runtime::Handle::current(),
             events_tx,
@@ -99,10 +112,8 @@ pub enum Event {
     Metrics(Box<Metrics>),
     /// HTTP/3 connection established, ready for actor spawning.
     H3Connected(H3ConnectedEvent),
-    /// HTTP/3 engine-based connection established (inbound or outbound).
-    H3v2Connected(ConnectedEvent),
-    /// `BareUDP` TX connection established, ready for bound registration.
-    BareConnected(ConnectedEvent),
+    /// Transport connection established (H3 or BareUDP).
+    Connected(ConnectedEvent),
     /// A dial attempt failed; orchestrator should clear in-flight state and update backoff.
     DialFailed(DialFailedEvent),
     /// Events originating from DNS resolution.
@@ -116,8 +127,7 @@ impl std::fmt::Debug for Event {
         match self {
             Self::Metrics(m) => f.debug_tuple("Metrics").field(m).finish(),
             Self::H3Connected(e) => f.debug_tuple("H3Connected").field(e).finish(),
-            Self::H3v2Connected(e) => f.debug_tuple("H3v2Connected").field(e).finish(),
-            Self::BareConnected(e) => f.debug_tuple("BareConnected").field(e).finish(),
+            Self::Connected(e) => f.debug_tuple("Connected").field(e).finish(),
             Self::DialFailed(e) => f.debug_tuple("DialFailed").field(e).finish(),
             Self::Dns(e) => f.debug_tuple("Dns").field(e).finish(),
             Self::Api(e) => f.debug_tuple("Api").field(e).finish(),
