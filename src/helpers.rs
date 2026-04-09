@@ -6,11 +6,11 @@ use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
 
 /// Reserved headroom bytes at the start of every packet buffer.
 ///
-/// 9 bytes tokio-quiche DGRAM_PREFIX (flow ID + flow context encoding) +
+/// 9 bytes tokio-quiche `DGRAM_PREFIX` (flow ID + flow context encoding) +
 /// 1 byte CONNECT-IP Context ID (0x00). If tokio-quiche `DGRAM_PREFIX`
 /// changes, this value must be updated accordingly.
 ///
-/// All packet-producing paths (TUN RX, BareUDP RX) reserve this headroom
+/// All packet-producing paths (TUN RX, `BareUDP` RX) reserve this headroom
 /// so downstream consumers (H3 TX, TUN TX) can prepend headers in-place.
 pub(crate) const HEADROOM: usize = 10;
 
@@ -68,7 +68,7 @@ pub(crate) fn batch_stats(batch: &[PooledBuf]) -> (u64, u64) {
 /// `Interrupted` errors retry immediately (no yield). `WouldBlock` errors
 /// call `tokio::task::yield_now().await` before retrying.
 ///
-/// The second argument is a closure invoked when a WouldBlock sequence
+/// The second argument is a closure invoked when a `WouldBlock` sequence
 /// completes (on both `Ok` and non-transient `Err`), receiving the total
 /// `Duration` spent waiting. Pass `|_| {}` when no tracking is needed.
 macro_rules! retry_on_transient {

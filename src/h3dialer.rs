@@ -134,11 +134,11 @@ impl H3Engine {
                     }
                 }
 
-                _ = &mut timer => {
+                () = &mut timer => {
                     self.conn.on_timeout();
                 }
 
-                _ = &mut deadline => {
+                () = &mut deadline => {
                     warn!(%self.meta.peer_id, ?timeout, "establish: handshake timeout");
                     self.conn.close(true, 0, b"handshake timeout").ok();
                     self.flush_send();
@@ -198,7 +198,9 @@ fn make_client_quiche_config(
         .map_err(|e| DialError::Handshake(format!("quiche config: {e}")))?;
     apply_transport_config(&mut config, &tuning.h3, max_udp_payload)
         .map_err(|e| DialError::Handshake(format!("transport config: {e}")))?;
-    if !tuning.h3.h3_insecure_skip_verify {
+    if tuning.h3.h3_insecure_skip_verify {
+        config.verify_peer(false);
+    } else {
         // Enable TLS peer verification. System CA certificates are already
         // loaded by quiche::Config::new() via BoringSSL's
         // SSL_CTX_set_default_verify_paths().
@@ -208,8 +210,6 @@ fn make_client_quiche_config(
                 .load_verify_locations_from_file(ca_path)
                 .map_err(|e| DialError::Handshake(format!("trusted CA `{ca_path}`: {e}")))?;
         }
-    } else {
-        config.verify_peer(false);
     }
     Ok(config)
 }
@@ -271,7 +271,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
         let local_addr = std_socket
             .local_addr()
             .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
-        let max_udp_payload = *tun_mtu + CONNECT_IP_OVERHEAD;
+        let max_udp_payload = usize::from(*tun_mtu) + CONNECT_IP_OVERHEAD;
         let (udp_rx, udp_tx) =
             udp::make_udp(std_socket, max_udp_payload, tuning.io.udp_enable_offload)
                 .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
@@ -321,7 +321,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
         meta: EngineMeta {
             local_addr,
             remote_addr,
-            peer_id: peer_id.to_string(),
+            peer_id: peer_id.clone(),
             max_udp_payload,
         },
         run_state: RunState::new(),
@@ -349,7 +349,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     let engine_handle = crypto_rt.spawn(engine.run());
 
     Ok(ConnectedEvent {
-        peer_id: peer_id.to_string(),
+        peer_id: peer_id.clone(),
         remote_addr,
         tx: egress_tx,
         endpoint: peer_h3.endpoint.as_ref().map(|ep| Endpoint::H3(ep.clone())),

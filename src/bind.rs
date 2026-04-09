@@ -40,7 +40,7 @@ pub enum UdpError {
 /// - `domain`: Socket domain (IPv4 or IPv6).
 /// - `bind_addr`: Local address to bind, or `None` for ephemeral port.
 /// - `bind_interface`: Optional interface name for binding.
-/// - `socket_buffer_bytes`: SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
+/// - `socket_buffer_bytes`: `SO_RCVBUF/SO_SNDBUF` size in bytes; 0 skips configuration.
 ///
 /// # Returns
 /// A tokio `UdpSocket`. Interface and buffer sizing warnings are logged directly.
@@ -98,7 +98,7 @@ pub(crate) fn make_udp_socket_raw(
 ///
 /// # Arguments
 /// - `listen`: Local socket address to bind.
-/// - `socket_buffer_bytes`: SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
+/// - `socket_buffer_bytes`: `SO_RCVBUF/SO_SNDBUF` size in bytes; 0 skips configuration.
 ///
 /// # Errors
 /// Returns `UdpError::Socket` when socket creation or binding fails.
@@ -115,7 +115,7 @@ pub fn make_server_udp_socket(
 ///
 /// Probes the routing table to select an appropriate interface for reaching `target`,
 /// excluding the TUN interface to avoid routing loops. Skips interface binding for
-/// localhost targets (127.x.x.x, ::1) to support Docker DNS and other localhost services.
+/// localhost targets (127.x.x.x, `::1`) to support Docker DNS and other localhost services.
 ///
 /// The socket is **not** connected; the caller decides whether to call `connect()`.
 ///
@@ -124,7 +124,7 @@ pub fn make_server_udp_socket(
 /// - `tun_if`: Optional TUN interface name to exclude from probing.
 /// - `bind_interface`: Optional preferred interface; treated as a filter during probing.
 /// - `probe`: Route probe implementation for testability.
-/// - `socket_buffer_bytes`: SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
+/// - `socket_buffer_bytes`: `SO_RCVBUF/SO_SNDBUF` size in bytes; 0 skips configuration.
 ///
 /// # Errors
 /// Returns `UdpError::Socket` when socket creation fails. Interface binding is
@@ -165,7 +165,7 @@ pub async fn make_unbound_udp_socket<P: RouteProbe>(
 /// - `tun_if`: Optional TUN interface name to exclude from probing.
 /// - `bind_interface`: Optional preferred interface; treated as a filter during probing.
 /// - `probe`: Route probe implementation for testability.
-/// - `socket_buffer_bytes`: SO_RCVBUF/SO_SNDBUF size in bytes; 0 skips configuration.
+/// - `socket_buffer_bytes`: `SO_RCVBUF/SO_SNDBUF` size in bytes; 0 skips configuration.
 ///
 /// # Returns
 /// A connected UDP socket. The OS assigns an ephemeral port during `connect()`.
@@ -198,7 +198,7 @@ pub async fn make_client_udp_socket<P: RouteProbe>(
 
     socket
         .connect(target)
-        .map_err(|e| UdpError::Socket(format!("connect to {}: {}", target, e)))?;
+        .map_err(|e| UdpError::Socket(format!("connect to {target}: {e}")))?;
 
     Ok(socket)
 }
@@ -597,14 +597,14 @@ fn lookup_ifindex(_name: &str) -> Option<u32> {
 /// Resolves an interface name from an index using libc.
 fn ifindex_to_name(ifindex: u32) -> io::Result<String> {
     let mut buf = [0u8; libc::IF_NAMESIZE + 1];
-    let ptr = buf.as_mut_ptr() as *mut libc::c_char;
+    let ptr = buf.as_mut_ptr().cast::<libc::c_char>();
     let ret = unsafe { libc::if_indextoname(ifindex, ptr) };
     if ret.is_null() {
         return Err(io::Error::last_os_error());
     }
     let cstr = unsafe { CStr::from_ptr(ptr) };
     cstr.to_str()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 

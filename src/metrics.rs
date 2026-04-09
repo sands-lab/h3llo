@@ -30,7 +30,7 @@ use crate::helpers::{send_with_backpressure, SendEvent};
 pub enum Source {
     /// TUN interface.
     Tun,
-    /// BareUDP socket.
+    /// `BareUDP` socket.
     BareUdp,
     /// HTTP/3 transport.
     Http3,
@@ -58,7 +58,7 @@ pub enum DropReason {
     DisallowedSource,
     /// OS-level send/write failed (e.g., TUN write error).
     SendError,
-    /// QUIC protocol error from quiche (recv or dgram_send failed).
+    /// QUIC protocol error from quiche (recv or `dgram_send` failed).
     QuicError,
     /// Packet could not be forwarded because the channel closed.
     ChannelClosed,
@@ -70,9 +70,9 @@ pub enum DropReason {
     NoRoute,
     /// No peer channel available for the route.
     NoPeerChannel,
-    /// PooledBuf lacked headroom for datagram prefix insertion.
+    /// `PooledBuf` lacked headroom for datagram prefix insertion.
     NoHeadroom,
-    /// QUIC DATAGRAM queue is full. TX: precise (dgram_send returned Done).
+    /// QUIC DATAGRAM queue is full. TX: precise (`dgram_send` returned Done).
     /// RX: heuristic — may over-count when non-datagram packets arrive while
     /// the queue is full, since not every `conn.recv()` adds a datagram.
     QueueFull,
@@ -106,7 +106,7 @@ impl CongestionStats {
         self.queue_full_duration = self.queue_full_duration.saturating_add(wait);
     }
 
-    /// Records a WouldBlock wait event with its duration, saturating on overflow.
+    /// Records a `WouldBlock` wait event with its duration, saturating on overflow.
     pub fn record_would_block(&mut self, wait: Duration) {
         self.would_block_count = self.would_block_count.saturating_add(1);
         self.would_block_duration = self.would_block_duration.saturating_add(wait);
@@ -153,7 +153,7 @@ pub struct Stats {
 /// Labels attached to transport metrics for grouping.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Labels {
-    /// Packet source (TUN, BareUDP, HTTP/3, Router).
+    /// Packet source (TUN, `BareUDP`, HTTP/3, Router).
     pub source: Source,
     /// Direction (receive or transmit) of the collected metrics.
     pub direction: Direction,
@@ -286,8 +286,7 @@ pub(crate) fn log_transport_metrics(metrics: &Metrics) {
     let stats = &metrics.stats;
     let remote = labels
         .remote_addr
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "-".into());
+        .map_or_else(|| "-".into(), |a| a.to_string());
     info!(
         "{:?} {:?} {} {}: {} batches/{} pkts/{} bytes ok, \
          {} batches/{} pkts/{} bytes dropped",
@@ -353,7 +352,7 @@ pub(crate) fn log_quic_metrics() {
 // Prometheus encoding (OpenMetrics text format)
 // ---------------------------------------------------------------------------
 
-/// OpenMetrics text format EOF marker.
+/// `OpenMetrics` text format EOF marker.
 const OPENMETRICS_EOF: &str = "# EOF\n";
 
 /// Collector that owns a snapshot of metrics data for one-shot encoding.
@@ -363,7 +362,7 @@ const OPENMETRICS_EOF: &str = "# EOF\n";
 #[derive(Debug)]
 struct SnapshotCollector(HashMap<Labels, Metrics>);
 
-/// Encodes a metrics snapshot into OpenMetrics text format.
+/// Encodes a metrics snapshot into `OpenMetrics` text format.
 ///
 /// Combines application-level transport metrics (via `prometheus-client`) with
 /// QUIC-level metrics (via `foundations::telemetry::metrics`) into a single

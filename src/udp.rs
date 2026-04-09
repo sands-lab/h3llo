@@ -1,6 +1,6 @@
 //! Protocol-agnostic UDP I/O actors with shared `Arc<UdpSocket>`.
 //!
-//! Provides GRO-aware receive and GSO-aware send loops that both BareUDP
+//! Provides GRO-aware receive and GSO-aware send loops that both `BareUDP`
 //! and H3v2 transports share. The actors communicate via
 //! `(SocketAddr, Vec<PooledBuf>)` channels, tagging each batch with
 //! the remote address.
@@ -119,7 +119,7 @@ pub fn spawn_udp_rx(
                         source: e,
                     })?;
                 }
-                _ = cancel.cancelled() => {
+                () = cancel.cancelled() => {
                     info!(addr = %local_addr, "UDP RX: cancelled, shutting down");
                     return Ok(());
                 }
@@ -168,7 +168,7 @@ pub fn spawn_udp_rx(
 /// Returns the input sender and join handle.
 ///
 /// Exits when the input channel closes, draining all remaining batches
-/// first. This guarantees that final packets (e.g. QUIC CONNECTION_CLOSE)
+/// first. This guarantees that final packets (e.g. QUIC `CONNECTION_CLOSE`)
 /// are sent before the actor stops. No `CancellationToken` is needed —
 /// the caller controls shutdown by dropping the returned sender.
 pub fn spawn_udp_tx(

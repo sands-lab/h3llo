@@ -42,8 +42,9 @@ impl fmt::Display for AuthError {
 ///
 /// # Returns
 /// Header value: `Bearer <token>`
+#[must_use]
 pub fn generate_bearer_auth(token: &str) -> String {
-    format!("Bearer {}", token)
+    format!("Bearer {token}")
 }
 
 /// Validates CONNECT-IP authentication against peer tokens using Bearer scheme.
@@ -53,8 +54,10 @@ pub fn generate_bearer_auth(token: &str) -> String {
 ///
 /// Uses constant-time comparison to prevent timing attacks.
 ///
-/// # Returns
-/// The peer ID if authentication succeeds, or an [`AuthError`].
+/// # Errors
+///
+/// Returns [`AuthError`] if the header is missing, not Bearer-prefixed,
+/// or no token matches any configured peer.
 pub fn validate_connect_auth<'a>(
     header_value: Option<&str>,
     peer_tokens: impl IntoIterator<Item = (&'a str, &'a str)>,

@@ -1,4 +1,4 @@
-//! Runtime orchestration for BareUDP and HTTP/3 transports.
+//! Runtime orchestration for `BareUDP` and HTTP/3 transports.
 
 use crate::actor::{ActorError, ActorExitResult, ActorKind, DedicatedRuntime};
 use crate::api;
@@ -177,7 +177,7 @@ impl PeerEntry {
         &mut self,
         events_tx: &mpsc::UnboundedSender<Event>,
         tun_if: &str,
-        tun_mtu: usize,
+        tun_mtu: u16,
         tuning: &Tuning,
         udp_handle: &Handle,
         crypto_handle: &Handle,
@@ -289,7 +289,7 @@ impl PeerEntry {
 
 /// Returns the DNS hostname for a peer's configured endpoint, if any.
 ///
-/// Extracts the hostname from BareUDP or H3 endpoint configuration,
+/// Extracts the hostname from `BareUDP` or H3 endpoint configuration,
 /// stripping IPv6 brackets from H3 hosts.
 fn peer_dns_hostname(peer: &Peer) -> Option<&str> {
     match &peer.transport {
@@ -301,7 +301,7 @@ fn peer_dns_hostname(peer: &Peer) -> Option<&str> {
 /// Errors returned by the orchestrator.
 #[derive(Debug, Error)]
 pub enum OrchestratorError {
-    /// BareUDP listen host could not be resolved.
+    /// `BareUDP` listen host could not be resolved.
     #[error("failed to resolve bare listen host '{host}': {reason}")]
     ListenResolveFailed { host: String, reason: String },
     /// HTTP/3 listener failed to start.
@@ -333,7 +333,7 @@ pub enum OrchestratorError {
     TaskJoin(String),
 }
 
-/// Runtime orchestrator for BareUDP and HTTP/3 transports.
+/// Runtime orchestrator for `BareUDP` and HTTP/3 transports.
 ///
 /// Manages child actors with selective supervision:
 /// - Critical actors (TUN, BareUDP-Rx, H3-Listener): failure causes immediate exit
@@ -345,7 +345,7 @@ pub struct Orchestrator {
 
     // Runtime state
     tun_if: String,
-    tun_mtu: usize,
+    tun_mtu: u16,
     /// Tuning parameters from config.
     tuning: Tuning,
     /// Unified peer state: config + active bound.
@@ -356,7 +356,7 @@ pub struct Orchestrator {
     /// H3v2 listener command sender (if listening).
     h3_listener_cmd_tx: Option<mpsc::UnboundedSender<DispatcherCommand>>,
 
-    /// DNS resolver command sender for SetHostnames.
+    /// DNS resolver command sender for `SetHostnames`.
     dns_cmd_tx: mpsc::UnboundedSender<DnsCommand>,
 
     /// Route sync actor command sender (None when `local.table` is false or init failed).
@@ -366,7 +366,7 @@ pub struct Orchestrator {
     /// Stored local config (TUN addrs, routing, GET /config snapshot).
     local: Local,
 
-    /// Metrics from non-peer-scoped actors (TUN RX/TX, BareUDP RX).
+    /// Metrics from non-peer-scoped actors (TUN RX/TX, `BareUDP` RX).
     ///
     /// At most 3 entries. Peer-scoped metrics live in `BoundState`.
     non_peer_metrics: HashMap<Labels, Metrics>,
@@ -377,15 +377,15 @@ pub struct Orchestrator {
     _tun_rt: DedicatedRuntime,
     /// Router + H3 Engine actors (thread: `h3llo-crypto`).
     crypto_rt: DedicatedRuntime,
-    /// All UDP I/O actors: BareUDP + H3 (thread: `h3llo-udp`).
+    /// All UDP I/O actors: `BareUDP` + H3 (thread: `h3llo-udp`).
     udp_rt: DedicatedRuntime,
 }
 
 impl Orchestrator {
-    /// Updates BareUDP RX accepted source filter.
+    /// Updates `BareUDP` RX accepted source filter.
     ///
-    /// Sends the new set of accepted source IPs to the BareUDP RX actor.
-    /// No-op when BareUDP is not configured (`bare_rx_cmd_tx` is `None`).
+    /// Sends the new set of accepted source IPs to the `BareUDP` RX actor.
+    /// No-op when `BareUDP` is not configured (`bare_rx_cmd_tx` is `None`).
     fn update_accepted_sources(&self) {
         if let Some(cmd_tx) = &self.bare_rx_cmd_tx {
             let accepted_ips: HashSet<IpAddr> = self
@@ -475,17 +475,21 @@ impl Orchestrator {
 
     /// Creates a new orchestrator from configuration.
     ///
-    /// Initializes TUN interface, transport listeners (BareUDP and/or H3),
+    /// Initializes TUN interface, transport listeners (`BareUDP` and/or H3),
     /// routing table, and spawns child actors. Listen hostnames are resolved
     /// synchronously; peer hostnames are resolved asynchronously via the event loop.
     ///
     /// # Errors
     ///
     /// Returns `OrchestratorError` when initialization fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if dedicated I/O runtimes cannot be created.
     pub async fn new(config: Config) -> Result<Self, OrchestratorError> {
         let tuning = &config.tuning;
         let tun_if = config.local.tun.ifname.clone();
-        let tun_mtu = config.local.tun.mtu as usize;
+        let tun_mtu = config.local.tun.mtu;
         let manage_routes = config.local.table;
 
         // Create dedicated current_thread runtimes for data-plane actors.
@@ -511,7 +515,6 @@ impl Orchestrator {
                 tuning.io.tun_tx_queue_len,
                 tuning.io.tun_enable_offload,
             )
-            .await
             .map_err(|err| OrchestratorError::Tun(err.to_string()))?
         };
 
@@ -592,7 +595,7 @@ impl Orchestrator {
                 listen_addr,
                 cert_path,
                 key_path,
-                tun_mtu as u16,
+                tun_mtu,
                 &tuning.io,
                 &tuning.h3,
                 udp_rt.handle(),
@@ -816,7 +819,7 @@ impl Orchestrator {
         }
     }
 
-    /// Collects all transport metrics from BoundState and non-peer sources into a snapshot.
+    /// Collects all transport metrics from `BoundState` and non-peer sources into a snapshot.
     ///
     /// Called on Prometheus scrape (`GetMetricsSnapshot`) and periodic metrics logging.
     /// Only includes metrics from currently live connections — pruned bounds are absent.
@@ -931,20 +934,17 @@ impl Orchestrator {
                     return;
                 };
 
-                let bound = match self
+                let Some(bound) = self
                     .peers
                     .get_mut(pid)
                     .and_then(|entry| entry.bounds.iter_mut().find(|b| b.dest == addr))
-                {
-                    Some(bound) => bound,
-                    None => {
-                        warn!(
-                            peer = %pid,
-                            addr = %addr,
-                            "metrics for unknown peer or bound (already removed/pruned?)"
-                        );
-                        return;
-                    }
+                else {
+                    warn!(
+                        peer = %pid,
+                        addr = %addr,
+                        "metrics for unknown peer or bound (already removed/pruned?)"
+                    );
+                    return;
                 };
 
                 match labels.direction {
@@ -967,7 +967,7 @@ impl Orchestrator {
                 self.handle_bare_connection(event);
             }
             Event::DialFailed(event) => {
-                self.handle_dial_failed(event);
+                self.handle_dial_failed(&event);
             }
         }
     }
@@ -1041,16 +1041,16 @@ impl Orchestrator {
         }
     }
 
-    /// Handles a BareUDP TX connection event.
+    /// Handles a `BareUDP` TX connection event.
     ///
-    /// Unconditionally registers the TX actor JoinHandle for lifecycle
+    /// Unconditionally registers the TX actor `JoinHandle` for lifecycle
     /// monitoring, then attempts to bind the peer via [`update_bound`].
     fn handle_bare_connection(&mut self, event: ConnectedEvent) {
         self.handle_connected(event);
     }
 
     /// Handles a dial failure event: clears in-flight flag and updates backoff.
-    fn handle_dial_failed(&mut self, event: DialFailedEvent) {
+    fn handle_dial_failed(&mut self, event: &DialFailedEvent) {
         let Some(entry) = self.peers.get_mut(&event.peer_id) else {
             debug!(
                 peer = %event.peer_id, ip = %event.ip,
@@ -1085,7 +1085,7 @@ impl Orchestrator {
         self.handle_connected(event);
     }
 
-    /// Shared handler for both H3v2 and BareUDP connected events.
+    /// Shared handler for both H3v2 and `BareUDP` connected events.
     ///
     /// Spawns all present actor join handles into the [`JoinSet`] for
     /// lifecycle monitoring, then registers the TX bound via [`update_bound`].
@@ -1120,9 +1120,11 @@ fn strip_ipv6_brackets(host: &str) -> &str {
 
 /// Resolves a listen address from host and port, using synchronous DNS lookup for hostnames.
 ///
-/// Handles IPv6 bracket notation (e.g., "[::1]" -> "::1") for compatibility with
+/// Handles IPv6 bracket notation (e.g., "[`::1`]" -> "`::1`") for compatibility with
 /// both UDP and H3 endpoint formats.
 fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, OrchestratorError> {
+    use std::net::ToSocketAddrs;
+
     // Strip IPv6 bracket notation (safe no-op for non-bracketed hosts)
     let host = strip_ipv6_brackets(host);
 
@@ -1132,8 +1134,7 @@ fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, Orchestrator
     }
 
     // Synchronous DNS lookup for hostname
-    use std::net::ToSocketAddrs;
-    let addr_str = format!("{}:{}", host, port);
+    let addr_str = format!("{host}:{port}");
     let mut addrs =
         addr_str
             .to_socket_addrs()
@@ -1163,7 +1164,7 @@ fn collect_allowed_ips(peers: &[Peer]) -> Vec<IpNet> {
 
 /// Collects all unique hostnames from peer configurations.
 ///
-/// Handles both BareUDP and H3 endpoints. Endpoints are pre-parsed during
+/// Handles both `BareUDP` and H3 endpoints. Endpoints are pre-parsed during
 /// config deserialization, so this function cannot fail.
 fn collect_hostnames(peers: &[Peer]) -> HashSet<String> {
     peers
@@ -1183,7 +1184,7 @@ mod test_support {
     /// to enable isolated unit testing of event handling logic.
     pub struct TestableOrchestratorBuilder {
         tun_if: String,
-        tun_mtu: usize,
+        tun_mtu: u16,
         peers: HashMap<String, PeerEntry>,
         local: Option<Local>,
     }
@@ -1192,7 +1193,7 @@ mod test_support {
         fn default() -> Self {
             Self {
                 tun_if: "test0".to_string(),
-                tun_mtu: default_mtu() as usize,
+                tun_mtu: default_mtu(),
                 peers: HashMap::new(),
                 local: None,
             }
@@ -2574,7 +2575,7 @@ mod tests {
             .dials
             .insert(ip, DialState::new_in_flight());
 
-        orch.handle_dial_failed(DialFailedEvent {
+        orch.handle_dial_failed(&DialFailedEvent {
             peer_id: "peer1".to_string(),
             ip,
         });
@@ -2590,7 +2591,7 @@ mod tests {
         let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
 
         // Should not panic
-        orch.handle_dial_failed(DialFailedEvent {
+        orch.handle_dial_failed(&DialFailedEvent {
             peer_id: "nonexistent".to_string(),
             ip: "1.2.3.4".parse().unwrap(),
         });

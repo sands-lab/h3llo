@@ -1,10 +1,10 @@
-//! H3 CONNECT-IP server: CID-based dispatcher with per-connection H3Engine.
+//! H3 CONNECT-IP server: CID-based dispatcher with per-connection `H3Engine`.
 //!
 //! Architecture:
 //! - **UDP RX actor** (I/O thread): GRO-aware recv, emits `(SocketAddr, Vec<PooledBuf>)`.
 //! - **Server UDP TX actor** (I/O thread): shared send actor for all connections.
-//! - **H3Dispatcher** (`crypto_rt`): CID routing, connection acceptance, actor lifecycle.
-//! - **H3Engine** (`crypto_rt`): per-connection unified QUIC/H3 engine with ingress + egress.
+//! - **`H3Dispatcher`** (`crypto_rt`): CID routing, connection acceptance, actor lifecycle.
+//! - **`H3Engine`** (`crypto_rt`): per-connection unified QUIC/H3 engine with ingress + egress.
 //!
 //! See [`make_h3_dispatcher`] + [`spawn_h3_dispatcher`] for the public entry points.
 
@@ -60,21 +60,21 @@ fn validate_server_connect_headers(headers: &[quiche::h3::Header]) -> Result<(),
     let method = headers
         .iter()
         .find(|h| h.name() == b":method")
-        .map(|h| h.value());
+        .map(quiche::h3::NameValue::value);
     if method != Some(b"CONNECT") {
         return Err("invalid :method, expected CONNECT".into());
     }
     let protocol = headers
         .iter()
         .find(|h| h.name() == b":protocol")
-        .map(|h| h.value());
+        .map(quiche::h3::NameValue::value);
     if protocol != Some(b"connect-ip") {
         return Err("invalid :protocol, expected connect-ip".into());
     }
     let capsule = headers
         .iter()
         .find(|h| h.name().eq_ignore_ascii_case(b"capsule-protocol"))
-        .map(|h| h.value());
+        .map(quiche::h3::NameValue::value);
     if capsule != Some(b"?1") {
         return Err("invalid capsule-protocol, expected ?1".into());
     }
@@ -157,7 +157,7 @@ pub(crate) fn make_h3_dispatcher(
     let bound_addr = std_socket
         .local_addr()
         .map_err(|e| ServerError::Socket(format!("local_addr: {e}")))?;
-    let max_udp_payload = tun_mtu as usize + CONNECT_IP_OVERHEAD;
+    let max_udp_payload = usize::from(tun_mtu) + CONNECT_IP_OVERHEAD;
     let config = make_server_quiche_config(h3_tuning, max_udp_payload, cert_path, key_path)?;
 
     let (udp_rx, udp_tx) = {
@@ -311,11 +311,11 @@ impl H3Engine {
                     }
                 }
 
-                _ = &mut timer => {
+                () = &mut timer => {
                     self.conn.on_timeout();
                 }
 
-                _ = &mut deadline => {
+                () = &mut deadline => {
                     self.conn.close(true, 0, b"handshake timeout").ok();
                     self.flush_send();
                     return Err(ServerError::Accept("handshake timeout".into()));

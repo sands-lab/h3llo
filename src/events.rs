@@ -18,7 +18,7 @@ use tokio_quiche::buf_factory::PooledBuf;
 /// enabling prune logic to detect endpoint reconfiguration and DNS staleness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
-    /// BareUDP endpoint (host:port).
+    /// `BareUDP` endpoint (host:port).
     Udp(UdpEndpoint),
     /// HTTP/3 endpoint (host:port/path).
     H3(H3Endpoint),
@@ -34,7 +34,7 @@ pub(crate) struct DialContext {
     /// TUN interface name (for route-probe exclusion).
     pub tun_if: String,
     /// TUN MTU in bytes.
-    pub tun_mtu: usize,
+    pub tun_mtu: u16,
     /// Tuning parameters (timeouts, buffers, congestion control).
     pub tuning: Tuning,
     /// Runtime handle for UDP I/O actors.
@@ -61,9 +61,9 @@ impl DialContext {
     }
 }
 
-/// Transport connection established event (H3 or BareUDP).
+/// Transport connection established event (H3 or `BareUDP`).
 ///
-/// Emitted by H3 listener/dialer or BareUDP dial task when connection
+/// Emitted by H3 listener/dialer or `BareUDP` dial task when connection
 /// setup completes. Carries the per-connection egress channel, optional
 /// endpoint, and actor join handles for orchestrator registration.
 pub struct ConnectedEvent {
@@ -101,7 +101,7 @@ pub enum Event {
     H3Connected(H3ConnectedEvent),
     /// HTTP/3 engine-based connection established (inbound or outbound).
     H3v2Connected(ConnectedEvent),
-    /// BareUDP TX connection established, ready for bound registration.
+    /// `BareUDP` TX connection established, ready for bound registration.
     BareConnected(ConnectedEvent),
     /// A dial attempt failed; orchestrator should clear in-flight state and update backoff.
     DialFailed(DialFailedEvent),

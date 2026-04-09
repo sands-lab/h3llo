@@ -70,7 +70,6 @@ async fn check_device_creation() -> Result<(), String> {
         h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
-    .await
     .map_err(|e| format!("device_creation: make_tun failed: {e}"))?;
 
     let output = Command::new("ip")
@@ -126,7 +125,6 @@ async fn check_multi_address() -> Result<(), String> {
         h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
-    .await
     .map_err(|e| format!("multi_address: make_tun failed: {e}"))?;
 
     let output = Command::new("ip")
@@ -159,7 +157,6 @@ async fn check_tx_queue_len() -> Result<(), String> {
     };
 
     let (_reader, _writer) = h3llo::tun::make_tun(&local_tun, Some(2000), true)
-        .await
         .map_err(|e| format!("tx_queue_len: make_tun failed: {e}"))?;
 
     let output = Command::new("ip")
@@ -195,7 +192,6 @@ async fn check_send_recv() -> Result<(), String> {
         h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
-    .await
     .map_err(|e| format!("send_recv: make_tun failed: {e}"))?;
 
     // Disable rp_filter to allow ICMP replies from non-local source.
@@ -336,7 +332,6 @@ async fn check_mtu_configuration() -> Result<(), String> {
         h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
-    .await
     .map_err(|e| format!("mtu_configuration: make_tun failed: {e}"))?;
 
     let output = Command::new("ip")
