@@ -290,11 +290,11 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 
 - Linux CI: `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, Docker integration tests.
 - Unit: `src/config.rs` tests for defaults, H3/API config validation, peer transport exclusivity.
-- Unit: `src/h3.rs` tests for datagram encoding, error display, CONNECT-IP header validation, and listener spawn/shutdown.
+- Unit: `src/test_support/tokio_quiche_h3.rs` (test-only) tests for datagram encoding, error display, CONNECT-IP header validation, and listener spawn/shutdown.
 - Unit: `src/h3session.rs` tests for QSI encode/decode, ConnectIpDatagramCodec framing (prepend/strip/roundtrip, rejection paths), ConnectFailure actor reason mapping, and CONNECT-IP constant verification.
 - Unit: `src/h3engine.rs` tests for quiche transport config creation (valid and invalid CC), LoopExit result conversion, EngineMeta recv_info construction, and RunState initialization.
-- Unit: `src/h3dialer.rs` tests for DialError display, From<ConnectFailure> conversion, and client quiche config validation (bad CA path, insecure mode CA bypass, default verify_peer). Integration tests for h3dialer client against h3.rs server (handshake, auth rejection, C2S/S2C/bidirectional datagrams, shutdown, trusted CA validation, untrusted cert rejection).
-- Unit: `src/h3listener.rs` tests for ServerError display, server header/auth validation, and make_h3_dispatcher cert rejection. Integration tests for h3listener dispatcher against h3.rs client (handshake, auth rejection, C2S/S2C/bidirectional datagrams) and h3dialer.rs client (handshake, auth rejection, C2S/S2C/bidirectional datagrams, client shutdown, listener shutdown).
+- Unit: `src/h3dialer.rs` tests for DialError display, From<ConnectFailure> conversion, and client quiche config validation (bad CA path, insecure mode CA bypass, default verify_peer). Integration tests for h3dialer client against the legacy `tokio_quiche_h3` test server (handshake, auth rejection, C2S/S2C/bidirectional datagrams, shutdown, trusted CA validation, untrusted cert rejection).
+- Unit: `src/h3listener.rs` tests for ServerError display, server header/auth validation, and make_h3_dispatcher cert rejection. Integration tests for h3listener dispatcher against the legacy `tokio_quiche_h3` test client fixture (handshake, auth rejection, C2S/S2C/bidirectional datagrams) and h3dialer.rs client (handshake, auth rejection, C2S/S2C/bidirectional datagrams, client shutdown, listener shutdown).
 - Unit: `src/auth.rs` tests for Bearer Token generation and validation.
 - Unit: `src/dns.rs` real-network DNS resolver tests.
 - Unit: `src/bare.rs` real-network BareUDP tests.

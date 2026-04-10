@@ -8,7 +8,6 @@ pub mod bind;
 pub mod config;
 pub mod dns;
 pub mod events;
-pub mod h3;
 pub mod h3dialer;
 pub mod h3engine;
 pub mod h3listener;
@@ -20,6 +19,10 @@ pub mod route;
 pub mod router;
 pub mod tun;
 pub mod udp;
+
+/// Test-only support modules that depend on crate internals.
+#[cfg(test)]
+pub(crate) mod test_support;
 
 /// Test utilities module exposed via the `test-utils` feature.
 ///

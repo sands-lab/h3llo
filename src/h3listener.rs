@@ -763,11 +763,13 @@ mod tests {
     use crate::bind::test_support::FakeRouteProbe;
     use crate::config::default_mtu;
     use crate::events::DialContext;
-    use crate::h3::{dial_h3, spawn_h3_rx, spawn_h3_tx, DialError as OldDialError, H3Connection};
     use crate::h3dialer::{dial_h3_client, DialError};
     use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::helpers::alloc_packet_buf;
     use crate::helpers::test_packets::make_ipv4_packet;
+    use crate::test_support::tokio_quiche_h3::{
+        dial_h3, spawn_h3_rx, spawn_h3_tx, DialError as OldDialError, H3Connection,
+    };
     use std::net::Ipv4Addr;
     use test_support::await_connected;
     use tokio_quiche::buf_factory::PooledBuf;
@@ -825,7 +827,7 @@ mod tests {
 
     // ========== Integration Test Helpers ==========
 
-    /// Dials the h3v2 server with the OLD client (h3.rs tokio-quiche).
+    /// Dials the h3v2 server with the legacy tokio-quiche client fixture.
     async fn dial_old_client(bound_addr: SocketAddr, token: &str, peer_id: &str) -> H3Connection {
         let peer_h3 = test_peer_h3(bound_addr, token);
         let probe = FakeRouteProbe::noop();

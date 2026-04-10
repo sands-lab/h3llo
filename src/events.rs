@@ -6,7 +6,6 @@ use std::net::{IpAddr, SocketAddr};
 use crate::actor::ActorExitResult;
 use crate::bind::RouteProbe;
 use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
-use crate::h3::H3Connection;
 use crate::metrics::{Labels, Metrics};
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::{mpsc, oneshot};
@@ -110,7 +109,8 @@ impl std::fmt::Debug for ConnectedEvent {
 pub enum Event {
     /// Cumulative metrics snapshot from any source (boxed to reduce enum size).
     Metrics(Box<Metrics>),
-    /// HTTP/3 connection established, ready for actor spawning.
+    /// Test-only legacy tokio-quiche H3 connection event.
+    #[cfg(test)]
     H3Connected(H3ConnectedEvent),
     /// Transport connection established (H3 or BareUDP).
     Connected(ConnectedEvent),
@@ -126,6 +126,7 @@ impl std::fmt::Debug for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Metrics(m) => f.debug_tuple("Metrics").field(m).finish(),
+            #[cfg(test)]
             Self::H3Connected(e) => f.debug_tuple("H3Connected").field(e).finish(),
             Self::Connected(e) => f.debug_tuple("Connected").field(e).finish(),
             Self::DialFailed(e) => f.debug_tuple("DialFailed").field(e).finish(),
@@ -194,14 +195,15 @@ pub struct DialFailedEvent {
     pub ip: IpAddr,
 }
 
-/// HTTP/3 connection established event with full connection object.
+/// Test-only legacy tokio-quiche H3 connection event.
 ///
-/// Emitted by listener (inbound) and dialer (outbound) when connection is
-/// established and ready for RX/TX actors to be spawned.
+/// Emitted by [`crate::test_support::tokio_quiche_h3`] when the legacy
+/// tokio-quiche high-level API fixture finishes the H3 handshake.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct H3ConnectedEvent {
     /// The established connection.
-    pub connection: H3Connection,
+    pub connection: crate::test_support::tokio_quiche_h3::H3Connection,
 }
 
 /// DNS resolution state change notification.

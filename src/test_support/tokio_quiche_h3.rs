@@ -1,10 +1,10 @@
-//! **Deprecated**: HTTP/3 CONNECT-IP transport using tokio-quiche high-level API.
+//! Test-only HTTP/3 CONNECT-IP interop fixture using tokio-quiche high-level API.
 //!
-//! This module is superseded by the production stack:
+//! This legacy implementation is superseded by the production stack:
 //! [`h3dialer`](crate::h3dialer), [`h3listener`](crate::h3listener),
 //! [`h3engine`](crate::h3engine), [`h3session`](crate::h3session).
-//! The orchestrator ignores `Event::H3Connected` events from this module.
-//! Retained only for interop tests; will be deleted once tests are migrated.
+//! It is compiled only in test builds and retained to verify interoperability
+//! between h3llo's production stack and tokio-quiche's high-level HTTP/3 API.
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{bearer_auth_header, validate_connect_auth, AuthError};
@@ -1144,10 +1144,10 @@ pub fn spawn_h3_listener(
 
 // ========== Test Support ==========
 
-/// Shared test utilities for H3 integration tests across modules.
+/// Shared test utilities for legacy tokio-quiche H3 integration tests.
 ///
 /// Re-exports common utilities from [`crate::h3session::test_support`] and
-/// adds h3.rs-specific helpers (`await_server_connection`).
+/// adds tokio-quiche-H3-specific helpers (`await_server_connection`).
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::events::{Event, H3ConnectedEvent};

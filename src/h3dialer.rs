@@ -367,13 +367,13 @@ mod tests {
     use crate::bind::test_support::FakeRouteProbe;
     use crate::config::{default_mtu, H3Tuning};
     use crate::events::{ConnectedEvent, Event};
-    use crate::h3::test_support::await_server_connection;
-    use crate::h3::{
-        make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
-    };
     use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::h3session::ConnectFailure;
     use crate::helpers::alloc_packet_buf;
+    use crate::test_support::tokio_quiche_h3::test_support::await_server_connection;
+    use crate::test_support::tokio_quiche_h3::{
+        make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -449,7 +449,7 @@ mod tests {
 
     // ========== Integration Test Helpers ==========
 
-    /// Test server wrapping h3.rs listener with cert and handle lifecycle management.
+    /// Test server wrapping the legacy tokio-quiche H3 listener.
     struct TestServer {
         cmd_tx: mpsc::UnboundedSender<H3ListenerCommand>,
         events_rx: mpsc::UnboundedReceiver<Event>,
