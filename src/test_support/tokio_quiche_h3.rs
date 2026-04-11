@@ -10,7 +10,7 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::{bearer_auth_header, validate_connect_auth, AuthError};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
-use crate::events::{Event, H3ConnectedEvent};
+use crate::events::Event;
 use crate::helpers::{send_with_backpressure, SendEvent};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use futures_util::sink::SinkExt;
@@ -193,7 +193,7 @@ async fn handle_h3_connection(
     mut controller: tokio_quiche::http3::driver::ServerH3Controller,
     remote_addr: SocketAddr,
     tokens: HashMap<String, String>,
-    events_tx: mpsc::UnboundedSender<Event>,
+    connection_tx: mpsc::UnboundedSender<H3Connection>,
     h3_handshake_timeout: Duration,
 ) {
     // Extract cmd_sender before the handshake loop consumes event_receiver_mut().
@@ -307,9 +307,8 @@ async fn handle_h3_connection(
                     flow_id,
                     quic_cmd_send,
                 };
-                let event = Event::H3Connected(H3ConnectedEvent { connection: conn });
-                if events_tx.send(event).is_err() {
-                    debug!(%remote_addr, "events channel closed");
+                if connection_tx.send(conn).is_err() {
+                    debug!(%remote_addr, "connection channel closed");
                     close_quic_connection(&quic_cmd_tx);
                 }
                 return;
@@ -1034,7 +1033,9 @@ pub fn make_h3_listener(
 /// * `listener` - H3 listener state from `make_h3_listener`.
 /// * `peer_tokens` - Map of peer ID to expected token for authentication.
 /// * `tun_mtu` - TUN interface MTU for deriving QUIC payload size.
-/// * `events_tx` - Unbounded channel for emitting events to orchestrator.
+/// Returns the command sender, listener join handle, bound address, and a
+/// dedicated channel that yields each successfully established server-side
+/// `H3Connection`.
 ///
 /// # Panics
 ///
@@ -1043,14 +1044,15 @@ pub fn spawn_h3_listener(
     listener: H3Listener,
     mut peer_tokens: HashMap<String, String>,
     tun_mtu: u16,
-    events_tx: mpsc::UnboundedSender<Event>,
     tuning: &Tuning,
 ) -> (
     mpsc::UnboundedSender<H3ListenerCommand>,
     JoinHandle<ActorExitResult>,
     SocketAddr,
+    mpsc::UnboundedReceiver<H3Connection>,
 ) {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<H3ListenerCommand>();
+    let (connection_tx, connection_rx) = mpsc::unbounded_channel::<H3Connection>();
 
     let H3Listener {
         socket,
@@ -1128,7 +1130,7 @@ pub fn spawn_h3_listener(
                         controller,
                         remote_addr,
                         peer_tokens.clone(),
-                        events_tx.clone(),
+                        connection_tx.clone(),
                         h3_handshake_timeout,
                     ));
                 }
@@ -1136,7 +1138,7 @@ pub fn spawn_h3_listener(
         }
     });
 
-    (cmd_tx, handle, bound_addr)
+    (cmd_tx, handle, bound_addr, connection_rx)
 }
 
 // ========== Test Support ==========
@@ -1147,26 +1149,19 @@ pub fn spawn_h3_listener(
 /// adds tokio-quiche-H3-specific helpers (`await_server_connection`).
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::events::{Event, H3ConnectedEvent};
+    use super::H3Connection;
     pub use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
 
-    /// Waits for an `H3ConnectedEvent` on the events channel, with timeout.
+    /// Waits for a server-side `H3Connection` on the listener channel, with timeout.
     ///
-    /// Skips non-H3Connected events (e.g. metrics). Panics on timeout or if
-    /// the channel closes before an H3Connected event arrives.
+    /// Panics on timeout or if the channel closes before a connection arrives.
     pub async fn await_server_connection(
-        events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
-    ) -> H3ConnectedEvent {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while let Some(event) = events_rx.recv().await {
-                if let Event::H3Connected(connected) = event {
-                    return connected;
-                }
-            }
-            panic!("events channel closed without H3Connected");
-        })
-        .await
-        .expect("timeout waiting for H3Connected event")
+        connection_rx: &mut tokio::sync::mpsc::UnboundedReceiver<H3Connection>,
+    ) -> H3Connection {
+        tokio::time::timeout(std::time::Duration::from_secs(5), connection_rx.recv())
+            .await
+            .expect("timeout waiting for server connection")
+            .expect("connection channel closed without server connection")
     }
 }
 
@@ -1464,14 +1459,8 @@ mod tests {
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
 
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, handle, bound_addr) = spawn_h3_listener(
-            listener,
-            HashMap::new(),
-            default_mtu(),
-            events_tx,
-            &Tuning::default(),
-        );
+        let (cmd_tx, handle, bound_addr, _connection_rx) =
+            spawn_h3_listener(listener, HashMap::new(), default_mtu(), &Tuning::default());
 
         // Verify bound address is valid
         assert_ne!(bound_addr.port(), 0);
@@ -1494,17 +1483,10 @@ mod tests {
 
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let peer_tokens = HashMap::from([("test-peer".to_string(), "test-token-12ch".to_string())]);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
-        let (cmd_tx, handle, _bound_addr) = spawn_h3_listener(
-            listener,
-            peer_tokens,
-            default_mtu(),
-            events_tx,
-            &Tuning::default(),
-        );
+        let (cmd_tx, handle, _bound_addr, _connection_rx) =
+            spawn_h3_listener(listener, peer_tokens, default_mtu(), &Tuning::default());
 
         // Verify command channel is functional
         assert!(cmd_tx
@@ -1534,17 +1516,10 @@ mod tests {
         let token = "test-token-12chars";
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
-        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
-            listener,
-            peer_tokens,
-            default_mtu(),
-            events_tx,
-            &Tuning::default(),
-        );
+        let (cmd_tx, _listener_handle, bound_addr, mut connection_rx) =
+            spawn_h3_listener(listener, peer_tokens, default_mtu(), &Tuning::default());
 
         // Give listener time to bind
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1570,9 +1545,8 @@ mod tests {
         let client_conn = client_result.unwrap();
         assert_eq!(client_conn.peer_id, peer_id);
 
-        // Server should emit an H3Connected event
-        let server_event = await_server_connection(&mut events_rx).await;
-        assert_eq!(server_event.connection.peer_id, peer_id);
+        let server_connection = await_server_connection(&mut connection_rx).await;
+        assert_eq!(server_connection.peer_id, peer_id);
 
         // Clean shutdown
         drop(cmd_tx);
@@ -1587,17 +1561,10 @@ mod tests {
         let token = "sni-test-token-12ch";
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
-        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
-            listener,
-            peer_tokens,
-            default_mtu(),
-            events_tx,
-            &Tuning::default(),
-        );
+        let (cmd_tx, _listener_handle, bound_addr, mut connection_rx) =
+            spawn_h3_listener(listener, peer_tokens, default_mtu(), &Tuning::default());
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1625,9 +1592,8 @@ mod tests {
         let client_conn = client_result.unwrap();
         assert_eq!(client_conn.peer_id, peer_id);
 
-        // Server should emit an H3Connected event
-        let server_event = await_server_connection(&mut events_rx).await;
-        assert_eq!(server_event.connection.peer_id, peer_id);
+        let server_connection = await_server_connection(&mut connection_rx).await;
+        assert_eq!(server_connection.peer_id, peer_id);
 
         drop(cmd_tx);
     }
@@ -1643,17 +1609,10 @@ mod tests {
         let token = "split-test-token12";
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make listener");
-        let (cmd_tx, _handle, bound_addr) = spawn_h3_listener(
-            listener,
-            peer_tokens,
-            default_mtu(),
-            events_tx,
-            &Tuning::default(),
-        );
+        let (cmd_tx, _handle, bound_addr, mut connection_rx) =
+            spawn_h3_listener(listener, peer_tokens, default_mtu(), &Tuning::default());
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1671,9 +1630,9 @@ mod tests {
         .await
         .expect("dial");
 
-        let server_event = await_server_connection(&mut events_rx).await;
+        let server_connection = await_server_connection(&mut connection_rx).await;
 
-        let (rx, tx) = server_event.connection.into_actors();
+        let (rx, tx) = server_connection.into_actors();
         assert_eq!(rx.peer_id, peer_id);
         assert_eq!(tx.peer_id, peer_id);
         assert_eq!(rx.remote_addr, tx.remote_addr);
@@ -1684,24 +1643,15 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_rejects_wrong_secret() {
-        use crate::events::Event;
-
         let certs = TestCertBundle::generate();
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         let peer_tokens =
             HashMap::from([("test-client".to_string(), "correct-token-12".to_string())]);
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
-        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
-            listener,
-            peer_tokens,
-            default_mtu(),
-            events_tx,
-            &Tuning::default(),
-        );
+        let (cmd_tx, _listener_handle, bound_addr, mut connection_rx) =
+            spawn_h3_listener(listener, peer_tokens, default_mtu(), &Tuning::default());
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1725,16 +1675,8 @@ mod tests {
             Ok(_) => panic!("expected dial to fail with wrong secret"),
         }
 
-        // Server should NOT have emitted an H3Connected event
-        let server_recv = tokio::time::timeout(Duration::from_millis(500), async {
-            while let Some(event) = events_rx.recv().await {
-                if matches!(event, Event::H3Connected(_)) {
-                    return Some(());
-                }
-            }
-            None
-        })
-        .await;
+        let server_recv =
+            tokio::time::timeout(Duration::from_millis(500), connection_rx.recv()).await;
         assert!(
             server_recv.is_err() || server_recv.unwrap().is_none(),
             "server should not accept connection with wrong secret"
@@ -1751,17 +1693,10 @@ mod tests {
         // Server only knows "known-peer"
         let peer_tokens =
             HashMap::from([("known-peer".to_string(), "token-12chars-x".to_string())]);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
-        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
-            listener,
-            peer_tokens,
-            default_mtu(),
-            events_tx,
-            &Tuning::default(),
-        );
+        let (cmd_tx, _listener_handle, bound_addr, _connection_rx) =
+            spawn_h3_listener(listener, peer_tokens, default_mtu(), &Tuning::default());
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1798,17 +1733,10 @@ mod tests {
         let token = "datagram-token-12";
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
-        let (listener_events_tx, mut listener_events_rx) = mpsc::unbounded_channel();
-
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
-        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
-            listener,
-            peer_tokens,
-            default_mtu(),
-            listener_events_tx,
-            &Tuning::default(),
-        );
+        let (cmd_tx, _listener_handle, bound_addr, mut listener_connections_rx) =
+            spawn_h3_listener(listener, peer_tokens, default_mtu(), &Tuning::default());
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1826,7 +1754,7 @@ mod tests {
         .await
         .expect("dial failed");
 
-        let server_event = await_server_connection(&mut listener_events_rx).await;
+        let server_connection = await_server_connection(&mut listener_connections_rx).await;
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let metrics_interval = Duration::from_secs(60);
@@ -1844,7 +1772,7 @@ mod tests {
         );
 
         // Split server connection for RX
-        let (server_rx, _server_tx) = server_event.connection.into_actors();
+        let (server_rx, _server_tx) = server_connection.into_actors();
 
         // Server RX actor
         let (server_router_tx, mut server_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
@@ -1881,17 +1809,10 @@ mod tests {
         let token = "bidir-token-12ch";
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
-        let (listener_events_tx, mut listener_events_rx) = mpsc::unbounded_channel();
-
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
-        let (cmd_tx, _listener_handle, bound_addr) = spawn_h3_listener(
-            listener,
-            peer_tokens,
-            default_mtu(),
-            listener_events_tx,
-            &Tuning::default(),
-        );
+        let (cmd_tx, _listener_handle, bound_addr, mut listener_connections_rx) =
+            spawn_h3_listener(listener, peer_tokens, default_mtu(), &Tuning::default());
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1909,7 +1830,7 @@ mod tests {
         .await
         .expect("dial failed");
 
-        let server_event = await_server_connection(&mut listener_events_rx).await;
+        let server_connection = await_server_connection(&mut listener_connections_rx).await;
 
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let metrics_interval = Duration::from_secs(60);
@@ -1937,7 +1858,7 @@ mod tests {
         );
 
         // Split server connection
-        let (server_rx, server_tx) = server_event.connection.into_actors();
+        let (server_rx, server_tx) = server_connection.into_actors();
 
         // Server TX -> Client RX
         let (server_send_tx, _) = spawn_h3_tx(
@@ -1991,17 +1912,10 @@ mod tests {
         let token = "shutdown-token-12";
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-
         let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
             .expect("make_h3_listener");
-        let (cmd_tx, listener_handle, bound_addr) = spawn_h3_listener(
-            listener,
-            peer_tokens,
-            default_mtu(),
-            events_tx,
-            &Tuning::default(),
-        );
+        let (cmd_tx, listener_handle, bound_addr, mut connection_rx) =
+            spawn_h3_listener(listener, peer_tokens, default_mtu(), &Tuning::default());
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2019,7 +1933,7 @@ mod tests {
         .await
         .expect("dial failed");
 
-        let _server_event = await_server_connection(&mut events_rx).await;
+        let _server_connection = await_server_connection(&mut connection_rx).await;
 
         // Graceful shutdown: drop command channel with active connection
         drop(cmd_tx);

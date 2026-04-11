@@ -940,8 +940,6 @@ impl Orchestrator {
                     Direction::Tx => bound.tx_metrics = Some(metrics),
                 }
             }
-            #[cfg(test)]
-            Event::H3Connected(_) => {}
             Event::Connected(event) => {
                 self.handle_connected(event);
             }

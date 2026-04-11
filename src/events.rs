@@ -109,9 +109,6 @@ impl std::fmt::Debug for ConnectedEvent {
 pub enum Event {
     /// Cumulative metrics snapshot from any source (boxed to reduce enum size).
     Metrics(Box<Metrics>),
-    /// Test-only legacy tokio-quiche H3 connection event.
-    #[cfg(test)]
-    H3Connected(H3ConnectedEvent),
     /// Transport connection established (H3 or BareUDP).
     Connected(ConnectedEvent),
     /// A dial attempt failed; orchestrator should clear in-flight state and update backoff.
@@ -126,8 +123,6 @@ impl std::fmt::Debug for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Metrics(m) => f.debug_tuple("Metrics").field(m).finish(),
-            #[cfg(test)]
-            Self::H3Connected(e) => f.debug_tuple("H3Connected").field(e).finish(),
             Self::Connected(e) => f.debug_tuple("Connected").field(e).finish(),
             Self::DialFailed(e) => f.debug_tuple("DialFailed").field(e).finish(),
             Self::Dns(e) => f.debug_tuple("Dns").field(e).finish(),
@@ -193,17 +188,6 @@ pub struct DialFailedEvent {
     pub peer_id: String,
     /// The IP address that failed to connect.
     pub ip: IpAddr,
-}
-
-/// Test-only legacy tokio-quiche H3 connection event.
-///
-/// Emitted by [`crate::test_support::tokio_quiche_h3`] when the legacy
-/// tokio-quiche high-level API fixture finishes the H3 handshake.
-#[cfg(test)]
-#[derive(Debug)]
-pub struct H3ConnectedEvent {
-    /// The established connection.
-    pub connection: crate::test_support::tokio_quiche_h3::H3Connection,
 }
 
 /// DNS resolution state change notification.
