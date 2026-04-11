@@ -366,14 +366,14 @@ mod tests {
     use crate::actor::ActorExitResult;
     use crate::bind::test_support::FakeRouteProbe;
     use crate::config::{default_mtu, H3Tuning};
-    use crate::events::{ConnectedEvent, Event};
-    use crate::h3::test_support::await_server_connection;
-    use crate::h3::{
-        make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
-    };
+    use crate::events::ConnectedEvent;
     use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
     use crate::h3session::ConnectFailure;
     use crate::helpers::alloc_packet_buf;
+    use crate::test_support::tokio_quiche_h3::test_support::await_server_connection;
+    use crate::test_support::tokio_quiche_h3::{
+        make_h3_listener, spawn_h3_listener, spawn_h3_rx, spawn_h3_tx, H3ListenerCommand,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -449,10 +449,10 @@ mod tests {
 
     // ========== Integration Test Helpers ==========
 
-    /// Test server wrapping h3.rs listener with cert and handle lifecycle management.
+    /// Test server wrapping the legacy tokio-quiche H3 listener.
     struct TestServer {
         cmd_tx: mpsc::UnboundedSender<H3ListenerCommand>,
-        events_rx: mpsc::UnboundedReceiver<Event>,
+        connection_rx: mpsc::UnboundedReceiver<crate::test_support::tokio_quiche_h3::H3Connection>,
         bound_addr: SocketAddr,
         _certs: TestCertBundle,
         _handle: tokio::task::JoinHandle<ActorExitResult>,
@@ -466,21 +466,15 @@ mod tests {
             let listener = make_h3_listener(listen_addr, certs.cert_path(), certs.key_path(), 0)
                 .expect("make_h3_listener");
 
-            let (events_tx, events_rx) = mpsc::unbounded_channel();
-            let (cmd_tx, handle, bound_addr) = spawn_h3_listener(
-                listener,
-                peer_tokens,
-                default_mtu(),
-                events_tx,
-                &Tuning::default(),
-            );
+            let (cmd_tx, handle, bound_addr, connection_rx) =
+                spawn_h3_listener(listener, peer_tokens, default_mtu(), &Tuning::default());
 
             // Give listener time to start accepting.
             tokio::time::sleep(Duration::from_millis(50)).await;
 
             Self {
                 cmd_tx,
-                events_rx,
+                connection_rx,
                 bound_addr,
                 _certs: certs,
                 _handle: handle,
@@ -531,8 +525,8 @@ mod tests {
         assert_eq!(event.remote_addr, server.bound_addr);
 
         // Server should emit H3Connected with correct peer_id.
-        let server_event = await_server_connection(&mut server.events_rx).await;
-        assert_eq!(server_event.connection.peer_id, peer_id);
+        let server_connection = await_server_connection(&mut server.connection_rx).await;
+        assert_eq!(server_connection.peer_id, peer_id);
 
         drop(server.cmd_tx);
     }
@@ -582,8 +576,8 @@ mod tests {
         let (event, _ingress_rx) = dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Obtain server-side connection and set up RX actor.
-        let server_event = await_server_connection(&mut server.events_rx).await;
-        let (server_rx, _server_tx) = server_event.connection.into_actors();
+        let server_connection = await_server_connection(&mut server.connection_rx).await;
+        let (server_rx, _server_tx) = server_connection.into_actors();
         let (server_router_tx, mut server_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (srv_events_tx, _srv_events_rx) = mpsc::unbounded_channel();
         let _server_rx_handle = spawn_h3_rx(
@@ -623,8 +617,8 @@ mod tests {
         let (_event, mut ingress_rx) = dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Obtain server-side connection and set up TX actor.
-        let server_event = await_server_connection(&mut server.events_rx).await;
-        let (_server_rx, server_tx) = server_event.connection.into_actors();
+        let server_connection = await_server_connection(&mut server.connection_rx).await;
+        let (_server_rx, server_tx) = server_connection.into_actors();
         let (srv_events_tx, _srv_events_rx) = mpsc::unbounded_channel();
         let (server_send_tx, _server_tx_handle) = spawn_h3_tx(
             server_tx,
@@ -664,8 +658,8 @@ mod tests {
         let (event, mut ingress_rx) = dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Set up server RX and TX actors.
-        let server_event = await_server_connection(&mut server.events_rx).await;
-        let (server_rx, server_tx) = server_event.connection.into_actors();
+        let server_connection = await_server_connection(&mut server.connection_rx).await;
+        let (server_rx, server_tx) = server_connection.into_actors();
         let (srv_events_tx, _srv_events_rx) = mpsc::unbounded_channel();
 
         let (c2s_router_tx, mut c2s_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
@@ -722,7 +716,7 @@ mod tests {
         let (event, _ingress_rx) = dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Verify server accepted the connection.
-        let _server_event = await_server_connection(&mut server.events_rx).await;
+        let _server_connection = await_server_connection(&mut server.connection_rx).await;
 
         // Drop the egress sender to trigger client shutdown.
         let ConnectedEvent {

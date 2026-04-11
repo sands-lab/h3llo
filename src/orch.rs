@@ -940,14 +940,6 @@ impl Orchestrator {
                     Direction::Tx => bound.tx_metrics = Some(metrics),
                 }
             }
-            Event::H3Connected(event) => {
-                // Deprecated: old h3.rs path no longer used in production.
-                // Kept for compilation compatibility while h3.rs exists.
-                error!(
-                    peer_id = %event.connection.peer_id,
-                    "received old-style H3Connected event (h3.rs path); ignoring"
-                );
-            }
             Event::Connected(event) => {
                 self.handle_connected(event);
             }
