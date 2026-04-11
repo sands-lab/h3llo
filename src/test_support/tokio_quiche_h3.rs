@@ -75,7 +75,7 @@ fn extract_and_validate_auth(
     let auth_header = headers
         .iter()
         .find(|h| h.name().eq_ignore_ascii_case(b"authorization"))
-        .map(|h| String::from_utf8_lossy(h.value()).to_string());
+        .map(|h| String::from_utf8_lossy(h.value()));
 
     let peer_iter = tokens.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     validate_connect_auth(auth_header.as_deref(), peer_iter)

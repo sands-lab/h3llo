@@ -91,7 +91,7 @@ fn validate_server_auth(
     let auth_value = headers
         .iter()
         .find(|h| h.name().eq_ignore_ascii_case(b"authorization"))
-        .map(|h| String::from_utf8_lossy(h.value()).to_string());
+        .map(|h| String::from_utf8_lossy(h.value()));
     let peer_iter = tokens.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     validate_connect_auth(auth_value.as_deref(), peer_iter).map_err(|reason| reason.to_string())
 }

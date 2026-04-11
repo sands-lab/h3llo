@@ -241,7 +241,7 @@ Routine, low-risk patterns. Each typically yields -5 to -50 LOC.
 
 **G3. Replace Hand-Rolled Security with Audited Libraries**
 - Hand-rolled `constant_time_eq`; `&&` combining constant-time results (short-circuits, breaking timing guarantees).
-- Fix: use an audited crypto primitive that normalizes variable-length secrets before comparison, such as HMAC-SHA256 over both inputs with an ephemeral key; if multiple constant-time conditions must be combined, use `&` (bitwise AND) not `&&`.
+- Fix: use an audited crypto primitive that compares fixed-size tags derived from the inputs, such as HMAC-SHA256 over both inputs with an ephemeral key; this removes direct length-mismatch leakage from the equality check, but callers still need explicit input bounds because MAC computation remains linear in input length. If multiple constant-time conditions must be combined, use `&` (bitwise AND) not `&&`.
 - Signal: Any function named `constant_time_*` or `timing_safe_*` that isn't from a crypto crate; `&&` between results that must be constant-time.
 - Impact: -10 to -37 LOC, eliminates subtle security bugs.
 
