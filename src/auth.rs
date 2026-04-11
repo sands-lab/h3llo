@@ -6,8 +6,9 @@
 //! # Security
 //!
 //! Token comparisons use HMAC-SHA256 with a per-call random key to normalize
-//! variable-length tokens to fixed 32-byte digests before verification,
-//! eliminating length-based timing side-channels.
+//! variable-length tokens to fixed 32-byte digests before verification.
+//! This removes direct length-mismatch leakage from the equality check, though
+//! total processing cost still scales with token length, so inputs are bounded.
 
 use std::fmt;
 
@@ -54,12 +55,12 @@ pub fn bearer_auth_header(token: &str) -> String {
 /// Per `docs/protocol.md`: client sends `Authorization: Bearer <peers[target].h3.token>`.
 /// Server matches token against its `peers[].h3.token` collection.
 ///
-/// Uses HMAC-SHA256 with a per-call random key to prevent content and
-/// length timing side-channels.
+/// Uses HMAC-SHA256 with a per-call random key to compare fixed-size MACs
+/// instead of the original variable-length token bytes.
 ///
 /// # Errors
 ///
-/// Returns [`AuthError`] if the header is missing, not Bearer-prefixed,
+/// Returns [`AuthError`] if the header is missing, not Bearer-prefixed, empty,
 /// or no token matches any configured peer.
 pub fn validate_connect_auth<'a>(
     header_value: Option<&str>,
@@ -72,8 +73,8 @@ pub fn validate_connect_auth<'a>(
         return Err(AuthError::EmptyToken);
     }
 
-    // Normalize both candidate tokens to fixed-length MACs so verification
-    // does not leak whether the original token lengths differ.
+    // Compare fixed-size MACs so the equality check does not expose whether
+    // the original token lengths differ.
     let key: [u8; 32] = rand::random();
     let presented_mac = HMAC::mac(token.as_bytes(), key);
 
