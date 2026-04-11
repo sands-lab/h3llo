@@ -340,9 +340,6 @@ pub enum DialError {
     /// Socket setup failed.
     #[error("socket failed: {0}")]
     Socket(String),
-    /// TLS setup failed.
-    #[error("tls failed: {0}")]
-    Tls(String),
     /// QUIC handshake failed.
     #[error("handshake failed: {0}")]
     Handshake(String),
