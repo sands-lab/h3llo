@@ -31,7 +31,7 @@ jobs:
       - name: Cargo fmt
         run: cargo fmt -- --check
       - name: Cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Generate coverage
         run: cargo llvm-cov --lib --codecov --output-path codecov.json
       - name: Upload to Codecov

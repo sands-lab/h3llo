@@ -2426,7 +2426,9 @@ peers:
 
     #[test]
     fn rejects_zero_duration_fields() {
-        let fields: &[(&str, fn(&mut Tuning))] = &[
+        type TuningSetter = fn(&mut Tuning);
+
+        let fields: &[(&str, TuningSetter)] = &[
             ("reconcile_interval", |t| {
                 t.reconcile_interval = Duration::ZERO
             }),

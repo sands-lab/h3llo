@@ -288,7 +288,7 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 
 ## Current Tests
 
-- Linux CI: `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, Docker integration tests.
+- Linux CI: `cargo fmt -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, Docker integration tests.
 - Unit: `src/config.rs` tests for defaults, H3/API config validation, peer transport exclusivity.
 - Unit: `src/test_support/tokio_quiche_h3.rs` (test-only) tests for datagram encoding, error display, CONNECT-IP header validation, and listener spawn/shutdown.
 - Unit: `src/h3session.rs` tests for QSI encode/decode, ConnectIpDatagramCodec framing (prepend/strip/roundtrip, rejection paths), ConnectFailure actor reason mapping, and CONNECT-IP constant verification.

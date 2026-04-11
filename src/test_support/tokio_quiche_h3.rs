@@ -1033,6 +1033,7 @@ pub fn make_h3_listener(
 /// * `listener` - H3 listener state from `make_h3_listener`.
 /// * `peer_tokens` - Map of peer ID to expected token for authentication.
 /// * `tun_mtu` - TUN interface MTU for deriving QUIC payload size.
+///
 /// Returns the command sender, listener join handle, bound address, and a
 /// dedicated channel that yields each successfully established server-side
 /// `H3Connection`.
