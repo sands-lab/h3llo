@@ -1236,7 +1236,7 @@ The `ticker.tick() => events_tx.send(Event::Metrics(counters.snapshot(...)))` ar
 |-----------|--------|
 | **Architecture** | Good: actor model, thread-per-core, batch channels correctly implemented |
 | **Largest tech debt** | `h3.rs` 2228 LOC deprecated code; ~183 LOC cross-file test boilerplate |
-| **Highest risk** | auth.rs timing side-channel; TUN RX infinite loop bug; stale routes after peer deletion |
+| **Highest risk** | stale routes after peer deletion |
 | **Greatest observability gap** | bare.rs + udp.rs with zero tracing; metrics summary at debug level |
 | **Tier 3 structural debt** | H4 handshake loop duplication (~50 LOC); H3 wrapper types (~400 LOC); K3 parameter bundling (4 clippy suppressions) |
 | **Type-safety gaps** | J1 `h3_cc_algorithm: String`; J2 `handles: Vec` as positional tuple; J3 accept handshake error swallowing |
