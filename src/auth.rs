@@ -5,11 +5,13 @@
 //!
 //! # Security
 //!
-//! All token comparisons use constant-time operations via the `subtle` crate
-//! to prevent timing attacks.
+//! Token comparisons use HMAC-SHA256 with a per-call random key to normalize
+//! variable-length tokens to fixed 32-byte digests before verification,
+//! eliminating length-based timing side-channels.
 
 use std::fmt;
-use subtle::ConstantTimeEq;
+
+use hmac_sha256::HMAC;
 
 /// Authentication failure reasons.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +54,8 @@ pub fn bearer_auth_header(token: &str) -> String {
 /// Per `docs/protocol.md`: client sends `Authorization: Bearer <peers[target].h3.token>`.
 /// Server matches token against its `peers[].h3.token` collection.
 ///
-/// Uses constant-time comparison to prevent timing attacks.
+/// Uses HMAC-SHA256 with a per-call random key to prevent content and
+/// length timing side-channels.
 ///
 /// # Errors
 ///
@@ -69,10 +72,13 @@ pub fn validate_connect_auth<'a>(
         return Err(AuthError::EmptyToken);
     }
 
+    // Normalize both candidate tokens to fixed-length MACs so verification
+    // does not leak whether the original token lengths differ.
+    let key: [u8; 32] = rand::random();
+    let presented_mac = HMAC::mac(token.as_bytes(), key);
+
     for (peer_id, peer_token) in peer_tokens {
-        // Use constant-time comparison to prevent timing attacks
-        let token_match: bool = peer_token.as_bytes().ct_eq(token.as_bytes()).into();
-        if token_match {
+        if HMAC::verify(peer_token.as_bytes(), key, &presented_mac) {
             return Ok(peer_id.to_string());
         }
     }
@@ -130,5 +136,29 @@ mod tests {
     fn validate_connect_auth_empty_token() {
         let result = validate_connect_auth(Some("Bearer "), [("peer", "token")]);
         assert_eq!(result, Err(AuthError::EmptyToken));
+    }
+
+    #[test]
+    fn validate_connect_auth_different_length_tokens() {
+        let header = bearer_auth_header("short");
+        let tokens = [("peer1", "a-much-longer-token-here")];
+        let result = validate_connect_auth(Some(&header), tokens);
+        assert_eq!(result, Err(AuthError::InvalidToken));
+    }
+
+    #[test]
+    fn validate_connect_auth_same_length_wrong_token() {
+        let header = bearer_auth_header("aaaa-bbbb-cccc");
+        let tokens = [("peer1", "xxxx-yyyy-zzzz")];
+        let result = validate_connect_auth(Some(&header), tokens);
+        assert_eq!(result, Err(AuthError::InvalidToken));
+    }
+
+    #[test]
+    fn validate_connect_auth_rejects_prefix_of_valid_token() {
+        let header = bearer_auth_header("token-for");
+        let tokens = [("peer1", "token-for-peer1")];
+        let result = validate_connect_auth(Some(&header), tokens);
+        assert_eq!(result, Err(AuthError::InvalidToken));
     }
 }
