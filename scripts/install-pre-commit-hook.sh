@@ -14,8 +14,8 @@ cd "$repo_root"
 echo "Running cargo fmt -- --check..."
 cargo fmt -- --check
 
-echo "Running cargo clippy -- -D warnings..."
-cargo clippy -- -D warnings
+echo "Running cargo clippy --all-targets --all-features -- -D warnings..."
+cargo clippy --all-targets --all-features -- -D warnings
 
 echo "Running cargo test (may require elevated privileges)..."
 cargo test

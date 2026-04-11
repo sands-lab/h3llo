@@ -7,7 +7,7 @@
 - 文档详略分工：深度细节集中在 [docs/protocol.md](../protocol.md)（认证、传输、动态配置）与 [docs/internals.md](../internals.md)（运行时连接选择、绑定、路由）；[README.md](../../README.md) 与 [docs/configuration.md](../configuration.md) 仅保留概要并引用前述文档避免重复。
 - 依赖选择：优先使用 tokio 生态中仍活跃维护的成熟 crates（如 `serde`、`serde_yaml`、`thiserror`、`tokio` 等）。
 - 测试平台：非平台相关代码默认在 Linux 下测试；仅平台相关代码需要补充 macOS/Windows 测试，并在 [docs/test.md](../test.md) 标记 TODO。
-- CI：使用 GitHub Actions（Linux）运行 `cargo fmt -- --check`、`cargo clippy -- -D warnings`、`cargo test`。
+- CI：使用 GitHub Actions（Linux）运行 `cargo fmt -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test`。
 - 性能准则：避免频繁跨线程共享引用计数更新，优先通过所有权转移或消息传递移动数据；小且高频状态可按线程/协程维护副本。
 - 许可证：MIT，存放于 `LICENSE`。
 -  `cargo` 命令可能需在提升权限的环境下运行，特别是 `cargo check`，`cargo test`，否则可能遇到 `Invalid cross-device link` 问题。 
