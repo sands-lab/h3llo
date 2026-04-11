@@ -63,7 +63,7 @@ impl<P: RouteProbe> DialContext<P> {
             peer_id: peer_id.to_string(),
             dial_ip,
             tun_if: String::new(),
-            tun_mtu: crate::config::default_mtu().into(),
+            tun_mtu: crate::config::default_mtu(),
             tuning,
             probe,
             udp_rt: tokio::runtime::Handle::current(),
