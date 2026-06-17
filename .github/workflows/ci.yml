@@ -19,6 +19,9 @@ jobs:
   linux:
     runs-on: self-hosted
     timeout-minutes: 30
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.cargo
+      RUSTUP_HOME: ${{ github.workspace }}/.rustup
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,6 +47,9 @@ jobs:
   docker-tests:
     runs-on: self-hosted
     timeout-minutes: 30
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.cargo
+      RUSTUP_HOME: ${{ github.workspace }}/.rustup
     concurrency:
       group: docker-tests
       cancel-in-progress: false
