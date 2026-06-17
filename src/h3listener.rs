@@ -316,6 +316,15 @@ impl H3Engine {
                 }
 
                 () = &mut deadline => {
+                    debug!(
+                        remote = %self.meta.remote_addr,
+                        peer = %self.meta.peer_id,
+                        established = self.conn.is_established(),
+                        closed = self.conn.is_closed(),
+                        session_created = self.session.is_some(),
+                        timeout = ?self.conn.timeout(),
+                        "server handshake timeout state"
+                    );
                     self.conn.close(true, 0, b"handshake timeout").ok();
                     self.flush_send();
                     return Err(ServerError::Accept("handshake timeout".into()));
@@ -453,6 +462,15 @@ impl DispatcherRuntime {
             return;
         }
 
+        debug!(
+            %remote,
+            version = header.hdr_version,
+            batch_len = batch.len(),
+            dcid_len = header.dcid.len(),
+            client_scid_len = header.client_scid.len(),
+            "dispatcher: accepting Initial for unknown CID"
+        );
+
         if !quiche::version_is_supported(header.hdr_version) {
             let mut pkt = alloc_uninit_packet_buf(self.max_udp_payload);
             if let Ok(len) = quiche::negotiate_version(
@@ -482,6 +500,8 @@ impl DispatcherRuntime {
             }
         };
 
+        debug!(%remote, "dispatcher: quiche accept ok");
+
         handle_udp_recv(
             &mut conn,
             batch,
@@ -490,6 +510,14 @@ impl DispatcherRuntime {
                 to: self.bound_addr,
             },
             None,
+        );
+
+        debug!(
+            %remote,
+            established = conn.is_established(),
+            closed = conn.is_closed(),
+            timeout = ?conn.timeout(),
+            "dispatcher: Initial consumed"
         );
 
         // Create per-connection channels.
