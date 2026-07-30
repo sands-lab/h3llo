@@ -107,6 +107,13 @@ pub enum ActorError {
         reason: String,
     },
 
+    /// TLS certificate reloader exited unexpectedly.
+    #[error("tls_reloader: {reason}")]
+    TlsReloader {
+        /// Failure reason.
+        reason: String,
+    },
+
     /// Router actor exited unexpectedly.
     #[error("router: fatal error: {reason}")]
     RouterFailed {
@@ -126,6 +133,7 @@ impl ActorError {
             | ActorError::UdpRxRecv { .. }
             | ActorError::DnsRecv { .. }
             | ActorError::ApiServer { .. }
+            | ActorError::TlsReloader { .. }
             | ActorError::RouterFailed { .. } => SupervisionPolicy::Critical,
             // Restartable actors - could be reconnected (future work)
             ActorError::UdpTxSend { .. }
@@ -239,6 +247,9 @@ mod tests {
             ActorError::ApiServer {
                 addr: "127.0.0.1:9090".into(),
                 reason: "bind failed".into(),
+            },
+            ActorError::TlsReloader {
+                reason: "watcher stopped".into(),
             },
         ];
         for err in errors {

@@ -10,6 +10,7 @@ h3llo is a lightweight overlay network that rides on standard HTTP/3 (MASQUE/CON
 
 - Low-latency overlay: WireGuard-like performance with symmetric or asymmetric peer layouts.
 - Zero-downtime updates: atomic peer/routing refresh without disrupting active traffic.
+- Automatic TLS rotation: certificate and private-key changes apply to new H3 connections without restarting the listener or closing established connections.
 - Two protocols: encrypted HTTP/3 by default; BareUDP as an opt-in, high-throughput plaintext path for trusted networks.
 - Routing aware: longest-prefix routing per peer; optional system route updates.
 - Multi-path: route different subnets through different peers; DNS multi-answer builds multiple connections per peer for automatic failover.

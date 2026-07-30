@@ -14,6 +14,7 @@ use crate::h3listener::{make_h3_dispatcher, spawn_h3_dispatcher, DispatcherComma
 use crate::metrics::{log_quic_metrics, log_transport_metrics, Direction, Labels, Metrics};
 use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::router::{spawn_router, RouterCommand, RoutingTable};
+use crate::tls_reload::{make_tls_reloader, spawn_tls_reloader};
 use crate::tun;
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -576,7 +577,7 @@ impl Orchestrator {
         };
 
         // Initialize H3 dispatcher if configured (dispatcher on crypto_rt, UDP I/O on udp_rt)
-        let h3_listener_cmd_tx = if let Some(ref h3_cfg) = config.local.h3 {
+        let (h3_listener_cmd_tx, tls_reloader_handle) = if let Some(ref h3_cfg) = config.local.h3 {
             let listen_addr = resolve_listen_addr(&h3_cfg.listen.host, h3_cfg.listen.port)?;
             let cert_path = Path::new(&h3_cfg.cert);
             let key_path = Path::new(&h3_cfg.key);
@@ -604,14 +605,21 @@ impl Orchestrator {
                 udp_rt.handle(),
                 crypto_rt.handle(),
             );
+            let tls_reloader =
+                make_tls_reloader(cert_path, key_path, tun_mtu, &tuning.h3, cmd_tx.clone())
+                    .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
+            let tls_reloader_handle = spawn_tls_reloader(tls_reloader);
 
             join_set.spawn(dispatcher_handle);
             join_set.spawn(udp_rx_handle);
             join_set.spawn(udp_tx_handle);
-            Some(cmd_tx)
+            (Some(cmd_tx), Some(tls_reloader_handle))
         } else {
-            None
+            (None, None)
         };
+        if let Some(handle) = tls_reloader_handle {
+            join_set.spawn(handle);
+        }
 
         // Initialize unified peer state from config
         let peers: HashMap<String, PeerEntry> = config
@@ -2792,7 +2800,9 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("H3 listener should receive UpdatePeerTokens");
-        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd else {
+            panic!("expected UpdatePeerTokens");
+        };
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens.get("h3-peer").unwrap(), "secure-token-12ch");
     }
@@ -2821,7 +2831,9 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("H3 listener should receive UpdatePeerTokens after delete");
-        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd else {
+            panic!("expected UpdatePeerTokens");
+        };
         assert!(
             tokens.is_empty(),
             "tokens should be empty after removing the only H3 peer"
@@ -2881,7 +2893,9 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("should receive UpdatePeerTokens");
-        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd else {
+            panic!("expected UpdatePeerTokens");
+        };
         assert_eq!(tokens.len(), 1, "only H3 peers should be included");
         assert!(tokens.contains_key("h3-peer"));
         assert!(!tokens.contains_key("bare-peer"));

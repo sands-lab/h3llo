@@ -23,11 +23,12 @@ use crate::udp;
 use quiche::h3::NameValue;
 use rand::Rng;
 use std::collections::HashMap;
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 use tokio::runtime::Handle as RuntimeHandle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
 use tokio_util::sync::CancellationToken;
@@ -99,7 +100,7 @@ fn validate_server_auth(
 // ========== Configuration Helpers ==========
 
 /// Creates a quiche QUIC server configuration with TLS credentials.
-fn make_server_quiche_config(
+pub(crate) fn make_server_quiche_config(
     h3_tuning: &H3Tuning,
     max_udp_payload: usize,
     cert_path: &Path,
@@ -129,10 +130,30 @@ fn make_server_quiche_config(
 // ========== H3 Dispatcher ==========
 
 /// Commands accepted by the H3 dispatcher actor.
-#[derive(Debug)]
 pub enum DispatcherCommand {
     /// Replace the peer token map used for CONNECT-IP authentication.
     UpdatePeerTokens(HashMap<String, String>),
+    /// Replace the TLS configuration used only for newly accepted connections.
+    ReplaceTlsConfig {
+        /// Fully validated QUIC and TLS configuration.
+        config: Box<quiche::Config>,
+        /// Signals after the dispatcher has installed the configuration.
+        applied_tx: oneshot::Sender<()>,
+    },
+}
+
+impl fmt::Debug for DispatcherCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UpdatePeerTokens(tokens) => formatter
+                .debug_tuple("UpdatePeerTokens")
+                .field(tokens)
+                .finish(),
+            Self::ReplaceTlsConfig { .. } => formatter
+                .debug_struct("ReplaceTlsConfig")
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Creates [`H3Dispatcher`] state ready for spawning.
@@ -421,6 +442,14 @@ impl DispatcherRuntime {
                         Some(DispatcherCommand::UpdatePeerTokens(update)) => {
                             peer_tokens = update;
                             info!("dispatcher: updated peer tokens");
+                        }
+                        Some(DispatcherCommand::ReplaceTlsConfig {
+                            config,
+                            applied_tx,
+                        }) => {
+                            self.config = *config;
+                            let _ = applied_tx.send(());
+                            info!("dispatcher: installed reloaded TLS certificate");
                         }
                         None => return Ok(()),
                     }
@@ -789,7 +818,7 @@ mod tests {
     // ========== Integration Test Imports ==========
 
     use crate::bind::test_support::FakeRouteProbe;
-    use crate::config::default_mtu;
+    use crate::config::{default_mtu, Tuning};
     use crate::events::DialContext;
     use crate::h3dialer::{dial_h3_client, DialError};
     use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
@@ -880,8 +909,17 @@ mod tests {
         token: &str,
         peer_id: &str,
     ) -> (ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
-        let peer_h3 = test_peer_h3(bound_addr, token);
         let tuning = insecure_tuning();
+        dial_new_client_with_tuning(bound_addr, token, peer_id, tuning).await
+    }
+
+    async fn dial_new_client_with_tuning(
+        bound_addr: SocketAddr,
+        token: &str,
+        peer_id: &str,
+        tuning: Tuning,
+    ) -> (ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
+        let peer_h3 = test_peer_h3(bound_addr, token);
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
@@ -1000,6 +1038,56 @@ mod tests {
 
         assert_eq!(event.peer_id, peer_id);
         assert_eq!(event.remote_addr, server.bound_addr);
+
+        drop(server.cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn h3v2_listener_replaces_tls_for_new_connections() {
+        let peer_id = "new-cli-tls-peer";
+        let token = "new-cli-tls-tk12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let server = TestH3Server::start(peer_tokens).await;
+        let (existing, _existing_ingress_rx) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
+
+        let replacement = TestCertBundle::generate();
+        let replacement_config = make_server_quiche_config(
+            &H3Tuning::default(),
+            usize::from(default_mtu()) + CONNECT_IP_OVERHEAD,
+            replacement.cert_path(),
+            replacement.key_path(),
+        )
+        .expect("build replacement TLS config");
+        let (applied_tx, applied_rx) = oneshot::channel();
+        server
+            .cmd_tx
+            .send(DispatcherCommand::ReplaceTlsConfig {
+                config: Box::new(replacement_config),
+                applied_tx,
+            })
+            .expect("send replacement TLS config");
+        time::timeout(Duration::from_secs(1), applied_rx)
+            .await
+            .expect("timeout applying replacement TLS config")
+            .expect("dispatcher dropped TLS replacement acknowledgement");
+
+        let tuning = Tuning {
+            h3: H3Tuning {
+                h3_trusted_ca: Some(replacement.cert_path().to_string_lossy().into_owned()),
+                ..H3Tuning::default()
+            },
+            ..Tuning::default()
+        };
+        let (new_connection, _new_ingress_rx) =
+            dial_new_client_with_tuning(server.bound_addr, token, peer_id, tuning).await;
+
+        assert_eq!(new_connection.peer_id, peer_id);
+        assert!(
+            !existing.tx.is_closed(),
+            "replacing listener TLS config must not close existing connections"
+        );
 
         drop(server.cmd_tx);
     }

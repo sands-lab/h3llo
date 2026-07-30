@@ -218,6 +218,17 @@ When configuration changes arrive (management API POST/DELETE or initialization)
 
 **Terminology**: "Accepted sources" refers to the BareUDP RX source IP filter. "Allowed IPs" refers to TUN routing prefixes (`peers[].tun.allowed_ips`).
 
+### TLS Certificate Reload
+
+Server credentials are reloaded transactionally for new H3 connections. The listener socket and established `H3Engine` actors remain untouched throughout rotation.
+
+- **Detection**: `notify::RecommendedWatcher` watches the distinct parent directories of `local.h3.cert` and `local.h3.key` non-recursively. Watching directories preserves notifications when a credential inode is replaced with `rename` or a symlink target is rotated.
+- **Coalescing**: Any non-access event, watcher error, or rescan marker starts a 500 ms quiet-period timer. Subsequent events reset the timer so certificate-chain and private-key updates are normally validated together.
+- **Validation**: The control-plane reloader uses `spawn_blocking` to build a fresh `quiche::Config`, apply the unchanged H3 transport tuning, parse the certificate chain, and load the private key. BoringSSL rejects a private key that does not match the leaf certificate.
+- **Commit**: Only a fully constructed configuration is sent to `H3Dispatcher`. The dispatcher swaps its config and acknowledges the command before a success is logged. Every later `quiche::accept` uses the new TLS context.
+- **Isolation**: A `quiche::Connection` creates and owns its TLS handshake state during acceptance, so replacing the dispatcher config neither renegotiates nor closes established connections.
+- **Failure handling**: Credential parsing or pairing failures are warnings and retain the last valid config. Loss of the reloader-to-dispatcher control path is a critical actor failure because future certificate rotation can no longer be guaranteed.
+
 Connection management:
 - Each peer maintains multiple active connections (`Vec<BoundState>`), one per resolved IP.
 - The first element in the bounds Vec is the preferred TX path for outbound data.

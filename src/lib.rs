@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod orch;
 pub mod route;
 pub mod router;
+mod tls_reload;
 pub mod tun;
 pub mod udp;
 
