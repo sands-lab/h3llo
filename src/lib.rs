@@ -11,7 +11,6 @@ pub mod events;
 pub mod h3dialer;
 pub mod h3engine;
 pub mod h3listener;
-mod h3reloader;
 pub mod h3session;
 mod helpers;
 pub mod metrics;

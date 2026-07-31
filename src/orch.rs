@@ -608,7 +608,6 @@ impl Orchestrator {
             join_set.spawn(spawned.dispatcher_handle);
             join_set.spawn(spawned.udp_rx_handle);
             join_set.spawn(spawned.udp_tx_handle);
-            join_set.spawn(spawned.reloader_handle);
             Some(spawned.command_tx)
         } else {
             None
@@ -2793,9 +2792,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("H3 listener should receive UpdatePeerTokens");
-        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd else {
-            panic!("expected UpdatePeerTokens");
-        };
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens.get("h3-peer").unwrap(), "secure-token-12ch");
     }
@@ -2824,9 +2821,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("H3 listener should receive UpdatePeerTokens after delete");
-        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd else {
-            panic!("expected UpdatePeerTokens");
-        };
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
         assert!(
             tokens.is_empty(),
             "tokens should be empty after removing the only H3 peer"
@@ -2886,9 +2881,7 @@ mod tests {
             .h3_listener_cmd_rx
             .try_recv()
             .expect("should receive UpdatePeerTokens");
-        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd else {
-            panic!("expected UpdatePeerTokens");
-        };
+        let DispatcherCommand::UpdatePeerTokens(tokens) = cmd;
         assert_eq!(tokens.len(), 1, "only H3 peers should be included");
         assert!(tokens.contains_key("h3-peer"));
         assert!(!tokens.contains_key("bare-peer"));

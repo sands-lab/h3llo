@@ -28,7 +28,7 @@ Platform tiers and binding behavior:
 Concurrency model overview: h3llo adopts the actor model—each coroutine (actor) owns private state, communicates exclusively via MPSC message queues, and never shares mutable data with other actors. This eliminates lock contention and simplifies reasoning about concurrent correctness.
 
 Actor design principles:
-- **Isolated state**: each actor (TUN-Rx, TUN-Tx, Router, DNS Resolver, UDP-Rx/Tx, BareUDP-Rx/Tx, Route Sync, Orchestrator, H3Dispatcher, H3Reloader, H3Engine per connection) maintains its own state; no `Arc<Mutex<_>>` across actors. UDP I/O actors (`udp.rs`) provide protocol-agnostic socket access via `Arc<UdpSocket>`; BareUDP actors (`bare.rs`) layer protocol logic (source-IP filtering, destination tagging) on top without touching sockets.
+- **Isolated state**: each actor (TUN-Rx, TUN-Tx, Router, DNS Resolver, UDP-Rx/Tx, BareUDP-Rx/Tx, Route Sync, Orchestrator, H3Dispatcher, H3Engine per connection) maintains its own state; no `Arc<Mutex<_>>` across actors. UDP I/O actors (`udp.rs`) provide protocol-agnostic socket access via `Arc<UdpSocket>`; BareUDP actors (`bare.rs`) layer protocol logic (source-IP filtering, destination tagging) on top without touching sockets.
 - **Actor-owned message box**: each actor creates its own channels during spawn. Control-plane command channels use `mpsc::unbounded_channel()`; data-plane packet channels use `mpsc::channel(PACKET_QUEUE_DEPTH)`. The actor owns the receiver; the caller receives the sender via tuple return (e.g., `(cmd_tx, JoinHandle)` or `(packet_tx, JoinHandle)`). This ensures clear ownership and enables graceful shutdown when all senders are dropped.
 - **Message passing**: actors communicate through typed `mpsc::channel` queues; the `Event` enum and command types define the message protocol.
 - **Async select loop**: each actor runs a `tokio::select!` loop over its input channels, I/O sources, and timers.
@@ -202,7 +202,7 @@ The orchestrator and control-plane actors (DNS, Route Sync, API) share the main 
 Orchestrator responsibilities and invariants:
 - Maintain the latest configuration snapshot and H3 connection pool; receive commands from other actors through its MPSC queue.
 - Stay fully async: handle config updates, DNS refresh results, connection close notifications, and timer ticks without blocking other commands.
-- Spawn child actors (DNS resolver, H3 dialers, H3Dispatcher, H3Reloader) and register newly established H3 connections' TX channels in the Router's routing table via `RouterCommand::UpdateRouting`. `spawn_h3_dispatcher` starts both H3Dispatcher and H3Reloader and returns both handles; the orchestrator registers every long-lived child with its `JoinSet`.
+- Spawn child actors (DNS resolver, H3 dialers, H3Dispatcher) and register newly established H3 connections' TX channels in the Router's routing table via `RouterCommand::UpdateRouting`. `spawn_h3_dispatcher` returns the dispatcher and UDP I/O handles; the orchestrator registers every long-lived child with its `JoinSet`.
 - Process events from child actors (metrics, DNS) and log them appropriately; child actors control their own metric emission timing.
 - Handle graceful shutdown on `ctrl_c` signal; task exit errors include task labels for debugging.
 
@@ -223,12 +223,12 @@ When configuration changes arrive (management API POST/DELETE or initialization)
 Server credentials are reloaded transactionally for new H3 connections. The listener socket and established `H3Engine` actors remain untouched throughout rotation.
 
 - **Detection**: `notify::RecommendedWatcher` watches the distinct parent directories of `local.h3.cert` and `local.h3.key` non-recursively. Watching directories preserves notifications when a credential inode is replaced with `rename` or a symlink target is rotated.
-- **Lifecycle**: `make_h3_dispatcher` performs fallible watcher registration and stores the resulting `H3Reloader` state. `spawn_h3_dispatcher` starts both actors and returns the reloader's `JoinHandle`, which the orchestrator registers with its `JoinSet` for critical-failure supervision. The reloader uses a weak dispatcher command sender so only orchestrator-owned strong senders control mailbox closure and graceful shutdown.
+- **Lifecycle**: `make_h3_dispatcher` performs fallible watcher registration. `H3Dispatcher` owns the native watcher, its event receiver, debounce state, and any in-flight credential loader task; no separate reload actor or control protocol is involved.
 - **Coalescing**: Any non-access event, watcher error, or rescan marker starts a 500 ms quiet-period timer. Subsequent events reset the timer so certificate-chain and private-key updates are normally validated together.
-- **Validation**: The control-plane reloader uses `spawn_blocking` to build a fresh `quiche::Config`, apply the unchanged H3 transport tuning, parse the certificate chain, and load the private key. BoringSSL rejects a private key that does not match the leaf certificate.
-- **Commit**: Only a fully constructed configuration is sent to `H3Dispatcher`. The dispatcher swaps its config and acknowledges the command before a success is logged. Every later `quiche::accept` uses the new TLS context.
+- **Validation**: When the debounce timer expires, the dispatcher starts `spawn_blocking` to build a fresh `quiche::Config`, apply the unchanged H3 transport tuning, parse the certificate chain, and load the private key. The blocking task is polled as another dispatcher `select!` branch, so CID routing continues while validation runs. BoringSSL rejects a private key that does not match the leaf certificate.
+- **Commit**: The dispatcher directly swaps in a fully constructed configuration when the blocking task succeeds. Every later `quiche::accept` uses the new TLS context.
 - **Isolation**: A `quiche::Connection` creates and owns its TLS handshake state during acceptance, so replacing the dispatcher config neither renegotiates nor closes established connections.
-- **Failure handling**: Credential parsing or pairing failures are warnings and retain the last valid config. Loss of the reloader-to-dispatcher control path is a critical actor failure because future certificate rotation can no longer be guaranteed.
+- **Failure handling**: Credential parsing, pairing, or loader-task failures are warnings and retain the last valid config. If the watcher event channel closes unexpectedly, the dispatcher keeps serving with the current config and disables further hot reload attempts.
 
 Connection management:
 - Each peer maintains multiple active connections (`Vec<BoundState>`), one per resolved IP.

@@ -107,13 +107,6 @@ pub enum ActorError {
         reason: String,
     },
 
-    /// H3 certificate reloader exited unexpectedly.
-    #[error("h3_reloader: {reason}")]
-    H3Reloader {
-        /// Failure reason.
-        reason: String,
-    },
-
     /// Router actor exited unexpectedly.
     #[error("router: fatal error: {reason}")]
     RouterFailed {
@@ -133,7 +126,6 @@ impl ActorError {
             | ActorError::UdpRxRecv { .. }
             | ActorError::DnsRecv { .. }
             | ActorError::ApiServer { .. }
-            | ActorError::H3Reloader { .. }
             | ActorError::RouterFailed { .. } => SupervisionPolicy::Critical,
             // Restartable actors - could be reconnected (future work)
             ActorError::UdpTxSend { .. }
@@ -247,9 +239,6 @@ mod tests {
             ActorError::ApiServer {
                 addr: "127.0.0.1:9090".into(),
                 reason: "bind failed".into(),
-            },
-            ActorError::H3Reloader {
-                reason: "watcher stopped".into(),
             },
         ];
         for err in errors {
