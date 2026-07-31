@@ -29,7 +29,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
 use tokio_quiche::buf_factory::PooledBuf;
 use tokio_util::sync::CancellationToken;
@@ -445,17 +444,6 @@ struct DispatcherRuntime {
     cid_table: HashMap<Vec<u8>, mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>>,
 }
 
-type ReloadTask = JoinHandle<Result<quiche::Config, ServerError>>;
-
-async fn wait_for_reload(
-    task: &mut Option<ReloadTask>,
-) -> Result<Result<quiche::Config, ServerError>, tokio::task::JoinError> {
-    match task {
-        Some(task) => task.await,
-        None => std::future::pending().await,
-    }
-}
-
 fn should_reload(event: &NotifyEvent) -> bool {
     event.need_rescan() || !event.kind.is_access()
 }
@@ -471,7 +459,6 @@ impl DispatcherRuntime {
         let debounce = time::sleep(Duration::MAX);
         tokio::pin!(debounce);
         let mut reload_pending = false;
-        let mut reload_task = None;
         let mut reload_events_open = true;
 
         info!(
@@ -540,24 +527,21 @@ impl DispatcherRuntime {
                     }
                 }
 
-                () = &mut debounce, if reload_pending && reload_task.is_none() => {
+                () = &mut debounce, if reload_pending => {
                     reload_pending = false;
                     let cert_path = self.cert_path.clone();
                     let key_path = self.key_path.clone();
                     let h3_tuning = self.h3_tuning.clone();
                     let max_udp_payload = self.max_udp_payload;
-                    reload_task = Some(tokio::task::spawn_blocking(move || {
+                    let loaded = tokio::task::spawn_blocking(move || {
                         make_server_quiche_config(
                             &h3_tuning,
                             max_udp_payload,
                             &cert_path,
                             &key_path,
                         )
-                    }));
-                }
-
-                loaded = wait_for_reload(&mut reload_task) => {
-                    reload_task = None;
+                    })
+                    .await;
                     match loaded {
                         Ok(Ok(config)) => {
                             self.config = config;
