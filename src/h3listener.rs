@@ -104,8 +104,6 @@ fn validate_server_auth(
 
 /// Quiet period used to coalesce multi-file certificate rotations.
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(500);
-/// Bounded callback queue; one retained event is enough to trigger validation.
-const WATCH_EVENT_QUEUE_DEPTH: usize = 64;
 
 /// Creates a quiche QUIC server configuration with TLS credentials.
 pub(crate) fn make_server_quiche_config(
@@ -184,9 +182,9 @@ pub(crate) fn make_h3_dispatcher(
         .filter_map(Path::parent)
         .map(Path::to_path_buf)
         .collect::<BTreeSet<_>>();
-    let (reload_event_tx, reload_event_rx) = mpsc::channel(WATCH_EVENT_QUEUE_DEPTH);
+    let (reload_event_tx, reload_event_rx) = mpsc::unbounded_channel();
     let mut credential_watcher = notify::recommended_watcher(move |event| {
-        let _ = reload_event_tx.try_send(event);
+        let _ = reload_event_tx.send(event);
     })
     .map_err(|error| ServerError::Watcher(format!("failed to create watcher: {error}")))?;
     for directory in &watch_directories {
@@ -419,7 +417,7 @@ pub(crate) struct H3Dispatcher {
     h3_tuning: H3Tuning,
     /// Kept alive so native filesystem watches remain registered.
     credential_watcher: RecommendedWatcher,
-    reload_event_rx: mpsc::Receiver<notify::Result<NotifyEvent>>,
+    reload_event_rx: mpsc::UnboundedReceiver<notify::Result<NotifyEvent>>,
     cert_path: PathBuf,
     key_path: PathBuf,
 }
@@ -437,7 +435,7 @@ struct DispatcherRuntime {
     h3_tuning: H3Tuning,
     /// Kept alive so native filesystem watches remain registered.
     _credential_watcher: RecommendedWatcher,
-    reload_event_rx: mpsc::Receiver<notify::Result<NotifyEvent>>,
+    reload_event_rx: mpsc::UnboundedReceiver<notify::Result<NotifyEvent>>,
     cert_path: PathBuf,
     key_path: PathBuf,
     /// Maps each registered CID directly to the per-connection packet sender.
@@ -744,31 +742,24 @@ impl DispatcherRuntime {
 
 // ========== Spawn ==========
 
-/// Running H3 server actors and their command endpoint.
-pub(crate) struct SpawnedH3Dispatcher {
-    /// Command sender for dispatcher configuration updates.
-    pub(crate) command_tx: mpsc::UnboundedSender<DispatcherCommand>,
-    /// CID-routing dispatcher task.
-    pub(crate) dispatcher_handle: tokio::task::JoinHandle<ActorExitResult>,
-    /// UDP receive task.
-    pub(crate) udp_rx_handle: tokio::task::JoinHandle<ActorExitResult>,
-    /// UDP transmit task.
-    pub(crate) udp_tx_handle: tokio::task::JoinHandle<ActorExitResult>,
-}
-
-/// Spawns the H3 server actors.
+/// Spawns the H3 dispatcher: UDP I/O actors on `udp_rt`, dispatcher on `crypto_rt`.
 ///
 /// Consumes the [`H3Dispatcher`] state from [`make_h3_dispatcher`], spawns
-/// UDP RX/TX actors on `udp_rt` and the CID-routing dispatcher on `crypto_rt`.
+/// UDP RX/TX actors, then spawns the CID-routing dispatcher loop.
 ///
-/// Returns the command sender and dispatcher/UDP join handles. The caller must
-/// retain or supervise every join handle.
+/// Returns command sender, dispatcher/UDP-RX/UDP-TX join handles, and bound address.
 pub(crate) fn spawn_h3_dispatcher(
     dispatcher: H3Dispatcher,
     peer_tokens: HashMap<String, String>,
     udp_rt: &RuntimeHandle,
     crypto_rt: &RuntimeHandle,
-) -> SpawnedH3Dispatcher {
+) -> (
+    mpsc::UnboundedSender<DispatcherCommand>,
+    tokio::task::JoinHandle<ActorExitResult>,
+    tokio::task::JoinHandle<ActorExitResult>,
+    tokio::task::JoinHandle<ActorExitResult>,
+    SocketAddr,
+) {
     let H3Dispatcher {
         bound_addr,
         config,
@@ -819,12 +810,7 @@ pub(crate) fn spawn_h3_dispatcher(
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
     });
 
-    SpawnedH3Dispatcher {
-        command_tx: cmd_tx,
-        dispatcher_handle: handle,
-        udp_rx_handle,
-        udp_tx_handle,
-    }
+    (cmd_tx, handle, udp_rx_handle, udp_tx_handle, bound_addr)
 }
 
 /// Shared test utilities for H3v2 listener integration tests across modules.
@@ -1016,20 +1002,21 @@ mod tests {
             )
             .expect("make_h3_dispatcher");
 
-            let spawned = spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
+            let (cmd_tx, handle, udp_rx_handle, udp_tx_handle, _) =
+                spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
 
             // Give dispatcher time to start accepting.
             tokio::time::sleep(Duration::from_millis(50)).await;
 
             Self {
-                cmd_tx: spawned.command_tx,
+                cmd_tx,
                 events_rx,
                 ingress_rx,
                 bound_addr,
                 certs,
-                _handle: spawned.dispatcher_handle,
-                _udp_rx_handle: spawned.udp_rx_handle,
-                _udp_tx_handle: spawned.udp_tx_handle,
+                _handle: handle,
+                _udp_rx_handle: udp_rx_handle,
+                _udp_tx_handle: udp_tx_handle,
             }
         }
     }
