@@ -228,7 +228,7 @@ Server credentials are reloaded transactionally for new H3 connections. The list
 - **Validation**: When the debounce timer expires, the dispatcher awaits `spawn_blocking` while it builds a fresh `quiche::Config`, applies the unchanged H3 transport tuning, parses the certificate chain, and loads the private key. The dispatcher pauses packet routing during this bounded reload, while the blocking work runs outside the crypto runtime thread so established `H3Engine` actors continue independently. BoringSSL rejects a private key that does not match the leaf certificate.
 - **Commit**: The dispatcher directly swaps in a fully constructed configuration when the blocking task succeeds. Every later `quiche::accept` uses the new TLS context.
 - **Isolation**: A `quiche::Connection` creates and owns its TLS handshake state during acceptance, so replacing the dispatcher config neither renegotiates nor closes established connections.
-- **Failure handling**: Credential parsing, pairing, or loader-task failures are warnings and retain the last valid config. If the watcher event channel closes unexpectedly, the dispatcher keeps serving with the current config and disables further hot reload attempts.
+- **Failure handling**: Credential parsing, pairing, or loader-task failures are warnings and retain the last valid config so a later filesystem update can recover automatically. Closing the watcher event channel permanently removes reload capability, so the dispatcher returns a critical actor error and the orchestrator exits h3llo instead of reporting a healthy but stale listener.
 
 Connection management:
 - Each peer maintains multiple active connections (`Vec<BoundState>`), one per resolved IP.

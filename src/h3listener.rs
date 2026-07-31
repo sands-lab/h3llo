@@ -459,7 +459,6 @@ impl DispatcherRuntime {
         let debounce = time::sleep(Duration::MAX);
         tokio::pin!(debounce);
         let mut reload_pending = false;
-        let mut reload_events_open = true;
 
         info!(
             bound_addr = %self.bound_addr,
@@ -495,9 +494,15 @@ impl DispatcherRuntime {
                     }
                 }
 
-                event = self.reload_event_rx.recv(), if reload_events_open => {
+                event = self.reload_event_rx.recv() => {
+                    let Some(event) = event else {
+                        return Err(ActorError::H3Dispatcher {
+                            addr: self.bound_addr.to_string(),
+                            reason: "TLS certificate watcher event channel closed".into(),
+                        });
+                    };
                     match event {
-                        Some(Ok(event)) if should_reload(&event) => {
+                        Ok(event) if should_reload(&event) => {
                             debug!(
                                 kind = ?event.kind,
                                 paths = ?event.paths,
@@ -509,8 +514,8 @@ impl DispatcherRuntime {
                                 .reset(Instant::now() + RELOAD_DEBOUNCE);
                             reload_pending = true;
                         }
-                        Some(Ok(_)) => {}
-                        Some(Err(error)) => {
+                        Ok(_) => {}
+                        Err(error) => {
                             warn!(
                                 %error,
                                 "TLS certificate watcher reported an error; validating current files"
@@ -519,10 +524,6 @@ impl DispatcherRuntime {
                                 .as_mut()
                                 .reset(Instant::now() + RELOAD_DEBOUNCE);
                             reload_pending = true;
-                        }
-                        None => {
-                            reload_events_open = false;
-                            warn!("TLS certificate watcher event channel closed; hot reload disabled");
                         }
                     }
                 }
