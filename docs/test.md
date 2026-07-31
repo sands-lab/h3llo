@@ -296,7 +296,7 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 - Unit: `src/h3engine.rs` tests for quiche transport config creation (valid and invalid CC), LoopExit result conversion, EngineMeta recv_info construction, and RunState initialization.
 - Unit: `src/h3dialer.rs` tests for DialError display, From<ConnectFailure> conversion, and client quiche config validation (bad CA path, insecure mode CA bypass, default verify_peer). Integration tests for h3dialer client against the legacy `tokio_quiche_h3` test server (handshake, auth rejection, C2S/S2C/bidirectional datagrams, shutdown, trusted CA validation, untrusted cert rejection).
 - Unit: `src/h3listener.rs` tests for ServerError display, server header/auth validation, make_h3_dispatcher cert rejection, and transactional TLS config replacement. Integration tests for h3listener dispatcher against the legacy `tokio_quiche_h3` test client fixture (handshake, auth rejection, C2S/S2C/bidirectional datagrams) and h3dialer.rs client (handshake, auth rejection, C2S/S2C/bidirectional datagrams, client shutdown, listener shutdown, replacement certificate on new connections without closing established connections).
-- Unit: `src/tls_reload.rs` tests event filtering, repeated atomic credential replacement, mismatched certificate/private-key rejection, and recovery when the matching key arrives.
+- Unit: `src/h3reloader.rs` tests event filtering, repeated atomic credential replacement, mismatched certificate/private-key rejection, and recovery when the matching key arrives.
 - Unit: `src/auth.rs` tests for Bearer Token generation and validation.
 - Unit: `src/dns.rs` real-network DNS resolver tests.
 - Unit: `src/bare.rs` real-network BareUDP tests.

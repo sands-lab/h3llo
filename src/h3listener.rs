@@ -5,8 +5,9 @@
 //! - **Server UDP TX actor** (I/O thread): shared send actor for all connections.
 //! - **`H3Dispatcher`** (`crypto_rt`): CID routing, connection acceptance, actor lifecycle.
 //! - **`H3Engine`** (`crypto_rt`): per-connection unified QUIC/H3 engine with ingress + egress.
+//! - **`H3Reloader`** (control plane): filesystem-driven certificate rotation.
 //!
-//! See [`make_h3_dispatcher`] + [`spawn_h3_dispatcher`] for the public entry points.
+//! See [`make_h3_dispatcher`] + [`spawn_h3_dispatcher`] for the server entry points.
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::validate_connect_auth;
@@ -16,6 +17,7 @@ use crate::events::{ConnectedEvent, Event};
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, H3Engine, RunState,
 };
+use crate::h3reloader::{make_h3_reloader, spawn_h3_reloader, H3ReloadError, H3Reloader};
 use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
 use crate::helpers::alloc_uninit_packet_buf;
@@ -45,6 +47,9 @@ pub(crate) enum ServerError {
     /// TLS or QUIC configuration failed.
     #[error("config: {0}")]
     Config(String),
+    /// H3 certificate reloader initialization failed.
+    #[error("reloader: {0}")]
+    Reloader(#[from] H3ReloadError),
     /// Connection acceptance or CONNECT-IP handshake failed.
     #[error("accept: {0}")]
     Accept(String),
@@ -130,7 +135,7 @@ pub(crate) fn make_server_quiche_config(
 // ========== H3 Dispatcher ==========
 
 /// Commands accepted by the H3 dispatcher actor.
-pub enum DispatcherCommand {
+pub(crate) enum DispatcherCommand {
     /// Replace the peer token map used for CONNECT-IP authentication.
     UpdatePeerTokens(HashMap<String, String>),
     /// Replace the TLS configuration used only for newly accepted connections.
@@ -159,8 +164,9 @@ impl fmt::Debug for DispatcherCommand {
 /// Creates [`H3Dispatcher`] state ready for spawning.
 ///
 /// Performs all fallible setup: socket binding, TLS credential loading,
-/// QUIC config construction, and UDP socket initialization. Does NOT spawn
-/// any tasks — use [`spawn_h3_dispatcher`] for that.
+/// certificate watcher registration, QUIC config construction, and UDP socket
+/// initialization. Does NOT spawn any tasks — use [`spawn_h3_dispatcher`] for
+/// that.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_h3_dispatcher(
     listen_addr: SocketAddr,
@@ -180,6 +186,7 @@ pub(crate) fn make_h3_dispatcher(
         .map_err(|e| ServerError::Socket(format!("local_addr: {e}")))?;
     let max_udp_payload = usize::from(tun_mtu) + CONNECT_IP_OVERHEAD;
     let config = make_server_quiche_config(h3_tuning, max_udp_payload, cert_path, key_path)?;
+    let reloader = make_h3_reloader(cert_path, key_path, tun_mtu, h3_tuning)?;
 
     let (udp_rx, udp_tx) = {
         let _guard = udp_rt.enter();
@@ -197,6 +204,7 @@ pub(crate) fn make_h3_dispatcher(
         events_tx,
         io_tuning: io_tuning.clone(),
         h3_tuning: h3_tuning.clone(),
+        reloader,
     };
 
     info!(%listen_addr, %bound_addr, "h3 dispatcher created");
@@ -379,10 +387,10 @@ struct DispatchIo {
 
 /// H3 dispatcher state created by [`make_h3_dispatcher`].
 ///
-/// Contains all resources needed to run the dispatcher. Spawned infallibly
-/// via [`spawn_h3_dispatcher`], which creates UDP I/O actors and the
-/// dispatcher task.
-pub struct H3Dispatcher {
+/// Contains all resources needed to run the H3 server. Spawned infallibly via
+/// [`spawn_h3_dispatcher`], which creates the UDP I/O, dispatcher, and
+/// certificate reloader actors.
+pub(crate) struct H3Dispatcher {
     bound_addr: SocketAddr,
     config: quiche::Config,
     max_udp_payload: usize,
@@ -392,6 +400,7 @@ pub struct H3Dispatcher {
     events_tx: mpsc::UnboundedSender<Event>,
     io_tuning: IoTuning,
     h3_tuning: H3Tuning,
+    reloader: H3Reloader,
 }
 
 /// Runtime state for the CID-routing dispatcher loop.
@@ -630,24 +639,34 @@ impl DispatcherRuntime {
 
 // ========== Spawn ==========
 
-/// Spawns the H3 dispatcher: UDP I/O actors on `udp_rt`, dispatcher on `crypto_rt`.
+/// Running H3 server actors and their command endpoint.
+pub(crate) struct SpawnedH3Dispatcher {
+    /// Command sender for dispatcher configuration updates.
+    pub(crate) command_tx: mpsc::UnboundedSender<DispatcherCommand>,
+    /// CID-routing dispatcher task.
+    pub(crate) dispatcher_handle: tokio::task::JoinHandle<ActorExitResult>,
+    /// UDP receive task.
+    pub(crate) udp_rx_handle: tokio::task::JoinHandle<ActorExitResult>,
+    /// UDP transmit task.
+    pub(crate) udp_tx_handle: tokio::task::JoinHandle<ActorExitResult>,
+    /// Certificate reload task.
+    pub(crate) reloader_handle: tokio::task::JoinHandle<ActorExitResult>,
+}
+
+/// Spawns the H3 server actors.
 ///
 /// Consumes the [`H3Dispatcher`] state from [`make_h3_dispatcher`], spawns
-/// UDP RX/TX actors, then spawns the CID-routing dispatcher loop.
+/// UDP RX/TX actors on `udp_rt`, the CID-routing dispatcher on `crypto_rt`,
+/// and the certificate reloader on the caller's current Tokio runtime.
 ///
-/// Returns command sender, dispatcher/UDP-RX/UDP-TX join handles, and bound address.
-pub fn spawn_h3_dispatcher(
+/// Returns the command sender and dispatcher/UDP/reloader join handles. The
+/// caller must retain or supervise every join handle.
+pub(crate) fn spawn_h3_dispatcher(
     dispatcher: H3Dispatcher,
     peer_tokens: HashMap<String, String>,
     udp_rt: &RuntimeHandle,
     crypto_rt: &RuntimeHandle,
-) -> (
-    mpsc::UnboundedSender<DispatcherCommand>,
-    tokio::task::JoinHandle<ActorExitResult>,
-    tokio::task::JoinHandle<ActorExitResult>,
-    tokio::task::JoinHandle<ActorExitResult>,
-    SocketAddr,
-) {
+) -> SpawnedH3Dispatcher {
     let H3Dispatcher {
         bound_addr,
         config,
@@ -658,6 +677,7 @@ pub fn spawn_h3_dispatcher(
         events_tx,
         io_tuning,
         h3_tuning,
+        reloader,
     } = dispatcher;
 
     // Spawn UDP actors on udp_rt.
@@ -672,6 +692,9 @@ pub fn spawn_h3_dispatcher(
     };
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    // A weak sender lets the orchestrator-owned command sender control the
+    // dispatcher's mailbox lifetime without a reloader-to-dispatcher cycle.
+    let reloader_handle = spawn_h3_reloader(reloader, cmd_tx.downgrade());
 
     let handle = crypto_rt.spawn(async move {
         let runtime = DispatcherRuntime {
@@ -690,7 +713,13 @@ pub fn spawn_h3_dispatcher(
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
     });
 
-    (cmd_tx, handle, udp_rx_handle, udp_tx_handle, bound_addr)
+    SpawnedH3Dispatcher {
+        command_tx: cmd_tx,
+        dispatcher_handle: handle,
+        udp_rx_handle,
+        udp_tx_handle,
+        reloader_handle,
+    }
 }
 
 /// Shared test utilities for H3v2 listener integration tests across modules.
@@ -841,6 +870,9 @@ mod tests {
         bound_addr: SocketAddr,
         _certs: TestCertBundle,
         _handle: tokio::task::JoinHandle<ActorExitResult>,
+        _udp_rx_handle: tokio::task::JoinHandle<ActorExitResult>,
+        _udp_tx_handle: tokio::task::JoinHandle<ActorExitResult>,
+        _reloader_handle: tokio::task::JoinHandle<ActorExitResult>,
     }
 
     impl TestH3Server {
@@ -866,18 +898,21 @@ mod tests {
             )
             .expect("make_h3_dispatcher");
 
-            let (cmd_tx, handle, _, _, _) = spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
+            let spawned = spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
 
             // Give dispatcher time to start accepting.
             tokio::time::sleep(Duration::from_millis(50)).await;
 
             Self {
-                cmd_tx,
+                cmd_tx: spawned.command_tx,
                 events_rx,
                 ingress_rx,
                 bound_addr,
                 _certs: certs,
-                _handle: handle,
+                _handle: spawned.dispatcher_handle,
+                _udp_rx_handle: spawned.udp_rx_handle,
+                _udp_tx_handle: spawned.udp_tx_handle,
+                _reloader_handle: spawned.reloader_handle,
             }
         }
     }

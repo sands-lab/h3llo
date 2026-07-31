@@ -1,4 +1,4 @@
-//! Filesystem-driven TLS certificate reloading for the H3 listener.
+//! Filesystem-driven certificate reloading for the H3 server.
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::config::H3Tuning;
@@ -19,7 +19,7 @@ const WATCH_EVENT_QUEUE_DEPTH: usize = 64;
 
 /// Errors returned while initializing certificate filesystem watches.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum TlsReloadError {
+pub(crate) enum H3ReloadError {
     /// A configured credential path could not be made absolute.
     #[error("failed to resolve credential path `{path}`: {source}")]
     ResolvePath {
@@ -42,7 +42,7 @@ pub(crate) enum TlsReloadError {
 }
 
 /// Long-lived watcher state for an H3 listener's certificate and private key.
-pub(crate) struct TlsReloader {
+pub(crate) struct H3Reloader {
     /// Kept alive so native filesystem watches remain registered.
     _watcher: RecommendedWatcher,
     event_rx: mpsc::Receiver<notify::Result<Event>>,
@@ -50,11 +50,13 @@ pub(crate) struct TlsReloader {
     key_path: PathBuf,
     h3_tuning: H3Tuning,
     max_udp_payload: usize,
-    dispatcher_tx: mpsc::UnboundedSender<DispatcherCommand>,
 }
 
-impl TlsReloader {
-    async fn run(mut self) -> ActorExitResult {
+impl H3Reloader {
+    async fn run(
+        mut self,
+        dispatcher_tx: mpsc::WeakUnboundedSender<DispatcherCommand>,
+    ) -> ActorExitResult {
         let debounce = time::sleep(Duration::MAX);
         tokio::pin!(debounce);
         let mut reload_pending = false;
@@ -69,7 +71,7 @@ impl TlsReloader {
             tokio::select! {
                 event = self.event_rx.recv() => {
                     let Some(event) = event else {
-                        return Err(ActorError::TlsReloader {
+                        return Err(ActorError::H3Reloader {
                             reason: "filesystem watcher event channel closed".into(),
                         });
                     };
@@ -103,13 +105,16 @@ impl TlsReloader {
 
                 () = &mut debounce, if reload_pending => {
                     reload_pending = false;
-                    self.reload().await?;
+                    self.reload(&dispatcher_tx).await?;
                 }
             }
         }
     }
 
-    async fn reload(&self) -> ActorExitResult {
+    async fn reload(
+        &self,
+        dispatcher_tx: &mpsc::WeakUnboundedSender<DispatcherCommand>,
+    ) -> ActorExitResult {
         let cert_path = self.cert_path.clone();
         let key_path = self.key_path.clone();
         let h3_tuning = self.h3_tuning.clone();
@@ -119,7 +124,7 @@ impl TlsReloader {
             make_server_quiche_config(&h3_tuning, max_udp_payload, &cert_path, &key_path)
         })
         .await
-        .map_err(|error| ActorError::TlsReloader {
+        .map_err(|error| ActorError::H3Reloader {
             reason: format!("credential loader task failed: {error}"),
         })?;
 
@@ -137,15 +142,20 @@ impl TlsReloader {
         };
 
         let (applied_tx, applied_rx) = oneshot::channel();
-        self.dispatcher_tx
+        let dispatcher_tx = dispatcher_tx
+            .upgrade()
+            .ok_or_else(|| ActorError::H3Reloader {
+                reason: "H3 dispatcher command channel closed".into(),
+            })?;
+        dispatcher_tx
             .send(DispatcherCommand::ReplaceTlsConfig {
                 config: Box::new(config),
                 applied_tx,
             })
-            .map_err(|_| ActorError::TlsReloader {
+            .map_err(|_| ActorError::H3Reloader {
                 reason: "H3 dispatcher command channel closed".into(),
             })?;
-        applied_rx.await.map_err(|_| ActorError::TlsReloader {
+        applied_rx.await.map_err(|_| ActorError::H3Reloader {
             reason: "H3 dispatcher closed before applying TLS configuration".into(),
         })?;
 
@@ -162,13 +172,12 @@ impl TlsReloader {
 ///
 /// Parent directories are watched rather than credential file inodes so
 /// atomic rename and symlink-based rotation schemes remain observable.
-pub(crate) fn make_tls_reloader(
+pub(crate) fn make_h3_reloader(
     cert_path: &Path,
     key_path: &Path,
     tun_mtu: u16,
     h3_tuning: &H3Tuning,
-    dispatcher_tx: mpsc::UnboundedSender<DispatcherCommand>,
-) -> Result<TlsReloader, TlsReloadError> {
+) -> Result<H3Reloader, H3ReloadError> {
     let cert_path = absolute_path(cert_path)?;
     let key_path = absolute_path(key_path)?;
     let watch_directories = [cert_path.as_path(), key_path.as_path()]
@@ -181,37 +190,37 @@ pub(crate) fn make_tls_reloader(
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = event_tx.try_send(event);
     })
-    .map_err(TlsReloadError::CreateWatcher)?;
+    .map_err(H3ReloadError::CreateWatcher)?;
 
     for directory in &watch_directories {
         watcher
             .watch(directory, RecursiveMode::NonRecursive)
-            .map_err(|source| TlsReloadError::WatchDirectory {
+            .map_err(|source| H3ReloadError::WatchDirectory {
                 path: directory.clone(),
                 source,
             })?;
     }
 
-    Ok(TlsReloader {
+    Ok(H3Reloader {
         _watcher: watcher,
         event_rx,
         cert_path,
         key_path,
         h3_tuning: h3_tuning.clone(),
         max_udp_payload: usize::from(tun_mtu) + CONNECT_IP_OVERHEAD,
-        dispatcher_tx,
     })
 }
 
-/// Spawns the certificate reloader on the current Tokio runtime.
-pub(crate) fn spawn_tls_reloader(
-    reloader: TlsReloader,
+/// Spawns the H3 certificate reloader on the current Tokio runtime.
+pub(crate) fn spawn_h3_reloader(
+    reloader: H3Reloader,
+    dispatcher_tx: mpsc::WeakUnboundedSender<DispatcherCommand>,
 ) -> tokio::task::JoinHandle<ActorExitResult> {
-    tokio::spawn(reloader.run())
+    tokio::spawn(reloader.run(dispatcher_tx))
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf, TlsReloadError> {
-    std::path::absolute(path).map_err(|source| TlsReloadError::ResolvePath {
+fn absolute_path(path: &Path) -> Result<PathBuf, H3ReloadError> {
+    std::path::absolute(path).map_err(|source| H3ReloadError::ResolvePath {
         path: path.to_path_buf(),
         source,
     })
@@ -271,15 +280,9 @@ mod tests {
         write_pair(&cert_path, &key_path, &initial_cert, &initial_key);
 
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-        let reloader = make_tls_reloader(
-            &cert_path,
-            &key_path,
-            1291,
-            &H3Tuning::default(),
-            command_tx,
-        )
-        .expect("create TLS reloader");
-        let handle = spawn_tls_reloader(reloader);
+        let reloader = make_h3_reloader(&cert_path, &key_path, 1291, &H3Tuning::default())
+            .expect("create H3 reloader");
+        let handle = spawn_h3_reloader(reloader, command_tx.downgrade());
 
         for generation in 0..2 {
             let (cert, key) = generate_pem_pair();
@@ -303,15 +306,9 @@ mod tests {
         write_pair(&cert_path, &key_path, &initial_cert, &initial_key);
 
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-        let reloader = make_tls_reloader(
-            &cert_path,
-            &key_path,
-            1291,
-            &H3Tuning::default(),
-            command_tx,
-        )
-        .expect("create TLS reloader");
-        let handle = spawn_tls_reloader(reloader);
+        let reloader = make_h3_reloader(&cert_path, &key_path, 1291, &H3Tuning::default())
+            .expect("create H3 reloader");
+        let handle = spawn_h3_reloader(reloader, command_tx.downgrade());
 
         let (replacement_cert, replacement_key) = generate_pem_pair();
         fs::write(&cert_path, replacement_cert).expect("replace certificate");

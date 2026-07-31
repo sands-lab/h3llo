@@ -14,7 +14,6 @@ use crate::h3listener::{make_h3_dispatcher, spawn_h3_dispatcher, DispatcherComma
 use crate::metrics::{log_quic_metrics, log_transport_metrics, Direction, Labels, Metrics};
 use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::router::{spawn_router, RouterCommand, RoutingTable};
-use crate::tls_reload::{make_tls_reloader, spawn_tls_reloader};
 use crate::tun;
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -577,7 +576,7 @@ impl Orchestrator {
         };
 
         // Initialize H3 dispatcher if configured (dispatcher on crypto_rt, UDP I/O on udp_rt)
-        let (h3_listener_cmd_tx, tls_reloader_handle) = if let Some(ref h3_cfg) = config.local.h3 {
+        let h3_listener_cmd_tx = if let Some(ref h3_cfg) = config.local.h3 {
             let listen_addr = resolve_listen_addr(&h3_cfg.listen.host, h3_cfg.listen.port)?;
             let cert_path = Path::new(&h3_cfg.cert);
             let key_path = Path::new(&h3_cfg.key);
@@ -599,27 +598,21 @@ impl Orchestrator {
             // spawn: infallible task creation
             // Initial peer tokens are empty; sync_peers_to_actors() populates them
             // immediately after construction.
-            let (cmd_tx, dispatcher_handle, udp_rx_handle, udp_tx_handle, _) = spawn_h3_dispatcher(
+            let spawned = spawn_h3_dispatcher(
                 dispatcher,
                 HashMap::new(),
                 udp_rt.handle(),
                 crypto_rt.handle(),
             );
-            let tls_reloader =
-                make_tls_reloader(cert_path, key_path, tun_mtu, &tuning.h3, cmd_tx.clone())
-                    .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
-            let tls_reloader_handle = spawn_tls_reloader(tls_reloader);
 
-            join_set.spawn(dispatcher_handle);
-            join_set.spawn(udp_rx_handle);
-            join_set.spawn(udp_tx_handle);
-            (Some(cmd_tx), Some(tls_reloader_handle))
+            join_set.spawn(spawned.dispatcher_handle);
+            join_set.spawn(spawned.udp_rx_handle);
+            join_set.spawn(spawned.udp_tx_handle);
+            join_set.spawn(spawned.reloader_handle);
+            Some(spawned.command_tx)
         } else {
-            (None, None)
+            None
         };
-        if let Some(handle) = tls_reloader_handle {
-            join_set.spawn(handle);
-        }
 
         // Initialize unified peer state from config
         let peers: HashMap<String, PeerEntry> = config
