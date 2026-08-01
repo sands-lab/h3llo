@@ -18,7 +18,7 @@ use crate::h3engine::{
 };
 use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
-use crate::helpers::alloc_uninit_packet_buf;
+use crate::helpers::{alloc_uninit_packet_buf, make_interval};
 use crate::udp;
 use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use quiche::h3::NameValue;
@@ -433,7 +433,7 @@ impl H3Dispatcher {
         mut cmd_rx: mpsc::UnboundedReceiver<DispatcherCommand>,
         mut peer_tokens: HashMap<String, String>,
     ) -> ActorExitResult {
-        let mut cleanup_ticker = time::interval(Duration::from_secs(1));
+        let mut cleanup_ticker = make_interval(Duration::from_secs(1));
         let debounce = time::sleep(Duration::MAX);
         tokio::pin!(debounce);
         let mut reload_pending = false;

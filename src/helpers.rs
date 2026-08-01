@@ -1,8 +1,23 @@
-//! Helpers for retrying transient I/O errors, channel backpressure, and
-//! headroom-aware packet buffer allocation.
+//! Helpers for actor timers, transient I/O retries, channel backpressure,
+//! and headroom-aware packet buffer allocation.
 
 use std::time::{Duration, Instant};
+use tokio::time::{self, Interval, MissedTickBehavior};
 use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
+
+/// Creates an interval that delays its schedule after missed ticks.
+///
+/// The first tick still completes immediately. After a missed tick, the next
+/// tick is scheduled one full period later instead of catching up in a burst.
+///
+/// # Arguments
+///
+/// * `period` - Duration between consecutive ticks.
+pub(crate) fn make_interval(period: Duration) -> Interval {
+    let mut interval = time::interval(period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    interval
+}
 
 /// Reserved headroom bytes at the start of every packet buffer.
 ///
@@ -205,6 +220,14 @@ mod tests {
     };
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn make_interval_uses_delay_missed_tick_behavior() {
+        let mut interval = make_interval(Duration::from_secs(1));
+
+        assert_eq!(interval.missed_tick_behavior(), MissedTickBehavior::Delay);
+        interval.tick().await;
+    }
 
     #[tokio::test]
     async fn retries_on_interrupted_errors() {

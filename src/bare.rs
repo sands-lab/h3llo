@@ -7,7 +7,7 @@ use crate::actor::ActorExitResult;
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
 use crate::config::{PeerBare, Tuning};
 use crate::events::{ConnectedEvent, DialContext, Endpoint, Event};
-use crate::helpers::batch_stats;
+use crate::helpers::{batch_stats, make_interval};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::udp;
 use std::collections::HashSet;
@@ -15,7 +15,6 @@ use std::net::{IpAddr, SocketAddr};
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -104,7 +103,7 @@ fn spawn_bare_filter(
     let handle = tokio::spawn(async move {
         info!("bare RX filter actor started");
         let mut counters = Counters::new(Source::BareUdp, Direction::Rx);
-        let mut ticker = time::interval(interval);
+        let mut ticker = make_interval(interval);
         loop {
             tokio::select! {
                 maybe = udp_rx.recv() => {
@@ -216,7 +215,7 @@ pub(crate) fn spawn_bare_tx(
     let handle = tokio::spawn(async move {
         info!(peer = %peer_id, dest = %destination, "bare TX actor started");
         let mut counters = Counters::new(Source::BareUdp, Direction::Tx);
-        let mut ticker = time::interval(metrics_interval);
+        let mut ticker = make_interval(metrics_interval);
 
         loop {
             tokio::select! {
