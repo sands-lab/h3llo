@@ -17,7 +17,8 @@ env:
 
 jobs:
   linux:
-    runs-on: self-hosted
+    # Change this anchor to `self-hosted` to move every job back to the local runner.
+    runs-on: &runner ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -46,7 +47,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
   docker-tests:
-    runs-on: self-hosted
+    runs-on: *runner
     timeout-minutes: 30
     concurrency:
       group: docker-tests
@@ -84,7 +85,7 @@ jobs:
   # Build multi-arch Docker images in parallel with lint and test jobs.
   # Runs on PRs too (for cross-compilation validation) but skips push.
   docker-build:
-    runs-on: self-hosted
+    runs-on: *runner
     timeout-minutes: 60
     concurrency:
       group: buildx-${{ matrix.arch_label }}
@@ -186,7 +187,7 @@ jobs:
   # Gates behind ALL jobs: builds must succeed AND tests must pass.
   docker-merge:
     if: github.event_name != 'pull_request'
-    runs-on: self-hosted
+    runs-on: *runner
     timeout-minutes: 10
     needs: [docker-build, linux, docker-tests]
     steps:
@@ -233,7 +234,7 @@ jobs:
   # Gates behind docker-merge, which transitively requires all builds and tests.
   release:
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/master'
-    runs-on: self-hosted
+    runs-on: *runner
     timeout-minutes: 10
     needs: [docker-merge]
     permissions:
