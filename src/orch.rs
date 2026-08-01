@@ -11,6 +11,7 @@ use crate::events::{
 };
 use crate::h3dialer::dial_h3_client;
 use crate::h3listener::{make_h3_dispatcher, spawn_h3_dispatcher, DispatcherCommand};
+use crate::helpers::make_interval;
 use crate::metrics::{log_quic_metrics, log_transport_metrics, Direction, Labels, Metrics};
 use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::router::{spawn_router, RouterCommand, RoutingTable};
@@ -707,8 +708,8 @@ impl Orchestrator {
     pub async fn run(mut self) -> Result<(), OrchestratorError> {
         // Reconcile at the configured interval to detect closed channels and
         // attempt reconnection for uncovered IPs.
-        let mut reconcile_ticker = tokio::time::interval(self.tuning.reconcile_interval);
-        let mut metrics_log_ticker = tokio::time::interval(self.tuning.metrics_log_interval);
+        let mut reconcile_ticker = make_interval(self.tuning.reconcile_interval);
+        let mut metrics_log_ticker = make_interval(self.tuning.metrics_log_interval);
         loop {
             tokio::select! {
                 Some(event) = self.events_rx.recv() => {

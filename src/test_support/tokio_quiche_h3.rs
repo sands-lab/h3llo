@@ -11,7 +11,7 @@ use crate::auth::{bearer_auth_header, validate_connect_auth, AuthError};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::Event;
-use crate::helpers::{send_with_backpressure, SendEvent};
+use crate::helpers::{make_interval, send_with_backpressure, SendEvent};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
@@ -694,7 +694,7 @@ pub fn spawn_h3_rx(
 
     tokio::spawn(async move {
         let mut counters = Counters::new(Source::Http3, Direction::Rx);
-        let mut ticker = time::interval(interval);
+        let mut ticker = make_interval(interval);
         loop {
             tokio::select! {
                 frame = datagram_rx.recv() => {
@@ -845,8 +845,8 @@ pub fn spawn_h3_tx(
 
     let handle = tokio::spawn(async move {
         let mut counters = Counters::new(Source::Http3, Direction::Tx);
-        let mut ticker = time::interval(interval);
-        let mut keepalive_ticker = time::interval(keepalive_interval);
+        let mut ticker = make_interval(interval);
+        let mut keepalive_ticker = make_interval(keepalive_interval);
         keepalive_ticker.tick().await; // Skip first immediate tick
 
         // Bypass PollSender's Sink abstraction: use the underlying mpsc::Sender

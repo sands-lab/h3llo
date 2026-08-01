@@ -12,7 +12,6 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time;
 use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
 use tracing::{info, warn};
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
@@ -21,7 +20,9 @@ use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
 /// Headroom reserved in every datapath `PooledBuf`.
 ///
-use crate::helpers::{alloc_packet_buf, alloc_uninit_packet_buf, batch_stats, HEADROOM};
+use crate::helpers::{
+    alloc_packet_buf, alloc_uninit_packet_buf, batch_stats, make_interval, HEADROOM,
+};
 
 // Compile-time guard: TunBuf::prepend_hdr relies on HEADROOM being sufficient
 // to prepend a zeroed virtio_net_hdr via add_prefix without allocation.
@@ -464,7 +465,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
 
     tokio::spawn(async move {
         let mut counters = Counters::new(Source::Tun, Direction::Rx);
-        let mut ticker = time::interval(metrics_push_interval);
+        let mut ticker = make_interval(metrics_push_interval);
         let mtu = tun.mtu();
 
         let mut scratch = vec![0u8; scratch_buf_size];
@@ -528,7 +529,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     let handle = tokio::spawn(async move {
         let mtu = tun.mtu();
         let mut counters = Counters::new(Source::Tun, Direction::Tx);
-        let mut ticker = time::interval(metrics_push_interval);
+        let mut ticker = make_interval(metrics_push_interval);
 
         loop {
             tokio::select! {

@@ -5,6 +5,7 @@ use crate::actor::{ActorError, ActorExitResult};
 use crate::bind::{make_client_udp_socket, RouteProbe, UdpError};
 use crate::config::{DnsTuning, LocalDns, Tuning};
 use crate::events::{DnsEvent, Event};
+use crate::helpers::make_interval;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rand::RngExt;
@@ -217,10 +218,9 @@ impl DnsActor {
         );
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
-        let mut query_ticker = time::interval(query_interval);
-        query_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut query_ticker = make_interval(query_interval);
 
-        let mut refresh_ticker = time::interval(refresh_interval);
+        let mut refresh_ticker = make_interval(refresh_interval);
         refresh_ticker.tick().await; // consume immediate first tick
 
         loop {

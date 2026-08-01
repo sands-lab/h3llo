@@ -13,7 +13,7 @@ use crate::events::Event;
 use crate::h3session::{
     ConnectIpDatagramCodec, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT,
 };
-use crate::helpers::alloc_uninit_packet_buf;
+use crate::helpers::{alloc_uninit_packet_buf, make_interval};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -360,8 +360,8 @@ impl H3Engine {
         } = self;
         let mut session = session.expect("session present after establish/accept");
 
-        let mut ticker = time::interval(metrics_interval);
-        let mut keepalive = time::interval(keepalive_interval);
+        let mut ticker = make_interval(metrics_interval);
+        let mut keepalive = make_interval(keepalive_interval);
         keepalive.tick().await;
 
         let timer = time::sleep(conn.timeout().unwrap_or(MAX_TIMEOUT));

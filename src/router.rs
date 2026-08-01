@@ -7,7 +7,7 @@
 use crate::actor::ActorExitResult;
 use crate::config::{LocalTun, Peer};
 use crate::events::Event;
-use crate::helpers::{batch_stats, send_with_backpressure, SendEvent};
+use crate::helpers::{batch_stats, make_interval, send_with_backpressure, SendEvent};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
@@ -17,7 +17,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
 use tracing::warn;
 
@@ -367,7 +366,7 @@ pub fn spawn_router(
 
     let handle = tokio::spawn(async move {
         let mut counters = Counters::new(Source::Router, Direction::Rx);
-        let mut ticker = time::interval(interval);
+        let mut ticker = make_interval(interval);
 
         loop {
             tokio::select! {
