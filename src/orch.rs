@@ -582,7 +582,7 @@ impl Orchestrator {
             let key_path = Path::new(&h3_cfg.key);
 
             // make: fallible I/O (socket bind, TLS config, UDP actor setup)
-            let (dispatcher, _bound_addr) = make_h3_dispatcher(
+            let (dispatcher_group, _bound_addr) = make_h3_dispatcher(
                 listen_addr,
                 cert_path,
                 key_path,
@@ -599,7 +599,7 @@ impl Orchestrator {
             // Initial peer tokens are empty; sync_peers_to_actors() populates them
             // immediately after construction.
             let (cmd_tx, dispatcher_handle, udp_rx_handle, udp_tx_handle, _) = spawn_h3_dispatcher(
-                dispatcher,
+                dispatcher_group,
                 HashMap::new(),
                 udp_rt.handle(),
                 crypto_rt.handle(),
