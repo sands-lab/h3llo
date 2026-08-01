@@ -192,7 +192,6 @@ impl DnsActor {
         let server_str = self.server.to_string();
         let query_timeout = self.dns_tuning.dns_query_timeout;
         let refresh_interval = self.dns_tuning.dns_refresh_interval;
-        let snapshot_delay = self.dns_tuning.dns_snapshot_delay;
 
         info!(
             server = %self.server,
@@ -204,11 +203,6 @@ impl DnsActor {
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
         let mut ticker = time::interval(query_timeout / 2);
 
-        // Debounce timer: armed when state becomes dirty, fires after snapshot_delay.
-        let snapshot_timer = time::sleep(snapshot_delay);
-        tokio::pin!(snapshot_timer);
-        let mut snapshot_armed = false;
-
         let refresh_duration = if refresh_interval.is_zero() {
             Duration::from_secs(3600) // placeholder; branch disabled below
         } else {
@@ -216,18 +210,6 @@ impl DnsActor {
         };
         let mut refresh_ticker = time::interval(refresh_duration);
         refresh_ticker.tick().await; // consume immediate first tick
-
-        // Arms the debounce timer if dirty and not already armed.
-        macro_rules! arm_snapshot_timer {
-            () => {
-                if self.dirty && !snapshot_armed {
-                    snapshot_timer
-                        .as_mut()
-                        .reset(time::Instant::now() + snapshot_delay);
-                    snapshot_armed = true;
-                }
-            };
-        }
 
         loop {
             tokio::select! {
@@ -243,7 +225,7 @@ impl DnsActor {
                     match result {
                         Ok(len) if len > 0 => {
                             self.handle_packet(&buf[..len]);
-                            arm_snapshot_timer!();
+                            self.emit_snapshot(&events_tx);
                         }
                         Ok(_) => {}
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
@@ -252,14 +234,10 @@ impl DnsActor {
                         }
                     }
                 }
-                () = &mut snapshot_timer, if snapshot_armed => {
-                    snapshot_armed = false;
-                    self.emit_snapshot(&events_tx);
-                }
                 _ = ticker.tick() => {
                     self.handle_tick().await;
                     self.expire_stale();
-                    arm_snapshot_timer!();
+                    self.emit_snapshot(&events_tx);
                 }
                 _ = refresh_ticker.tick(), if !refresh_interval.is_zero() => {
                     self.trigger_refresh().await;
@@ -749,8 +727,7 @@ mod tests {
         );
         socket.send_to(&response2, peer2).await.unwrap();
 
-        // Drain any pending debounce snapshot before the re-register check
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Drain snapshots queued before the re-register check.
         while events_rx.try_recv().is_ok() {}
 
         // Re-register same hosts (simulating config push with changed allowed_ips)
@@ -844,7 +821,7 @@ mod tests {
         hosts.insert("192.168.1.100".to_string());
         cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
 
-        // Snapshot emitted on next tick (not immediately anymore)
+        // SetHostnames emits the snapshot immediately.
         let snapshot = next_dns_snapshot(&mut events_rx).await;
         let ips = snapshot.get("192.168.1.100").expect("missing IP literal");
         assert!(ips.contains(&"192.168.1.100".parse::<IpAddr>().unwrap()));
@@ -863,7 +840,7 @@ mod tests {
         hosts.insert("2001:db8::1".to_string());
         cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
 
-        // Snapshot emitted on next tick
+        // SetHostnames emits the snapshot immediately.
         let snapshot = next_dns_snapshot(&mut events_rx).await;
         let ips = snapshot.get("2001:db8::1").expect("missing IPv6 literal");
         assert!(ips.iter().any(|ip| ip.is_ipv6()));

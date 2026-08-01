@@ -146,17 +146,17 @@ The drop location tells you where the bottleneck is:
 
 ## Common Issues
 
-### DNS Resolution Failure Due to Query Burst Rate Limiting
+### DNS Resolution Failure Under Query Load
 
 **Symptom**: Some or all peer endpoints fail to resolve on startup. Logs show `dns: response truncated, will retry` warnings and/or `dns: query timed out, retrying` for multiple hostnames. Affected peers never establish QUIC connections. The issue is intermittent — restarting may resolve a different subset of hostnames each time.
 
-**Root cause**: On startup, h3llo issues A and AAAA queries for every peer endpoint hostname simultaneously. With many peers (e.g., 20+ peers = 40+ concurrent queries), the burst of UDP packets sent to a remote public DNS resolver (e.g., `1.1.1.1`, `8.8.8.8`) can trigger server-side rate limiting. The resolver responds with truncated (`TC=1`) or empty responses for the excess queries. h3llo treats truncated responses as packet loss and retries after `dns_query_timeout` (default 2s), but if the server persistently truncates under load, retries will also be truncated.
+**Root cause**: h3llo serializes A and AAAA queries across all peer endpoint hostnames with `dns_query_interval` (default `100ms`). Very large peer sets, a lower configured interval, packet loss, or retries can still create sustained load on the network path or resolver. A truncated (`TC=1`) response confirms that the UDP response was truncated; it does not by itself prove server-side rate limiting. h3llo treats truncated responses as packet loss and retries after `dns_query_timeout` (default `2s`).
 
-The severity depends on the number of peers and the DNS server's rate-limiting policy. A mesh with 5 peers may work fine; a mesh with 20+ peers will likely hit the limit on remote resolvers.
+The severity depends on the number of peers, the configured query interval, packet loss, response size, and resolver behavior.
 
 **Diagnostic clues**:
 
-With 20+ peers and `dns.server: udp://1.1.1.1:53`, startup logs will show a burst of truncation warnings within the same millisecond:
+Under sustained query load, logs may show clustered truncation or timeout warnings:
 
 ```
 WARN h3llo::dns: dns: response truncated, will retry host=peer1.example.com
@@ -164,7 +164,7 @@ WARN h3llo::dns: dns: response truncated, will retry host=peer2.example.com
 WARN h3llo::dns: dns: response truncated, will retry host=peer3.example.com
 WARN h3llo::dns: dns: response truncated, will retry host=peer4.example.com
 WARN h3llo::dns: dns: response truncated, will retry host=peer5.example.com
-...  (28 warnings in <3ms)
+...
 ```
 
 To confirm:
@@ -177,18 +177,19 @@ docker logs <container> 2>&1 | grep -i "truncated"
 docker logs <container> 2>&1 | grep "dialing H3 endpoint"
 ```
 
-**Fix**: Use a local caching resolver instead of a remote public resolver:
+**Fix**: Keep the default query interval or increase it for large peer sets. A local caching resolver can further reduce traffic sent over the WAN:
 
 ```yaml
 local:
   dns:
-    server: udp://127.0.0.53:53    # systemd-resolved (local cache)
-    # server: udp://1.1.1.1:53     # avoid: rate-limited under burst
+    server: udp://127.0.0.53:53 # systemd-resolved (local cache)
+tuning:
+  dns_query_interval: 250ms
 ```
 
-The local resolver (e.g., systemd-resolved at `127.0.0.53`) absorbs the query burst locally, deduplicates identical queries, and handles upstream TCP fallback transparently. This eliminates both the rate-limiting and truncation issues.
+The local resolver (e.g., systemd-resolved at `127.0.0.53`) can cache answers and handle upstream fallback independently of h3llo.
 
-> **Note**: h3llo's DNS implementation uses plain UDP without EDNS0 and does not fall back to TCP on truncation. Truncated responses are treated as packet loss — the pending query is preserved and retried after `dns_query_timeout` (default 2s) with a new transaction ID. However, if the server persistently truncates (e.g., due to rate limiting under burst), retries will also be truncated until the burst subsides. Using a local caching resolver (as recommended above) remains the most effective mitigation.
+> **Note**: h3llo's DNS implementation uses plain UDP without EDNS0 and does not fall back to TCP on truncation. Truncated responses are treated as packet loss: the pending query is preserved and retried after `dns_query_timeout` (default `2s`) with a new transaction ID. Use a local caching resolver when TCP fallback or richer resolver behavior is required.
 
 ### Silent H3/QUIC Connection Failure on Multi-NIC Hosts
 
