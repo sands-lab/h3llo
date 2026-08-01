@@ -108,6 +108,8 @@ impl DnsActor {
             self.dirty = true;
             info!(hostnames = ?removed, "dns: hostnames unregistered");
         }
+        self.queued_queries
+            .retain(|query| hosts.contains(&query.hostname));
         self.pending_queries
             .retain(|query, _| hosts.contains(&query.hostname));
         for host in hosts {
@@ -118,8 +120,6 @@ impl DnsActor {
                     .insert(host.clone(), HostnameState::default());
             }
         }
-        self.queued_queries
-            .retain(|query| hosts.contains(&query.hostname));
     }
 
     /// Records a resolved IP for a hostname.
@@ -230,7 +230,7 @@ impl DnsActor {
                 maybe_cmd = cmd_rx.recv() => {
                     match maybe_cmd {
                         Some(DnsCommand::SetHostnames { hosts }) => {
-                            self.handle_set_hostnames(hosts, &events_tx);
+                            self.handle_set_hostnames(hosts);
                         }
                         None => return Ok(()),
                     }
@@ -239,7 +239,6 @@ impl DnsActor {
                     match result {
                         Ok(len) if len > 0 => {
                             self.handle_packet(&buf[..len]);
-                            self.emit_snapshot(&events_tx);
                         }
                         Ok(_) => {}
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
@@ -251,7 +250,6 @@ impl DnsActor {
                 _ = refresh_ticker.tick() => {
                     self.trigger_refresh();
                     self.expire_stale();
-                    self.emit_snapshot(&events_tx);
                 }
                 _ = query_ticker.tick(), if query_work_pending => {
                     self.queue_timed_out_queries();
@@ -263,15 +261,13 @@ impl DnsActor {
                     }
                 }
             }
+
+            self.emit_snapshot(&events_tx);
         }
     }
 
     /// Applies a complete hostname registration update and triggers resolution.
-    fn handle_set_hostnames(
-        &mut self,
-        new_hosts: HashSet<String>,
-        events_tx: &mpsc::UnboundedSender<Event>,
-    ) {
+    fn handle_set_hostnames(&mut self, new_hosts: HashSet<String>) {
         self.set_hostnames(&new_hosts);
 
         // Record IP literals immediately (trigger_refresh skips them).
@@ -285,7 +281,6 @@ impl DnsActor {
         // changes. Without this, config updates that only change allowed_ips (same
         // hostnames, same resolved IPs) would never trigger a routing table rebuild.
         self.dirty = true;
-        self.emit_snapshot(events_tx);
 
         self.trigger_refresh();
     }
