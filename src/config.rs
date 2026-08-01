@@ -331,7 +331,7 @@ pub struct DnsTuning {
     /// DNS query timeout (default: 2s).
     #[serde(with = "humantime_serde")]
     pub dns_query_timeout: Duration,
-    /// DNS refresh interval; 0 disables (default: 120s).
+    /// DNS refresh interval (default: 120s).
     ///
     /// **Warning:** `dns_min_ttl` should be at least `2 × dns_refresh_interval`.
     /// Otherwise, cached IPs may expire before the next refresh re-queries them,
@@ -543,7 +543,6 @@ impl Config {
         }
 
         // Duration fields that must be strictly positive.
-        // dns_refresh_interval is intentionally excluded: zero disables periodic refresh.
         let duration_checks: &[(&'static str, Duration)] = &[
             ("tuning.reconcile_interval", self.tuning.reconcile_interval),
             (
@@ -565,6 +564,10 @@ impl Config {
             (
                 "tuning.dns_query_timeout",
                 self.tuning.dns.dns_query_timeout,
+            ),
+            (
+                "tuning.dns_refresh_interval",
+                self.tuning.dns.dns_refresh_interval,
             ),
             (
                 "tuning.dns_query_interval",
@@ -635,18 +638,16 @@ impl Config {
 
         // DNS TTL floor vs refresh interval: if min_ttl < 2× refresh, IPs can
         // expire between refresh cycles, causing repeated connection churn.
-        if !self.tuning.dns.dns_refresh_interval.is_zero() {
-            let min_safe_ttl = self.tuning.dns.dns_refresh_interval.saturating_mul(2);
-            if self.tuning.dns.dns_min_ttl < min_safe_ttl {
-                tracing::warn!(
-                    dns_min_ttl = ?self.tuning.dns.dns_min_ttl,
-                    dns_refresh_interval = ?self.tuning.dns.dns_refresh_interval,
-                    recommended_min_ttl = ?min_safe_ttl,
-                    "tuning.dns_min_ttl should be at least 2× tuning.dns_refresh_interval; \
-                     otherwise cached IPs may expire before the next refresh, \
-                     causing repeated connection pruning and reconnection"
-                );
-            }
+        let min_safe_ttl = self.tuning.dns.dns_refresh_interval.saturating_mul(2);
+        if self.tuning.dns.dns_min_ttl < min_safe_ttl {
+            tracing::warn!(
+                dns_min_ttl = ?self.tuning.dns.dns_min_ttl,
+                dns_refresh_interval = ?self.tuning.dns.dns_refresh_interval,
+                recommended_min_ttl = ?min_safe_ttl,
+                "tuning.dns_min_ttl should be at least 2× tuning.dns_refresh_interval; \
+                 otherwise cached IPs may expire before the next refresh, \
+                 causing repeated connection pruning and reconnection"
+            );
         }
 
         if self.tuning.reconnect_backoff_min > self.tuning.reconnect_backoff_max {
@@ -2433,6 +2434,9 @@ peers:
             ("dns_query_timeout", |t| {
                 t.dns.dns_query_timeout = Duration::ZERO
             }),
+            ("dns_refresh_interval", |t| {
+                t.dns.dns_refresh_interval = Duration::ZERO
+            }),
             ("dns_query_interval", |t| {
                 t.dns.dns_query_interval = Duration::ZERO
             }),
@@ -2488,14 +2492,6 @@ peers:
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.tuning.metrics_log_interval, Duration::from_secs(5));
-    }
-
-    #[test]
-    fn allows_zero_dns_refresh_interval() {
-        let mut config = sample_h3_config();
-        config.tuning.dns.dns_refresh_interval = Duration::ZERO;
-        // dns_refresh_interval = 0 means "disable periodic refresh" — this is valid
-        assert!(config.validate().is_ok());
     }
 
     #[test]
