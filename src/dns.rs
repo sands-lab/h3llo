@@ -260,7 +260,9 @@ impl DnsActor {
                     self.trigger_refresh();
                 }
                 () = &mut query_timer, if !query_queue_was_empty => {
-                    if let Some(query) = self.take_queued_query() {
+                    // A partially consumed ExtractIf retains every unvisited query.
+                    let query = self.queued_queries.extract_if(|_| true).next();
+                    if let Some(query) = query {
                         self.send_query(query).await;
                     }
                     if !self.queued_queries.is_empty() {
@@ -310,45 +312,27 @@ impl DnsActor {
     fn trigger_refresh(&mut self) {
         let now = Instant::now();
         let refresh_interval = self.dns_tuning.dns_refresh_interval;
-        let hosts: Vec<String> = self
-            .hostnames
-            .iter()
-            .filter(|(host, _)| host.parse::<IpAddr>().is_err())
-            .filter(|(_, entry)| now >= entry.next_refresh_at)
-            .map(|(host, _)| host.clone())
-            .collect();
+        let queued_queries = &mut self.queued_queries;
 
-        for host in hosts {
-            let (a_pending, aaaa_pending) = {
-                let entry = self
-                    .hostnames
-                    .get_mut(&host)
-                    .expect("refresh hostname must remain registered");
-                entry.next_refresh_at = now + refresh_interval;
-                (
-                    entry.pending.contains_key(&RecordType::A),
-                    entry.pending.contains_key(&RecordType::AAAA),
-                )
-            };
-            if !a_pending {
-                self.queued_queries.insert(DnsQuery {
-                    hostname: host.clone(),
+        for (hostname, entry) in &mut self.hostnames {
+            if hostname.parse::<IpAddr>().is_ok() || now < entry.next_refresh_at {
+                continue;
+            }
+
+            entry.next_refresh_at = now + refresh_interval;
+            if !entry.pending.contains_key(&RecordType::A) {
+                queued_queries.insert(DnsQuery {
+                    hostname: hostname.clone(),
                     record_type: RecordType::A,
                 });
             }
-            if !aaaa_pending {
-                self.queued_queries.insert(DnsQuery {
-                    hostname: host,
+            if !entry.pending.contains_key(&RecordType::AAAA) {
+                queued_queries.insert(DnsQuery {
+                    hostname: hostname.clone(),
                     record_type: RecordType::AAAA,
                 });
             }
         }
-    }
-
-    /// Removes and returns an arbitrary queued query.
-    fn take_queued_query(&mut self) -> Option<DnsQuery> {
-        let query = self.queued_queries.iter().next()?.clone();
-        self.queued_queries.take(&query)
     }
 
     /// Sends a queued DNS query and records it as pending.
@@ -357,6 +341,10 @@ impl DnsActor {
             hostname,
             record_type,
         } = query;
+        let Some(entry) = self.hostnames.get_mut(&hostname) else {
+            warn!(host = %hostname, record_type = ?record_type, "dns: dropping queued query for unregistered hostname");
+            return;
+        };
 
         let result: Result<(), String> = async {
             let name = Name::from_ascii(&hostname).map_err(|err| err.to_string())?;
@@ -375,11 +363,7 @@ impl DnsActor {
                 .await
                 .map_err(|err| err.to_string())?;
 
-            self.hostnames
-                .get_mut(&hostname)
-                .expect("queued DNS query hostname must remain registered")
-                .pending
-                .insert(record_type, (id, Instant::now()));
+            entry.pending.insert(record_type, (id, Instant::now()));
 
             Ok(())
         }
@@ -1166,6 +1150,20 @@ mod tests {
             hostname: "example.com".to_string(),
             record_type: RecordType::AAAA,
         }));
+    }
+
+    #[tokio::test]
+    async fn send_query_drops_unregistered_hostname() {
+        let mut actor = test_dns_actor().await;
+
+        actor
+            .send_query(DnsQuery {
+                hostname: "removed.example".to_string(),
+                record_type: RecordType::A,
+            })
+            .await;
+
+        assert!(actor.hostnames.is_empty());
     }
 
     #[tokio::test]
