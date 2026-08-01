@@ -12,6 +12,7 @@ use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::udp;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -30,10 +31,27 @@ pub enum BareUdpRxCommand {
     UpdateAcceptedSources(HashSet<IpAddr>),
 }
 
-/// Creates the `BareUDP` listen socket and UDP RX state.
+/// State owned exclusively by the `BareUDP` source-filter actor.
+struct BareRx {
+    accepted_sources: HashSet<IpAddr>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+    events_tx: mpsc::UnboundedSender<Event>,
+    metrics_interval: Duration,
+}
+
+/// Prepared state for the actors that implement the `BareUDP` receive pipeline.
+///
+/// Created by [`make_bare_rx`] and consumed by [`spawn_bare_rx`]. Each field is
+/// moved directly into its corresponding actor.
+pub struct BareRxGroup {
+    filter: BareRx,
+    udp_rx: udp::UdpRx,
+}
+
+/// Creates the `BareUDP` receive pipeline state.
 ///
 /// Performs fallible I/O: socket binding and quinn-udp initialization.
-/// The returned [`udp::UdpRx`] is consumed by [`spawn_bare_rx`].
+/// The returned [`BareRxGroup`] is consumed by [`spawn_bare_rx`].
 ///
 /// # Errors
 ///
@@ -41,26 +59,31 @@ pub enum BareUdpRxCommand {
 pub fn make_bare_rx(
     listen_addr: SocketAddr,
     tun_mtu: u16,
+    accepted_sources: HashSet<IpAddr>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+    events_tx: mpsc::UnboundedSender<Event>,
     tuning: &Tuning,
     udp_rt: &RuntimeHandle,
-) -> Result<udp::UdpRx, UdpError> {
+) -> Result<BareRxGroup, UdpError> {
     let _guard = udp_rt.enter();
     let socket = make_server_udp_socket(listen_addr, tuning.io.socket_buffer_bytes())?;
     let (udp_rx, _udp_tx) = udp::make_udp(socket, tun_mtu.into(), tuning.io.udp_enable_offload)?;
-    Ok(udp_rx)
+    let filter = BareRx {
+        accepted_sources,
+        ingress_tx,
+        events_tx,
+        metrics_interval: tuning.io.metrics_push_interval,
+    };
+    Ok(BareRxGroup { filter, udp_rx })
 }
 
 /// Spawns the `BareUDP` receive pipeline: UDP RX actor + source-filter actor.
 ///
 /// The UDP RX actor runs on `udp_rt`, the filter actor on `crypto_rt`.
 /// Returns command sender and both join handles for orchestrator supervision.
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_bare_rx(
-    udp_rx: udp::UdpRx,
-    accepted_sources: HashSet<IpAddr>,
-    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-    events_tx: mpsc::UnboundedSender<Event>,
-    tuning: &Tuning,
+    group: BareRxGroup,
+    packet_queue_depth: usize,
     udp_rt: &RuntimeHandle,
     crypto_rt: &RuntimeHandle,
 ) -> (
@@ -68,9 +91,10 @@ pub fn spawn_bare_rx(
     JoinHandle<ActorExitResult>,
     JoinHandle<ActorExitResult>,
 ) {
+    let BareRxGroup { filter, udp_rx } = group;
     let (udp_output_tx, cmd_tx, bare_rx_handle) = {
         let _guard = crypto_rt.enter();
-        spawn_bare_filter(accepted_sources, ingress_tx, events_tx, tuning)
+        spawn_bare_filter(filter, packet_queue_depth)
     };
 
     let udp_rx_handle = {
@@ -87,24 +111,26 @@ pub fn spawn_bare_rx(
 /// channel and returns the `Sender` for the upstream UDP RX actor.
 #[allow(clippy::type_complexity)]
 fn spawn_bare_filter(
-    mut accepted_sources: HashSet<IpAddr>,
-    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-    events_tx: mpsc::UnboundedSender<Event>,
-    tuning: &Tuning,
+    filter: BareRx,
+    packet_queue_depth: usize,
 ) -> (
     mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     mpsc::UnboundedSender<BareUdpRxCommand>,
     JoinHandle<ActorExitResult>,
 ) {
-    let (input_tx, mut udp_rx) =
-        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
+    let BareRx {
+        mut accepted_sources,
+        ingress_tx,
+        events_tx,
+        metrics_interval,
+    } = filter;
+    let (input_tx, mut udp_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(packet_queue_depth);
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-    let interval = tuning.io.metrics_push_interval;
 
     let handle = tokio::spawn(async move {
         info!("bare RX filter actor started");
         let mut counters = Counters::new(Source::BareUdp, Direction::Rx);
-        let mut ticker = time::interval(interval);
+        let mut ticker = time::interval(metrics_interval);
         loop {
             tokio::select! {
                 maybe = udp_rx.recv() => {
@@ -266,6 +292,20 @@ mod tests {
         }
     }
 
+    fn test_bare_rx(
+        accepted_sources: HashSet<IpAddr>,
+        ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+        events_tx: mpsc::UnboundedSender<Event>,
+        tuning: &Tuning,
+    ) -> BareRx {
+        BareRx {
+            accepted_sources,
+            ingress_tx,
+            events_tx,
+            metrics_interval: tuning.io.metrics_push_interval,
+        }
+    }
+
     #[tokio::test]
     async fn bare_rx_filters_non_accepted_sources() {
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
@@ -273,7 +313,8 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_millis(200));
-        let (udp_tx, _cmd_tx, handle) = spawn_bare_filter(accepted, ingress_tx, events_tx, &tuning);
+        let filter = test_bare_rx(accepted, ingress_tx, events_tx, &tuning);
+        let (udp_tx, _cmd_tx, handle) = spawn_bare_filter(filter, tuning.io.packet_queue_depth);
 
         // Send from a non-accepted source
         let remote: SocketAddr = "192.168.1.1:5353".parse().unwrap();
@@ -296,7 +337,8 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_millis(200));
-        let (udp_tx, _cmd_tx, handle) = spawn_bare_filter(accepted, ingress_tx, events_tx, &tuning);
+        let filter = test_bare_rx(accepted, ingress_tx, events_tx, &tuning);
+        let (udp_tx, _cmd_tx, handle) = spawn_bare_filter(filter, tuning.io.packet_queue_depth);
 
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
         let batch = vec![BufFactory::buf_from_slice(&[7, 8, 9])];
@@ -318,8 +360,8 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_millis(200));
-        let (udp_tx, cmd_tx, handle) =
-            spawn_bare_filter(HashSet::new(), ingress_tx, events_tx, &tuning);
+        let filter = test_bare_rx(HashSet::new(), ingress_tx, events_tx, &tuning);
+        let (udp_tx, cmd_tx, handle) = spawn_bare_filter(filter, tuning.io.packet_queue_depth);
 
         // Initially no sources accepted — packet should be dropped.
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
@@ -361,7 +403,8 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_millis(10));
-        let (udp_tx, _cmd_tx, handle) = spawn_bare_filter(accepted, ingress_tx, events_tx, &tuning);
+        let filter = test_bare_rx(accepted, ingress_tx, events_tx, &tuning);
+        let (udp_tx, _cmd_tx, handle) = spawn_bare_filter(filter, tuning.io.packet_queue_depth);
 
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
         udp_tx
@@ -468,8 +511,8 @@ mod tests {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_secs(60));
-        let (_udp_tx, cmd_tx, handle) =
-            spawn_bare_filter(HashSet::new(), ingress_tx, events_tx, &tuning);
+        let filter = test_bare_rx(HashSet::new(), ingress_tx, events_tx, &tuning);
+        let (_udp_tx, cmd_tx, handle) = spawn_bare_filter(filter, tuning.io.packet_queue_depth);
 
         // Drop cmd_tx to signal shutdown via command channel closure.
         drop(cmd_tx);
