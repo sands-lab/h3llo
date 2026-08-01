@@ -338,18 +338,11 @@ pub struct DnsTuning {
     /// causing connections to be pruned and re-established in a loop.
     #[serde(with = "humantime_serde")]
     pub dns_refresh_interval: Duration,
-    /// Delay before emitting a DNS snapshot after the first state change (default: 100ms).
+    /// Minimum interval between consecutive DNS query sends (default: 100ms).
     ///
-    /// After a DNS reply marks the state dirty, the resolver waits this duration
-    /// before emitting a snapshot to the orchestrator. Subsequent replies within
-    /// the window are coalesced into the same snapshot.
-    #[serde(with = "humantime_serde")]
-    pub dns_snapshot_delay: Duration,
-    /// Minimum interval between consecutive DNS query sends (default: 50ms).
-    ///
-    /// Serializes outbound DNS queries to avoid triggering rate limits on
-    /// public resolvers (e.g., Cloudflare 1.1.1.1). A sleep of this duration
-    /// is inserted before each outbound query send.
+    /// Serializes outbound DNS queries to reduce bursts sent to public
+    /// resolvers. A sleep of this duration is inserted before each outbound
+    /// query send.
     #[serde(with = "humantime_serde")]
     pub dns_query_interval: Duration,
     /// Minimum TTL floor for DNS records (default: `"5m"`).
@@ -372,8 +365,7 @@ impl Default for DnsTuning {
         Self {
             dns_query_timeout: Duration::from_secs(2),
             dns_refresh_interval: Duration::from_secs(120),
-            dns_snapshot_delay: Duration::from_millis(100),
-            dns_query_interval: Duration::from_millis(50),
+            dns_query_interval: Duration::from_millis(100),
             dns_min_ttl: Duration::from_secs(300),
         }
     }
@@ -574,10 +566,6 @@ impl Config {
             (
                 "tuning.dns_query_timeout",
                 self.tuning.dns.dns_query_timeout,
-            ),
-            (
-                "tuning.dns_snapshot_delay",
-                self.tuning.dns.dns_snapshot_delay,
             ),
             (
                 "tuning.dns_query_interval",
@@ -2071,10 +2059,9 @@ peers:
             Duration::from_secs(120)
         );
         assert_eq!(
-            cfg.tuning.dns.dns_snapshot_delay,
+            cfg.tuning.dns.dns_query_interval,
             Duration::from_millis(100)
         );
-        assert_eq!(cfg.tuning.dns.dns_query_interval, Duration::from_millis(50));
         assert_eq!(cfg.tuning.dns.dns_min_ttl, Duration::from_secs(300));
         assert_eq!(cfg.tuning.h3.h3_handshake_timeout, Duration::from_secs(5));
         assert_eq!(cfg.tuning.h3.h3_max_idle_timeout, Duration::from_secs(60));
@@ -2340,12 +2327,12 @@ local:
     addrs:
       - 192.168.180.1/32
 tuning:
-  dns_query_interval: 100ms
+  dns_query_interval: 250ms
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(
             cfg.tuning.dns.dns_query_interval,
-            Duration::from_millis(100)
+            Duration::from_millis(250)
         );
     }
 
@@ -2446,9 +2433,6 @@ peers:
             }),
             ("dns_query_timeout", |t| {
                 t.dns.dns_query_timeout = Duration::ZERO
-            }),
-            ("dns_snapshot_delay", |t| {
-                t.dns.dns_snapshot_delay = Duration::ZERO
             }),
             ("dns_query_interval", |t| {
                 t.dns.dns_query_interval = Duration::ZERO

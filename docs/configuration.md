@@ -34,9 +34,8 @@ tuning: # optional, all fields have defaults
   metrics_log_interval: 3s # optional, default: 3s
   dns_query_timeout: 2s # optional, default: 2s
   dns_refresh_interval: 2m # optional, default: 2m (0s disables)
-  dns_snapshot_delay: 100ms # optional, default: 100ms
   dns_min_ttl: 5m # optional, default: 5m (should be >= 2× dns_refresh_interval)
-  dns_query_interval: 50ms # optional, default: 50ms (minimum delay between DNS query sends)
+  dns_query_interval: 100ms # optional, default: 100ms (minimum delay between DNS query sends)
   h3_handshake_timeout: 5s # optional, default: 5s
   h3_max_idle_timeout: 60s # optional, default: 60s
   h3_keepalive_interval: 20s # optional, default: 20s (must be < h3_max_idle_timeout)
@@ -87,9 +86,8 @@ peers: # optional, default: []
 - `tuning.metrics_log_interval` (default `3s`): Interval between periodic `debug!`-level logging of QUIC and transport metrics by the orchestrator. Independent of `metrics_push_interval`, which controls actor emission cadence.
 - `tuning.dns_query_timeout` (default `2s`): Timeout before a DNS query is considered failed and retried.
 - `tuning.dns_refresh_interval` (default `2m`): DNS refresh interval (`0s` disables). The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)). **Warning:** `dns_min_ttl` should be at least `2× dns_refresh_interval`; otherwise cached IPs may expire before the next refresh cycle re-queries them, causing repeated connection pruning and reconnection.
-- `tuning.dns_snapshot_delay` (default `100ms`): Delay after the first DNS state change before emitting a snapshot to the orchestrator. Coalesces bursts of DNS replies into a single event.
 - `tuning.dns_min_ttl` (default `5m`): Minimum TTL floor for DNS records. Responses with shorter TTL are raised to this value. Recursive DNS servers return the *remaining* cache TTL, which can be near zero when the upstream record is about to expire; without a sufficient floor the IP expires locally before the next refresh cycle, triggering connection churn. **Warning:** Should be at least `2× dns_refresh_interval` (a warning is emitted at startup when this invariant is violated).
-- `tuning.dns_query_interval` (default `50ms`): Interval between consecutive outbound DNS query sends. Serializes queries to prevent public DNS resolvers (e.g., 1.1.1.1) from rate-limiting or truncating responses due to query bursts. Applies globally across all hostnames and record types.
+- `tuning.dns_query_interval` (default `100ms`): Interval between consecutive outbound DNS query sends. Serializes queries and reduces bursts sent to public DNS resolvers. Applies globally across all hostnames and record types.
 - `tuning.h3_handshake_timeout` (default `5s`): Timeout for an HTTP/3 handshake to complete.
 - `tuning.h3_max_idle_timeout` (default `60s`): QUIC idle timeout; connections idle longer than this are closed.
 - `tuning.h3_keepalive_interval` (default `20s`): QUIC keepalive interval; sends PING frames to prevent idle timeout. Must be less than `h3_max_idle_timeout`.
