@@ -7,6 +7,7 @@ use crate::config::{DnsTuning, LocalDns, Tuning};
 use crate::events::{DnsEvent, Event};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
+use ordered_hash_map::OrderedHashMap;
 use rand::RngExt;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -42,18 +43,11 @@ fn normalize_dns_name(name: &Name) -> String {
     s.strip_suffix('.').unwrap_or(&s).to_ascii_lowercase()
 }
 
-/// Per-hostname DNS resolution and query tracking state.
-///
-/// Co-locates resolved IPs, in-flight queries, and refresh scheduling into a
-/// single struct to eliminate map synchronization overhead. The `pending` map
-/// is keyed by `RecordType` (A or AAAA), allowing at most one pending query
-/// per record type per hostname.
+/// Per-hostname DNS resolution and refresh state.
 #[derive(Debug)]
 struct HostnameState {
     /// Resolved IPs with TTL-based expiration times.
     ips: HashMap<IpAddr, Instant>,
-    /// Pending queries keyed by record type: (`transaction_id`, `last_sent_time`).
-    pending: HashMap<RecordType, (u16, Instant)>,
     /// Earliest time at which `trigger_refresh` should re-query this hostname.
     next_refresh_at: Instant,
 }
@@ -65,11 +59,17 @@ struct DnsQuery {
     record_type: RecordType,
 }
 
+/// State associated with an in-flight DNS query.
+#[derive(Debug, Clone, Copy)]
+struct PendingQuery {
+    transaction_id: u16,
+    sent_at: Instant,
+}
+
 impl Default for HostnameState {
     fn default() -> Self {
         Self {
             ips: HashMap::new(),
-            pending: HashMap::new(),
             next_refresh_at: Instant::now(),
         }
     }
@@ -83,11 +83,13 @@ pub struct DnsActor {
     server: SocketAddr,
     socket: UdpSocket,
     dns_tuning: DnsTuning,
-    /// Per-hostname resolution state: resolved IPs, pending queries, and refresh scheduling.
+    /// Per-hostname resolution and refresh state.
     hostnames: HashMap<String, HostnameState>,
     /// Queries waiting to be sent, deduplicated by hostname and record type.
-    /// A query is never both queued here and pending in its hostname state.
+    /// A query is never both queued here and present in `pending_queries`.
     queued_queries: HashSet<DnsQuery>,
+    /// In-flight queries ordered by send time, oldest first.
+    pending_queries: OrderedHashMap<DnsQuery, PendingQuery>,
     /// True if state changed since the last snapshot emission.
     dirty: bool,
 }
@@ -106,6 +108,14 @@ impl DnsActor {
         if !removed.is_empty() {
             self.dirty = true;
             info!(hostnames = ?removed, "dns: hostnames unregistered");
+        }
+        for hostname in &removed {
+            for record_type in [RecordType::A, RecordType::AAAA] {
+                self.pending_queries.remove(&DnsQuery {
+                    hostname: hostname.clone(),
+                    record_type,
+                });
+            }
         }
         for host in hosts {
             if !self.hostnames.contains_key(host) {
@@ -169,29 +179,29 @@ impl DnsActor {
     ///
     /// Returns `true` only when the hostname, record type, and transaction ID
     /// all match an in-flight query.
-    fn take_pending(&mut self, hostname: &str, record_type: RecordType, id: u16) -> bool {
-        let Some(entry) = self.hostnames.get_mut(hostname) else {
-            warn!(hostname = %hostname, "dns: response for unregistered hostname");
+    fn take_pending(&mut self, query: &DnsQuery, id: u16) -> bool {
+        let Some(pending) = self.pending_queries.get(query) else {
+            if self.hostnames.contains_key(&query.hostname) {
+                debug!(
+                    hostname = %query.hostname,
+                    record_type = ?query.record_type,
+                    "dns: response without pending query"
+                );
+            } else {
+                warn!(hostname = %query.hostname, "dns: response for unregistered hostname");
+            }
             return false;
         };
-        let Some(&(expected_id, _)) = entry.pending.get(&record_type) else {
-            debug!(
-                hostname = %hostname,
-                record_type = ?record_type,
-                "dns: response without pending query"
-            );
-            return false;
-        };
-        if expected_id != id {
+        if pending.transaction_id != id {
             warn!(
-                hostname = %hostname,
-                expected = expected_id,
+                hostname = %query.hostname,
+                expected = pending.transaction_id,
                 got = id,
                 "dns: transaction ID mismatch"
             );
             return false;
         }
-        entry.pending.remove(&record_type);
+        self.pending_queries.remove(query);
         true
     }
 
@@ -313,6 +323,7 @@ impl DnsActor {
         let now = Instant::now();
         let refresh_interval = self.dns_tuning.dns_refresh_interval;
         let queued_queries = &mut self.queued_queries;
+        let pending_queries = &self.pending_queries;
 
         for (hostname, entry) in &mut self.hostnames {
             if hostname.parse::<IpAddr>().is_ok() || now < entry.next_refresh_at {
@@ -320,34 +331,27 @@ impl DnsActor {
             }
 
             entry.next_refresh_at = now + refresh_interval;
-            if !entry.pending.contains_key(&RecordType::A) {
-                queued_queries.insert(DnsQuery {
+            for record_type in [RecordType::A, RecordType::AAAA] {
+                let query = DnsQuery {
                     hostname: hostname.clone(),
-                    record_type: RecordType::A,
-                });
-            }
-            if !entry.pending.contains_key(&RecordType::AAAA) {
-                queued_queries.insert(DnsQuery {
-                    hostname: hostname.clone(),
-                    record_type: RecordType::AAAA,
-                });
+                    record_type,
+                };
+                if !pending_queries.contains_key(&query) {
+                    queued_queries.insert(query);
+                }
             }
         }
     }
 
     /// Sends a queued DNS query and records it as pending.
     async fn send_query(&mut self, query: DnsQuery) {
-        let DnsQuery {
-            hostname,
-            record_type,
-        } = query;
-        let Some(entry) = self.hostnames.get_mut(&hostname) else {
-            warn!(host = %hostname, record_type = ?record_type, "dns: dropping queued query for unregistered hostname");
+        if !self.hostnames.contains_key(&query.hostname) {
+            warn!(host = %query.hostname, record_type = ?query.record_type, "dns: dropping queued query for unregistered hostname");
             return;
-        };
+        }
 
-        let result: Result<(), String> = async {
-            let name = Name::from_ascii(&hostname).map_err(|err| err.to_string())?;
+        let result: Result<PendingQuery, String> = async {
+            let name = Name::from_ascii(&query.hostname).map_err(|err| err.to_string())?;
 
             let mut message = Message::new();
             let id = rand::rng().random::<u16>();
@@ -355,7 +359,7 @@ impl DnsActor {
             message.set_message_type(MessageType::Query);
             message.set_op_code(OpCode::Query);
             message.set_recursion_desired(true);
-            message.add_query(record_type_query(name, record_type));
+            message.add_query(record_type_query(name, query.record_type));
 
             let outbound = message.to_vec().map_err(|err| err.to_string())?;
             self.socket
@@ -363,15 +367,21 @@ impl DnsActor {
                 .await
                 .map_err(|err| err.to_string())?;
 
-            entry.pending.insert(record_type, (id, Instant::now()));
-
-            Ok(())
+            Ok(PendingQuery {
+                transaction_id: id,
+                sent_at: Instant::now(),
+            })
         }
         .await;
 
-        if let Err(err) = result {
-            warn!(host = %hostname, record_type = ?record_type, server = %self.server, error = %err, "dns: query send failed");
-        }
+        let pending = match result {
+            Ok(pending) => pending,
+            Err(err) => {
+                warn!(host = %query.hostname, record_type = ?query.record_type, server = %self.server, error = %err, "dns: query send failed");
+                return;
+            }
+        };
+        self.pending_queries.insert(query, pending);
     }
 
     /// Parses a DNS response and updates the matching hostname state.
@@ -387,31 +397,33 @@ impl DnsActor {
             }
         };
 
-        let Some(query) = message.queries().first() else {
+        let Some(question) = message.queries().first() else {
             warn!("dns: response with empty question section");
             return;
         };
 
-        let hostname = normalize_dns_name(query.name());
-        let record_type = query.query_type();
+        let query = DnsQuery {
+            hostname: normalize_dns_name(question.name()),
+            record_type: question.query_type(),
+        };
         let id = message.id();
 
         // Treat truncated responses as packet loss: leave the pending entry
         // untouched so the timeout handler retries it.
         if message.truncated() {
-            if self.hostnames.contains_key(&hostname) {
-                warn!(host = %hostname, "dns: response truncated, will retry");
+            if self.hostnames.contains_key(&query.hostname) {
+                warn!(host = %query.hostname, "dns: response truncated, will retry");
             } else {
-                debug!(host = %hostname, "dns: truncated response for unregistered hostname");
+                debug!(host = %query.hostname, "dns: truncated response for unregistered hostname");
             }
             return;
         }
 
-        if !self.take_pending(&hostname, record_type, id) {
+        if !self.take_pending(&query, id) {
             return;
         }
 
-        self.handle_decoded_packet(&message, &hostname, record_type);
+        self.handle_decoded_packet(&message, &query.hostname, query.record_type);
     }
 
     /// Applies records from a decoded response that matches a pending query.
@@ -446,24 +458,21 @@ impl DnsActor {
     fn handle_tick(&mut self) {
         let now = Instant::now();
         let timeout = self.dns_tuning.dns_query_timeout;
-        let mut expired = Vec::new();
-        for (host, entry) in &self.hostnames {
-            for (&record_type, &(_, last_sent)) in &entry.pending {
-                if now.duration_since(last_sent) >= timeout {
-                    expired.push((host.clone(), record_type));
-                }
-            }
-        }
 
-        for (host, record_type) in expired {
-            if let Some(entry) = self.hostnames.get_mut(&host) {
-                entry.pending.remove(&record_type);
+        loop {
+            let expired = self
+                .pending_queries
+                .front()
+                .is_some_and(|pending| now.duration_since(pending.sent_at) >= timeout);
+            if !expired {
+                break;
             }
-            warn!(host = %host, record_type = ?record_type, "dns: query timed out, scheduling retry");
-            self.queued_queries.insert(DnsQuery {
-                hostname: host,
-                record_type,
-            });
+
+            let Some((query, _)) = self.pending_queries.pop_front_entry() else {
+                break;
+            };
+            warn!(host = %query.hostname, record_type = ?query.record_type, "dns: query timed out, scheduling retry");
+            self.queued_queries.insert(query);
         }
     }
 }
@@ -507,6 +516,7 @@ pub async fn make_dns<P: RouteProbe>(
         dns_tuning: tuning.dns.clone(),
         hostnames: HashMap::new(),
         queued_queries: HashSet::new(),
+        pending_queries: OrderedHashMap::new(),
         dirty: false,
     })
 }
@@ -622,6 +632,7 @@ mod tests {
             dns_tuning: DnsTuning::default(),
             hostnames: HashMap::new(),
             queued_queries: HashSet::new(),
+            pending_queries: OrderedHashMap::new(),
             dirty: false,
         }
     }
@@ -1093,10 +1104,30 @@ mod tests {
         hosts.insert("example.com".to_string());
         actor.set_hostnames(&hosts);
 
-        let entry = actor.hostnames.get_mut("example.com").unwrap();
-        entry.pending.insert(RecordType::A, (42, Instant::now()));
-        entry.pending.insert(RecordType::AAAA, (43, Instant::now()));
-        entry
+        actor.pending_queries.insert(
+            DnsQuery {
+                hostname: "example.com".to_string(),
+                record_type: RecordType::A,
+            },
+            PendingQuery {
+                transaction_id: 42,
+                sent_at: Instant::now(),
+            },
+        );
+        actor.pending_queries.insert(
+            DnsQuery {
+                hostname: "example.com".to_string(),
+                record_type: RecordType::AAAA,
+            },
+            PendingQuery {
+                transaction_id: 43,
+                sent_at: Instant::now(),
+            },
+        );
+        actor
+            .hostnames
+            .get_mut("example.com")
+            .unwrap()
             .ips
             .insert(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), Instant::now());
         actor.queued_queries.insert(DnsQuery {
@@ -1107,6 +1138,7 @@ mod tests {
         actor.set_hostnames(&HashSet::new());
         assert!(actor.hostnames.is_empty());
         assert!(actor.queued_queries.is_empty());
+        assert!(actor.pending_queries.is_empty());
     }
 
     #[tokio::test]
@@ -1137,12 +1169,16 @@ mod tests {
 
         let hosts = HashSet::from(["example.com".to_string()]);
         actor.set_hostnames(&hosts);
-        actor
-            .hostnames
-            .get_mut("example.com")
-            .unwrap()
-            .pending
-            .insert(RecordType::A, (42, Instant::now()));
+        actor.pending_queries.insert(
+            DnsQuery {
+                hostname: "example.com".to_string(),
+                record_type: RecordType::A,
+            },
+            PendingQuery {
+                transaction_id: 42,
+                sent_at: Instant::now(),
+            },
+        );
         actor.trigger_refresh();
 
         assert_eq!(actor.queued_queries.len(), 1);
@@ -1247,29 +1283,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_tick_retries_only_expired_pending_prefix() {
+        let mut actor = test_dns_actor().await;
+        let expired_query = DnsQuery {
+            hostname: "expired.example".to_string(),
+            record_type: RecordType::A,
+        };
+        let fresh_query = DnsQuery {
+            hostname: "fresh.example".to_string(),
+            record_type: RecordType::AAAA,
+        };
+        actor.pending_queries.insert(
+            expired_query.clone(),
+            PendingQuery {
+                transaction_id: 42,
+                sent_at: Instant::now() - actor.dns_tuning.dns_query_timeout,
+            },
+        );
+        actor.pending_queries.insert(
+            fresh_query.clone(),
+            PendingQuery {
+                transaction_id: 43,
+                sent_at: Instant::now(),
+            },
+        );
+
+        actor.handle_tick();
+
+        assert!(actor.queued_queries.contains(&expired_query));
+        assert!(!actor.queued_queries.contains(&fresh_query));
+        assert_eq!(
+            actor.pending_queries.front_entry().map(|(query, _)| query),
+            Some(&fresh_query)
+        );
+    }
+
+    #[tokio::test]
     async fn take_pending_validates_txid() {
         let mut actor = test_dns_actor().await;
-        let mut entry = HostnameState::default();
-        entry.pending.insert(RecordType::A, (42, Instant::now()));
-        actor.hostnames.insert("example.com".into(), entry);
+        actor
+            .hostnames
+            .insert("example.com".into(), HostnameState::default());
+        let query = DnsQuery {
+            hostname: "example.com".to_string(),
+            record_type: RecordType::A,
+        };
+        actor.pending_queries.insert(
+            query.clone(),
+            PendingQuery {
+                transaction_id: 42,
+                sent_at: Instant::now(),
+            },
+        );
 
         // Unregistered hostname → rejected
-        assert!(!actor.take_pending("unknown.com", RecordType::A, 42));
+        assert!(!actor.take_pending(
+            &DnsQuery {
+                hostname: "unknown.com".to_string(),
+                record_type: RecordType::A,
+            },
+            42,
+        ));
 
         // Wrong txid → rejected, pending preserved
-        assert!(!actor.take_pending("example.com", RecordType::A, 99));
-        assert!(actor.hostnames["example.com"]
-            .pending
-            .contains_key(&RecordType::A));
+        assert!(!actor.take_pending(&query, 99));
+        assert!(actor.pending_queries.contains_key(&query));
 
         // Wrong record type → rejected
-        assert!(!actor.take_pending("example.com", RecordType::AAAA, 42));
+        assert!(!actor.take_pending(
+            &DnsQuery {
+                hostname: "example.com".to_string(),
+                record_type: RecordType::AAAA,
+            },
+            42,
+        ));
 
         // Correct txid → accepted and cleared
-        assert!(actor.take_pending("example.com", RecordType::A, 42));
-        assert!(!actor.hostnames["example.com"]
-            .pending
-            .contains_key(&RecordType::A));
+        assert!(actor.take_pending(&query, 42));
+        assert!(!actor.pending_queries.contains_key(&query));
     }
 
     #[tokio::test]
