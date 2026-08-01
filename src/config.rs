@@ -331,25 +331,17 @@ pub struct DnsTuning {
     /// DNS query timeout (default: 2s).
     #[serde(with = "humantime_serde")]
     pub dns_query_timeout: Duration,
-    /// DNS refresh interval; 0 disables (default: 120s).
+    /// DNS refresh interval (default: 120s).
     ///
     /// **Warning:** `dns_min_ttl` should be at least `2 × dns_refresh_interval`.
     /// Otherwise, cached IPs may expire before the next refresh re-queries them,
     /// causing connections to be pruned and re-established in a loop.
     #[serde(with = "humantime_serde")]
     pub dns_refresh_interval: Duration,
-    /// Delay before emitting a DNS snapshot after the first state change (default: 100ms).
+    /// Minimum interval between consecutive DNS query sends (default: 100ms).
     ///
-    /// After a DNS reply marks the state dirty, the resolver waits this duration
-    /// before emitting a snapshot to the orchestrator. Subsequent replies within
-    /// the window are coalesced into the same snapshot.
-    #[serde(with = "humantime_serde")]
-    pub dns_snapshot_delay: Duration,
-    /// Minimum interval between consecutive DNS query sends (default: 50ms).
-    ///
-    /// Serializes outbound DNS queries to avoid triggering rate limits on
-    /// public resolvers (e.g., Cloudflare 1.1.1.1). A sleep of this duration
-    /// is inserted before each outbound query send.
+    /// The DNS query pacing timer sends at most one queued query per interval,
+    /// reducing bursts sent to public resolvers without blocking the actor loop.
     #[serde(with = "humantime_serde")]
     pub dns_query_interval: Duration,
     /// Minimum TTL floor for DNS records (default: `"5m"`).
@@ -372,8 +364,7 @@ impl Default for DnsTuning {
         Self {
             dns_query_timeout: Duration::from_secs(2),
             dns_refresh_interval: Duration::from_secs(120),
-            dns_snapshot_delay: Duration::from_millis(100),
-            dns_query_interval: Duration::from_millis(50),
+            dns_query_interval: Duration::from_millis(100),
             dns_min_ttl: Duration::from_secs(300),
         }
     }
@@ -552,7 +543,6 @@ impl Config {
         }
 
         // Duration fields that must be strictly positive.
-        // dns_refresh_interval is intentionally excluded: zero disables periodic refresh.
         let duration_checks: &[(&'static str, Duration)] = &[
             ("tuning.reconcile_interval", self.tuning.reconcile_interval),
             (
@@ -576,8 +566,8 @@ impl Config {
                 self.tuning.dns.dns_query_timeout,
             ),
             (
-                "tuning.dns_snapshot_delay",
-                self.tuning.dns.dns_snapshot_delay,
+                "tuning.dns_refresh_interval",
+                self.tuning.dns.dns_refresh_interval,
             ),
             (
                 "tuning.dns_query_interval",
@@ -648,18 +638,16 @@ impl Config {
 
         // DNS TTL floor vs refresh interval: if min_ttl < 2× refresh, IPs can
         // expire between refresh cycles, causing repeated connection churn.
-        if !self.tuning.dns.dns_refresh_interval.is_zero() {
-            let min_safe_ttl = self.tuning.dns.dns_refresh_interval.saturating_mul(2);
-            if self.tuning.dns.dns_min_ttl < min_safe_ttl {
-                tracing::warn!(
-                    dns_min_ttl = ?self.tuning.dns.dns_min_ttl,
-                    dns_refresh_interval = ?self.tuning.dns.dns_refresh_interval,
-                    recommended_min_ttl = ?min_safe_ttl,
-                    "tuning.dns_min_ttl should be at least 2× tuning.dns_refresh_interval; \
-                     otherwise cached IPs may expire before the next refresh, \
-                     causing repeated connection pruning and reconnection"
-                );
-            }
+        let min_safe_ttl = self.tuning.dns.dns_refresh_interval.saturating_mul(2);
+        if self.tuning.dns.dns_min_ttl < min_safe_ttl {
+            tracing::warn!(
+                dns_min_ttl = ?self.tuning.dns.dns_min_ttl,
+                dns_refresh_interval = ?self.tuning.dns.dns_refresh_interval,
+                recommended_min_ttl = ?min_safe_ttl,
+                "tuning.dns_min_ttl should be at least 2× tuning.dns_refresh_interval; \
+                 otherwise cached IPs may expire before the next refresh, \
+                 causing repeated connection pruning and reconnection"
+            );
         }
 
         if self.tuning.reconnect_backoff_min > self.tuning.reconnect_backoff_max {
@@ -2071,10 +2059,9 @@ peers:
             Duration::from_secs(120)
         );
         assert_eq!(
-            cfg.tuning.dns.dns_snapshot_delay,
+            cfg.tuning.dns.dns_query_interval,
             Duration::from_millis(100)
         );
-        assert_eq!(cfg.tuning.dns.dns_query_interval, Duration::from_millis(50));
         assert_eq!(cfg.tuning.dns.dns_min_ttl, Duration::from_secs(300));
         assert_eq!(cfg.tuning.h3.h3_handshake_timeout, Duration::from_secs(5));
         assert_eq!(cfg.tuning.h3.h3_max_idle_timeout, Duration::from_secs(60));
@@ -2340,12 +2327,12 @@ local:
     addrs:
       - 192.168.180.1/32
 tuning:
-  dns_query_interval: 100ms
+  dns_query_interval: 250ms
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(
             cfg.tuning.dns.dns_query_interval,
-            Duration::from_millis(100)
+            Duration::from_millis(250)
         );
     }
 
@@ -2447,8 +2434,8 @@ peers:
             ("dns_query_timeout", |t| {
                 t.dns.dns_query_timeout = Duration::ZERO
             }),
-            ("dns_snapshot_delay", |t| {
-                t.dns.dns_snapshot_delay = Duration::ZERO
+            ("dns_refresh_interval", |t| {
+                t.dns.dns_refresh_interval = Duration::ZERO
             }),
             ("dns_query_interval", |t| {
                 t.dns.dns_query_interval = Duration::ZERO
@@ -2505,14 +2492,6 @@ peers:
 "#;
         let cfg = Config::load_from_str(yaml).expect("config should load");
         assert_eq!(cfg.tuning.metrics_log_interval, Duration::from_secs(5));
-    }
-
-    #[test]
-    fn allows_zero_dns_refresh_interval() {
-        let mut config = sample_h3_config();
-        config.tuning.dns.dns_refresh_interval = Duration::ZERO;
-        // dns_refresh_interval = 0 means "disable periodic refresh" — this is valid
-        assert!(config.validate().is_ok());
     }
 
     #[test]
