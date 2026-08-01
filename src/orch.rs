@@ -556,15 +556,20 @@ impl Orchestrator {
         let bare_rx_cmd_tx = if let Some(ref local_bare) = config.local.bare {
             let listen_addr = resolve_listen_addr(&local_bare.listen.host, local_bare.listen.port)?;
 
-            let udp_rx = make_bare_rx(listen_addr, tun_mtu, tuning, udp_rt.handle())
-                .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
-
-            let (cmd_tx, bare_rx_handle, udp_rx_handle) = spawn_bare_rx(
-                udp_rx,
+            let bare_rx_group = make_bare_rx(
+                listen_addr,
+                tun_mtu,
                 HashSet::new(),
                 ingress_tx.clone(),
                 events_tx.clone(),
                 tuning,
+                udp_rt.handle(),
+            )
+            .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
+
+            let (cmd_tx, bare_rx_handle, udp_rx_handle) = spawn_bare_rx(
+                bare_rx_group,
+                tuning.io.packet_queue_depth,
                 udp_rt.handle(),
                 crypto_rt.handle(),
             );
