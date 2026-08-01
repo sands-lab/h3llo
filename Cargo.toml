@@ -42,7 +42,6 @@ tokio-util = "0.7"
 humantime-serde = "1.1.1"
 enum-map = "2.7.3"
 notify = "8.2"
-indexmap = "2.13"
 
 # Use mimalloc for musl targets to avoid musl's slow default allocator.
 # Purge tuning is done via MIMALLOC_PURGE_DELAY=0 env var in the Dockerfile.

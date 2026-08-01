@@ -7,7 +7,6 @@ use crate::config::{DnsTuning, LocalDns, Tuning};
 use crate::events::{DnsEvent, Event};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use indexmap::IndexMap;
 use rand::RngExt;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -88,8 +87,8 @@ pub struct DnsActor {
     /// Queries waiting to be sent, deduplicated by hostname and record type.
     /// A query is never both queued here and present in `pending_queries`.
     queued_queries: HashSet<DnsQuery>,
-    /// In-flight queries ordered by send time, oldest first.
-    pending_queries: IndexMap<DnsQuery, PendingQuery>,
+    /// In-flight queries keyed by hostname and record type.
+    pending_queries: HashMap<DnsQuery, PendingQuery>,
     /// True if state changed since the last snapshot emission.
     dirty: bool,
 }
@@ -109,14 +108,8 @@ impl DnsActor {
             self.dirty = true;
             info!(hostnames = ?removed, "dns: hostnames unregistered");
         }
-        for hostname in &removed {
-            for record_type in [RecordType::A, RecordType::AAAA] {
-                self.pending_queries.shift_remove(&DnsQuery {
-                    hostname: hostname.clone(),
-                    record_type,
-                });
-            }
-        }
+        self.pending_queries
+            .retain(|query, _| hosts.contains(&query.hostname));
         for host in hosts {
             if !self.hostnames.contains_key(host) {
                 self.dirty = true;
@@ -201,7 +194,7 @@ impl DnsActor {
             );
             return false;
         }
-        self.pending_queries.shift_remove(query);
+        self.pending_queries.remove(query);
         true
     }
 
@@ -459,14 +452,11 @@ impl DnsActor {
         let now = Instant::now();
         let timeout = self.dns_tuning.dns_query_timeout;
 
-        let expired_count = self
-            .pending_queries
-            .values()
-            .take_while(|pending| now.duration_since(pending.sent_at) >= timeout)
-            .count();
         let pending_queries = &mut self.pending_queries;
         let queued_queries = &mut self.queued_queries;
-        for (query, _) in pending_queries.drain(..expired_count) {
+        for (query, _) in
+            pending_queries.extract_if(|_, pending| now.duration_since(pending.sent_at) >= timeout)
+        {
             warn!(host = %query.hostname, record_type = ?query.record_type, "dns: query timed out, scheduling retry");
             queued_queries.insert(query);
         }
@@ -512,7 +502,7 @@ pub async fn make_dns<P: RouteProbe>(
         dns_tuning: tuning.dns.clone(),
         hostnames: HashMap::new(),
         queued_queries: HashSet::new(),
-        pending_queries: IndexMap::new(),
+        pending_queries: HashMap::new(),
         dirty: false,
     })
 }
@@ -628,7 +618,7 @@ mod tests {
             dns_tuning: DnsTuning::default(),
             hostnames: HashMap::new(),
             queued_queries: HashSet::new(),
-            pending_queries: IndexMap::new(),
+            pending_queries: HashMap::new(),
             dirty: false,
         }
     }
@@ -1279,7 +1269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_tick_retries_only_expired_pending_prefix() {
+    async fn handle_tick_retries_expired_pending_queries() {
         let mut actor = test_dns_actor().await;
         let expired_query = DnsQuery {
             hostname: "expired.example".to_string(),
@@ -1308,10 +1298,8 @@ mod tests {
 
         assert!(actor.queued_queries.contains(&expired_query));
         assert!(!actor.queued_queries.contains(&fresh_query));
-        assert_eq!(
-            actor.pending_queries.first().map(|(query, _)| query),
-            Some(&fresh_query)
-        );
+        assert!(!actor.pending_queries.contains_key(&expired_query));
+        assert!(actor.pending_queries.contains_key(&fresh_query));
     }
 
     #[tokio::test]
