@@ -340,9 +340,8 @@ pub struct DnsTuning {
     pub dns_refresh_interval: Duration,
     /// Minimum interval between consecutive DNS query sends (default: 100ms).
     ///
-    /// Serializes outbound DNS queries to reduce bursts sent to public
-    /// resolvers. A sleep of this duration is inserted before each outbound
-    /// query send.
+    /// The DNS query pacing timer sends at most one queued query per interval,
+    /// reducing bursts sent to public resolvers without blocking the actor loop.
     #[serde(with = "humantime_serde")]
     pub dns_query_interval: Duration,
     /// Minimum TTL floor for DNS records (default: `"5m"`).
