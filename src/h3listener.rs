@@ -3,10 +3,10 @@
 //! Architecture:
 //! - **UDP RX actor** (I/O thread): GRO-aware recv, emits `(SocketAddr, Vec<PooledBuf>)`.
 //! - **Server UDP TX actor** (I/O thread): shared send actor for all connections.
-//! - **`H3Dispatcher`** (`crypto_rt`): CID routing, connection acceptance, actor lifecycle.
+//! - **`H3Dispatcher`** (`crypto_rt`): CID routing, connection acceptance, and certificate rotation.
 //! - **`H3Engine`** (`crypto_rt`): per-connection unified QUIC/H3 engine with ingress + egress.
 //!
-//! See [`make_h3_dispatcher`] + [`spawn_h3_dispatcher`] for the public entry points.
+//! See [`make_h3_dispatcher`] + [`spawn_h3_dispatcher`] for the server entry points.
 
 use crate::actor::{ActorError, ActorExitResult};
 use crate::auth::validate_connect_auth;
@@ -20,15 +20,16 @@ use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
 use crate::helpers::alloc_uninit_packet_buf;
 use crate::udp;
+use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use quiche::h3::NameValue;
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
-use tokio::time;
+use tokio::time::{self, Instant};
 use tokio_quiche::buf_factory::PooledBuf;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -44,6 +45,9 @@ pub(crate) enum ServerError {
     /// TLS or QUIC configuration failed.
     #[error("config: {0}")]
     Config(String),
+    /// Certificate filesystem watcher setup failed.
+    #[error("certificate watcher: {0}")]
+    Watcher(String),
     /// Connection acceptance or CONNECT-IP handshake failed.
     #[error("accept: {0}")]
     Accept(String),
@@ -98,8 +102,11 @@ fn validate_server_auth(
 
 // ========== Configuration Helpers ==========
 
+/// Quiet period used to coalesce multi-file certificate rotations.
+const RELOAD_DEBOUNCE: Duration = Duration::from_millis(500);
+
 /// Creates a quiche QUIC server configuration with TLS credentials.
-fn make_server_quiche_config(
+pub(crate) fn make_server_quiche_config(
     h3_tuning: &H3Tuning,
     max_udp_payload: usize,
     cert_path: &Path,
@@ -130,7 +137,7 @@ fn make_server_quiche_config(
 
 /// Commands accepted by the H3 dispatcher actor.
 #[derive(Debug)]
-pub enum DispatcherCommand {
+pub(crate) enum DispatcherCommand {
     /// Replace the peer token map used for CONNECT-IP authentication.
     UpdatePeerTokens(HashMap<String, String>),
 }
@@ -138,8 +145,9 @@ pub enum DispatcherCommand {
 /// Creates [`H3Dispatcher`] state ready for spawning.
 ///
 /// Performs all fallible setup: socket binding, TLS credential loading,
-/// QUIC config construction, and UDP socket initialization. Does NOT spawn
-/// any tasks — use [`spawn_h3_dispatcher`] for that.
+/// certificate watcher registration, QUIC config construction, and UDP socket
+/// initialization. Does NOT spawn any tasks — use [`spawn_h3_dispatcher`] for
+/// that.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_h3_dispatcher(
     listen_addr: SocketAddr,
@@ -157,8 +165,41 @@ pub(crate) fn make_h3_dispatcher(
     let bound_addr = std_socket
         .local_addr()
         .map_err(|e| ServerError::Socket(format!("local_addr: {e}")))?;
+    let cert_path = std::path::absolute(cert_path).map_err(|error| {
+        ServerError::Watcher(format!(
+            "failed to resolve credential path `{}`: {error}",
+            cert_path.display()
+        ))
+    })?;
+    let key_path = std::path::absolute(key_path).map_err(|error| {
+        ServerError::Watcher(format!(
+            "failed to resolve credential path `{}`: {error}",
+            key_path.display()
+        ))
+    })?;
+    let watch_directories = [cert_path.as_path(), key_path.as_path()]
+        .into_iter()
+        .filter_map(Path::parent)
+        .map(Path::to_path_buf)
+        .collect::<BTreeSet<_>>();
+    let (reload_event_tx, reload_event_rx) = mpsc::unbounded_channel();
+    let mut credential_watcher = notify::recommended_watcher(move |event| {
+        let _ = reload_event_tx.send(event);
+    })
+    .map_err(|error| ServerError::Watcher(format!("failed to create watcher: {error}")))?;
+    for directory in &watch_directories {
+        credential_watcher
+            .watch(directory, RecursiveMode::NonRecursive)
+            .map_err(|error| {
+                ServerError::Watcher(format!(
+                    "failed to watch credential directory `{}`: {error}",
+                    directory.display()
+                ))
+            })?;
+    }
+
     let max_udp_payload = usize::from(tun_mtu) + CONNECT_IP_OVERHEAD;
-    let config = make_server_quiche_config(h3_tuning, max_udp_payload, cert_path, key_path)?;
+    let config = make_server_quiche_config(h3_tuning, max_udp_payload, &cert_path, &key_path)?;
 
     let (udp_rx, udp_tx) = {
         let _guard = udp_rt.enter();
@@ -176,6 +217,10 @@ pub(crate) fn make_h3_dispatcher(
         events_tx,
         io_tuning: io_tuning.clone(),
         h3_tuning: h3_tuning.clone(),
+        credential_watcher,
+        reload_event_rx,
+        cert_path,
+        key_path,
     };
 
     info!(%listen_addr, %bound_addr, "h3 dispatcher created");
@@ -358,10 +403,9 @@ struct DispatchIo {
 
 /// H3 dispatcher state created by [`make_h3_dispatcher`].
 ///
-/// Contains all resources needed to run the dispatcher. Spawned infallibly
-/// via [`spawn_h3_dispatcher`], which creates UDP I/O actors and the
-/// dispatcher task.
-pub struct H3Dispatcher {
+/// Contains all resources needed to run the H3 server. Spawned infallibly via
+/// [`spawn_h3_dispatcher`], which creates the UDP I/O and dispatcher actors.
+pub(crate) struct H3Dispatcher {
     bound_addr: SocketAddr,
     config: quiche::Config,
     max_udp_payload: usize,
@@ -371,6 +415,11 @@ pub struct H3Dispatcher {
     events_tx: mpsc::UnboundedSender<Event>,
     io_tuning: IoTuning,
     h3_tuning: H3Tuning,
+    /// Kept alive so native filesystem watches remain registered.
+    credential_watcher: RecommendedWatcher,
+    reload_event_rx: mpsc::UnboundedReceiver<notify::Result<NotifyEvent>>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
 }
 
 /// Runtime state for the CID-routing dispatcher loop.
@@ -384,8 +433,17 @@ struct DispatcherRuntime {
     io: DispatchIo,
     io_tuning: IoTuning,
     h3_tuning: H3Tuning,
+    /// Kept alive so native filesystem watches remain registered.
+    _credential_watcher: RecommendedWatcher,
+    reload_event_rx: mpsc::UnboundedReceiver<notify::Result<NotifyEvent>>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
     /// Maps each registered CID directly to the per-connection packet sender.
     cid_table: HashMap<Vec<u8>, mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>>,
+}
+
+fn should_reload(event: &NotifyEvent) -> bool {
+    event.need_rescan() || !event.kind.is_access()
 }
 
 impl DispatcherRuntime {
@@ -396,8 +454,16 @@ impl DispatcherRuntime {
         mut peer_tokens: HashMap<String, String>,
     ) -> ActorExitResult {
         let mut cleanup_ticker = time::interval(Duration::from_secs(1));
+        let debounce = time::sleep(Duration::MAX);
+        tokio::pin!(debounce);
+        let mut reload_pending = false;
 
-        info!(bound_addr = %self.bound_addr, "h3 dispatcher started");
+        info!(
+            bound_addr = %self.bound_addr,
+            cert = %self.cert_path.display(),
+            key = %self.key_path.display(),
+            "h3 dispatcher started"
+        );
 
         loop {
             tokio::select! {
@@ -423,6 +489,81 @@ impl DispatcherRuntime {
                             info!("dispatcher: updated peer tokens");
                         }
                         None => return Ok(()),
+                    }
+                }
+
+                event = self.reload_event_rx.recv() => {
+                    let Some(event) = event else {
+                        return Err(ActorError::H3Dispatcher {
+                            addr: self.bound_addr.to_string(),
+                            reason: "TLS certificate watcher event channel closed".into(),
+                        });
+                    };
+                    match event {
+                        Ok(event) if should_reload(&event) => {
+                            debug!(
+                                kind = ?event.kind,
+                                paths = ?event.paths,
+                                rescan = event.need_rescan(),
+                                "TLS credential filesystem change detected"
+                            );
+                            debounce
+                                .as_mut()
+                                .reset(Instant::now() + RELOAD_DEBOUNCE);
+                            reload_pending = true;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                "TLS certificate watcher reported an error; validating current files"
+                            );
+                            debounce
+                                .as_mut()
+                                .reset(Instant::now() + RELOAD_DEBOUNCE);
+                            reload_pending = true;
+                        }
+                    }
+                }
+
+                () = &mut debounce, if reload_pending => {
+                    reload_pending = false;
+                    let cert_path = self.cert_path.clone();
+                    let key_path = self.key_path.clone();
+                    let h3_tuning = self.h3_tuning.clone();
+                    let max_udp_payload = self.max_udp_payload;
+                    let loaded = tokio::task::spawn_blocking(move || {
+                        make_server_quiche_config(
+                            &h3_tuning,
+                            max_udp_payload,
+                            &cert_path,
+                            &key_path,
+                        )
+                    })
+                    .await;
+                    match loaded {
+                        Ok(Ok(config)) => {
+                            self.config = config;
+                            info!(
+                                cert = %self.cert_path.display(),
+                                key = %self.key_path.display(),
+                                "TLS certificate reloaded"
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            warn!(
+                                %error,
+                                cert = %self.cert_path.display(),
+                                key = %self.key_path.display(),
+                                "TLS certificate reload rejected; retaining previous certificate"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                "TLS certificate loader task failed; retaining previous certificate"
+                            );
+                        }
                     }
                 }
             }
@@ -607,7 +748,7 @@ impl DispatcherRuntime {
 /// UDP RX/TX actors, then spawns the CID-routing dispatcher loop.
 ///
 /// Returns command sender, dispatcher/UDP-RX/UDP-TX join handles, and bound address.
-pub fn spawn_h3_dispatcher(
+pub(crate) fn spawn_h3_dispatcher(
     dispatcher: H3Dispatcher,
     peer_tokens: HashMap<String, String>,
     udp_rt: &RuntimeHandle,
@@ -629,6 +770,10 @@ pub fn spawn_h3_dispatcher(
         events_tx,
         io_tuning,
         h3_tuning,
+        credential_watcher,
+        reload_event_rx,
+        cert_path,
+        key_path,
     } = dispatcher;
 
     // Spawn UDP actors on udp_rt.
@@ -656,6 +801,10 @@ pub fn spawn_h3_dispatcher(
             },
             io_tuning,
             h3_tuning,
+            _credential_watcher: credential_watcher,
+            reload_event_rx,
+            cert_path,
+            key_path,
             cid_table: HashMap::new(),
         };
         runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
@@ -701,6 +850,8 @@ mod tests {
         assert!(err.to_string().contains("socket"));
         let err = ServerError::Config("cert not found".into());
         assert!(err.to_string().contains("config"));
+        let err = ServerError::Watcher("watch failed".into());
+        assert!(err.to_string().contains("watcher"));
         let err = ServerError::Accept("auth failed".into());
         assert!(err.to_string().contains("accept"));
     }
@@ -762,6 +913,18 @@ mod tests {
         assert!(validate_server_auth(&headers, &tokens).is_err());
     }
 
+    #[test]
+    fn reload_ignores_read_only_access_events() {
+        let event = NotifyEvent::new(notify::EventKind::Access(notify::event::AccessKind::Read));
+        assert!(!should_reload(&event));
+    }
+
+    #[test]
+    fn reload_accepts_mutating_events() {
+        let event = NotifyEvent::new(notify::EventKind::Modify(notify::event::ModifyKind::Any));
+        assert!(should_reload(&event));
+    }
+
     // ========== make_h3_dispatcher Tests ==========
 
     #[tokio::test]
@@ -789,7 +952,7 @@ mod tests {
     // ========== Integration Test Imports ==========
 
     use crate::bind::test_support::FakeRouteProbe;
-    use crate::config::default_mtu;
+    use crate::config::{default_mtu, Tuning};
     use crate::events::DialContext;
     use crate::h3dialer::{dial_h3_client, DialError};
     use crate::h3session::test_support::{insecure_tuning, test_peer_h3, TestCertBundle};
@@ -810,8 +973,10 @@ mod tests {
         events_rx: mpsc::UnboundedReceiver<Event>,
         ingress_rx: mpsc::Receiver<Vec<PooledBuf>>,
         bound_addr: SocketAddr,
-        _certs: TestCertBundle,
+        certs: TestCertBundle,
         _handle: tokio::task::JoinHandle<ActorExitResult>,
+        _udp_rx_handle: tokio::task::JoinHandle<ActorExitResult>,
+        _udp_tx_handle: tokio::task::JoinHandle<ActorExitResult>,
     }
 
     impl TestH3Server {
@@ -837,7 +1002,8 @@ mod tests {
             )
             .expect("make_h3_dispatcher");
 
-            let (cmd_tx, handle, _, _, _) = spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
+            let (cmd_tx, handle, udp_rx_handle, udp_tx_handle, _) =
+                spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
 
             // Give dispatcher time to start accepting.
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -847,8 +1013,10 @@ mod tests {
                 events_rx,
                 ingress_rx,
                 bound_addr,
-                _certs: certs,
+                certs,
                 _handle: handle,
+                _udp_rx_handle: udp_rx_handle,
+                _udp_tx_handle: udp_tx_handle,
             }
         }
     }
@@ -880,8 +1048,17 @@ mod tests {
         token: &str,
         peer_id: &str,
     ) -> (ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
-        let peer_h3 = test_peer_h3(bound_addr, token);
         let tuning = insecure_tuning();
+        dial_new_client_with_tuning(bound_addr, token, peer_id, tuning).await
+    }
+
+    async fn dial_new_client_with_tuning(
+        bound_addr: SocketAddr,
+        token: &str,
+        peer_id: &str,
+        tuning: Tuning,
+    ) -> (ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
+        let peer_h3 = test_peer_h3(bound_addr, token);
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
@@ -898,6 +1075,27 @@ mod tests {
             .expect("dial_h3_client failed");
 
         (event, ingress_rx)
+    }
+
+    fn trusted_tuning(cert_path: &Path) -> Tuning {
+        Tuning {
+            h3: H3Tuning {
+                h3_trusted_ca: Some(cert_path.to_string_lossy().into_owned()),
+                ..H3Tuning::default()
+            },
+            ..Tuning::default()
+        }
+    }
+
+    fn replace_credentials(server: &TestH3Server, replacement: &TestCertBundle) {
+        std::fs::copy(replacement.cert_path(), server.certs.cert_path())
+            .expect("replace certificate");
+        std::fs::copy(replacement.key_path(), server.certs.key_path())
+            .expect("replace private key");
+    }
+
+    async fn wait_for_certificate_reload() {
+        time::sleep(RELOAD_DEBOUNCE + Duration::from_millis(300)).await;
     }
 
     // ========== Old Client (h3.rs) → H3v2 Listener Tests ==========
@@ -1000,6 +1198,79 @@ mod tests {
 
         assert_eq!(event.peer_id, peer_id);
         assert_eq!(event.remote_addr, server.bound_addr);
+
+        drop(server.cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn h3v2_listener_reloads_tls_more_than_once() {
+        let peer_id = "new-cli-tls-peer";
+        let token = "new-cli-tls-tk12";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+
+        let server = TestH3Server::start(peer_tokens).await;
+        let (existing, _existing_ingress_rx) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
+
+        for _ in 0..2 {
+            let replacement = TestCertBundle::generate();
+            replace_credentials(&server, &replacement);
+            wait_for_certificate_reload().await;
+
+            let (new_connection, _new_ingress_rx) = dial_new_client_with_tuning(
+                server.bound_addr,
+                token,
+                peer_id,
+                trusted_tuning(replacement.cert_path()),
+            )
+            .await;
+
+            assert_eq!(new_connection.peer_id, peer_id);
+            assert!(
+                !existing.tx.is_closed(),
+                "replacing listener TLS config must not close existing connections"
+            );
+        }
+
+        drop(server.cmd_tx);
+    }
+
+    #[tokio::test]
+    async fn h3v2_listener_rejects_mismatched_tls_then_recovers() {
+        let peer_id = "new-cli-tls-recovery-peer";
+        let token = "new-cli-tls-recovery-token";
+        let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
+        let server = TestH3Server::start(peer_tokens).await;
+        let original_ca = tempfile::NamedTempFile::new().expect("create original CA file");
+        std::fs::copy(server.certs.cert_path(), original_ca.path())
+            .expect("preserve original certificate");
+
+        let replacement = TestCertBundle::generate();
+        std::fs::copy(replacement.cert_path(), server.certs.cert_path())
+            .expect("replace certificate only");
+        wait_for_certificate_reload().await;
+
+        let (old_config_connection, _old_ingress_rx) = dial_new_client_with_tuning(
+            server.bound_addr,
+            token,
+            peer_id,
+            trusted_tuning(original_ca.path()),
+        )
+        .await;
+        assert_eq!(old_config_connection.peer_id, peer_id);
+
+        std::fs::copy(replacement.key_path(), server.certs.key_path())
+            .expect("replace matching private key");
+        wait_for_certificate_reload().await;
+
+        let (recovered_connection, _recovered_ingress_rx) = dial_new_client_with_tuning(
+            server.bound_addr,
+            token,
+            peer_id,
+            trusted_tuning(replacement.cert_path()),
+        )
+        .await;
+        assert_eq!(recovered_connection.peer_id, peer_id);
 
         drop(server.cmd_tx);
     }

@@ -257,7 +257,7 @@ ip route show table all
 
 **Symptom**: h3llo logs a TLS error at startup (e.g., `tls error`, `failed to read private key`, or a rustls/quinn handshake failure) even though the certificate and key files exist and appear correct.
 
-**Root cause**: On NFS mounts with `root_squash` (the default), the NFS server maps UID 0 (root inside the container) to `nobody`/`nfsnobody`. Private key files typically have `0600` permissions owned by the creating user. When the container process (running as root) tries to read the key via NFS, the squashed UID has no read permission.
+**Root cause**: On NFS mounts with `root_squash` (the default), the NFS server maps UID 0 (root inside the container) to `nobody`/`nfsnobody`. Private key files typically have `0600` permissions owned by the creating user. When the container process (running as root) tries to read the key via NFS, the squashed UID has no read permission. Native filesystem watchers also do not reliably receive remote NFS changes, so hot reload can remain idle even when permissions allow reading.
 
 This manifests differently from a missing file — the file is visible in `ls -la`, but reading by root inside the container fails with a permission error that surfaces as a TLS initialization failure.
 
@@ -291,6 +291,29 @@ docker run -d \
 ```
 
 Alternatively, if NFS is unavoidable, either disable `root_squash` on the export or `chmod 644` the key file (less secure — only acceptable for test environments).
+
+### TLS Certificate Hot Reload Does Not Trigger
+
+**Symptom**: The certificate files changed, but no `TLS certificate reloaded` log appears and new H3 connections still receive the previous certificate.
+
+**Common causes**:
+
+- **File-only container mount**: A certificate or key was bind-mounted as an individual file. Atomic replacement changes the host directory entry while the container mount can remain attached to the old file. Mount the containing directory read-only instead.
+- **Kubernetes `subPath`**: Secret volume updates are not propagated through `subPath` mounts. Mount the complete Secret or projected volume directory.
+- **Network filesystem**: NFS and similar filesystems may not emit native notification events. Copy credentials onto a local filesystem before rotation or restart h3llo after renewal.
+- **Parent replacement**: The credential parent directory itself was replaced. Keep the watched directory stable and rotate its child files or symlinks.
+- **Invalid pair**: h3llo detected the change but logged `TLS certificate reload rejected; retaining previous certificate`. Check that the leaf certificate and private key match and that both files are readable.
+
+**Recommended container mount**:
+
+```bash
+docker run -d \
+  --mount type=bind,src=/host/h3llo-certs,dst=/etc/h3llo/certs,readonly \
+  ... \
+  h3llo -c /etc/h3llo/config.yaml
+```
+
+Configure `cert: /etc/h3llo/certs/cert.pem` and `key: /etc/h3llo/certs/key.pem`, then stage and rename both files inside `/host/h3llo-certs`. Hot reload affects only new handshakes; existing H3 connections intentionally keep their established TLS sessions.
 
 ### Silent QUIC Handshake Timeout Due to TLS Certificate SAN Mismatch
 

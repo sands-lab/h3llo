@@ -301,44 +301,40 @@ pub(crate) mod test_support {
 
     /// Test certificate bundle with temporary files.
     pub struct TestCertBundle {
-        cert_file: tempfile::NamedTempFile,
-        key_file: tempfile::NamedTempFile,
+        _directory: tempfile::TempDir,
+        cert_path: std::path::PathBuf,
+        key_path: std::path::PathBuf,
     }
 
     impl TestCertBundle {
         /// Generates a self-signed certificate for localhost using rcgen.
         pub fn generate() -> Self {
             use rcgen::{generate_simple_self_signed, CertifiedKey};
-            use std::io::Write;
-
             let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
             let CertifiedKey { cert, signing_key } =
                 generate_simple_self_signed(subject_alt_names).expect("cert generation");
 
-            let mut cert_file = tempfile::NamedTempFile::new().expect("create cert temp file");
-            cert_file
-                .write_all(cert.pem().as_bytes())
-                .expect("write cert");
-
-            let mut key_file = tempfile::NamedTempFile::new().expect("create key temp file");
-            key_file
-                .write_all(signing_key.serialize_pem().as_bytes())
-                .expect("write key");
+            let directory = tempfile::tempdir().expect("create certificate temp directory");
+            let cert_path = directory.path().join("cert.pem");
+            let key_path = directory.path().join("key.pem");
+            std::fs::write(&cert_path, cert.pem()).expect("write cert");
+            std::fs::write(&key_path, signing_key.serialize_pem()).expect("write key");
 
             Self {
-                cert_file,
-                key_file,
+                _directory: directory,
+                cert_path,
+                key_path,
             }
         }
 
         /// Returns the path to the certificate PEM file.
         pub fn cert_path(&self) -> &std::path::Path {
-            self.cert_file.path()
+            &self.cert_path
         }
 
         /// Returns the path to the private key PEM file.
         pub fn key_path(&self) -> &std::path::Path {
-            self.key_file.path()
+            &self.key_path
         }
     }
 

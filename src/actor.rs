@@ -15,7 +15,7 @@ use tracing::error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisionPolicy {
     /// Critical actors whose failure should exit h3llo.
-    /// Includes: `tun_rx`, `tun_tx`, `udp_rx`, `dns_resolver`
+    /// Includes: `tun_rx`, `tun_tx`, `udp_rx`, `dns_resolver`, `h3_dispatcher`
     Critical,
     /// Restartable actors that could be reconnected on failure.
     /// Includes: `udp_tx`, `h3_tx`, `h3_rx`
@@ -98,6 +98,15 @@ pub enum ActorError {
         reason: String,
     },
 
+    /// H3 dispatcher actor exited unexpectedly.
+    #[error("h3_dispatcher[{addr}]: {reason}")]
+    H3Dispatcher {
+        /// Listener address.
+        addr: String,
+        /// Failure reason.
+        reason: String,
+    },
+
     /// Management API server exited with I/O error.
     #[error("api[{addr}]: server failed: {reason}")]
     ApiServer {
@@ -125,6 +134,7 @@ impl ActorError {
             | ActorError::TunTxSend { .. }
             | ActorError::UdpRxRecv { .. }
             | ActorError::DnsRecv { .. }
+            | ActorError::H3Dispatcher { .. }
             | ActorError::ApiServer { .. }
             | ActorError::RouterFailed { .. } => SupervisionPolicy::Critical,
             // Restartable actors - could be reconnected (future work)
@@ -240,6 +250,10 @@ mod tests {
                 addr: "127.0.0.1:9090".into(),
                 reason: "bind failed".into(),
             },
+            ActorError::H3Dispatcher {
+                addr: "0.0.0.0:443".into(),
+                reason: "watcher channel closed".into(),
+            },
         ];
         for err in errors {
             assert_eq!(
@@ -318,6 +332,17 @@ mod tests {
         assert!(msg.contains("h3_tx"));
         assert!(msg.contains("node-3"));
         assert!(msg.contains("flow control blocked"));
+    }
+
+    #[test]
+    fn actor_error_h3_dispatcher_includes_addr() {
+        let err = ActorError::H3Dispatcher {
+            addr: "0.0.0.0:443".into(),
+            reason: "watcher channel closed".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("h3_dispatcher[0.0.0.0:443]"));
+        assert!(msg.contains("watcher channel closed"));
     }
 
     #[test]

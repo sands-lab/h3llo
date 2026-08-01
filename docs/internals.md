@@ -202,7 +202,7 @@ The orchestrator and control-plane actors (DNS, Route Sync, API) share the main 
 Orchestrator responsibilities and invariants:
 - Maintain the latest configuration snapshot and H3 connection pool; receive commands from other actors through its MPSC queue.
 - Stay fully async: handle config updates, DNS refresh results, connection close notifications, and timer ticks without blocking other commands.
-- Spawn child actors (DNS resolver, H3 dialers, H3Dispatcher) and register newly established H3 connections' TX channels in the Router's routing table via `RouterCommand::UpdateRouting`. The DNS resolver and H3Dispatcher are long-lived child actors that join the orchestrator's JoinSet.
+- Spawn child actors (DNS resolver, H3 dialers, H3Dispatcher) and register newly established H3 connections' TX channels in the Router's routing table via `RouterCommand::UpdateRouting`. `spawn_h3_dispatcher` returns the dispatcher and UDP I/O handles; the orchestrator registers every long-lived child with its `JoinSet`.
 - Process events from child actors (metrics, DNS) and log them appropriately; child actors control their own metric emission timing.
 - Handle graceful shutdown on `ctrl_c` signal; task exit errors include task labels for debugging.
 
@@ -217,6 +217,18 @@ Spawn an actor for every I/O path (TUN-Rx, TUN-Tx, Router, H3Dispatcher, each H3
 When configuration changes arrive (management API POST/DELETE or initialization), update the accepted-source filter first (fast, in-memory), then the internal routing table, then the system routing table. Dynamic reconfiguration flows through the orchestrator via the event channel.
 
 **Terminology**: "Accepted sources" refers to the BareUDP RX source IP filter. "Allowed IPs" refers to TUN routing prefixes (`peers[].tun.allowed_ips`).
+
+### TLS Certificate Reload
+
+Server credentials are reloaded transactionally for new H3 connections. The listener socket and established `H3Engine` actors remain untouched throughout rotation.
+
+- **Detection**: `notify::RecommendedWatcher` watches the distinct parent directories of `local.h3.cert` and `local.h3.key` non-recursively. Watching directories preserves notifications when a credential inode is replaced with `rename` or a symlink target is rotated.
+- **Lifecycle**: `make_h3_dispatcher` performs fallible watcher registration. `H3Dispatcher` owns the native watcher and its event receiver, while the dispatcher loop owns the debounce state; no separate reload actor or control protocol is involved.
+- **Coalescing**: Any non-access event, watcher error, or rescan marker starts a 500 ms quiet-period timer. Subsequent events reset the timer so certificate-chain and private-key updates are normally validated together.
+- **Validation**: When the debounce timer expires, the dispatcher awaits `spawn_blocking` while it builds a fresh `quiche::Config`, applies the unchanged H3 transport tuning, parses the certificate chain, and loads the private key. The dispatcher pauses packet routing during this bounded reload, while the blocking work runs outside the crypto runtime thread so established `H3Engine` actors continue independently. BoringSSL rejects a private key that does not match the leaf certificate.
+- **Commit**: The dispatcher directly swaps in a fully constructed configuration when the blocking task succeeds. Every later `quiche::accept` uses the new TLS context.
+- **Isolation**: A `quiche::Connection` creates and owns its TLS handshake state during acceptance, so replacing the dispatcher config neither renegotiates nor closes established connections.
+- **Failure handling**: Credential parsing, pairing, or loader-task failures are warnings and retain the last valid config so a later filesystem update can recover automatically. Closing the watcher event channel permanently removes reload capability, so the dispatcher returns a critical actor error and the orchestrator exits h3llo instead of reporting a healthy but stale listener.
 
 Connection management:
 - Each peer maintains multiple active connections (`Vec<BoundState>`), one per resolved IP.
