@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time;
 use tracing::{debug, info, warn};
 
 const DNS_BUFFER_SIZE: usize = 1500;
@@ -559,6 +558,7 @@ mod tests {
     use crate::bind::test_support::FakeRouteProbe;
     use hickory_proto::rr::rdata::A;
     use std::net::Ipv4Addr;
+    use tokio::time;
 
     /// Starts a resolver coroutine wired to the provided server socket.
     async fn start_resolver(
