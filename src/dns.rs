@@ -48,7 +48,7 @@ fn normalize_dns_name(name: &Name) -> String {
 /// single struct to eliminate map synchronization overhead. The `pending` map
 /// is keyed by `RecordType` (A or AAAA), allowing at most one pending query
 /// per record type per hostname.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct HostnameState {
     /// Resolved IPs with TTL-based expiration times.
     ips: HashMap<IpAddr, Instant>,
@@ -68,22 +68,21 @@ impl Default for HostnameState {
     }
 }
 
-/// Unified DNS resolution state.
+/// DNS resolver actor state.
 ///
-/// Consolidates hostname registration, IP cache, pending queries, and refresh
-/// scheduling into a single per-hostname structure. Emits state snapshots on
-/// change rather than per-IP events.
-#[derive(Debug, Clone)]
-struct DnsState {
-    /// Per-hostname resolution state: resolved IPs, pending queries, refresh scheduling.
+/// Created by `make_dns()`, consumed by `spawn_dns()`.
+#[derive(Debug)]
+pub struct DnsActor {
+    server: SocketAddr,
+    socket: UdpSocket,
+    dns_tuning: DnsTuning,
+    /// Per-hostname resolution state: resolved IPs, pending queries, and refresh scheduling.
     hostnames: HashMap<String, HostnameState>,
-    /// True if state changed since last snapshot emission.
+    /// True if state changed since the last snapshot emission.
     dirty: bool,
-    /// Minimum TTL floor to prevent excessive refresh.
-    min_ttl: Duration,
 }
 
-impl DnsState {
+impl DnsActor {
     /// Updates the set of registered hostnames.
     ///
     /// Removes unregistered hostnames (including their IPs and pending queries);
@@ -91,18 +90,19 @@ impl DnsState {
     fn set_hostnames(&mut self, hosts: &HashSet<String>) {
         let removed: Vec<String> = self
             .hostnames
-            .extract_if(|h, _| !hosts.contains(h))
-            .map(|(h, _)| h)
+            .extract_if(|host, _| !hosts.contains(host))
+            .map(|(host, _)| host)
             .collect();
         if !removed.is_empty() {
             self.dirty = true;
             info!(hostnames = ?removed, "dns: hostnames unregistered");
         }
-        for h in hosts {
-            if !self.hostnames.contains_key(h) {
+        for host in hosts {
+            if !self.hostnames.contains_key(host) {
                 self.dirty = true;
-                info!(hostname = %h, "dns: hostname registered");
-                self.hostnames.insert(h.clone(), HostnameState::default());
+                info!(hostname = %host, "dns: hostname registered");
+                self.hostnames
+                    .insert(host.clone(), HostnameState::default());
             }
         }
     }
@@ -113,7 +113,7 @@ impl DnsState {
             return;
         };
         let record_ttl = Duration::from_secs(u64::from(ttl));
-        let effective_ttl = record_ttl.max(self.min_ttl);
+        let effective_ttl = record_ttl.max(self.dns_tuning.dns_min_ttl);
         let expires_at = Instant::now() + effective_ttl;
         if entry.ips.insert(ip, expires_at).is_none() {
             self.dirty = true;
@@ -127,7 +127,7 @@ impl DnsState {
         for (host, entry) in &mut self.hostnames {
             let expired: Vec<IpAddr> = entry
                 .ips
-                .extract_if(|_, exp| *exp <= now)
+                .extract_if(|_, expires_at| *expires_at <= now)
                 .map(|(ip, _)| ip)
                 .collect();
             if !expired.is_empty() {
@@ -155,9 +155,8 @@ impl DnsState {
 
     /// Validates and clears a pending query matching (hostname, `record_type`, txid).
     ///
-    /// Returns `true` if a matching pending query was found and cleared. Performs
-    /// dual validation: hostname must be registered, record type must have a
-    /// pending slot, and the transaction ID must match.
+    /// Returns `true` only when the hostname, record type, and transaction ID
+    /// all match an in-flight query.
     fn take_pending(&mut self, hostname: &str, record_type: RecordType, id: u16) -> bool {
         let Some(entry) = self.hostnames.get_mut(hostname) else {
             warn!(hostname = %hostname, "dns: response for unregistered hostname");
@@ -183,16 +182,276 @@ impl DnsState {
         entry.pending.remove(&record_type);
         true
     }
-}
 
-/// DNS resolver actor state.
-///
-/// Created by `make_dns()`, consumed by `spawn_dns()`.
-#[derive(Debug)]
-pub struct DnsActor {
-    server: SocketAddr,
-    socket: UdpSocket,
-    dns_tuning: DnsTuning,
+    /// Runs the DNS resolver actor until its command channel closes or socket I/O fails.
+    async fn run(
+        mut self,
+        mut cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
+        events_tx: mpsc::UnboundedSender<Event>,
+    ) -> ActorExitResult {
+        let server_str = self.server.to_string();
+        let query_timeout = self.dns_tuning.dns_query_timeout;
+        let refresh_interval = self.dns_tuning.dns_refresh_interval;
+        let snapshot_delay = self.dns_tuning.dns_snapshot_delay;
+
+        info!(
+            server = %self.server,
+            refresh_interval = ?refresh_interval,
+            min_ttl = ?self.dns_tuning.dns_min_ttl,
+            "dns: resolver started"
+        );
+
+        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
+        let mut ticker = time::interval(query_timeout / 2);
+
+        // Debounce timer: armed when state becomes dirty, fires after snapshot_delay.
+        let snapshot_timer = time::sleep(snapshot_delay);
+        tokio::pin!(snapshot_timer);
+        let mut snapshot_armed = false;
+
+        let refresh_duration = if refresh_interval.is_zero() {
+            Duration::from_secs(3600) // placeholder; branch disabled below
+        } else {
+            refresh_interval
+        };
+        let mut refresh_ticker = time::interval(refresh_duration);
+        refresh_ticker.tick().await; // consume immediate first tick
+
+        // Arms the debounce timer if dirty and not already armed.
+        macro_rules! arm_snapshot_timer {
+            () => {
+                if self.dirty && !snapshot_armed {
+                    snapshot_timer
+                        .as_mut()
+                        .reset(time::Instant::now() + snapshot_delay);
+                    snapshot_armed = true;
+                }
+            };
+        }
+
+        loop {
+            tokio::select! {
+                maybe_cmd = cmd_rx.recv() => {
+                    match maybe_cmd {
+                        Some(DnsCommand::SetHostnames { hosts }) => {
+                            self.handle_set_hostnames(hosts, &events_tx).await;
+                        }
+                        None => return Ok(()),
+                    }
+                }
+                result = self.socket.recv(&mut buf) => {
+                    match result {
+                        Ok(len) if len > 0 => {
+                            self.handle_packet(&buf[..len]);
+                            arm_snapshot_timer!();
+                        }
+                        Ok(_) => {}
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                        Err(err) => {
+                            return Err(ActorError::DnsRecv { server: server_str, source: err });
+                        }
+                    }
+                }
+                () = &mut snapshot_timer, if snapshot_armed => {
+                    snapshot_armed = false;
+                    self.emit_snapshot(&events_tx);
+                }
+                _ = ticker.tick() => {
+                    self.handle_tick().await;
+                    self.expire_stale();
+                    arm_snapshot_timer!();
+                }
+                _ = refresh_ticker.tick(), if !refresh_interval.is_zero() => {
+                    self.trigger_refresh().await;
+                }
+            }
+        }
+    }
+
+    /// Applies a complete hostname registration update and triggers resolution.
+    async fn handle_set_hostnames(
+        &mut self,
+        new_hosts: HashSet<String>,
+        events_tx: &mpsc::UnboundedSender<Event>,
+    ) {
+        self.set_hostnames(&new_hosts);
+
+        // Record IP literals immediately (trigger_refresh skips them).
+        for host in &new_hosts {
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                self.record_ip(host, ip, u32::MAX);
+            }
+        }
+
+        // Always emit a snapshot so the orchestrator rebuilds routing after config
+        // changes. Without this, config updates that only change allowed_ips (same
+        // hostnames, same resolved IPs) would never trigger a routing table rebuild.
+        self.dirty = true;
+        self.emit_snapshot(events_tx);
+
+        self.trigger_refresh().await;
+    }
+
+    /// Sends A+AAAA queries for hostnames whose refresh deadline has passed.
+    ///
+    /// Skips IP literals and recently refreshed hostnames, then advances each
+    /// selected hostname's refresh deadline.
+    async fn trigger_refresh(&mut self) {
+        let now = Instant::now();
+        let refresh_interval = self.dns_tuning.dns_refresh_interval;
+        let query_interval = self.dns_tuning.dns_query_interval;
+        let hosts: Vec<String> = self
+            .hostnames
+            .iter()
+            .filter(|(host, _)| host.parse::<IpAddr>().is_err())
+            .filter(|(_, entry)| now >= entry.next_refresh_at)
+            .map(|(host, _)| host.clone())
+            .collect();
+
+        for host in hosts {
+            if let Some(entry) = self.hostnames.get_mut(&host) {
+                entry.next_refresh_at = now + refresh_interval;
+            }
+            time::sleep(query_interval).await;
+            self.send_query(host.clone(), RecordType::A).await;
+            time::sleep(query_interval).await;
+            self.send_query(host, RecordType::AAAA).await;
+        }
+    }
+
+    /// Sends a DNS query and records it as pending.
+    ///
+    /// Skips the send when the same hostname and record type are already pending.
+    async fn send_query(&mut self, host: String, record_type: RecordType) {
+        if self
+            .hostnames
+            .get(&host)
+            .is_some_and(|entry| entry.pending.contains_key(&record_type))
+        {
+            return;
+        }
+
+        let result: Result<(), String> = async {
+            let name = Name::from_ascii(&host).map_err(|err| err.to_string())?;
+
+            let mut message = Message::new();
+            let id = rand::rng().random::<u16>();
+            message.set_id(id);
+            message.set_message_type(MessageType::Query);
+            message.set_op_code(OpCode::Query);
+            message.set_recursion_desired(true);
+            message.add_query(record_type_query(name, record_type));
+
+            let outbound = message.to_vec().map_err(|err| err.to_string())?;
+            self.socket
+                .send(&outbound)
+                .await
+                .map_err(|err| err.to_string())?;
+
+            if let Some(entry) = self.hostnames.get_mut(&host) {
+                entry.pending.insert(record_type, (id, Instant::now()));
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            warn!(host = %host, record_type = ?record_type, server = %self.server, error = %err, "dns: query send failed");
+        }
+    }
+
+    /// Parses a DNS response and updates the matching hostname state.
+    ///
+    /// Uses the response question for direct hostname lookup, then validates
+    /// both the record type and transaction ID before applying records.
+    fn handle_packet(&mut self, data: &[u8]) {
+        let message = match Message::from_vec(data) {
+            Ok(message) => message,
+            Err(err) => {
+                warn!(error = %err, "dns: packet decode failed");
+                return;
+            }
+        };
+
+        let Some(query) = message.queries().first() else {
+            warn!("dns: response with empty question section");
+            return;
+        };
+
+        let hostname = normalize_dns_name(query.name());
+        let record_type = query.query_type();
+        let id = message.id();
+
+        // Treat truncated responses as packet loss: leave the pending entry
+        // untouched so the timeout handler retries it.
+        if message.truncated() {
+            if self.hostnames.contains_key(&hostname) {
+                warn!(host = %hostname, "dns: response truncated, will retry");
+            } else {
+                debug!(host = %hostname, "dns: truncated response for unregistered hostname");
+            }
+            return;
+        }
+
+        if !self.take_pending(&hostname, record_type, id) {
+            return;
+        }
+
+        self.handle_decoded_packet(&message, &hostname, record_type);
+    }
+
+    /// Applies records from a decoded response that matches a pending query.
+    fn handle_decoded_packet(&mut self, message: &Message, host: &str, record_type: RecordType) {
+        log_response_warnings(message, host);
+
+        let records = extract_records(message, record_type);
+
+        if message.response_code() == ResponseCode::NoError && records.is_empty() {
+            if let Some(got) = message
+                .answers()
+                .iter()
+                .map(Record::record_type)
+                .find(|&got| got != record_type)
+            {
+                warn!(
+                    host = %host,
+                    expected = ?record_type,
+                    got = ?got,
+                    "dns: unexpected record type in response"
+                );
+                return;
+            }
+        }
+
+        for (address, ttl) in records {
+            self.record_ip(host, address, ttl);
+        }
+    }
+
+    /// Retries timed-out pending queries with new transaction IDs.
+    async fn handle_tick(&mut self) {
+        let now = Instant::now();
+        let timeout = self.dns_tuning.dns_query_timeout;
+        let query_interval = self.dns_tuning.dns_query_interval;
+        let mut expired = Vec::new();
+        for (host, entry) in &self.hostnames {
+            for (&record_type, &(_, last_sent)) in &entry.pending {
+                if now.duration_since(last_sent) >= timeout {
+                    expired.push((host.clone(), record_type));
+                }
+            }
+        }
+
+        for (host, record_type) in expired {
+            if let Some(entry) = self.hostnames.get_mut(&host) {
+                entry.pending.remove(&record_type);
+            }
+            time::sleep(query_interval).await;
+            warn!(host = %host, record_type = ?record_type, "dns: query timed out, retrying");
+            self.send_query(host, record_type).await;
+        }
+    }
 }
 
 /// Creates a DNS resolver actor state from configuration.
@@ -232,6 +491,8 @@ pub async fn make_dns<P: RouteProbe>(
         server,
         socket,
         dns_tuning: tuning.dns.clone(),
+        hostnames: HashMap::new(),
+        dirty: false,
     })
 }
 
@@ -252,305 +513,10 @@ pub fn spawn_dns(
     mpsc::UnboundedSender<DnsCommand>,
     JoinHandle<ActorExitResult>,
 ) {
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-
-    let DnsActor {
-        server,
-        socket,
-        dns_tuning: dns,
-    } = actor;
-
-    let server_str = server.to_string();
-
-    info!(
-        server = %server,
-        refresh_interval = ?dns.dns_refresh_interval,
-        min_ttl = ?dns.dns_min_ttl,
-        "dns: resolver started"
-    );
-
-    let handle = tokio::spawn(async move {
-        let mut state = DnsState {
-            hostnames: HashMap::new(),
-            dirty: false,
-            min_ttl: dns.dns_min_ttl,
-        };
-
-        let mut buf = vec![0u8; DNS_BUFFER_SIZE];
-        let mut ticker = time::interval(dns.dns_query_timeout / 2);
-
-        // Debounce timer: armed when state becomes dirty, fires after snapshot_delay.
-        let snapshot_timer = time::sleep(dns.dns_snapshot_delay);
-        tokio::pin!(snapshot_timer);
-        let mut snapshot_armed = false;
-
-        let refresh_duration = if dns.dns_refresh_interval.is_zero() {
-            Duration::from_secs(3600) // placeholder; branch disabled below
-        } else {
-            dns.dns_refresh_interval
-        };
-        let mut refresh_ticker = time::interval(refresh_duration);
-        refresh_ticker.tick().await; // consume immediate first tick
-
-        // Arms the debounce timer if dirty and not already armed.
-        macro_rules! arm_snapshot_timer {
-            () => {
-                if state.dirty && !snapshot_armed {
-                    snapshot_timer
-                        .as_mut()
-                        .reset(time::Instant::now() + dns.dns_snapshot_delay);
-                    snapshot_armed = true;
-                }
-            };
-        }
-
-        loop {
-            tokio::select! {
-                maybe_cmd = cmd_rx.recv() => {
-                    match maybe_cmd {
-                        Some(DnsCommand::SetHostnames { hosts }) => {
-                            handle_set_hostnames(hosts, &mut state, &socket, dns.dns_query_interval, dns.dns_refresh_interval, &events_tx).await;
-                        }
-                        None => return Ok(()),
-                    }
-                }
-                result = socket.recv(&mut buf) => {
-                    match result {
-                        Ok(len) if len > 0 => {
-                            handle_packet(&buf[..len], &mut state);
-                            arm_snapshot_timer!();
-                        }
-                        Ok(_) => {}
-                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                        Err(err) => {
-                            return Err(ActorError::DnsRecv { server: server_str, source: err });
-                        }
-                    }
-                }
-                () = &mut snapshot_timer, if snapshot_armed => {
-                    snapshot_armed = false;
-                    state.emit_snapshot(&events_tx);
-                }
-                _ = ticker.tick() => {
-                    handle_tick(&mut state, &socket, dns.dns_query_timeout, dns.dns_query_interval).await;
-                    state.expire_stale();
-                    arm_snapshot_timer!();
-                }
-                _ = refresh_ticker.tick(), if !dns.dns_refresh_interval.is_zero() => {
-                    trigger_refresh(&mut state, &socket, dns.dns_query_interval, dns.dns_refresh_interval).await;
-                }
-            }
-        }
-    });
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(actor.run(cmd_rx, events_tx));
 
     (cmd_tx, handle)
-}
-
-/// Handles the `SetHostnames` command: diffs against current state,
-/// records IP literals, emits a snapshot, and triggers refresh.
-async fn handle_set_hostnames(
-    new_hosts: HashSet<String>,
-    state: &mut DnsState,
-    socket: &UdpSocket,
-    query_interval: Duration,
-    refresh_interval: Duration,
-    events_tx: &mpsc::UnboundedSender<Event>,
-) {
-    state.set_hostnames(&new_hosts);
-
-    // Record IP literals immediately (trigger_refresh skips them)
-    for host in &new_hosts {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            state.record_ip(host, ip, u32::MAX);
-        }
-    }
-
-    // Always emit a snapshot so the orchestrator rebuilds routing after config
-    // changes. Without this, config updates that only change allowed_ips (same
-    // hostnames, same resolved IPs) would never trigger a routing table rebuild.
-    state.dirty = true;
-    state.emit_snapshot(events_tx);
-
-    trigger_refresh(state, socket, query_interval, refresh_interval).await;
-}
-
-/// Sends A+AAAA queries for registered hostnames whose `next_refresh_at` has passed.
-///
-/// Skips IP literals and hostnames refreshed recently (within `refresh_interval`).
-/// After sending, advances each hostname's `next_refresh_at` by `refresh_interval`.
-async fn trigger_refresh(
-    state: &mut DnsState,
-    socket: &UdpSocket,
-    query_interval: Duration,
-    refresh_interval: Duration,
-) {
-    let now = Instant::now();
-    let hosts: Vec<String> = state
-        .hostnames
-        .iter()
-        .filter(|(host, _)| host.parse::<IpAddr>().is_err())
-        .filter(|(_, entry)| now >= entry.next_refresh_at)
-        .map(|(host, _)| host.clone())
-        .collect();
-
-    for host in hosts {
-        if let Some(entry) = state.hostnames.get_mut(&host) {
-            entry.next_refresh_at = now + refresh_interval;
-        }
-        time::sleep(query_interval).await;
-        send_query(host.clone(), RecordType::A, state, socket).await;
-        time::sleep(query_interval).await;
-        send_query(host, RecordType::AAAA, state, socket).await;
-    }
-}
-
-/// Sends a DNS query packet and records it in state. Logs on error.
-///
-/// Skips sending if there is already a pending query for the same record type,
-/// avoiding redundant queries and stale txid overwrites.
-async fn send_query(
-    host: String,
-    record_type: RecordType,
-    state: &mut DnsState,
-    socket: &UdpSocket,
-) {
-    if state
-        .hostnames
-        .get(&host)
-        .is_some_and(|e| e.pending.contains_key(&record_type))
-    {
-        return;
-    }
-
-    let result: Result<(), String> = async {
-        let name = Name::from_ascii(&host).map_err(|e| e.to_string())?;
-
-        let mut message = Message::new();
-        let id = rand::rng().random::<u16>();
-        message.set_id(id);
-        message.set_message_type(MessageType::Query);
-        message.set_op_code(OpCode::Query);
-        message.set_recursion_desired(true);
-        message.add_query(record_type_query(name, record_type));
-
-        let outbound = message.to_vec().map_err(|e| e.to_string())?;
-        socket.send(&outbound).await.map_err(|e| e.to_string())?;
-
-        if let Some(entry) = state.hostnames.get_mut(&host) {
-            entry.pending.insert(record_type, (id, Instant::now()));
-        }
-
-        Ok(())
-    }
-    .await;
-
-    if let Err(err) = result {
-        let server = socket
-            .peer_addr()
-            .map_or("unknown".into(), |a| a.to_string());
-        warn!(host = %host, record_type = ?record_type, server = %server, error = %err, "dns: query send failed");
-    }
-}
-
-/// Parses a DNS response and updates state via O(1) hostname lookup.
-///
-/// Extracts the queried hostname from the response's question section
-/// (RFC 1035 §4.1.1) for direct `HashMap` lookup. Validates both hostname
-/// and txid before processing.
-fn handle_packet(data: &[u8], state: &mut DnsState) {
-    let message = match Message::from_vec(data) {
-        Ok(msg) => msg,
-        Err(err) => {
-            warn!(error = %err, "dns: packet decode failed");
-            return;
-        }
-    };
-
-    let Some(query) = message.queries().first() else {
-        warn!("dns: response with empty question section");
-        return;
-    };
-
-    let hostname = normalize_dns_name(query.name());
-    let record_type = query.query_type();
-    let id = message.id();
-
-    // Treat truncated responses as packet loss: leave the pending entry
-    // untouched so handle_tick retries after dns_query_timeout elapses.
-    if message.truncated() {
-        if state.hostnames.contains_key(&hostname) {
-            warn!(host = %hostname, "dns: response truncated, will retry");
-        } else {
-            debug!(host = %hostname, "dns: truncated response for unregistered hostname");
-        }
-        return;
-    }
-
-    if !state.take_pending(&hostname, record_type, id) {
-        return;
-    }
-
-    handle_decoded_packet(&message, &hostname, record_type, state);
-}
-
-/// Handles a parsed DNS packet that matches a pending request.
-fn handle_decoded_packet(
-    message: &Message,
-    host: &str,
-    record_type: RecordType,
-    state: &mut DnsState,
-) {
-    log_response_warnings(message, host);
-
-    let records = extract_records(message, record_type);
-
-    if message.response_code() == ResponseCode::NoError && records.is_empty() {
-        if let Some(got) = message
-            .answers()
-            .iter()
-            .map(Record::record_type)
-            .find(|&rt| rt != record_type)
-        {
-            warn!(
-                host = %host,
-                expected = ?record_type,
-                got = ?got,
-                "dns: unexpected record type in response"
-            );
-            return;
-        }
-    }
-
-    for (address, ttl) in records {
-        state.record_ip(host, address, ttl);
-    }
-}
-
-/// Retries timed-out pending queries with new transaction IDs.
-async fn handle_tick(
-    state: &mut DnsState,
-    socket: &UdpSocket,
-    timeout: Duration,
-    query_interval: Duration,
-) {
-    let now = Instant::now();
-    let mut expired: Vec<(String, RecordType)> = Vec::new();
-    for (host, entry) in &state.hostnames {
-        for (&rt, &(_, last_sent)) in &entry.pending {
-            if now.duration_since(last_sent) >= timeout {
-                expired.push((host.clone(), rt));
-            }
-        }
-    }
-
-    for (host, rt) in expired {
-        if let Some(entry) = state.hostnames.get_mut(&host) {
-            entry.pending.remove(&rt);
-        }
-        time::sleep(query_interval).await;
-        warn!(host = %host, record_type = ?rt, "dns: query timed out, retrying");
-        send_query(host, rt, state, socket).await;
-    }
 }
 
 /// Builds a query for `name` and `record_type`.
@@ -630,6 +596,18 @@ mod tests {
 
         let (cmd_tx, handle) = spawn_dns(dns_actor, event_tx);
         (cmd_tx, event_rx, handle)
+    }
+
+    /// Creates an actor for tests that exercise synchronous state transitions.
+    async fn test_dns_actor() -> DnsActor {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        DnsActor {
+            server: socket.local_addr().unwrap(),
+            socket,
+            dns_tuning: DnsTuning::default(),
+            hostnames: HashMap::new(),
+            dirty: false,
+        }
     }
 
     /// Builds a DNS response message for the provided transaction ID.
@@ -1133,7 +1111,7 @@ mod tests {
         handle.abort();
     }
 
-    // ========== Unit Tests for New Structures ==========
+    // ========== Actor State Unit Tests ==========
 
     #[test]
     fn normalize_dns_name_strips_trailing_dot() {
@@ -1147,54 +1125,46 @@ mod tests {
         assert_eq!(normalize_dns_name(&root), "");
     }
 
-    #[test]
-    fn set_hostnames_cleans_all_state() {
-        let mut state = DnsState {
-            hostnames: HashMap::new(),
-            dirty: false,
-            min_ttl: Duration::from_secs(300),
-        };
+    #[tokio::test]
+    async fn set_hostnames_cleans_all_state() {
+        let mut actor = test_dns_actor().await;
         let mut hosts = HashSet::new();
         hosts.insert("example.com".to_string());
-        state.set_hostnames(&hosts);
+        actor.set_hostnames(&hosts);
 
-        let entry = state.hostnames.get_mut("example.com").unwrap();
+        let entry = actor.hostnames.get_mut("example.com").unwrap();
         entry.pending.insert(RecordType::A, (42, Instant::now()));
         entry.pending.insert(RecordType::AAAA, (43, Instant::now()));
         entry
             .ips
             .insert(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), Instant::now());
 
-        state.set_hostnames(&HashSet::new());
-        assert!(state.hostnames.is_empty());
+        actor.set_hostnames(&HashSet::new());
+        assert!(actor.hostnames.is_empty());
     }
 
-    #[test]
-    fn take_pending_validates_txid() {
-        let mut state = DnsState {
-            hostnames: HashMap::new(),
-            dirty: false,
-            min_ttl: Duration::from_secs(300),
-        };
+    #[tokio::test]
+    async fn take_pending_validates_txid() {
+        let mut actor = test_dns_actor().await;
         let mut entry = HostnameState::default();
         entry.pending.insert(RecordType::A, (42, Instant::now()));
-        state.hostnames.insert("example.com".into(), entry);
+        actor.hostnames.insert("example.com".into(), entry);
 
         // Unregistered hostname → rejected
-        assert!(!state.take_pending("unknown.com", RecordType::A, 42));
+        assert!(!actor.take_pending("unknown.com", RecordType::A, 42));
 
         // Wrong txid → rejected, pending preserved
-        assert!(!state.take_pending("example.com", RecordType::A, 99));
-        assert!(state.hostnames["example.com"]
+        assert!(!actor.take_pending("example.com", RecordType::A, 99));
+        assert!(actor.hostnames["example.com"]
             .pending
             .contains_key(&RecordType::A));
 
         // Wrong record type → rejected
-        assert!(!state.take_pending("example.com", RecordType::AAAA, 42));
+        assert!(!actor.take_pending("example.com", RecordType::AAAA, 42));
 
         // Correct txid → accepted and cleared
-        assert!(state.take_pending("example.com", RecordType::A, 42));
-        assert!(!state.hostnames["example.com"]
+        assert!(actor.take_pending("example.com", RecordType::A, 42));
+        assert!(!actor.hostnames["example.com"]
             .pending
             .contains_key(&RecordType::A));
     }
