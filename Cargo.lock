@@ -1413,7 +1413,6 @@ dependencies = [
  "humantime-serde",
  "hyper",
  "hyper-util",
- "indexmap 2.13.0",
  "ipnet",
  "ipnet-trie",
  "libc",
