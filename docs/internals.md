@@ -202,7 +202,7 @@ The orchestrator and control-plane actors (DNS, Route Sync, API) share the main 
 Orchestrator responsibilities and invariants:
 - Maintain the latest configuration snapshot and H3 connection pool; receive commands from other actors through its MPSC queue.
 - Stay fully async: handle config updates, DNS refresh results, connection close notifications, and timer ticks without blocking other commands.
-- Spawn child actors (DNS resolver, H3 dialers, H3Dispatcher) and register newly established H3 connections' TX channels in the Router's routing table via `RouterCommand::UpdateRouting`. `spawn_h3_dispatcher` returns the dispatcher and UDP I/O handles; the orchestrator registers every long-lived child with its `JoinSet`.
+- Spawn child actors (DNS resolver, H3 dialers, H3Dispatcher) and register newly established H3 connections' TX channels in the Router's routing table via `RouterCommand::UpdateRouting`. `make_h3_dispatcher` prepares an `H3DispatcherGroup` containing the dispatcher and UDP actor states; `spawn_h3_dispatcher` consumes the group and returns their handles for registration with the orchestrator's `JoinSet`.
 - Process events from child actors (metrics, DNS) and log them appropriately; child actors control their own metric emission timing.
 - Handle graceful shutdown on `ctrl_c` signal; task exit errors include task labels for debugging.
 

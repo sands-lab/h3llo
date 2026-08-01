@@ -142,7 +142,7 @@ pub(crate) enum DispatcherCommand {
     UpdatePeerTokens(HashMap<String, String>),
 }
 
-/// Creates [`H3Dispatcher`] state ready for spawning.
+/// Creates an [`H3DispatcherGroup`] ready for spawning.
 ///
 /// Performs all fallible setup: socket binding, TLS credential loading,
 /// certificate watcher registration, QUIC config construction, and UDP socket
@@ -159,7 +159,7 @@ pub(crate) fn make_h3_dispatcher(
     udp_rt: &RuntimeHandle,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
-) -> Result<(H3Dispatcher, SocketAddr), ServerError> {
+) -> Result<(H3DispatcherGroup, SocketAddr), ServerError> {
     let std_socket = make_server_udp_socket(listen_addr, io_tuning.socket_buffer_bytes())
         .map_err(|e| ServerError::Socket(e.to_string()))?;
     let bound_addr = std_socket
@@ -207,24 +207,27 @@ pub(crate) fn make_h3_dispatcher(
             .map_err(|e| ServerError::Socket(format!("make_udp: {e}")))?
     };
 
-    let dispatcher = H3Dispatcher {
-        bound_addr,
-        config,
-        max_udp_payload,
+    let group = H3DispatcherGroup {
+        dispatcher: H3Dispatcher {
+            bound_addr,
+            config,
+            max_udp_payload,
+            ingress_tx,
+            events_tx,
+            io_tuning: io_tuning.clone(),
+            h3_tuning: h3_tuning.clone(),
+            _credential_watcher: credential_watcher,
+            reload_event_rx,
+            cert_path,
+            key_path,
+            cid_table: HashMap::new(),
+        },
         udp_rx,
         udp_tx,
-        ingress_tx,
-        events_tx,
-        io_tuning: io_tuning.clone(),
-        h3_tuning: h3_tuning.clone(),
-        credential_watcher,
-        reload_event_rx,
-        cert_path,
-        key_path,
     };
 
     info!(%listen_addr, %bound_addr, "h3 dispatcher created");
-    Ok((dispatcher, bound_addr))
+    Ok((group, bound_addr))
 }
 
 // ========== Packet Routing ==========
@@ -390,47 +393,23 @@ impl H3Engine {
 
 // ========== Server Dispatcher ==========
 
-/// Shared channel senders cloned into each per-connection [`H3Engine`].
-#[derive(Clone)]
-struct DispatchIo {
-    /// Tagged UDP send channel shared by all connections.
-    udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
-    /// Router ingress channel for decoded IP packets.
-    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-    /// System event channel (metrics, connection events).
-    events_tx: mpsc::UnboundedSender<Event>,
-}
-
-/// H3 dispatcher state created by [`make_h3_dispatcher`].
+/// Prepared state for the actors that implement the H3 dispatcher pipeline.
 ///
-/// Contains all resources needed to run the H3 server. Spawned infallibly via
-/// [`spawn_h3_dispatcher`], which creates the UDP I/O and dispatcher actors.
-pub(crate) struct H3Dispatcher {
-    bound_addr: SocketAddr,
-    config: quiche::Config,
-    max_udp_payload: usize,
+/// Created by [`make_h3_dispatcher`] and consumed by [`spawn_h3_dispatcher`].
+/// Each field is moved directly into its corresponding actor.
+pub(crate) struct H3DispatcherGroup {
+    dispatcher: H3Dispatcher,
     udp_rx: udp::UdpRx,
     udp_tx: udp::UdpTx,
-    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-    events_tx: mpsc::UnboundedSender<Event>,
-    io_tuning: IoTuning,
-    h3_tuning: H3Tuning,
-    /// Kept alive so native filesystem watches remain registered.
-    credential_watcher: RecommendedWatcher,
-    reload_event_rx: mpsc::UnboundedReceiver<notify::Result<NotifyEvent>>,
-    cert_path: PathBuf,
-    key_path: PathBuf,
 }
 
-/// Runtime state for the CID-routing dispatcher loop.
-///
-/// Built by [`spawn_h3_dispatcher`] from an [`H3Dispatcher`] after UDP actors
-/// are spawned. Routes packets to per-connection actors by CID.
-struct DispatcherRuntime {
+/// State owned exclusively by the CID-routing dispatcher actor.
+struct H3Dispatcher {
     bound_addr: SocketAddr,
     config: quiche::Config,
     max_udp_payload: usize,
-    io: DispatchIo,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+    events_tx: mpsc::UnboundedSender<Event>,
     io_tuning: IoTuning,
     h3_tuning: H3Tuning,
     /// Kept alive so native filesystem watches remain registered.
@@ -446,10 +425,11 @@ fn should_reload(event: &NotifyEvent) -> bool {
     event.need_rescan() || !event.kind.is_access()
 }
 
-impl DispatcherRuntime {
+impl H3Dispatcher {
     async fn run(
         mut self,
         mut udp_recv_rx: mpsc::Receiver<(SocketAddr, Vec<PooledBuf>)>,
+        udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
         mut cmd_rx: mpsc::UnboundedReceiver<DispatcherCommand>,
         mut peer_tokens: HashMap<String, String>,
     ) -> ActorExitResult {
@@ -475,7 +455,7 @@ impl DispatcherRuntime {
                         });
                     };
 
-                    self.handle_udp_batch(remote, batch, &peer_tokens).await;
+                    self.handle_udp_batch(remote, batch, &peer_tokens, &udp_send_tx).await;
                 }
 
                 _ = cleanup_ticker.tick() => {
@@ -575,6 +555,7 @@ impl DispatcherRuntime {
         remote: SocketAddr,
         mut batch: Vec<PooledBuf>,
         peer_tokens: &HashMap<String, String>,
+        udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     ) {
         let Some(header) = ServerPacketHeader::parse(&mut batch) else {
             debug!(%remote, "dispatcher: failed to parse packet header, dropping batch");
@@ -588,7 +569,7 @@ impl DispatcherRuntime {
             return;
         }
 
-        self.accept_and_spawn(remote, batch, header, peer_tokens);
+        self.accept_and_spawn(remote, batch, header, peer_tokens, udp_send_tx);
     }
 
     fn accept_and_spawn(
@@ -597,6 +578,7 @@ impl DispatcherRuntime {
         batch: Vec<PooledBuf>,
         header: ServerPacketHeader,
         peer_tokens: &HashMap<String, String>,
+        udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     ) {
         if header.hdr_ty != quiche::Type::Initial {
             debug!(%remote, ty = ?header.hdr_ty, "dispatcher: dropping non-Initial packet for unknown CID");
@@ -620,7 +602,7 @@ impl DispatcherRuntime {
                 &mut pkt,
             ) {
                 pkt.truncate(len);
-                if self.io.udp_send_tx.try_send((remote, vec![pkt])).is_err() {
+                if udp_send_tx.try_send((remote, vec![pkt])).is_err() {
                     debug!(%remote, "dispatcher: failed to send version negotiation");
                 }
             }
@@ -671,7 +653,6 @@ impl DispatcherRuntime {
             self.cid_table.insert(cid, packet_tx.clone());
         }
         let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(depth);
-        let channels = self.io.clone();
         let peer_tokens = peer_tokens.clone();
         let handshake_timeout = self.h3_tuning.h3_handshake_timeout;
 
@@ -680,10 +661,10 @@ impl DispatcherRuntime {
             session: None,
             io: EngineIo {
                 udp_recv_rx: packet_rx,
-                udp_send_tx: channels.udp_send_tx,
+                udp_send_tx: udp_send_tx.clone(),
                 egress_rx,
-                ingress_tx: channels.ingress_tx,
-                events_tx: channels.events_tx,
+                ingress_tx: self.ingress_tx.clone(),
+                events_tx: self.events_tx.clone(),
             },
             meta: EngineMeta {
                 local_addr: self.bound_addr,
@@ -744,12 +725,12 @@ impl DispatcherRuntime {
 
 /// Spawns the H3 dispatcher: UDP I/O actors on `udp_rt`, dispatcher on `crypto_rt`.
 ///
-/// Consumes the [`H3Dispatcher`] state from [`make_h3_dispatcher`], spawns
+/// Consumes the [`H3DispatcherGroup`] from [`make_h3_dispatcher`], spawns
 /// UDP RX/TX actors, then spawns the CID-routing dispatcher loop.
 ///
 /// Returns command sender, dispatcher/UDP-RX/UDP-TX join handles, and bound address.
 pub(crate) fn spawn_h3_dispatcher(
-    dispatcher: H3Dispatcher,
+    group: H3DispatcherGroup,
     peer_tokens: HashMap<String, String>,
     udp_rt: &RuntimeHandle,
     crypto_rt: &RuntimeHandle,
@@ -760,55 +741,28 @@ pub(crate) fn spawn_h3_dispatcher(
     tokio::task::JoinHandle<ActorExitResult>,
     SocketAddr,
 ) {
-    let H3Dispatcher {
-        bound_addr,
-        config,
-        max_udp_payload,
+    let H3DispatcherGroup {
+        dispatcher,
         udp_rx,
         udp_tx,
-        ingress_tx,
-        events_tx,
-        io_tuning,
-        h3_tuning,
-        credential_watcher,
-        reload_event_rx,
-        cert_path,
-        key_path,
-    } = dispatcher;
+    } = group;
+    let bound_addr = dispatcher.bound_addr;
+    let packet_queue_depth = dispatcher.io_tuning.packet_queue_depth;
 
     // Spawn UDP actors on udp_rt.
     let (udp_recv_rx, udp_send_tx, udp_rx_handle, udp_tx_handle) = {
         let _guard = udp_rt.enter();
         let (udp_recv_tx, udp_recv_rx) =
-            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(io_tuning.packet_queue_depth);
+            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(packet_queue_depth);
         let cancel = CancellationToken::new();
         let rx_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx, cancel);
-        let (udp_send_tx, tx_handle) = udp::spawn_udp_tx(udp_tx, io_tuning.packet_queue_depth);
+        let (udp_send_tx, tx_handle) = udp::spawn_udp_tx(udp_tx, packet_queue_depth);
         (udp_recv_rx, udp_send_tx, rx_handle, tx_handle)
     };
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-    let handle = crypto_rt.spawn(async move {
-        let runtime = DispatcherRuntime {
-            bound_addr,
-            config,
-            max_udp_payload,
-            io: DispatchIo {
-                udp_send_tx,
-                ingress_tx,
-                events_tx,
-            },
-            io_tuning,
-            h3_tuning,
-            _credential_watcher: credential_watcher,
-            reload_event_rx,
-            cert_path,
-            key_path,
-            cid_table: HashMap::new(),
-        };
-        runtime.run(udp_recv_rx, cmd_rx, peer_tokens).await
-    });
+    let handle = crypto_rt.spawn(dispatcher.run(udp_recv_rx, udp_send_tx, cmd_rx, peer_tokens));
 
     (cmd_tx, handle, udp_rx_handle, udp_tx_handle, bound_addr)
 }
@@ -989,7 +943,7 @@ mod tests {
             let (events_tx, events_rx) = mpsc::unbounded_channel();
             let rt = tokio::runtime::Handle::current();
 
-            let (dispatcher, bound_addr) = make_h3_dispatcher(
+            let (dispatcher_group, bound_addr) = make_h3_dispatcher(
                 listen_addr,
                 certs.cert_path(),
                 certs.key_path(),
@@ -1003,7 +957,7 @@ mod tests {
             .expect("make_h3_dispatcher");
 
             let (cmd_tx, handle, udp_rx_handle, udp_tx_handle, _) =
-                spawn_h3_dispatcher(dispatcher, peer_tokens, &rt, &rt);
+                spawn_h3_dispatcher(dispatcher_group, peer_tokens, &rt, &rt);
 
             // Give dispatcher time to start accepting.
             tokio::time::sleep(Duration::from_millis(50)).await;
