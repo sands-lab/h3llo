@@ -31,6 +31,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview, rustfmt, clippy
+      - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Cargo fmt
@@ -65,6 +70,7 @@ jobs:
         with:
           name: ci-builder
           keep-state: true
+          cache-binary: ${{ runner.environment == 'github-hosted' }}
       - name: Build Docker test image
         uses: docker/build-push-action@v6
         with:
@@ -75,8 +81,15 @@ jobs:
           target: test
           platforms: linux/amd64
           load: true
+          cache-from: ${{ runner.environment == 'github-hosted' && 'type=gha,scope=docker-tests' || '' }}
+          cache-to: ${{ runner.environment == 'github-hosted' && 'type=gha,mode=max,scope=docker-tests' || '' }}
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies
+        if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Run integration tests
         run: cargo test --test integration --features test-utils -- --ignored --nocapture
       - name: Run E2E tests
@@ -117,6 +130,8 @@ jobs:
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          cache-image: ${{ runner.environment == 'github-hosted' }}
 
       - name: Set up Docker Buildx
         id: buildx
@@ -124,6 +139,7 @@ jobs:
         with:
           name: builder-${{ matrix.arch_label }}
           keep-state: true
+          cache-binary: ${{ runner.environment == 'github-hosted' }}
 
       - name: Login to Docker Hub
         if: github.event_name != 'pull_request'
@@ -143,6 +159,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ env.REGISTRY_IMAGE }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: ${{ runner.environment == 'github-hosted' && format('type=gha,scope=runtime-{0}', matrix.arch_label) || '' }}
+          cache-to: ${{ runner.environment == 'github-hosted' && format('type=gha,mode=max,scope=runtime-{0}', matrix.arch_label) || '' }}
 
       - name: Export digest
         if: github.event_name != 'pull_request'
@@ -206,6 +224,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          cache-binary: ${{ runner.environment == 'github-hosted' }}
 
       - name: Docker meta
         id: meta
