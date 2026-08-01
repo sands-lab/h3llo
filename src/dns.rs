@@ -173,16 +173,17 @@ impl DnsActor {
     /// Returns `true` only when the hostname, record type, and transaction ID
     /// all match an in-flight query.
     fn take_pending(&mut self, query: &DnsQuery, id: u16) -> bool {
+        if !self.hostnames.contains_key(&query.hostname) {
+            warn!(hostname = %query.hostname, "dns: response for unregistered hostname");
+            return false;
+        }
+
         let Some(pending) = self.pending_queries.get(query) else {
-            if self.hostnames.contains_key(&query.hostname) {
-                debug!(
-                    hostname = %query.hostname,
-                    record_type = ?query.record_type,
-                    "dns: response without pending query"
-                );
-            } else {
-                warn!(hostname = %query.hostname, "dns: response for unregistered hostname");
-            }
+            debug!(
+                hostname = %query.hostname,
+                record_type = ?query.record_type,
+                "dns: response without pending query"
+            );
             return false;
         };
         if pending.transaction_id != id {
