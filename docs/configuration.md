@@ -33,7 +33,7 @@ tuning: # optional, all fields have defaults
   metrics_push_interval: 1s # optional, default: 1s
   metrics_log_interval: 3s # optional, default: 3s
   dns_query_timeout: 2s # optional, default: 2s
-  dns_refresh_interval: 2m # optional, default: 2m (0s disables)
+  dns_refresh_interval: 2m # optional, default: 2m
   dns_min_ttl: 5m # optional, default: 5m (should be >= 2× dns_refresh_interval)
   dns_query_interval: 100ms # optional, default: 100ms (minimum delay between DNS query sends)
   h3_handshake_timeout: 5s # optional, default: 5s
@@ -85,7 +85,7 @@ peers: # optional, default: []
 - `tuning.metrics_push_interval` (default `1s`): Interval between periodic metric push emissions from actors to the orchestrator.
 - `tuning.metrics_log_interval` (default `3s`): Interval between periodic `debug!`-level logging of QUIC and transport metrics by the orchestrator. Independent of `metrics_push_interval`, which controls actor emission cadence.
 - `tuning.dns_query_timeout` (default `2s`): Timeout before a DNS query is considered failed and retried.
-- `tuning.dns_refresh_interval` (default `2m`): DNS refresh interval (`0s` disables). The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)). **Warning:** `dns_min_ttl` should be at least `2× dns_refresh_interval`; otherwise cached IPs may expire before the next refresh cycle re-queries them, causing repeated connection pruning and reconnection.
+- `tuning.dns_refresh_interval` (default `2m`): DNS refresh interval. Must be greater than zero. The resolver re-queries all registered hostnames at this interval (see [docs/internals.md](internals.md)). **Warning:** `dns_min_ttl` should be at least `2× dns_refresh_interval`; otherwise cached IPs may expire before the next refresh cycle re-queries them, causing repeated connection pruning and reconnection.
 - `tuning.dns_min_ttl` (default `5m`): Minimum TTL floor for DNS records. Responses with shorter TTL are raised to this value. Recursive DNS servers return the *remaining* cache TTL, which can be near zero when the upstream record is about to expire; without a sufficient floor the IP expires locally before the next refresh cycle, triggering connection churn. **Warning:** Should be at least `2× dns_refresh_interval` (a warning is emitted at startup when this invariant is violated).
 - `tuning.dns_query_interval` (default `100ms`): Interval between consecutive outbound DNS query sends. An on-demand pacing timer sends at most one queued query per interval, globally across all hostnames and record types, without blocking other DNS actor work.
 - `tuning.h3_handshake_timeout` (default `5s`): Timeout for an HTTP/3 handshake to complete.

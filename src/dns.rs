@@ -205,7 +205,6 @@ impl DnsActor {
         events_tx: mpsc::UnboundedSender<Event>,
     ) -> ActorExitResult {
         let server_str = self.server.to_string();
-        let query_timeout = self.dns_tuning.dns_query_timeout;
         let refresh_interval = self.dns_tuning.dns_refresh_interval;
         let query_interval = self.dns_tuning.dns_query_interval;
 
@@ -217,20 +216,15 @@ impl DnsActor {
         );
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
-        let mut ticker = time::interval(query_timeout / 2);
-        let query_timer = time::sleep(query_interval);
-        tokio::pin!(query_timer);
+        let mut query_ticker = time::interval(query_interval);
+        query_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
-        let refresh_duration = if refresh_interval.is_zero() {
-            Duration::from_secs(3600) // placeholder; branch disabled below
-        } else {
-            refresh_interval
-        };
-        let mut refresh_ticker = time::interval(refresh_duration);
+        let mut refresh_ticker = time::interval(refresh_interval);
         refresh_ticker.tick().await; // consume immediate first tick
 
         loop {
-            let query_queue_was_empty = self.queued_queries.is_empty();
+            let query_work_pending =
+                !self.queued_queries.is_empty() || !self.pending_queries.is_empty();
 
             tokio::select! {
                 maybe_cmd = cmd_rx.recv() => {
@@ -254,32 +248,20 @@ impl DnsActor {
                         }
                     }
                 }
-                _ = ticker.tick() => {
-                    self.handle_tick();
+                _ = refresh_ticker.tick() => {
+                    self.trigger_refresh();
                     self.expire_stale();
                     self.emit_snapshot(&events_tx);
                 }
-                _ = refresh_ticker.tick(), if !refresh_interval.is_zero() => {
-                    self.trigger_refresh();
-                }
-                () = &mut query_timer, if !query_queue_was_empty => {
+                _ = query_ticker.tick(), if query_work_pending => {
+                    self.queue_timed_out_queries();
+
                     // A partially consumed ExtractIf retains every unvisited query.
                     let query = self.queued_queries.extract_if(|_| true).next();
                     if let Some(query) = query {
                         self.send_query(query).await;
                     }
-                    if !self.queued_queries.is_empty() {
-                        query_timer
-                            .as_mut()
-                            .reset(time::Instant::now() + query_interval);
-                    }
                 }
-            }
-
-            if query_queue_was_empty && !self.queued_queries.is_empty() {
-                query_timer
-                    .as_mut()
-                    .reset(time::Instant::now() + query_interval);
             }
         }
     }
@@ -448,7 +430,7 @@ impl DnsActor {
     }
 
     /// Queues timed-out pending queries for retry with new transaction IDs.
-    fn handle_tick(&mut self) {
+    fn queue_timed_out_queries(&mut self) {
         let now = Instant::now();
         let timeout = self.dns_tuning.dns_query_timeout;
 
@@ -956,7 +938,7 @@ mod tests {
             socket.send_to(&data, peer).await.unwrap();
         }
 
-        // Wait briefly, then collect retries queued by handle_tick and paced by the timer.
+        // Wait briefly, then collect retries queued and paced by the query-work timer.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut retry_ids: HashMap<RecordType, u16> = HashMap::new();
@@ -1130,11 +1112,14 @@ mod tests {
     #[tokio::test]
     async fn trigger_refresh_deduplicates_queued_queries() {
         let mut actor = test_dns_actor().await;
-        actor.dns_tuning.dns_refresh_interval = Duration::ZERO;
-
         let hosts = HashSet::from(["example.com".to_string()]);
         actor.set_hostnames(&hosts);
         actor.trigger_refresh();
+        actor
+            .hostnames
+            .get_mut("example.com")
+            .unwrap()
+            .next_refresh_at = Instant::now();
         actor.trigger_refresh();
 
         assert_eq!(actor.queued_queries.len(), 2);
@@ -1151,8 +1136,6 @@ mod tests {
     #[tokio::test]
     async fn trigger_refresh_skips_pending_queries() {
         let mut actor = test_dns_actor().await;
-        actor.dns_tuning.dns_refresh_interval = Duration::ZERO;
-
         let hosts = HashSet::from(["example.com".to_string()]);
         actor.set_hostnames(&hosts);
         actor.pending_queries.insert(
@@ -1269,7 +1252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_tick_retries_expired_pending_queries() {
+    async fn queue_timed_out_queries_retries_expired_queries() {
         let mut actor = test_dns_actor().await;
         let expired_query = DnsQuery {
             hostname: "expired.example".to_string(),
@@ -1294,7 +1277,7 @@ mod tests {
             },
         );
 
-        actor.handle_tick();
+        actor.queue_timed_out_queries();
 
         assert!(actor.queued_queries.contains(&expired_query));
         assert!(!actor.queued_queries.contains(&fresh_query));
