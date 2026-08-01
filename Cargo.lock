@@ -1413,13 +1413,13 @@ dependencies = [
  "humantime-serde",
  "hyper",
  "hyper-util",
+ "indexmap 2.13.0",
  "ipnet",
  "ipnet-trie",
  "libc",
  "mimalloc",
  "notify",
  "octets",
- "ordered_hash_map",
  "prometheus-client 0.24.0",
  "quiche",
  "quinn-udp",
@@ -1463,8 +1463,6 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -2550,15 +2548,6 @@ dependencies = [
  "percent-encoding",
  "rand 0.9.2",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "ordered_hash_map"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe5a1cbf49ce5de21ddae71cd1fbe91ff9e38d6a7a9af366fd9be6cea94d856f"
-dependencies = [
- "hashbrown 0.15.5",
 ]
 
 [[package]]
