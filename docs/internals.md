@@ -43,16 +43,17 @@ Actor design principles:
 
 Each actor follows a consistent two-function initialization pattern:
 
-1. **`make_*`** - Creates actor state from configuration:
-   - Takes configuration parameters (structured config or resolved types)
+1. **`make_*`** - Creates actor or actor-group state:
+   - Takes configuration and long-lived dependencies that the actors will own
    - Performs synchronous or fallible I/O (socket binding, parsing)
-   - Returns `Result<ActorState, Error>`
+   - Returns `Result<ActorState, Error>` or `Result<ActorGroupState, Error>`
    - Example: `udp::make_udp(socket, mtu, enable_offload) -> Result<(UdpRx, UdpTx), UdpError>`
+   - Example: `make_bare_rx(...) -> Result<BareRxGroup, UdpError>`
 
 2. **`spawn_*`** - Spawns the actor task:
-   - Takes the state struct and dependencies (events_tx, etc.)
+   - Takes prepared actor or actor-group state plus spawn-time dependencies such as runtime handles and channel capacities
    - Creates channels internally (actor owns receiver)
-   - Spawns `tokio::spawn` task
+   - Moves each prepared state object into its corresponding `tokio::spawn` task
    - Returns `(Sender, JoinHandle)` or similar tuple
    - Example: `spawn_bare_rx(group, packet_queue_depth, udp_rt, crypto_rt) -> (UnboundedSender<Cmd>, JoinHandle, JoinHandle)`
 

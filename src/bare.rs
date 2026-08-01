@@ -52,6 +52,20 @@ pub struct BareRxGroup {
 /// Performs fallible I/O: socket binding and quinn-udp initialization.
 /// The returned [`BareRxGroup`] is consumed by [`spawn_bare_rx`].
 ///
+/// # Arguments
+///
+/// * `listen_addr` - Local address for the shared `BareUDP` receive socket.
+/// * `tun_mtu` - Maximum packet size accepted from the UDP receive path.
+/// * `accepted_sources` - Initial set of source IPs allowed by the filter actor.
+/// * `ingress_tx` - Router ingress channel for accepted packet batches.
+/// * `events_tx` - Orchestrator event channel used for metrics snapshots.
+/// * `tuning` - Socket, queue, offload, and metrics configuration.
+/// * `udp_rt` - Runtime on which socket initialization is performed.
+///
+/// # Returns
+///
+/// Returns prepared state for the UDP receive and source-filter actors.
+///
 /// # Errors
 ///
 /// Returns [`UdpError`] if the UDP socket cannot be bound or configured.
@@ -80,6 +94,18 @@ pub fn make_bare_rx(
 ///
 /// The UDP RX actor runs on `udp_rt`, the filter actor on `crypto_rt`.
 /// Returns command sender and both join handles for orchestrator supervision.
+///
+/// # Arguments
+///
+/// * `group` - Prepared receive-pipeline state returned by [`make_bare_rx`].
+/// * `packet_queue_depth` - Capacity of the channel between the two actors.
+/// * `udp_rt` - Runtime on which the UDP receive actor is spawned.
+/// * `crypto_rt` - Runtime on which the source-filter actor is spawned.
+///
+/// # Returns
+///
+/// Returns the filter command sender, filter actor handle, and UDP receive
+/// actor handle, in that order.
 pub fn spawn_bare_rx(
     group: BareRxGroup,
     packet_queue_depth: usize,
