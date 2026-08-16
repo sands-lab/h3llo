@@ -5,7 +5,7 @@
 //! GET /metrics for Prometheus-compatible metrics exposition.
 //! Communicates with the orchestrator via the `Event` channel pattern.
 
-use crate::actor::{ActorError, ActorExitResult};
+use crate::actor::{ActorBusHandle, ActorError, ActorRuntime, SupervisionPolicy};
 use crate::config::{Config, Peer};
 use crate::events::{ApiEvent, Event};
 use crate::metrics::encode_metrics_snapshot;
@@ -19,7 +19,6 @@ use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 use tracing::info;
 
 // ---------------------------------------------------------------------------
@@ -65,7 +64,7 @@ pub(crate) async fn make_api(addr: SocketAddr) -> Result<TcpListener, std::io::E
 
 /// Spawns the management API actor.
 ///
-/// Returns a `JoinHandle` for the accept loop. Shutdown via `JoinSet` abort-on-drop.
+/// Registers the accept loop with `ActorBus`.
 ///
 /// # Arguments
 ///
@@ -76,31 +75,46 @@ pub(crate) fn spawn_api(
     listener: TcpListener,
     api_path: String,
     events_tx: mpsc::UnboundedSender<Event>,
-) -> JoinHandle<ActorExitResult> {
+    actor_bus: &ActorBusHandle,
+) {
     let addr = listener.local_addr().unwrap_or_else(|_| {
         "0.0.0.0:0"
             .parse()
             .expect("infallible: constant literal parse")
     });
     info!(%addr, "API listener started");
-    tokio::spawn(async move {
-        loop {
-            let (stream, remote) = listener.accept().await.map_err(|e| ActorError::ApiServer {
-                addr: addr.to_string(),
-                reason: format!("accept failed: {e}"),
-            })?;
-            let io = TokioIo::new(stream);
-            let events_tx = events_tx.clone();
-            let api_path = api_path.clone();
-            tokio::spawn(async move {
-                let svc =
-                    service_fn(|req| handle_request(req, events_tx.clone(), api_path.clone()));
-                if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                    info!(remote = %remote, error = %e, "API connection error");
-                }
-            });
-        }
-    })
+    let connection_bus = actor_bus.clone();
+    actor_bus.spawn(
+        format!("api[{addr}]"),
+        ActorRuntime::Main,
+        SupervisionPolicy::Critical,
+        async move {
+            loop {
+                let (stream, remote) =
+                    listener.accept().await.map_err(|e| ActorError::ApiServer {
+                        addr: addr.to_string(),
+                        reason: format!("accept failed: {e}"),
+                    })?;
+                let io = TokioIo::new(stream);
+                let events_tx = events_tx.clone();
+                let api_path = api_path.clone();
+                connection_bus.spawn(
+                    format!("api-connection[{remote}]"),
+                    ActorRuntime::Main,
+                    SupervisionPolicy::Detached,
+                    async move {
+                        let svc = service_fn(|req| {
+                            handle_request(req, events_tx.clone(), api_path.clone())
+                        });
+                        if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                            info!(remote = %remote, error = %e, "API connection error");
+                        }
+                        Ok(())
+                    },
+                );
+            }
+        },
+    );
 }
 
 fn response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
@@ -326,21 +340,27 @@ mod tests {
     // ========== Real-Network Test Helpers ==========
 
     /// Spawns the API actor on an ephemeral port and returns the bound address,
-    /// the event receiver (to mock orchestrator replies), and the task handle.
+    /// the event receiver (to mock orchestrator replies), and its actor bus.
     fn start_api(
         api_path: &str,
     ) -> (
         SocketAddr,
         mpsc::UnboundedReceiver<Event>,
-        JoinHandle<ActorExitResult>,
+        crate::actor::ActorBus,
     ) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let listener = TcpListener::from_std(listener).unwrap();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let handle = spawn_api(listener, api_path.to_string(), events_tx);
-        (addr, events_rx, handle)
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
+        spawn_api(
+            listener,
+            api_path.to_string(),
+            events_tx,
+            &actor_bus.handle(),
+        );
+        (addr, events_rx, actor_bus)
     }
 
     /// Constructs a minimal `Config` for orchestrator mock replies.
@@ -395,7 +415,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_config_returns_yaml() {
-        let (addr, mut events_rx, handle) = start_api("");
+        let (addr, mut events_rx, _actor_bus) = start_api("");
         let mut sender = http_client(addr).await;
 
         let req = Request::builder()
@@ -426,13 +446,11 @@ mod tests {
         let body = body_string(resp).await;
         let parsed: Config = serde_yaml::from_str(&body).unwrap();
         assert_eq!(parsed, config);
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn post_config_upserts_peers() {
-        let (addr, mut events_rx, handle) = start_api("");
+        let (addr, mut events_rx, _actor_bus) = start_api("");
         let mut sender = http_client(addr).await;
 
         let yaml_body = "peers:\n- id: peer-1\n  bare:\n    endpoint: udp://1.2.3.4:6635\n  tun:\n    allowed_ips:\n    - 10.0.1.0/24\n";
@@ -463,13 +481,11 @@ mod tests {
         let parsed: Config = serde_yaml::from_str(&body).unwrap();
         assert_eq!(parsed.peers.len(), 1);
         assert_eq!(parsed.peers[0].id, "peer-1");
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn post_config_invalid_yaml_returns_400() {
-        let (addr, _events_rx, handle) = start_api("");
+        let (addr, _events_rx, _actor_bus) = start_api("");
         let mut sender = http_client(addr).await;
 
         let req = Request::builder()
@@ -481,13 +497,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_string(resp).await;
         assert!(body.contains("invalid YAML"), "body: {body}");
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn post_config_orchestrator_rejects_returns_400() {
-        let (addr, mut events_rx, handle) = start_api("");
+        let (addr, mut events_rx, _actor_bus) = start_api("");
         let mut sender = http_client(addr).await;
 
         let yaml_body = "peers: []\n";
@@ -512,13 +526,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_string(resp).await;
         assert!(body.contains("validation failed"), "body: {body}");
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn delete_config_removes_peers() {
-        let (addr, mut events_rx, handle) = start_api("");
+        let (addr, mut events_rx, _actor_bus) = start_api("");
         let mut sender = http_client(addr).await;
 
         let yaml_body = "peers:\n- id: peer-1\n";
@@ -546,13 +558,11 @@ mod tests {
             resp.headers().get("content-type").unwrap(),
             "application/yaml"
         );
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn get_metrics_returns_openmetrics() {
-        let (addr, mut events_rx, handle) = start_api("");
+        let (addr, mut events_rx, _actor_bus) = start_api("");
         let mut sender = http_client(addr).await;
 
         let req = Request::builder()
@@ -609,15 +619,13 @@ mod tests {
             "must contain packet metrics: {body}"
         );
         assert!(body.contains("42"), "must contain packet count: {body}");
-
-        handle.abort();
     }
 
     // ========== Path Routing Tests ==========
 
     #[tokio::test]
     async fn unknown_path_returns_404() {
-        let (addr, _events_rx, handle) = start_api("");
+        let (addr, _events_rx, _actor_bus) = start_api("");
         let mut sender = http_client(addr).await;
 
         let req = Request::builder()
@@ -627,13 +635,11 @@ mod tests {
             .unwrap();
         let resp = sender.send_request(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn unsupported_method_returns_404() {
-        let (addr, _events_rx, handle) = start_api("");
+        let (addr, _events_rx, _actor_bus) = start_api("");
         let mut sender = http_client(addr).await;
 
         let req = Request::builder()
@@ -643,13 +649,11 @@ mod tests {
             .unwrap();
         let resp = sender.send_request(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn api_path_prefix_strips_correctly() {
-        let (addr, mut events_rx, handle) = start_api("/api/v1");
+        let (addr, mut events_rx, _actor_bus) = start_api("/api/v1");
         let mut sender = http_client(addr).await;
 
         let req = Request::builder()
@@ -671,15 +675,13 @@ mod tests {
         let resp = fut.await.unwrap();
         mock.await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-
-        handle.abort();
     }
 
     // ========== Error Path Tests ==========
 
     #[tokio::test]
     async fn get_config_orchestrator_unavailable_returns_500() {
-        let (addr, events_rx, handle) = start_api("");
+        let (addr, events_rx, _actor_bus) = start_api("");
         drop(events_rx);
 
         let mut sender = http_client(addr).await;
@@ -692,13 +694,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_string(resp).await;
         assert!(body.contains("orchestrator unavailable"), "body: {body}");
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn get_config_orchestrator_drops_reply_returns_500() {
-        let (addr, mut events_rx, handle) = start_api("");
+        let (addr, mut events_rx, _actor_bus) = start_api("");
         let mut sender = http_client(addr).await;
 
         let req = Request::builder()
@@ -722,7 +722,5 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_string(resp).await;
         assert!(body.contains("orchestrator dropped reply"), "body: {body}");
-
-        handle.abort();
     }
 }

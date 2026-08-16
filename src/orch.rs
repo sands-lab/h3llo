@@ -1,6 +1,8 @@
 //! Runtime orchestration for `BareUDP` and HTTP/3 transports.
 
-use crate::actor::{ActorError, ActorExitResult, DedicatedRuntime, SupervisionPolicy};
+use crate::actor::{
+    ActorBus, ActorBusExit, ActorBusHandle, ActorError, ActorRuntime, SupervisionPolicy,
+};
 use crate::api;
 use crate::bare::{dial_bare_tx, make_bare_rx, spawn_bare_rx, BareUdpRxCommand};
 use crate::bind::{DefaultRouteProbe, RouteProbe};
@@ -20,13 +22,10 @@ use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
 use tokio_quiche::buf_factory::PooledBuf;
 use tracing::{debug, error, info, warn};
 
@@ -180,8 +179,7 @@ impl PeerEntry {
         tun_if: &str,
         tun_mtu: u16,
         tuning: &Tuning,
-        udp_handle: &Handle,
-        crypto_handle: &Handle,
+        actor_bus: &ActorBusHandle,
         ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
     ) {
         if self.resolved_ips.is_empty() {
@@ -229,26 +227,37 @@ impl PeerEntry {
                 tun_mtu,
                 tuning: tuning.clone(),
                 probe: DefaultRouteProbe,
-                udp_rt: udp_handle.clone(),
-                crypto_rt: crypto_handle.clone(),
+                actor_bus: actor_bus.clone(),
                 events_tx: events_tx.clone(),
             };
 
             match &self.config.transport {
                 PeerTransport::Bare(bare) => {
                     let bare = bare.clone();
-                    tokio::spawn(async move {
-                        let result = dial_bare_tx(&bare, &ctx).await;
-                        report_dial(result, ctx, "bare");
-                    });
+                    actor_bus.spawn(
+                        format!("bare-dial[{}@{}]", ctx.peer_id, ctx.dial_ip),
+                        ActorRuntime::Crypto,
+                        SupervisionPolicy::Detached,
+                        async move {
+                            let result = dial_bare_tx(&bare, &ctx).await;
+                            report_dial(result, ctx, "bare");
+                            Ok(())
+                        },
+                    );
                 }
                 PeerTransport::H3(h3) => {
                     let peer_h3 = h3.clone();
                     let ingress_tx = ingress_tx.clone();
-                    tokio::spawn(async move {
-                        let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;
-                        report_dial(result, ctx, "H3");
-                    });
+                    actor_bus.spawn(
+                        format!("h3-dial[{}@{}]", ctx.peer_id, ctx.dial_ip),
+                        ActorRuntime::Crypto,
+                        SupervisionPolicy::Detached,
+                        async move {
+                            let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;
+                            report_dial(result, ctx, "H3");
+                            Ok(())
+                        },
+                    );
                 }
             }
         }
@@ -311,12 +320,9 @@ pub enum OrchestratorError {
     /// UDP socket setup failed.
     #[error("udp socket setup failed: {0}")]
     Udp(String),
-    /// Dedicated runtime creation failed.
-    #[error("dedicated runtime '{name}' failed: {source}")]
-    Runtime {
-        name: String,
-        source: std::io::Error,
-    },
+    /// Actor runtime initialization failed.
+    #[error("actor runtime initialization failed: {0}")]
+    Runtime(std::io::Error),
     /// An actor exited with an error.
     #[error("actor error: {0}")]
     ActorError(#[from] ActorError),
@@ -333,7 +339,7 @@ pub enum OrchestratorError {
 pub struct Orchestrator {
     events_rx: mpsc::UnboundedReceiver<Event>,
     events_tx: mpsc::UnboundedSender<Event>,
-    join_set: JoinSet<Result<ActorExitResult, tokio::task::JoinError>>,
+    actor_bus: ActorBus,
 
     // Runtime state
     tun_if: String,
@@ -362,15 +368,6 @@ pub struct Orchestrator {
     ///
     /// At most 3 entries. Peer-scoped metrics live in `ActiveConn`.
     non_peer_metrics: HashMap<Labels, Metrics>,
-
-    /// Dedicated runtime for TUN Tx/Rx actors (thread: `h3llo-tun`).
-    ///
-    /// Not read after init — kept alive for its `Drop` impl (RAII shutdown).
-    _tun_rt: DedicatedRuntime,
-    /// Router + H3 Engine actors (thread: `h3llo-crypto`).
-    crypto_rt: DedicatedRuntime,
-    /// All UDP I/O actors: `BareUDP` + H3 (thread: `h3llo-udp`).
-    udp_rt: DedicatedRuntime,
 }
 
 impl Orchestrator {
@@ -475,33 +472,20 @@ impl Orchestrator {
     ///
     /// Returns `OrchestratorError` when initialization fails.
     ///
-    /// # Panics
-    ///
-    /// Panics if dedicated I/O runtimes cannot be created.
     pub async fn new(config: Config) -> Result<Self, OrchestratorError> {
         let tuning = &config.tuning;
         let tun_if = config.local.tun.ifname.clone();
         let tun_mtu = config.local.tun.mtu;
         let manage_routes = config.local.table;
 
-        // Create dedicated current_thread runtimes for data-plane actors.
-        // Each runtime runs on its own OS thread, eliminating cross-thread
-        // task migration on data-plane hot paths (thread-per-core).
-        let make_runtime = |name: &str| {
-            DedicatedRuntime::new(name).map_err(|source| OrchestratorError::Runtime {
-                name: name.to_string(),
-                source,
-            })
-        };
-        let tun_rt = make_runtime("h3llo-tun")?;
-        let crypto_rt = make_runtime("h3llo-crypto")?;
-        let udp_rt = make_runtime("h3llo-udp")?;
+        let actor_bus = ActorBus::new().map_err(OrchestratorError::Runtime)?;
+        let actor_bus_handle = actor_bus.handle();
 
         // Setup TUN — enter guard ensures AsyncFd registers with the TUN
         // runtime's I/O reactor. make_tun is async in signature but has no
         // internal .await points, so the guard stays effective.
         let (tun_reader, tun_writer) = {
-            let _guard = tun_rt.handle().enter();
+            let _guard = actor_bus_handle.runtime_handle(ActorRuntime::Tun).enter();
             tun::make_tun(
                 &config.local.tun,
                 tuning.io.tun_tx_queue_len,
@@ -513,45 +497,25 @@ impl Orchestrator {
         // Control plane: unbounded to prevent deadlocks from actor cycles.
         let (events_tx, events_rx) = mpsc::unbounded_channel();
 
-        let mut join_set = JoinSet::new();
-
         // Start with empty routing table; routes populated as DNS answers arrive
         let routing = RoutingTable::new();
-
-        // RUNTIME CONTEXT: All spawn_* calls below MUST be wrapped in a
-        // Handle::enter() guard targeting the correct dedicated runtime.
-        // The guard sets the thread-local runtime context; tokio::spawn
-        // inside the called function picks up this context. All spawn_*
-        // functions are synchronous (no .await crossing).
-
-        // TUN-Tx on TUN runtime (sync fn — enter guard is safe, no .await).
-        let (input_tx, tun_tx_handle) = {
-            let _guard = tun_rt.handle().enter();
-            tun::spawn_tun_tx(tun_writer, events_tx.clone(), &tuning.io)
-        };
-
-        // Router on crypto runtime (sync fn — enter guard is safe, no .await).
-        let (output_tx, ingress_tx, router_cmd_tx, router_handle) = {
-            let _guard = crypto_rt.handle().enter();
-            spawn_router(
-                routing,
-                input_tx.clone(),
-                events_tx.clone(),
-                tuning.io.metrics_push_interval,
-                tuning.io.packet_queue_depth,
-            )
-        };
-
-        // TUN-Rx on TUN runtime (sync fn — enter guard is safe, no .await).
-        let tun_rx_handle = {
-            let _guard = tun_rt.handle().enter();
-            tun::spawn_tun_rx(tun_reader, output_tx, events_tx.clone(), &tuning.io)
-        };
-
-        join_set.spawn(tun_tx_handle);
-        join_set.spawn(router_handle);
-        join_set.spawn(tun_rx_handle);
-
+        let input_tx =
+            tun::spawn_tun_tx(tun_writer, events_tx.clone(), &tuning.io, &actor_bus_handle);
+        let (output_tx, ingress_tx, router_cmd_tx) = spawn_router(
+            routing,
+            input_tx.clone(),
+            events_tx.clone(),
+            tuning.io.metrics_push_interval,
+            tuning.io.packet_queue_depth,
+            &actor_bus_handle,
+        );
+        tun::spawn_tun_rx(
+            tun_reader,
+            output_tx,
+            events_tx.clone(),
+            &tuning.io,
+            &actor_bus_handle,
+        );
         // Initialize BareUDP listener if configured
         let bare_rx_cmd_tx = if let Some(ref local_bare) = config.local.bare {
             let listen_addr = resolve_listen_addr(&local_bare.listen.host, local_bare.listen.port)?;
@@ -563,25 +527,22 @@ impl Orchestrator {
                 ingress_tx.clone(),
                 events_tx.clone(),
                 tuning,
-                udp_rt.handle(),
+                &actor_bus_handle,
             )
             .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
 
-            let (cmd_tx, bare_rx_handle, udp_rx_handle) = spawn_bare_rx(
+            let cmd_tx = spawn_bare_rx(
                 bare_rx_group,
                 tuning.io.packet_queue_depth,
-                udp_rt.handle(),
-                crypto_rt.handle(),
+                &actor_bus_handle,
             );
-
-            join_set.spawn(udp_rx_handle);
-            join_set.spawn(bare_rx_handle);
             Some(cmd_tx)
         } else {
             None
         };
 
-        // Initialize H3 dispatcher if configured (dispatcher on crypto_rt, UDP I/O on udp_rt)
+        // Initialize H3 dispatcher if configured. ActorBus places the
+        // dispatcher on the crypto runtime and UDP I/O on the UDP runtime.
         let h3_listener_cmd_tx = if let Some(ref h3_cfg) = config.local.h3 {
             let listen_addr = resolve_listen_addr(&h3_cfg.listen.host, h3_cfg.listen.port)?;
             let cert_path = Path::new(&h3_cfg.cert);
@@ -595,7 +556,7 @@ impl Orchestrator {
                 tun_mtu,
                 &tuning.io,
                 &tuning.h3,
-                udp_rt.handle(),
+                &actor_bus_handle,
                 ingress_tx.clone(),
                 events_tx.clone(),
             )
@@ -604,16 +565,7 @@ impl Orchestrator {
             // spawn: infallible task creation
             // Initial peer tokens are empty; sync_peers_to_actors() populates them
             // immediately after construction.
-            let (cmd_tx, dispatcher_handle, udp_rx_handle, udp_tx_handle, _) = spawn_h3_dispatcher(
-                dispatcher_group,
-                HashMap::new(),
-                udp_rt.handle(),
-                crypto_rt.handle(),
-            );
-
-            join_set.spawn(dispatcher_handle);
-            join_set.spawn(udp_rx_handle);
-            join_set.spawn(udp_tx_handle);
+            let cmd_tx = spawn_h3_dispatcher(dispatcher_group, HashMap::new(), &actor_bus_handle);
             Some(cmd_tx)
         } else {
             None
@@ -633,17 +585,14 @@ impl Orchestrator {
             .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
 
         // Spawn DNS actor task (infallible)
-        let (dns_cmd_tx, handle) = spawn_dns(dns_actor, events_tx.clone());
-
-        join_set.spawn(handle);
+        let dns_cmd_tx = spawn_dns(dns_actor, events_tx.clone(), &actor_bus_handle);
 
         // Initialize route sync actor if system route management is enabled.
         // Soft failure: if make_route() fails (e.g., no netlink on BSD), warn and continue.
         let route_cmd_tx = if manage_routes {
             match make_route() {
                 Ok(route_actor) => {
-                    let (cmd_tx, route_handle) = spawn_route(route_actor, tun_if.clone());
-                    join_set.spawn(route_handle);
+                    let cmd_tx = spawn_route(route_actor, tun_if.clone(), &actor_bus_handle);
                     Some(cmd_tx)
                 }
                 Err(err) => {
@@ -669,18 +618,18 @@ impl Orchestrator {
             let api_listener = api::make_api(api_listen_addr)
                 .await
                 .map_err(|e| OrchestratorError::ApiInit(e.to_string()))?;
-            let api_handle = api::spawn_api(
+            api::spawn_api(
                 api_listener,
                 local_api.listen.path.clone(),
                 events_tx.clone(),
+                &actor_bus_handle,
             );
-            join_set.spawn(api_handle);
         }
 
         let orch = Self {
             events_rx,
             events_tx,
-            join_set,
+            actor_bus,
             tun_if,
             tun_mtu,
             tuning: config.tuning,
@@ -694,9 +643,6 @@ impl Orchestrator {
             input_tx,
             local: config.local,
             non_peer_metrics: HashMap::new(),
-            _tun_rt: tun_rt,
-            crypto_rt,
-            udp_rt,
         };
         orch.sync_peers_to_actors();
         Ok(orch)
@@ -729,10 +675,8 @@ impl Orchestrator {
                         log_transport_metrics(m);
                     }
                 }
-                result = self.join_set.join_next() => {
-                    if let ControlFlow::Break(outcome) = self.handle_actor_exit(result) {
-                        return outcome;
-                    }
+                exit = self.actor_bus.next_exit() => {
+                    self.handle_actor_exit(exit)?;
                 }
                 result = tokio::signal::ctrl_c() => {
                     match result {
@@ -751,53 +695,65 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Handles the result of a completed actor task from the join set.
-    ///
-    /// Returns `ControlFlow::Continue` to keep the event loop running,
-    /// or `ControlFlow::Break` with the final result to exit.
-    fn handle_actor_exit(
-        &mut self,
-        result: Option<
-            Result<Result<ActorExitResult, tokio::task::JoinError>, tokio::task::JoinError>,
-        >,
-    ) -> ControlFlow<Result<(), OrchestratorError>> {
-        let Some(result) = result else {
-            // All actors have exited
-            return ControlFlow::Break(Ok(()));
-        };
-
-        // Flatten the two JoinError layers (outer from JoinSet, inner from nested spawn)
-        let actor_result = match result {
-            Ok(Ok(r)) => r,
-            Ok(Err(join_err)) | Err(join_err) => {
-                error!("task join failed (panic/cancel): {}", join_err);
-                return ControlFlow::Break(Err(OrchestratorError::TaskJoin(join_err.to_string())));
-            }
-        };
-
-        match actor_result {
-            Ok(()) => {
-                info!("an actor exited gracefully; reconciling peer state");
-                self.reconcile();
-            }
-            Err(actor_error) => match actor_error.kind() {
-                SupervisionPolicy::Critical => {
-                    error!("critical actor failed: {}", actor_error);
-                    return ControlFlow::Break(Err(OrchestratorError::ActorError(actor_error)));
+    /// Handles an actor exit according to its spawn-time supervision policy.
+    fn handle_actor_exit(&mut self, exit: ActorBusExit) -> Result<(), OrchestratorError> {
+        let ActorBusExit {
+            name,
+            policy,
+            result,
+        } = exit;
+        match policy {
+            SupervisionPolicy::Critical => match result {
+                Ok(Err(actor_error)) => {
+                    error!(actor = %name, error = %actor_error, "critical actor failed");
+                    Err(OrchestratorError::ActorError(actor_error))
                 }
-                SupervisionPolicy::Restartable => {
-                    warn!("peer actor failed: {}; reconciling", actor_error);
-                    self.reconcile();
+                Ok(Ok(())) => {
+                    error!(actor = %name, "critical actor exited unexpectedly");
+                    Err(OrchestratorError::TaskJoin(format!(
+                        "critical actor {name} exited unexpectedly"
+                    )))
+                }
+                Err(error) => {
+                    error!(actor = %name, %error, "critical actor failed to join");
+                    Err(OrchestratorError::TaskJoin(error.to_string()))
                 }
             },
+            SupervisionPolicy::Restartable => {
+                match result {
+                    Ok(Ok(())) => {
+                        info!(actor = %name, "peer actor exited; reconciling");
+                    }
+                    Ok(Err(actor_error)) => {
+                        warn!(actor = %name, error = %actor_error, "peer actor failed; reconciling");
+                    }
+                    Err(error) => {
+                        warn!(actor = %name, %error, "peer actor failed to join; reconciling");
+                    }
+                }
+                self.reconcile();
+                Ok(())
+            }
+            SupervisionPolicy::Detached => {
+                match result {
+                    Ok(Ok(())) => {
+                        debug!(actor = %name, "detached task completed");
+                    }
+                    Ok(Err(actor_error)) => {
+                        warn!(actor = %name, error = %actor_error, "detached task failed");
+                    }
+                    Err(error) => {
+                        warn!(actor = %name, %error, "detached task failed to join");
+                    }
+                }
+                Ok(())
+            }
         }
-        ControlFlow::Continue(())
     }
 
     /// Periodic reconciliation: prune stale bounds and attempt reconnection.
     fn reconcile(&mut self) {
-        let udp_handle = self.udp_rt.handle().clone();
-        let crypto_handle = self.crypto_rt.handle().clone();
+        let actor_bus = self.actor_bus.handle();
         let mut routing_changed = false;
         for entry in self.peers.values_mut() {
             routing_changed |= entry.prune();
@@ -806,8 +762,7 @@ impl Orchestrator {
                 &self.tun_if,
                 self.tun_mtu,
                 &self.tuning,
-                &udp_handle,
-                &crypto_handle,
+                &actor_bus,
                 &self.ingress_tx,
             );
         }
@@ -962,8 +917,7 @@ impl Orchestrator {
     /// after DNS changes or peer mutations (add/remove via API).
     fn handle_dns_snapshot(&mut self, dns_event: DnsEvent) {
         let dns_state = dns_event.state;
-        let udp_handle = self.udp_rt.handle().clone();
-        let crypto_handle = self.crypto_rt.handle().clone();
+        let actor_bus = self.actor_bus.handle();
 
         for entry in self.peers.values_mut() {
             let hostname = peer_dns_hostname(&entry.config);
@@ -978,8 +932,7 @@ impl Orchestrator {
                 &self.tun_if,
                 self.tun_mtu,
                 &self.tuning,
-                &udp_handle,
-                &crypto_handle,
+                &actor_bus,
                 &self.ingress_tx,
             );
         }
@@ -1026,8 +979,7 @@ impl Orchestrator {
 
     /// Handles a `BareUDP` TX connection event.
     ///
-    /// Unconditionally registers the TX actor `JoinHandle` for lifecycle
-    /// monitoring, then attempts to bind the peer via [`update_bound`].
+    /// Registers the TX channel after its actors have already entered ActorBus supervision.
     /// Handles a dial failure event: clears in-flight flag and updates backoff.
     fn handle_dial_failed(&mut self, event: &DialFailedEvent) {
         let Some(entry) = self.peers.get_mut(&event.peer_id) else {
@@ -1058,28 +1010,15 @@ impl Orchestrator {
 
     /// Handles a transport connection event (H3 or BareUDP).
     ///
-    /// Spawns all present actor join handles into the [`JoinSet`] for
-    /// lifecycle monitoring, then registers the TX bound via [`update_bound`].
+    /// Actor tasks are already supervised by `ActorBus`; this only registers
+    /// the connection's TX bound via [`update_bound`].
     fn handle_connected(&mut self, event: ConnectedEvent) {
         let ConnectedEvent {
             peer_id,
             remote_addr,
             tx,
             endpoint,
-            main_handle,
-            udp_tx_handle,
-            udp_rx_handle,
         } = event;
-
-        if let Some(h) = main_handle {
-            self.join_set.spawn(h);
-        }
-        if let Some(h) = udp_tx_handle {
-            self.join_set.spawn(h);
-        }
-        if let Some(h) = udp_rx_handle {
-            self.join_set.spawn(h);
-        }
 
         self.update_bound(&peer_id, endpoint, remote_addr, tx);
     }
@@ -1260,7 +1199,7 @@ mod test_support {
             let orch = Orchestrator {
                 events_rx,
                 events_tx: events_tx.clone(),
-                join_set: JoinSet::new(),
+                actor_bus: ActorBus::on_current_runtime(),
                 tun_if: self.tun_if,
                 tun_mtu: self.tun_mtu,
                 tuning: Tuning::default(),
@@ -1274,9 +1213,6 @@ mod test_support {
                 input_tx,
                 local,
                 non_peer_metrics: HashMap::new(),
-                _tun_rt: DedicatedRuntime::new("test-tun").expect("test runtime"),
-                crypto_rt: DedicatedRuntime::new("test-crypto").expect("test runtime"),
-                udp_rt: DedicatedRuntime::new("test-udp").expect("test runtime"),
             };
 
             (
@@ -2126,8 +2062,6 @@ mod tests {
             .build();
 
         let (tx, _rx) = mpsc::channel(1);
-        let tx_handle = tokio::spawn(async { Ok(()) });
-        let udp_tx_handle = tokio::spawn(async { Ok(()) });
 
         let event = ConnectedEvent {
             peer_id: "unknown-peer".to_string(),
@@ -2137,9 +2071,6 @@ mod tests {
             })),
             remote_addr: "1.2.3.4:5353".parse().unwrap(),
             tx,
-            main_handle: Some(tx_handle),
-            udp_tx_handle: Some(udp_tx_handle),
-            udp_rx_handle: None,
         };
 
         orch.handle_connected(event);
@@ -2160,8 +2091,6 @@ mod tests {
             .build();
 
         let (tx, _rx) = mpsc::channel(1);
-        let tx_handle = tokio::spawn(async { Ok(()) });
-        let udp_tx_handle = tokio::spawn(async { Ok(()) });
 
         let event = ConnectedEvent {
             peer_id: "peer1".to_string(),
@@ -2171,9 +2100,6 @@ mod tests {
             })),
             remote_addr: "5.6.7.8:5353".parse().unwrap(),
             tx,
-            main_handle: Some(tx_handle),
-            udp_tx_handle: Some(udp_tx_handle),
-            udp_rx_handle: None,
         };
 
         orch.handle_connected(event);
@@ -2198,8 +2124,6 @@ mod tests {
             .build();
 
         let (tx, _rx) = mpsc::channel(1);
-        let tx_handle = tokio::spawn(async { Ok(()) });
-        let udp_tx_handle = tokio::spawn(async { Ok(()) });
 
         let event = ConnectedEvent {
             peer_id: "peer1".to_string(),
@@ -2209,9 +2133,6 @@ mod tests {
             })),
             remote_addr: "1.2.3.4:5353".parse().unwrap(),
             tx,
-            main_handle: Some(tx_handle),
-            udp_tx_handle: Some(udp_tx_handle),
-            udp_rx_handle: None,
         };
 
         orch.handle_connected(event);
@@ -2393,6 +2314,8 @@ mod tests {
 
     #[tokio::test]
     async fn try_connect_skips_in_flight() {
+        let actor_bus = ActorBus::on_current_runtime();
+        let actor_bus_handle = actor_bus.handle();
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
         let mut entry = PeerEntry::new(peer);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
@@ -2407,8 +2330,7 @@ mod tests {
             "test0",
             1393,
             &Tuning::default(),
-            &Handle::current(),
-            &Handle::current(),
+            &actor_bus_handle,
             &ingress_tx,
         );
         assert!(entry.dials.contains_key(&ip));
@@ -2422,8 +2344,7 @@ mod tests {
             "test0",
             1393,
             &Tuning::default(),
-            &Handle::current(),
-            &Handle::current(),
+            &actor_bus_handle,
             &ingress_tx,
         );
         assert_eq!(entry.dials[&ip].attempt, attempt_before);
@@ -2431,6 +2352,8 @@ mod tests {
 
     #[tokio::test]
     async fn try_connect_skips_backoff_not_elapsed() {
+        let actor_bus = ActorBus::on_current_runtime();
+        let actor_bus_handle = actor_bus.handle();
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
         let mut entry = PeerEntry::new(peer);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
@@ -2452,8 +2375,7 @@ mod tests {
             "test0",
             1393,
             &Tuning::default(),
-            &Handle::current(),
-            &Handle::current(),
+            &actor_bus_handle,
             &ingress_tx,
         );
 
@@ -2463,6 +2385,8 @@ mod tests {
 
     #[tokio::test]
     async fn try_connect_allows_after_backoff_elapsed() {
+        let actor_bus = ActorBus::on_current_runtime();
+        let actor_bus_handle = actor_bus.handle();
         let peer = bare_peer_at_host("peer1", "example.com", 5353, &["10.0.0.0/24"]);
         let mut entry = PeerEntry::new(peer);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
@@ -2484,8 +2408,7 @@ mod tests {
             "test0",
             1393,
             &Tuning::default(),
-            &Handle::current(),
-            &Handle::current(),
+            &actor_bus_handle,
             &ingress_tx,
         );
 

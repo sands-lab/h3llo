@@ -325,14 +325,24 @@ pub(crate) struct H3Engine {
 }
 
 impl H3Engine {
-    /// Best-effort flush of QUIC output to the UDP send channel.
+    /// Flushes QUIC output to the UDP send channel.
     ///
     /// Used during handshake where pending-send tracking is unnecessary.
-    /// Drops on channel backpressure — acceptable because quiche retransmits.
-    pub(crate) fn flush_send(&mut self) {
+    /// Queue backpressure drops the batch because quiche retransmits; a closed
+    /// channel is returned because it means the UDP transport actor is gone.
+    pub(crate) fn flush_send(&mut self) -> ActorExitResult {
         if let Some(send) = collect_udp_send(&mut self.conn, self.meta.max_udp_payload) {
-            let _ = self.io.udp_send_tx.try_send(send);
+            match self.io.udp_send_tx.try_send(send) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(ActorError::H3TxSend {
+                        peer_id: self.meta.peer_id.clone(),
+                        reason: "UDP TX actor channel closed".to_string(),
+                    });
+                }
+            }
         }
+        Ok(())
     }
 
     /// Established phase: steady-state datagram forwarding.

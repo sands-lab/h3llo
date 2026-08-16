@@ -33,7 +33,7 @@ Key design choices:
 - **Isolate UDP I/O on `udp_rt`**: kernel `sendmsg`/`recvmmsg` syscalls are the dominant cost in the UDP thread (see [profiling data](#profiling-insights)); isolating them prevents syscall latency from blocking TUN or crypto processing.
 - **Control plane on main thread**: orchestrator, DNS, and API are low-frequency; sharing the main thread avoids wasting a core.
 
-Actors are pinned to runtimes via `Handle::enter()` guards during initialization (`src/orch.rs`). This sets the thread-local runtime context so that `tokio::spawn` inside each actor targets the correct runtime.
+`ActorBus` owns every runtime and is the production task-spawning entry point. Each spawn selects a runtime explicitly; short `Handle::enter()` guards remain only where an I/O resource must be registered with that runtime's reactor during initialization.
 
 Profiled CPU distribution (BareUDP, 9.37 Gbps bidirectional, 4 cores):
 

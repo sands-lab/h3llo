@@ -15,7 +15,6 @@ use std::time::Duration;
 const RESOLVER_TIMEOUT: Duration = Duration::from_secs(5);
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-use h3llo::actor::ActorExitResult;
 use h3llo::config::{DnsTuning, LocalDns, Tuning};
 use h3llo::dns::{make_dns, spawn_dns, DnsCommand};
 use h3llo::events::Event;
@@ -89,7 +88,7 @@ async fn spawn_resolver(
 ) -> (
     mpsc::UnboundedSender<DnsCommand>,
     mpsc::UnboundedReceiver<Event>,
-    tokio::task::JoinHandle<ActorExitResult>,
+    h3llo::actor::ActorBus,
 ) {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -111,8 +110,9 @@ async fn spawn_resolver(
         .await
         .expect("make_dns failed");
 
-    let (cmd_tx, handle) = spawn_dns(dns_actor, event_tx);
-    (cmd_tx, event_rx, handle)
+    let actor_bus = h3llo::actor::ActorBus::on_current_runtime();
+    let cmd_tx = spawn_dns(dns_actor, event_tx, &actor_bus.handle());
+    (cmd_tx, event_rx, actor_bus)
 }
 
 /// Waits for a DNS snapshot with at least `expected_count` IPs, returning the snapshot contents.
@@ -156,7 +156,7 @@ fn hosts(names: &[&str]) -> HashSet<String> {
 async fn dns_resolve_single_a_record() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
+    let (cmd_tx, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
         .send(DnsCommand::SetHostnames {
@@ -178,8 +178,6 @@ async fn dns_resolve_single_a_record() {
         "expected 10.0.0.1 for single.test.h3llo: {:?}",
         resolved
     );
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -187,7 +185,7 @@ async fn dns_resolve_single_a_record() {
 async fn dns_resolve_multiple_records() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
+    let (cmd_tx, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
         .send(DnsCommand::SetHostnames {
@@ -213,8 +211,6 @@ async fn dns_resolve_multiple_records() {
         addrs.contains(&"2001:db8::2".parse().unwrap()),
         "missing 2001:db8::2: {addrs:?}"
     );
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -222,7 +218,7 @@ async fn dns_resolve_multiple_records() {
 async fn dns_resolve_aaaa_only() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
+    let (cmd_tx, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
         .send(DnsCommand::SetHostnames {
@@ -241,8 +237,6 @@ async fn dns_resolve_aaaa_only() {
         "expected 2001:db8::1 for ipv6only.test.h3llo: {:?}",
         resolved
     );
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -250,7 +244,7 @@ async fn dns_resolve_aaaa_only() {
 async fn dns_resolve_nxdomain_emits_no_events() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
+    let (cmd_tx, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     cmd_tx
         .send(DnsCommand::SetHostnames {
@@ -270,8 +264,6 @@ async fn dns_resolve_nxdomain_emits_no_events() {
         "expected no IPs for NXDOMAIN, got: {:?}",
         resolved
     );
-
-    handle.abort();
 }
 
 #[tokio::test]
@@ -279,7 +271,7 @@ async fn dns_resolve_nxdomain_emits_no_events() {
 async fn dns_resolve_multiple_hostnames() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, handle) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
+    let (cmd_tx, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     // Register multiple hostnames at once
     cmd_tx
@@ -304,6 +296,4 @@ async fn dns_resolve_multiple_hostnames() {
         "missing ipv6only.test.h3llo: {:?}",
         resolved
     );
-
-    handle.abort();
 }

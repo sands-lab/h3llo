@@ -1,7 +1,7 @@
 //! DNS resolver coroutine: consumes `SetHostnames` commands, manages IP lifecycle with TTL-based expiration,
 //! and emits state snapshot events on resolution changes.
 
-use crate::actor::{ActorError, ActorExitResult};
+use crate::actor::{ActorBusHandle, ActorError, ActorExitResult, ActorRuntime, SupervisionPolicy};
 use crate::bind::{make_client_udp_socket, RouteProbe, UdpError};
 use crate::config::{DnsTuning, LocalDns, Tuning};
 use crate::events::{DnsEvent, Event};
@@ -15,7 +15,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 const DNS_BUFFER_SIZE: usize = 1500;
@@ -487,8 +486,8 @@ pub async fn make_dns<P: RouteProbe>(
 /// Spawns the DNS resolver actor task.
 ///
 /// Creates an unbounded command channel internally (actor owns the receiver).
-/// Returns the command sender and join handle. The actor exits gracefully when
-/// all senders are dropped, closing the channel naturally.
+/// Returns the command sender. The actor exits gracefully when all senders are
+/// dropped, closing the channel naturally.
 ///
 /// # Arguments
 ///
@@ -497,14 +496,17 @@ pub async fn make_dns<P: RouteProbe>(
 pub fn spawn_dns(
     actor: DnsActor,
     events_tx: mpsc::UnboundedSender<Event>,
-) -> (
-    mpsc::UnboundedSender<DnsCommand>,
-    JoinHandle<ActorExitResult>,
-) {
+    actor_bus: &ActorBusHandle,
+) -> mpsc::UnboundedSender<DnsCommand> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let handle = tokio::spawn(actor.run(cmd_rx, events_tx));
+    actor_bus.spawn(
+        "dns-resolver",
+        ActorRuntime::Main,
+        SupervisionPolicy::Critical,
+        actor.run(cmd_rx, events_tx),
+    );
 
-    (cmd_tx, handle)
+    cmd_tx
 }
 
 /// Builds a query for `name` and `record_type`.
@@ -567,7 +569,7 @@ mod tests {
     ) -> (
         mpsc::UnboundedSender<DnsCommand>,
         mpsc::UnboundedReceiver<Event>,
-        JoinHandle<ActorExitResult>,
+        crate::actor::ActorBus,
     ) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -583,8 +585,9 @@ mod tests {
             .await
             .expect("make_dns failed");
 
-        let (cmd_tx, handle) = spawn_dns(dns_actor, event_tx);
-        (cmd_tx, event_rx, handle)
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let cmd_tx = spawn_dns(dns_actor, event_tx, &actor_bus.handle());
+        (cmd_tx, event_rx, actor_bus)
     }
 
     /// Creates an actor for tests that exercise synchronous state transitions.
@@ -695,7 +698,7 @@ mod tests {
     async fn emits_snapshot_for_new_ip() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+        let (cmd_tx, mut events_rx, _actor_bus) = start_resolver(server_addr, None).await;
 
         let mut hosts = HashSet::new();
         hosts.insert("example.com".to_string());
@@ -707,15 +710,13 @@ mod tests {
         let snapshot = next_dns_snapshot_with_ips(&mut events_rx, "example.com").await;
         let ips = snapshot.get("example.com").expect("missing example.com");
         assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn emits_snapshot_on_repeated_set_hostnames() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+        let (cmd_tx, mut events_rx, _actor_bus) = start_resolver(server_addr, None).await;
 
         let mut hosts = HashSet::new();
         hosts.insert("example.com".to_string());
@@ -742,15 +743,13 @@ mod tests {
         let snapshot = next_dns_snapshot(&mut events_rx).await;
         let ips = snapshot.get("example.com").expect("missing example.com");
         assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn emits_snapshot_on_hostname_removal() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+        let (cmd_tx, mut events_rx, _actor_bus) = start_resolver(server_addr, None).await;
 
         // Register and resolve
         let mut hosts = HashSet::new();
@@ -779,8 +778,6 @@ mod tests {
             !snapshot.contains_key("example.com"),
             "example.com should be removed"
         );
-
-        handle.abort();
     }
 
     // ========== IP Literal Tests ==========
@@ -789,7 +786,7 @@ mod tests {
     async fn ip_literal_emits_snapshot() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+        let (cmd_tx, mut events_rx, _actor_bus) = start_resolver(server_addr, None).await;
 
         // Register IP literal
         let mut hosts = HashSet::new();
@@ -800,15 +797,13 @@ mod tests {
         let snapshot = next_dns_snapshot(&mut events_rx).await;
         let ips = snapshot.get("192.168.1.100").expect("missing IP literal");
         assert!(ips.contains(&"192.168.1.100".parse::<IpAddr>().unwrap()));
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn ipv6_literal_emits_snapshot() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+        let (cmd_tx, mut events_rx, _actor_bus) = start_resolver(server_addr, None).await;
 
         // Register IPv6 literal
         let mut hosts = HashSet::new();
@@ -819,8 +814,6 @@ mod tests {
         let snapshot = next_dns_snapshot(&mut events_rx).await;
         let ips = snapshot.get("2001:db8::1").expect("missing IPv6 literal");
         assert!(ips.iter().any(|ip| ip.is_ipv6()));
-
-        handle.abort();
     }
 
     // ========== Multi-IP Tests ==========
@@ -829,7 +822,7 @@ mod tests {
     async fn snapshot_contains_multiple_ips_for_same_hostname() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+        let (cmd_tx, mut events_rx, _actor_bus) = start_resolver(server_addr, None).await;
 
         let mut hosts = HashSet::new();
         hosts.insert("multi.example.com".to_string());
@@ -847,14 +840,13 @@ mod tests {
         let ips = snapshot.get("multi.example.com").expect("missing host");
         assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
-
-        handle.abort();
     }
 
     // ========== Actor Lifecycle Tests ==========
 
     #[tokio::test]
     async fn spawn_dns_returns_working_cmd_tx() {
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
 
@@ -870,7 +862,7 @@ mod tests {
             .expect("make_dns");
 
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, _handle) = spawn_dns(dns_actor, event_tx);
+        let cmd_tx = spawn_dns(dns_actor, event_tx, &actor_bus.handle());
 
         // Verify cmd_tx is functional
         let mut hosts = HashSet::new();
@@ -880,6 +872,7 @@ mod tests {
 
     #[tokio::test]
     async fn dns_actor_exits_when_sender_dropped() {
+        let mut actor_bus = crate::actor::ActorBus::on_current_runtime();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
 
@@ -895,15 +888,20 @@ mod tests {
             .expect("make_dns");
 
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, join_handle) = spawn_dns(dns_actor, event_tx);
+        let cmd_tx = spawn_dns(dns_actor, event_tx, &actor_bus.handle());
 
         // Drop sender to signal shutdown
         drop(cmd_tx);
 
-        // Actor should exit gracefully (check both timeout and join result)
-        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
+        let result = tokio::time::timeout(Duration::from_millis(200), actor_bus.next_exit()).await;
         assert!(
-            matches!(result, Ok(Ok(Ok(())))),
+            matches!(
+                result,
+                Ok(crate::actor::ActorBusExit {
+                    result: Ok(Ok(())),
+                    ..
+                })
+            ),
             "actor should shut down cleanly after sender dropped, got {:?}",
             result
         );
@@ -915,7 +913,7 @@ mod tests {
     async fn retries_on_truncated_response() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, _events_rx, handle) = start_resolver(server_addr, None).await;
+        let (cmd_tx, _events_rx, _actor_bus) = start_resolver(server_addr, None).await;
 
         let mut hosts = HashSet::new();
         hosts.insert("truncated.example".to_string());
@@ -960,15 +958,13 @@ mod tests {
             .expect("missing retry AAAA query");
         assert_ne!(orig_a, retry_a);
         assert_ne!(orig_aaaa, retry_aaaa);
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn truncated_response_does_not_emit_snapshot() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+        let (cmd_tx, mut events_rx, _actor_bus) = start_resolver(server_addr, None).await;
 
         let mut hosts = HashSet::new();
         hosts.insert("truncated.example".to_string());
@@ -1002,8 +998,6 @@ mod tests {
             tokio::sync::mpsc::error::TryRecvError::Empty,
             "truncated response should not trigger a snapshot"
         );
-
-        handle.abort();
     }
 
     // ========== Timeout Retry Tests ==========
@@ -1012,7 +1006,7 @@ mod tests {
     async fn retries_with_new_id_on_timeout() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, _events_rx, handle) = start_resolver(server_addr, None).await;
+        let (cmd_tx, _events_rx, _actor_bus) = start_resolver(server_addr, None).await;
 
         let mut hosts = HashSet::new();
         hosts.insert("timeout.example".to_string());
@@ -1043,8 +1037,6 @@ mod tests {
             first_ids.get(&RecordType::AAAA),
             retry_ids.get(&RecordType::AAAA)
         );
-
-        handle.abort();
     }
 
     // ========== Actor State Unit Tests ==========
@@ -1169,6 +1161,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_queries_are_paced() {
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local_dns = LocalDns {
             server: socket.local_addr().unwrap(),
@@ -1181,7 +1174,7 @@ mod tests {
             .await
             .expect("make_dns");
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, handle) = spawn_dns(dns_actor, events_tx);
+        let cmd_tx = spawn_dns(dns_actor, events_tx, &actor_bus.handle());
 
         cmd_tx
             .send(DnsCommand::SetHostnames {
@@ -1204,12 +1197,11 @@ mod tests {
             .await
             .expect("second query should be sent after the pacing interval")
             .unwrap();
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn queued_queries_do_not_block_commands() {
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local_dns = LocalDns {
             server: socket.local_addr().unwrap(),
@@ -1222,7 +1214,7 @@ mod tests {
             .await
             .expect("make_dns");
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, handle) = spawn_dns(dns_actor, events_tx);
+        let cmd_tx = spawn_dns(dns_actor, events_tx, &actor_bus.handle());
 
         cmd_tx
             .send(DnsCommand::SetHostnames {
@@ -1243,8 +1235,6 @@ mod tests {
         .await
         .expect("SetHostnames should not wait for the query queue to drain");
         assert!(!snapshot.contains_key("example.com"));
-
-        handle.abort();
     }
 
     #[tokio::test]
@@ -1330,7 +1320,7 @@ mod tests {
     async fn repeated_set_hostnames_skips_recent_refresh() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
-        let (cmd_tx, mut events_rx, handle) = start_resolver(server_addr, None).await;
+        let (cmd_tx, mut events_rx, _actor_bus) = start_resolver(server_addr, None).await;
 
         let mut hosts = HashSet::new();
         hosts.insert("example.com".to_string());
@@ -1362,7 +1352,5 @@ mod tests {
             result.is_err(),
             "no additional queries expected after recent refresh"
         );
-
-        handle.abort();
     }
 }

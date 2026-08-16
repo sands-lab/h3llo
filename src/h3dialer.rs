@@ -3,6 +3,7 @@
 //! Uses a hand-rolled quiche event loop with separated UDP I/O actors.
 //! See [`dial_h3_client`] for the public entry point.
 
+use crate::actor::{ActorRuntime, SupervisionPolicy};
 use crate::auth::bearer_auth_header;
 use crate::bind::{make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
@@ -65,7 +66,8 @@ impl H3Engine {
         timeout: Duration,
     ) -> Result<Self, DialError> {
         // Send initial QUIC packets (e.g. ClientHello).
-        self.flush_send();
+        self.flush_send()
+            .map_err(|error| DialError::Handshake(error.to_string()))?;
 
         let deadline = time::sleep(timeout);
         tokio::pin!(deadline);
@@ -92,7 +94,8 @@ impl H3Engine {
                             H3Session::with_transport(&mut self.conn)
                                 .map_err(DialError::Handshake)?,
                         );
-                        self.flush_send();
+                        self.flush_send()
+                            .map_err(|error| DialError::Handshake(error.to_string()))?;
                         Self::send_connect_request(
                             &mut self.conn,
                             self.session.as_mut().unwrap(),
@@ -141,12 +144,14 @@ impl H3Engine {
                 () = &mut deadline => {
                     warn!(%self.meta.peer_id, ?timeout, "establish: handshake timeout");
                     self.conn.close(true, 0, b"handshake timeout").ok();
-                    self.flush_send();
+                    self.flush_send()
+                        .map_err(|error| DialError::Handshake(error.to_string()))?;
                     return Err(DialError::Timeout(timeout));
                 }
             }
 
-            self.flush_send();
+            self.flush_send()
+                .map_err(|error| DialError::Handshake(error.to_string()))?;
             reset_timer(timer.as_mut(), &self.conn);
 
             if self.conn.is_closed() {
@@ -232,8 +237,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
         tun_mtu,
         tuning,
         probe,
-        udp_rt,
-        crypto_rt,
+        actor_bus,
         events_tx,
     } = ctx;
     let endpoint = peer_h3
@@ -253,7 +257,8 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     let connect_path = endpoint.path.clone();
     let auth_header = bearer_auth_header(&peer_h3.token);
 
-    // Create unconnected UDP socket, then register and spawn actors on udp_rt.
+    // Create an unconnected UDP socket, then register and spawn its actors on
+    // the ActorBus UDP runtime.
     let std_socket = make_unbound_udp_socket(
         remote_addr,
         Some(tun_if.as_str()),
@@ -267,8 +272,8 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     let udp_cancel = CancellationToken::new();
     let cancel_guard = udp_cancel.clone().drop_guard();
 
-    let (local_addr, max_udp_payload, udp_recv_rx, udp_rx_handle, udp_send_tx, udp_tx_handle) = {
-        let _guard = udp_rt.enter();
+    let (local_addr, max_udp_payload, udp_recv_rx, udp_send_tx) = {
+        let _guard = actor_bus.runtime_handle(ActorRuntime::Udp).enter();
         let local_addr = std_socket
             .local_addr()
             .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
@@ -278,16 +283,20 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
                 .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
         let (udp_recv_tx, udp_recv_rx) =
             mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
-        let udp_rx_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx, udp_cancel.clone());
-        let (udp_send_tx, udp_tx_handle) = udp::spawn_udp_tx(udp_tx, tuning.io.packet_queue_depth);
-        (
-            local_addr,
-            max_udp_payload,
-            udp_recv_rx,
-            udp_rx_handle,
-            udp_send_tx,
-            udp_tx_handle,
-        )
+        udp::spawn_udp_rx(
+            udp_rx,
+            udp_recv_tx,
+            udp_cancel.clone(),
+            actor_bus,
+            SupervisionPolicy::Restartable,
+        );
+        let udp_send_tx = udp::spawn_udp_tx(
+            udp_tx,
+            tuning.io.packet_queue_depth,
+            actor_bus,
+            SupervisionPolicy::Restartable,
+        );
+        (local_addr, max_udp_payload, udp_recv_rx, udp_send_tx)
     };
 
     // Create quiche config and connection.
@@ -332,31 +341,30 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
         udp_cancel: Some(udp_cancel),
     };
 
-    let engine = crypto_rt
-        .spawn(engine.establish(
+    let engine = engine
+        .establish(
             authority,
             connect_path,
             auth_header,
             tuning.h3.h3_handshake_timeout,
-        ))
-        .await
-        .map_err(|join_err| {
-            DialError::Handshake(format!("startup task join error: {join_err}"))
-        })??;
+        )
+        .await?;
 
     // Engine now owns the token — disarm the caller-side guard.
     cancel_guard.disarm();
 
-    let engine_handle = crypto_rt.spawn(engine.run());
+    actor_bus.spawn(
+        format!("h3-engine[{peer_id}@{remote_addr}]"),
+        ActorRuntime::Crypto,
+        SupervisionPolicy::Restartable,
+        engine.run(),
+    );
 
     Ok(ConnectedEvent {
         peer_id: peer_id.clone(),
         remote_addr,
         tx: egress_tx,
         endpoint: peer_h3.endpoint.as_ref().map(|ep| Endpoint::H3(ep.clone())),
-        main_handle: Some(engine_handle),
-        udp_tx_handle: Some(udp_tx_handle),
-        udp_rx_handle: Some(udp_rx_handle),
     })
 }
 
@@ -488,25 +496,31 @@ mod tests {
         bound_addr: SocketAddr,
         token: &str,
         peer_id: &str,
-    ) -> (ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
+    ) -> (
+        ConnectedEvent,
+        mpsc::Receiver<Vec<PooledBuf>>,
+        crate::actor::ActorBus,
+    ) {
         let peer_h3 = test_peer_h3(bound_addr, token);
         let tuning = insecure_tuning();
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let ctx = DialContext::test(
             peer_id,
             bound_addr.ip(),
             tuning,
             events_tx,
             FakeRouteProbe::noop(),
+            actor_bus.handle(),
         );
 
         let event = dial_h3_client(&peer_h3, &ctx, ingress_tx)
             .await
             .expect("dial_h3_client failed");
 
-        (event, ingress_rx)
+        (event, ingress_rx, actor_bus)
     }
 
     // ========== h3v2 Client-Server Integration Tests ==========
@@ -519,7 +533,8 @@ mod tests {
 
         let mut server = TestServer::start(peer_tokens).await;
 
-        let (event, _ingress_rx) = dial_test_client(server.bound_addr, token, peer_id).await;
+        let (event, _ingress_rx, _actor_bus) =
+            dial_test_client(server.bound_addr, token, peer_id).await;
 
         assert_eq!(event.peer_id, peer_id);
         assert_eq!(event.remote_addr, server.bound_addr);
@@ -545,12 +560,14 @@ mod tests {
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let ctx = DialContext::test(
             peer_id,
             server.bound_addr.ip(),
             tuning,
             events_tx,
             FakeRouteProbe::noop(),
+            actor_bus.handle(),
         );
 
         let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;
@@ -573,7 +590,8 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestServer::start(peer_tokens).await;
-        let (event, _ingress_rx) = dial_test_client(server.bound_addr, token, peer_id).await;
+        let (event, _ingress_rx, _actor_bus) =
+            dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Obtain server-side connection and set up RX actor.
         let server_connection = await_server_connection(&mut server.connection_rx).await;
@@ -614,7 +632,8 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestServer::start(peer_tokens).await;
-        let (_event, mut ingress_rx) = dial_test_client(server.bound_addr, token, peer_id).await;
+        let (_event, mut ingress_rx, _actor_bus) =
+            dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Obtain server-side connection and set up TX actor.
         let server_connection = await_server_connection(&mut server.connection_rx).await;
@@ -655,7 +674,8 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestServer::start(peer_tokens).await;
-        let (event, mut ingress_rx) = dial_test_client(server.bound_addr, token, peer_id).await;
+        let (event, mut ingress_rx, _actor_bus) =
+            dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Set up server RX and TX actors.
         let server_connection = await_server_connection(&mut server.connection_rx).await;
@@ -713,39 +733,26 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestServer::start(peer_tokens).await;
-        let (event, _ingress_rx) = dial_test_client(server.bound_addr, token, peer_id).await;
+        let (event, _ingress_rx, mut actor_bus) =
+            dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Verify server accepted the connection.
         let _server_connection = await_server_connection(&mut server.connection_rx).await;
 
         // Drop the egress sender to trigger client shutdown.
-        let ConnectedEvent {
-            tx,
-            main_handle,
-            udp_rx_handle,
-            udp_tx_handle,
-            ..
-        } = event;
+        let ConnectedEvent { tx, .. } = event;
         drop(tx);
-        let engine_handle = main_handle.expect("client main_handle present");
-        let udp_rx_handle = udp_rx_handle.expect("client udp_rx_handle present");
-        let udp_tx_handle = udp_tx_handle.expect("client udp_tx_handle present");
-
-        // Engine handle should terminate cleanly within a reasonable timeout.
-        let engine_result = tokio::time::timeout(Duration::from_secs(5), engine_handle)
-            .await
-            .expect("engine_handle did not terminate in time")
-            .expect("engine task panicked");
-        assert!(
-            engine_result.is_ok(),
-            "engine exited with error: {:?}",
-            engine_result
-        );
-
-        // UDP actors may be aborted by the engine or complete on their own.
-        // Best-effort check: they should not hang indefinitely.
-        let _ = tokio::time::timeout(Duration::from_secs(2), udp_rx_handle).await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), udp_tx_handle).await;
+        let engine_exit = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let exit = actor_bus.next_exit().await;
+                if exit.name.starts_with("h3-engine[") {
+                    return exit;
+                }
+            }
+        })
+        .await
+        .expect("engine actor did not terminate in time");
+        assert!(matches!(engine_exit.result, Ok(Ok(()))));
 
         drop(server.cmd_tx);
     }
@@ -780,7 +787,15 @@ mod tests {
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let ctx = DialContext::test(peer_id, server.bound_addr.ip(), tuning, events_tx, probe);
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let ctx = DialContext::test(
+            peer_id,
+            server.bound_addr.ip(),
+            tuning,
+            events_tx,
+            probe,
+            actor_bus.handle(),
+        );
 
         let event = dial_h3_client(&peer_h3, &ctx, ingress_tx)
             .await
@@ -806,12 +821,14 @@ mod tests {
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let ctx = DialContext::test(
             peer_id,
             server.bound_addr.ip(),
             tuning,
             events_tx,
             FakeRouteProbe::noop(),
+            actor_bus.handle(),
         );
 
         let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;

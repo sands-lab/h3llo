@@ -3,13 +3,11 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
-use crate::actor::ActorExitResult;
+use crate::actor::ActorBusHandle;
 use crate::bind::RouteProbe;
 use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
 use crate::metrics::{Labels, Metrics};
-use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 use tokio_quiche::buf_factory::PooledBuf;
 
 /// Endpoint type discriminator for bound connections.
@@ -41,10 +39,8 @@ pub(crate) struct DialContext<P: RouteProbe> {
     pub tuning: Tuning,
     /// Route probe for interface selection.
     pub probe: P,
-    /// Runtime handle for UDP I/O actors.
-    pub udp_rt: RuntimeHandle,
-    /// Runtime handle for crypto / protocol actors.
-    pub crypto_rt: RuntimeHandle,
+    /// Unified actor spawning and runtime handle.
+    pub actor_bus: ActorBusHandle,
     /// Channel for emitting events back to the orchestrator.
     pub events_tx: mpsc::UnboundedSender<Event>,
 }
@@ -58,6 +54,7 @@ impl<P: RouteProbe> DialContext<P> {
         tuning: Tuning,
         events_tx: mpsc::UnboundedSender<Event>,
         probe: P,
+        actor_bus: ActorBusHandle,
     ) -> Self {
         Self {
             peer_id: peer_id.to_string(),
@@ -66,8 +63,7 @@ impl<P: RouteProbe> DialContext<P> {
             tun_mtu: crate::config::default_mtu(),
             tuning,
             probe,
-            udp_rt: tokio::runtime::Handle::current(),
-            crypto_rt: tokio::runtime::Handle::current(),
+            actor_bus,
             events_tx,
         }
     }
@@ -77,7 +73,7 @@ impl<P: RouteProbe> DialContext<P> {
 ///
 /// Emitted by H3 listener/dialer or `BareUDP` dial task when connection
 /// setup completes. Carries the per-connection egress channel, optional
-/// endpoint, and actor join handles for orchestrator registration.
+/// endpoint. Actor tasks register with `ActorBus` when they are spawned.
 pub struct ConnectedEvent {
     /// Authenticated peer identifier.
     pub peer_id: String,
@@ -87,12 +83,6 @@ pub struct ConnectedEvent {
     pub tx: mpsc::Sender<Vec<PooledBuf>>,
     /// Configured endpoint (present for outbound connections, absent for inbound).
     pub endpoint: Option<Endpoint>,
-    /// Primary actor handle (H3 engine or Bare TX adapter).
-    pub main_handle: Option<JoinHandle<ActorExitResult>>,
-    /// UDP TX I/O actor handle.
-    pub udp_tx_handle: Option<JoinHandle<ActorExitResult>>,
-    /// UDP RX I/O actor handle (H3 client only).
-    pub udp_rx_handle: Option<JoinHandle<ActorExitResult>>,
 }
 
 impl std::fmt::Debug for ConnectedEvent {

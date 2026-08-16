@@ -1,26 +1,45 @@
-//! Actor infrastructure: error types, supervision policy, and dedicated runtimes.
+//! Actor infrastructure: errors, runtimes, spawning, and supervision.
 //!
-//! Provides a unified error type for all actors, enabling the orchestrator
-//! to distinguish between graceful shutdowns and actual errors. Also provides
-//! [`DedicatedRuntime`] for thread-per-core actor scheduling.
+//! [`ActorBus`] owns all Tokio runtimes and is the only production entry point
+//! for spawning asynchronous tasks. Supervision policy is attached to an actor
+//! instance at spawn time instead of being inferred from its error variant.
 
+use std::future::Future;
 use std::io;
 
 use thiserror::Error;
 use tokio::runtime::{Builder, Handle};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{JoinError, JoinSet};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::error;
 
-/// Determines how the orchestrator handles an actor failure.
+/// Determines how the orchestrator handles an actor instance's exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisionPolicy {
-    /// Critical actors whose failure should exit h3llo.
-    /// Includes: `tun_rx`, `tun_tx`, `udp_rx`, `dns_resolver`, `h3_dispatcher`
+    /// An unexpected exit terminates h3llo.
+    ///
+    /// Used for infrastructure shared by the process or a listener bundle.
     Critical,
-    /// Restartable actors that could be reconnected on failure.
-    /// Includes: `udp_tx`, `h3_tx`, `h3_rx`
-    /// Note: Reconnection logic is not yet implemented.
+    /// An exit asks the orchestrator to reconcile peer connections.
+    ///
+    /// Used for actors whose lifetime is scoped to one peer connection.
     Restartable,
+    /// Short-lived tasks whose exit is logged but requires no recovery action.
+    Detached,
+}
+
+/// Runtime selected for an actor task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorRuntime {
+    /// The runtime driving the orchestrator.
+    Main,
+    /// Dedicated runtime for TUN I/O.
+    Tun,
+    /// Dedicated runtime for routing and protocol work.
+    Crypto,
+    /// Dedicated runtime for UDP I/O.
+    Udp,
 }
 
 /// Exit result type for all actors.
@@ -124,33 +143,12 @@ pub enum ActorError {
     },
 }
 
-impl ActorError {
-    /// Returns the supervision classification for this error type.
-    #[must_use]
-    pub fn kind(&self) -> SupervisionPolicy {
-        match self {
-            // Critical actors - failure exits h3llo
-            ActorError::TunRxRecv { .. }
-            | ActorError::TunTxSend { .. }
-            | ActorError::UdpRxRecv { .. }
-            | ActorError::DnsRecv { .. }
-            | ActorError::H3Dispatcher { .. }
-            | ActorError::ApiServer { .. }
-            | ActorError::RouterFailed { .. } => SupervisionPolicy::Critical,
-            // Restartable actors - could be reconnected (future work)
-            ActorError::UdpTxSend { .. }
-            | ActorError::H3TxSend { .. }
-            | ActorError::H3Engine { .. } => SupervisionPolicy::Restartable,
-        }
-    }
-}
-
 /// A `current_thread` Tokio runtime pinned to a dedicated OS thread.
 ///
 /// The background thread runs `Runtime::block_on`, which drives the I/O
 /// reactor and task scheduler. Tasks are submitted via [`handle()`](Self::handle)
-/// or by entering the runtime context with `handle().enter()` before calling
-/// `tokio::spawn`.
+/// or by entering the runtime context with `handle().enter()` before creating
+/// runtime-bound I/O resources.
 ///
 /// # Shutdown
 ///
@@ -223,69 +221,251 @@ impl Drop for DedicatedRuntime {
     }
 }
 
+#[derive(Clone)]
+struct RuntimeHandles {
+    main: Handle,
+    tun: Handle,
+    crypto: Handle,
+    udp: Handle,
+}
+
+impl RuntimeHandles {
+    fn get(&self, runtime: ActorRuntime) -> &Handle {
+        match runtime {
+            ActorRuntime::Main => &self.main,
+            ActorRuntime::Tun => &self.tun,
+            ActorRuntime::Crypto => &self.crypto,
+            ActorRuntime::Udp => &self.udp,
+        }
+    }
+}
+
+struct ActorRegistration {
+    name: String,
+    policy: SupervisionPolicy,
+    task: AbortOnDropHandle<ActorExitResult>,
+}
+
+type MonitoredActor = (String, Result<ActorExitResult, JoinError>);
+
+/// Cloneable actor spawning handle.
+///
+/// Every production task must be spawned through this handle so its runtime
+/// and supervision policy are registered together.
+#[derive(Clone)]
+pub struct ActorBusHandle {
+    runtimes: RuntimeHandles,
+    registrations_tx: mpsc::UnboundedSender<ActorRegistration>,
+}
+
+impl ActorBusHandle {
+    /// Spawns and registers an actor on the selected runtime.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Stable diagnostic name for the actor instance.
+    /// * `runtime` - Runtime on which the future is executed.
+    /// * `policy` - Action category reported when the task exits.
+    /// * `future` - Actor future returning the common actor exit result.
+    pub fn spawn<F>(
+        &self,
+        name: impl Into<String>,
+        runtime: ActorRuntime,
+        policy: SupervisionPolicy,
+        future: F,
+    ) where
+        F: Future<Output = ActorExitResult> + Send + 'static,
+    {
+        let name = name.into();
+        let task = AbortOnDropHandle::new(self.runtimes.get(runtime).spawn(future));
+        if let Err(registration) =
+            self.registrations_tx
+                .send(ActorRegistration { name, policy, task })
+        {
+            error!(
+                actor = %registration.0.name,
+                "actor bus closed while registering task; aborting actor"
+            );
+            // `AbortOnDropHandle` aborts the unregistered task here.
+        }
+    }
+
+    /// Returns the Tokio handle for constructing runtime-bound I/O resources.
+    ///
+    /// Actor tasks must still be started with [`spawn`](Self::spawn); this
+    /// escape hatch only exists because types such as `UdpSocket` and
+    /// `AsyncFd` must be registered while the target runtime is entered.
+    #[must_use]
+    pub(crate) fn runtime_handle(&self, runtime: ActorRuntime) -> &Handle {
+        self.runtimes.get(runtime)
+    }
+}
+
+/// Actor exit notification returned by [`ActorBus::next_exit`].
+#[derive(Debug)]
+pub struct ActorBusExit {
+    /// Stable diagnostic actor name supplied at spawn time.
+    pub name: String,
+    /// Spawn-time supervision policy for this actor instance.
+    pub policy: SupervisionPolicy,
+    /// Actor completion or Tokio join failure.
+    pub result: Result<ActorExitResult, JoinError>,
+}
+
+/// Owns actor runtimes and supervises every production asynchronous task.
+///
+/// The initial implementation intentionally covers only runtime ownership,
+/// spawning, and exit classification. Future work should add typed command and
+/// event endpoints, metrics handles, cancellation, and actor-group lifecycle
+/// propagation here so communication availability follows actor lifetime.
+pub struct ActorBus {
+    // Drop monitor sets before runtimes. Their AbortOnDropHandle futures abort
+    // the underlying actor tasks instead of silently detaching them.
+    critical_tasks: JoinSet<MonitoredActor>,
+    restartable_tasks: JoinSet<MonitoredActor>,
+    detached_tasks: JoinSet<MonitoredActor>,
+    registrations_rx: mpsc::UnboundedReceiver<ActorRegistration>,
+    handle: ActorBusHandle,
+    _dedicated: Option<[DedicatedRuntime; 3]>,
+}
+
+impl ActorBus {
+    /// Creates the production actor bus and its dedicated runtimes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when a Tokio runtime or its OS thread cannot be
+    /// created.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime.
+    pub fn new() -> io::Result<Self> {
+        let tun = DedicatedRuntime::new("h3llo-tun")?;
+        let crypto = DedicatedRuntime::new("h3llo-crypto")?;
+        let udp = DedicatedRuntime::new("h3llo-udp")?;
+        let runtimes = RuntimeHandles {
+            main: Handle::current(),
+            tun: tun.handle().clone(),
+            crypto: crypto.handle().clone(),
+            udp: udp.handle().clone(),
+        };
+        let (registrations_tx, registrations_rx) = mpsc::unbounded_channel();
+        Ok(Self {
+            critical_tasks: JoinSet::new(),
+            restartable_tasks: JoinSet::new(),
+            detached_tasks: JoinSet::new(),
+            registrations_rx,
+            handle: ActorBusHandle {
+                runtimes,
+                registrations_tx,
+            },
+            _dedicated: Some([tun, crypto, udp]),
+        })
+    }
+
+    /// Creates an actor bus that maps every runtime class to the current runtime.
+    ///
+    /// This is intended for tests and embedders that do not need dedicated
+    /// data-plane threads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime.
+    #[must_use]
+    pub fn on_current_runtime() -> Self {
+        let current = Handle::current();
+        let (registrations_tx, registrations_rx) = mpsc::unbounded_channel();
+        Self {
+            critical_tasks: JoinSet::new(),
+            restartable_tasks: JoinSet::new(),
+            detached_tasks: JoinSet::new(),
+            registrations_rx,
+            handle: ActorBusHandle {
+                runtimes: RuntimeHandles {
+                    main: current.clone(),
+                    tun: current.clone(),
+                    crypto: current.clone(),
+                    udp: current,
+                },
+                registrations_tx,
+            },
+            _dedicated: None,
+        }
+    }
+
+    /// Returns a cloneable actor spawning handle.
+    #[must_use]
+    pub fn handle(&self) -> ActorBusHandle {
+        self.handle.clone()
+    }
+
+    /// Waits for the next actor exit, registering concurrently spawned actors.
+    ///
+    /// # Returns
+    ///
+    /// The actor name, its spawn-time policy, and either its exit result or a
+    /// Tokio join error.
+    pub async fn next_exit(&mut self) -> ActorBusExit {
+        loop {
+            tokio::select! {
+                Some(registration) = self.registrations_rx.recv() => {
+                    let ActorRegistration { name, policy, task } = registration;
+                    let monitor = async move { (name, task.await) };
+                    let main = self.handle.runtimes.get(ActorRuntime::Main);
+                    match policy {
+                        SupervisionPolicy::Critical => {
+                            self.critical_tasks.spawn_on(monitor, main);
+                        }
+                        SupervisionPolicy::Restartable => {
+                            self.restartable_tasks.spawn_on(monitor, main);
+                        }
+                        SupervisionPolicy::Detached => {
+                            self.detached_tasks.spawn_on(monitor, main);
+                        }
+                    }
+                }
+                result = self.critical_tasks.join_next(), if !self.critical_tasks.is_empty() => {
+                    return Self::completed(SupervisionPolicy::Critical, result);
+                }
+                result = self.restartable_tasks.join_next(), if !self.restartable_tasks.is_empty() => {
+                    return Self::completed(SupervisionPolicy::Restartable, result);
+                }
+                result = self.detached_tasks.join_next(), if !self.detached_tasks.is_empty() => {
+                    return Self::completed(SupervisionPolicy::Detached, result);
+                }
+            }
+        }
+    }
+
+    fn completed(
+        policy: SupervisionPolicy,
+        result: Option<Result<MonitoredActor, JoinError>>,
+    ) -> ActorBusExit {
+        match result {
+            Some(Ok((name, Ok(actor_result)))) => ActorBusExit {
+                name,
+                policy,
+                result: Ok(actor_result),
+            },
+            Some(Ok((name, Err(join_error)))) => ActorBusExit {
+                name,
+                policy,
+                result: Err(join_error),
+            },
+            Some(Err(join_error)) => ActorBusExit {
+                name: "actor-monitor".to_string(),
+                policy,
+                result: Err(join_error),
+            },
+            None => unreachable!("guarded JoinSet cannot be empty"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn actor_kind_critical_for_infrastructure() {
-        let errors = vec![
-            ActorError::TunRxRecv {
-                name: "tun0".into(),
-                source: io::Error::other("test"),
-            },
-            ActorError::TunTxSend {
-                name: "tun0".into(),
-                source: io::Error::other("test"),
-            },
-            ActorError::UdpRxRecv {
-                addr: "0.0.0.0:5353".into(),
-                source: io::Error::other("test"),
-            },
-            ActorError::DnsRecv {
-                server: "8.8.8.8:53".into(),
-                source: io::Error::other("test"),
-            },
-            ActorError::ApiServer {
-                addr: "127.0.0.1:9090".into(),
-                reason: "bind failed".into(),
-            },
-            ActorError::H3Dispatcher {
-                addr: "0.0.0.0:443".into(),
-                reason: "watcher channel closed".into(),
-            },
-        ];
-        for err in errors {
-            assert_eq!(
-                err.kind(),
-                SupervisionPolicy::Critical,
-                "expected Critical for {}",
-                err
-            );
-        }
-    }
-
-    #[test]
-    fn actor_kind_restartable_for_peer_actors() {
-        let errors = vec![
-            ActorError::UdpTxSend {
-                addr: "1.2.3.4:5353".into(),
-                source: io::Error::other("test"),
-            },
-            ActorError::H3TxSend {
-                peer_id: "peer-1".into(),
-                reason: "flow control".into(),
-            },
-        ];
-        for err in errors {
-            assert_eq!(
-                err.kind(),
-                SupervisionPolicy::Restartable,
-                "expected Restartable for {}",
-                err
-            );
-        }
-    }
 
     #[test]
     fn actor_error_display_includes_context() {
@@ -345,15 +525,43 @@ mod tests {
         assert!(msg.contains("watcher channel closed"));
     }
 
-    #[test]
-    fn actor_kind_restartable_for_h3_engine() {
-        let err = ActorError::H3Engine {
-            peer_id: "client-1".into(),
-            reason: "connection reset".into(),
-        };
-        assert_eq!(err.kind(), SupervisionPolicy::Restartable);
-        let msg = err.to_string();
-        assert!(msg.contains("h3[client-1]"));
+    #[tokio::test]
+    async fn spawn_policy_is_independent_of_error_variant() {
+        let mut bus = ActorBus::on_current_runtime();
+        let handle = bus.handle();
+        handle.spawn(
+            "listener-udp-tx",
+            ActorRuntime::Main,
+            SupervisionPolicy::Critical,
+            async {
+                Err(ActorError::UdpTxSend {
+                    addr: "0.0.0.0:443".into(),
+                    source: io::Error::other("test"),
+                })
+            },
+        );
+
+        let exit = bus.next_exit().await;
+        assert_eq!(exit.name, "listener-udp-tx");
+        assert_eq!(exit.policy, SupervisionPolicy::Critical);
+        assert!(matches!(exit.result, Ok(Err(ActorError::UdpTxSend { .. }))));
+
+        handle.spawn(
+            "peer-udp-tx",
+            ActorRuntime::Main,
+            SupervisionPolicy::Restartable,
+            async {
+                Err(ActorError::UdpTxSend {
+                    addr: "192.0.2.1:443".into(),
+                    source: io::Error::other("test"),
+                })
+            },
+        );
+
+        let exit = bus.next_exit().await;
+        assert_eq!(exit.name, "peer-udp-tx");
+        assert_eq!(exit.policy, SupervisionPolicy::Restartable);
+        assert!(matches!(exit.result, Ok(Err(ActorError::UdpTxSend { .. }))));
     }
 
     #[tokio::test]

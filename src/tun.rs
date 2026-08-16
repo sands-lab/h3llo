@@ -1,6 +1,6 @@
 //! TUN management: device creation, read/write loops with backpressure, and metrics reporting.
 
-use crate::actor::{ActorError, ActorExitResult};
+use crate::actor::{ActorBusHandle, ActorError, ActorRuntime, SupervisionPolicy};
 use crate::config::{IoTuning, LocalTun};
 use crate::events::Event;
 use crate::helpers::retry_on_transient;
@@ -11,7 +11,6 @@ use std::net::Ipv6Addr;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
 use tracing::{info, warn};
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
@@ -457,13 +456,18 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
     output_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     io_tuning: &IoTuning,
-) -> JoinHandle<ActorExitResult> {
+    actor_bus: &ActorBusHandle,
+) {
     let tun_name = tun.name().to_string();
     let batch_size = tun.batch_size();
     let scratch_buf_size = tun.scratch_buf_size();
     let metrics_push_interval = io_tuning.metrics_push_interval;
 
-    tokio::spawn(async move {
+    actor_bus.spawn(
+        format!("tun-rx[{tun_name}]"),
+        ActorRuntime::Tun,
+        SupervisionPolicy::Critical,
+        async move {
         let mut counters = Counters::new(Source::Tun, Direction::Rx);
         let mut ticker = make_interval(metrics_push_interval);
         let mtu = tun.mtu();
@@ -509,72 +513,79 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                 }
             }
         }
-    })
+        },
+    );
 }
 
 /// Spawns the TUN write loop, dropping oversize packets with counting and emitting TX metrics.
 ///
-/// Creates a bounded packet channel internally (actor owns the receiver).
-/// Returns the packet sender and join handle.
+/// Creates a bounded packet channel internally (actor owns the receiver) and
+/// returns its sender. Lifecycle monitoring remains internal to `ActorBus`.
 pub(crate) fn spawn_tun_tx<T: TunTx>(
     mut tun: T,
     events_tx: mpsc::UnboundedSender<Event>,
     io_tuning: &IoTuning,
-) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
+    actor_bus: &ActorBusHandle,
+) -> mpsc::Sender<Vec<PooledBuf>> {
     // Actor creates and owns its data-plane channel receiver
     let (input_tx, mut input_rx) = mpsc::channel::<Vec<PooledBuf>>(io_tuning.packet_queue_depth);
     let tun_name = tun.name().to_string();
     let metrics_push_interval = io_tuning.metrics_push_interval;
 
-    let handle = tokio::spawn(async move {
-        let mtu = tun.mtu();
-        let mut counters = Counters::new(Source::Tun, Direction::Tx);
-        let mut ticker = make_interval(metrics_push_interval);
+    actor_bus.spawn(
+        format!("tun-tx[{tun_name}]"),
+        ActorRuntime::Tun,
+        SupervisionPolicy::Critical,
+        async move {
+            let mtu = tun.mtu();
+            let mut counters = Counters::new(Source::Tun, Direction::Tx);
+            let mut ticker = make_interval(metrics_push_interval);
 
-        loop {
-            tokio::select! {
-                maybe_batch = input_rx.recv() => {
-                    let Some(packets) = maybe_batch else {
-                        return Ok(()); // Channel closed, exit gracefully
-                    };
+            loop {
+                tokio::select! {
+                    maybe_batch = input_rx.recv() => {
+                        let Some(packets) = maybe_batch else {
+                            return Ok(()); // Channel closed, exit gracefully
+                        };
 
-                    let mut tun_bufs: Vec<TunBuf> = Vec::with_capacity(packets.len());
-                    let mut ok_count: u64 = 0;
-                    let mut ok_bytes: u64 = 0;
-                    for packet in packets {
-                        if packet.len() > mtu {
-                            counters.record_drop(DropReason::Oversize, 1, packet.len() as u64);
+                        let mut tun_bufs: Vec<TunBuf> = Vec::with_capacity(packets.len());
+                        let mut ok_count: u64 = 0;
+                        let mut ok_bytes: u64 = 0;
+                        for packet in packets {
+                            if packet.len() > mtu {
+                                counters.record_drop(DropReason::Oversize, 1, packet.len() as u64);
+                                continue;
+                            }
+                            ok_count += 1;
+                            ok_bytes += packet.len() as u64;
+                            tun_bufs.push(TunBuf::from(packet));
+                        }
+
+                        if tun_bufs.is_empty() {
                             continue;
                         }
-                        ok_count += 1;
-                        ok_bytes += packet.len() as u64;
-                        tun_bufs.push(TunBuf::from(packet));
-                    }
 
-                    if tun_bufs.is_empty() {
-                        continue;
-                    }
-
-                    match tun.send_batch(&mut tun_bufs).await {
-                        Ok(_) => {
-                            counters.record_success(ok_count, ok_bytes);
-                        }
-                        Err(err) => {
-                            counters.record_drop(DropReason::SendError, ok_count, ok_bytes);
-                            return Err(ActorError::TunTxSend { name: tun_name, source: err });
+                        match tun.send_batch(&mut tun_bufs).await {
+                            Ok(_) => {
+                                counters.record_success(ok_count, ok_bytes);
+                            }
+                            Err(err) => {
+                                counters.record_drop(DropReason::SendError, ok_count, ok_bytes);
+                                return Err(ActorError::TunTxSend { name: tun_name, source: err });
+                            }
                         }
                     }
-                }
-                _ = ticker.tick() => {
-                    if !counters.emit(&events_tx, None, None) {
-                        return Ok(()); // Events channel closed during shutdown
+                    _ = ticker.tick() => {
+                        if !counters.emit(&events_tx, None, None) {
+                            return Ok(()); // Events channel closed during shutdown
+                        }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 
-    (input_tx, handle)
+    input_tx
 }
 
 // ============================================================================
@@ -758,13 +769,15 @@ mod tests {
 
     #[tokio::test]
     async fn tun_rx_forwards_batch_to_router() {
+        let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus = actor_bus_owner.handle();
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem0", 64);
         let (output_tx, mut output_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
-        let tun_rx_task = spawn_tun_rx(
+        spawn_tun_rx(
             rx_tun,
             output_tx,
             events_tx,
@@ -772,6 +785,7 @@ mod tests {
                 metrics_push_interval: Duration::from_millis(10),
                 ..Default::default()
             },
+            &actor_bus,
         );
 
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
@@ -795,8 +809,6 @@ mod tests {
         })
         .await;
 
-        tun_rx_task.abort();
-
         let metrics = snapshot.expect("rx metrics should arrive");
         assert_eq!(metrics.labels.source, Source::Tun);
         assert_eq!(metrics.labels.direction, Direction::Rx);
@@ -807,9 +819,11 @@ mod tests {
 
     #[tokio::test]
     async fn tun_tx_drops_oversize_and_reports_metrics() {
+        let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus = actor_bus_owner.handle();
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) = memory_tun("mem1", 4);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (input_tx, tun_tx_task) = spawn_tun_tx(
+        let input_tx = spawn_tun_tx(
             tx_tun,
             events_tx,
             &IoTuning {
@@ -817,6 +831,7 @@ mod tests {
                 packet_queue_depth: 256,
                 ..Default::default()
             },
+            &actor_bus,
         );
 
         input_tx
@@ -848,8 +863,6 @@ mod tests {
         })
         .await;
 
-        tun_tx_task.abort();
-
         let metrics = snapshot.expect("tx metrics should arrive");
         assert_eq!(metrics.labels.source, Source::Tun);
         assert_eq!(metrics.labels.direction, Direction::Tx);
@@ -867,10 +880,12 @@ mod tests {
 
     #[tokio::test]
     async fn tun_tx_retries_interrupted_send() {
+        let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus = actor_bus_owner.handle();
         let (_rx_tun, tx_tun, _inject_tx, mut output_rx) =
             memory_tun_with_errors("mem-interrupt", 16, vec![std::io::ErrorKind::Interrupted]);
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let (input_tx, tun_tx_task) = spawn_tun_tx(
+        let input_tx = spawn_tun_tx(
             tx_tun,
             events_tx,
             &IoTuning {
@@ -878,6 +893,7 @@ mod tests {
                 packet_queue_depth: 256,
                 ..Default::default()
             },
+            &actor_bus,
         );
 
         input_tx
@@ -902,8 +918,6 @@ mod tests {
         .expect("tx metrics should arrive")
         .expect("tx metrics should not be None");
 
-        tun_tx_task.abort();
-
         assert_eq!(metrics.labels.source, Source::Tun);
         assert_eq!(metrics.labels.direction, Direction::Tx);
         assert_eq!(metrics.labels.peer_id, None);
@@ -917,10 +931,12 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_tun_tx_returns_working_input_tx() {
+        let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus = actor_bus_owner.handle();
         let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-lifecycle", 64);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (input_tx, handle) = spawn_tun_tx(
+        let input_tx = spawn_tun_tx(
             tx_tun,
             events_tx,
             &IoTuning {
@@ -928,6 +944,7 @@ mod tests {
                 packet_queue_depth: 256,
                 ..Default::default()
             },
+            &actor_bus,
         );
 
         // Verify input_tx is functional by sending a batch
@@ -935,16 +952,16 @@ mod tests {
             .send(vec![BufFactory::buf_from_slice(&[1, 2, 3])])
             .await
             .is_ok());
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn tun_tx_actor_exits_when_sender_dropped() {
+        let mut actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus = actor_bus_owner.handle();
         let (_rx_tun, tx_tun, _inject_tx, _output_rx) = memory_tun("mem-tx-shutdown", 64);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
-        let (input_tx, join_handle) = spawn_tun_tx(
+        let input_tx = spawn_tun_tx(
             tx_tun,
             events_tx,
             &IoTuning {
@@ -952,15 +969,22 @@ mod tests {
                 packet_queue_depth: 256,
                 ..Default::default()
             },
+            &actor_bus,
         );
 
         // Drop sender to signal shutdown
         drop(input_tx);
 
-        // Actor should exit gracefully (check both timeout and join result)
-        let result = tokio::time::timeout(Duration::from_millis(200), join_handle).await;
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), actor_bus_owner.next_exit()).await;
         assert!(
-            matches!(result, Ok(Ok(Ok(())))),
+            matches!(
+                result,
+                Ok(crate::actor::ActorBusExit {
+                    result: Ok(Ok(())),
+                    ..
+                })
+            ),
             "tun_tx actor should shut down cleanly after sender dropped, got {:?}",
             result
         );
@@ -978,6 +1002,8 @@ mod tests {
 
     #[tokio::test]
     async fn tun_rx_batch_fallback_dispatches_correctly() {
+        let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus = actor_bus_owner.handle();
         // Verifies that the batch-aware spawn_tun_rx loop works
         // correctly when recv_batch falls back to single-packet recv.
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem-batch-fb", 64);
@@ -986,7 +1012,7 @@ mod tests {
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
-        let tun_rx_task = spawn_tun_rx(
+        spawn_tun_rx(
             rx_tun,
             output_tx,
             events_tx,
@@ -994,6 +1020,7 @@ mod tests {
                 metrics_push_interval: Duration::from_millis(10),
                 ..Default::default()
             },
+            &actor_bus,
         );
 
         inject_tx.send(ipv4_packet.clone()).await.unwrap();
@@ -1003,8 +1030,6 @@ mod tests {
             .expect("packet should be forwarded to router");
         assert_eq!(batch.len(), 1);
         assert_eq!(&batch[0][..], &ipv4_packet[..]);
-
-        tun_rx_task.abort();
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 //! Provides both the core route sync logic (`sync_tun_routes`) and the route
 //! actor (`make_route` / `spawn_route`) that serializes system route updates.
 
-use crate::actor::ActorExitResult;
+use crate::actor::{ActorBusHandle, ActorRuntime, SupervisionPolicy};
 use crate::bind::lookup_ifindex;
 use ipnet::IpNet;
 pub use route_manager::AsyncRouteManager;
@@ -13,7 +13,6 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tracing::warn;
 
 /// Resolves interface indexes from names.
@@ -113,37 +112,41 @@ pub fn make_route() -> io::Result<RouteActor<AsyncRouteManager, PlatformIfIndexR
 pub fn spawn_route<H: RouteHandle, R: IfIndexResolver>(
     actor: RouteActor<H, R>,
     tun_if: String,
-) -> (
-    mpsc::UnboundedSender<RouteCommand>,
-    JoinHandle<ActorExitResult>,
-) {
+    actor_bus: &ActorBusHandle,
+) -> mpsc::UnboundedSender<RouteCommand> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     let RouteActor {
         mut handle,
         resolver,
     } = actor;
 
-    let join_handle = tokio::spawn(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            match cmd {
-                RouteCommand::SyncRoutes { tun_addrs, allowed } => {
-                    if let Err(err) =
-                        sync_tun_routes(&tun_if, &tun_addrs, &allowed, &mut handle, &resolver).await
-                    {
-                        warn!(
-                            tun = %tun_if,
-                            allowed_count = allowed.len(),
-                            error = %err,
-                            "route sync failed"
-                        );
+    actor_bus.spawn(
+        "route-sync",
+        ActorRuntime::Main,
+        SupervisionPolicy::Critical,
+        async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    RouteCommand::SyncRoutes { tun_addrs, allowed } => {
+                        if let Err(err) =
+                            sync_tun_routes(&tun_if, &tun_addrs, &allowed, &mut handle, &resolver)
+                                .await
+                        {
+                            warn!(
+                                tun = %tun_if,
+                                allowed_count = allowed.len(),
+                                error = %err,
+                                "route sync failed"
+                            );
+                        }
                     }
                 }
             }
-        }
-        Ok(())
-    });
+            Ok(())
+        },
+    );
 
-    (cmd_tx, join_handle)
+    cmd_tx
 }
 
 /// Fatal errors returned by route sync.
@@ -827,11 +830,13 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn spawn_route_processes_command_and_exits_on_drop() {
+        let mut actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus = actor_bus_owner.handle();
         let actor = RouteActor {
             handle: FakeHandle::new(vec![]),
             resolver: FakeResolver { idx: 7 },
         };
-        let (cmd_tx, join_handle) = spawn_route(actor, "tun0".to_string());
+        let cmd_tx = spawn_route(actor, "tun0".to_string(), &actor_bus);
         cmd_tx
             .send(RouteCommand::SyncRoutes {
                 tun_addrs: vec![],
@@ -839,9 +844,19 @@ mod tests {
             })
             .expect("send should succeed");
         drop(cmd_tx);
-        let result = tokio::time::timeout(std::time::Duration::from_millis(200), join_handle).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            actor_bus_owner.next_exit(),
+        )
+        .await;
         assert!(
-            matches!(result, Ok(Ok(Ok(())))),
+            matches!(
+                result,
+                Ok(crate::actor::ActorBusExit {
+                    result: Ok(Ok(())),
+                    ..
+                })
+            ),
             "actor should shut down cleanly after processing command, got {result:?}"
         );
         assert!(!logs_contain("route sync failed"));
@@ -850,11 +865,13 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn spawn_route_logs_sync_failure() {
+        let mut actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus = actor_bus_owner.handle();
         let actor = RouteActor {
             handle: FakeHandle::new(vec![]),
             resolver: FailingResolver,
         };
-        let (cmd_tx, join_handle) = spawn_route(actor, "tun0".to_string());
+        let cmd_tx = spawn_route(actor, "tun0".to_string(), &actor_bus);
         cmd_tx
             .send(RouteCommand::SyncRoutes {
                 tun_addrs: vec![],
@@ -862,9 +879,19 @@ mod tests {
             })
             .expect("send should succeed");
         drop(cmd_tx);
-        let result = tokio::time::timeout(std::time::Duration::from_millis(200), join_handle).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            actor_bus_owner.next_exit(),
+        )
+        .await;
         assert!(
-            matches!(result, Ok(Ok(Ok(())))),
+            matches!(
+                result,
+                Ok(crate::actor::ActorBusExit {
+                    result: Ok(Ok(())),
+                    ..
+                })
+            ),
             "actor should shut down cleanly even after sync failure, got {result:?}"
         );
         assert!(logs_contain("route sync failed"));
@@ -872,26 +899,40 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_route_exits_gracefully_on_sender_drop() {
+        let mut actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus = actor_bus_owner.handle();
         let actor = RouteActor {
             handle: FakeHandle::new(vec![]),
             resolver: FakeResolver { idx: 7 },
         };
-        let (cmd_tx, join_handle) = spawn_route(actor, "tun0".to_string());
+        let cmd_tx = spawn_route(actor, "tun0".to_string(), &actor_bus);
         drop(cmd_tx);
-        let result = tokio::time::timeout(std::time::Duration::from_millis(200), join_handle).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            actor_bus_owner.next_exit(),
+        )
+        .await;
         assert!(
-            matches!(result, Ok(Ok(Ok(())))),
+            matches!(
+                result,
+                Ok(crate::actor::ActorBusExit {
+                    result: Ok(Ok(())),
+                    ..
+                })
+            ),
             "actor should shut down cleanly after sender dropped, got {result:?}"
         );
     }
 
     #[tokio::test]
     async fn spawn_route_returns_working_cmd_tx() {
+        let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus = actor_bus_owner.handle();
         let actor = RouteActor {
             handle: FakeHandle::new(vec![]),
             resolver: FakeResolver { idx: 7 },
         };
-        let (cmd_tx, _join_handle) = spawn_route(actor, "tun0".to_string());
+        let cmd_tx = spawn_route(actor, "tun0".to_string(), &actor_bus);
         assert!(cmd_tx
             .send(RouteCommand::SyncRoutes {
                 tun_addrs: vec![],
@@ -903,11 +944,13 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn spawn_route_processes_multiple_commands_sequentially() {
+        let mut actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus = actor_bus_owner.handle();
         let actor = RouteActor {
             handle: FakeHandle::new(vec![]),
             resolver: FakeResolver { idx: 7 },
         };
-        let (cmd_tx, join_handle) = spawn_route(actor, "tun0".to_string());
+        let cmd_tx = spawn_route(actor, "tun0".to_string(), &actor_bus);
         for prefix in &["10.0.0.0/24", "10.0.1.0/24", "10.0.2.0/24"] {
             cmd_tx
                 .send(RouteCommand::SyncRoutes {
@@ -917,9 +960,19 @@ mod tests {
                 .expect("send should succeed");
         }
         drop(cmd_tx);
-        let result = tokio::time::timeout(std::time::Duration::from_millis(500), join_handle).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            actor_bus_owner.next_exit(),
+        )
+        .await;
         assert!(
-            matches!(result, Ok(Ok(Ok(())))),
+            matches!(
+                result,
+                Ok(crate::actor::ActorBusExit {
+                    result: Ok(Ok(())),
+                    ..
+                })
+            ),
             "actor should process all commands and shut down cleanly, got {result:?}"
         );
         assert!(!logs_contain("route sync failed"));
