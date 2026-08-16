@@ -245,8 +245,6 @@ struct ActorRegistration {
     task: AbortOnDropHandle<ActorExitResult>,
 }
 
-type MonitoredActor = (String, Result<ActorExitResult, JoinError>);
-
 /// Cloneable actor spawning handle.
 ///
 /// Every production task must be spawned through this handle so its runtime
@@ -334,11 +332,9 @@ pub struct ActorBusExit {
 /// event endpoints, metrics handles, cancellation, and actor-group lifecycle
 /// propagation here so communication availability follows actor lifetime.
 pub struct ActorBus {
-    // Drop monitor sets before runtimes. Their AbortOnDropHandle futures abort
+    // Drop task monitors before runtimes. Their AbortOnDropHandle futures abort
     // the underlying actor tasks instead of silently detaching them.
-    critical_tasks: JoinSet<MonitoredActor>,
-    restartable_tasks: JoinSet<MonitoredActor>,
-    detached_tasks: JoinSet<MonitoredActor>,
+    tasks: JoinSet<ActorBusExit>,
     registrations_rx: mpsc::UnboundedReceiver<ActorRegistration>,
     handle: ActorBusHandle,
     _dedicated: Option<[DedicatedRuntime; 3]>,
@@ -367,9 +363,7 @@ impl ActorBus {
         };
         let (registrations_tx, registrations_rx) = mpsc::unbounded_channel();
         Ok(Self {
-            critical_tasks: JoinSet::new(),
-            restartable_tasks: JoinSet::new(),
-            detached_tasks: JoinSet::new(),
+            tasks: JoinSet::new(),
             registrations_rx,
             handle: ActorBusHandle {
                 runtimes,
@@ -392,9 +386,7 @@ impl ActorBus {
         let current = Handle::current();
         let (registrations_tx, registrations_rx) = mpsc::unbounded_channel();
         Self {
-            critical_tasks: JoinSet::new(),
-            restartable_tasks: JoinSet::new(),
-            detached_tasks: JoinSet::new(),
+            tasks: JoinSet::new(),
             registrations_rx,
             handle: ActorBusHandle {
                 runtimes: RuntimeHandles {
@@ -426,54 +418,28 @@ impl ActorBus {
             tokio::select! {
                 Some(registration) = self.registrations_rx.recv() => {
                     let ActorRegistration { name, policy, task } = registration;
-                    let monitor = async move { (name, task.await) };
+                    let monitor = async move {
+                        ActorBusExit {
+                            name,
+                            policy,
+                            result: task.await,
+                        }
+                    };
                     let main = self.handle.runtimes.get(ActorRuntime::Main);
-                    match policy {
-                        SupervisionPolicy::Critical => {
-                            self.critical_tasks.spawn_on(monitor, main);
-                        }
-                        SupervisionPolicy::Restartable => {
-                            self.restartable_tasks.spawn_on(monitor, main);
-                        }
-                        SupervisionPolicy::Detached => {
-                            self.detached_tasks.spawn_on(monitor, main);
-                        }
-                    }
+                    self.tasks.spawn_on(monitor, main);
                 }
-                result = self.critical_tasks.join_next(), if !self.critical_tasks.is_empty() => {
-                    return Self::completed(SupervisionPolicy::Critical, result);
-                }
-                result = self.restartable_tasks.join_next(), if !self.restartable_tasks.is_empty() => {
-                    return Self::completed(SupervisionPolicy::Restartable, result);
-                }
-                result = self.detached_tasks.join_next(), if !self.detached_tasks.is_empty() => {
-                    return Self::completed(SupervisionPolicy::Detached, result);
+                result = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                    return match result {
+                        Some(Ok(exit)) => exit,
+                        Some(Err(error)) => ActorBusExit {
+                            name: "actor-monitor".to_string(),
+                            policy: SupervisionPolicy::Critical,
+                            result: Err(error),
+                        },
+                        None => unreachable!("guarded JoinSet cannot be empty"),
+                    };
                 }
             }
-        }
-    }
-
-    fn completed(
-        policy: SupervisionPolicy,
-        result: Option<Result<MonitoredActor, JoinError>>,
-    ) -> ActorBusExit {
-        match result {
-            Some(Ok((name, Ok(actor_result)))) => ActorBusExit {
-                name,
-                policy,
-                result: Ok(actor_result),
-            },
-            Some(Ok((name, Err(join_error)))) => ActorBusExit {
-                name,
-                policy,
-                result: Err(join_error),
-            },
-            Some(Err(join_error)) => ActorBusExit {
-                name: "actor-monitor".to_string(),
-                policy,
-                result: Err(join_error),
-            },
-            None => unreachable!("guarded JoinSet cannot be empty"),
         }
     }
 }
