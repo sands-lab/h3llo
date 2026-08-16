@@ -272,32 +272,33 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     let udp_cancel = CancellationToken::new();
     let cancel_guard = udp_cancel.clone().drop_guard();
 
-    let (local_addr, max_udp_payload, udp_recv_rx, udp_send_tx) = {
-        let _guard = actor_bus.runtime_handle(ActorRuntime::Udp).enter();
-        let local_addr = std_socket
-            .local_addr()
-            .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
-        let max_udp_payload = usize::from(*tun_mtu) + CONNECT_IP_OVERHEAD;
-        let (udp_rx, udp_tx) =
-            udp::make_udp(std_socket, max_udp_payload, tuning.io.udp_enable_offload)
-                .map_err(|e| DialError::Socket(format!("make_udp: {e}")))?;
-        let (udp_recv_tx, udp_recv_rx) =
-            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
-        udp::spawn_udp_rx(
-            udp_rx,
-            udp_recv_tx,
-            udp_cancel.clone(),
-            actor_bus,
-            SupervisionPolicy::Restartable,
-        );
-        let udp_send_tx = udp::spawn_udp_tx(
-            udp_tx,
-            tuning.io.packet_queue_depth,
-            actor_bus,
-            SupervisionPolicy::Restartable,
-        );
-        (local_addr, max_udp_payload, udp_recv_rx, udp_send_tx)
-    };
+    let local_addr = std_socket
+        .local_addr()
+        .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
+    let max_udp_payload = usize::from(*tun_mtu) + CONNECT_IP_OVERHEAD;
+    let enable_offload = tuning.io.udp_enable_offload;
+    let (udp_rx, udp_tx) = actor_bus
+        .run_on(ActorRuntime::Udp, move || {
+            udp::make_udp(std_socket, max_udp_payload, enable_offload)
+        })
+        .await
+        .map_err(|error| DialError::Socket(format!("UDP runtime task failed: {error}")))?
+        .map_err(|error| DialError::Socket(format!("make_udp: {error}")))?;
+    let (udp_recv_tx, udp_recv_rx) =
+        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
+    udp::spawn_udp_rx(
+        udp_rx,
+        udp_recv_tx,
+        udp_cancel.clone(),
+        actor_bus,
+        SupervisionPolicy::Restartable,
+    );
+    let udp_send_tx = udp::spawn_udp_tx(
+        udp_tx,
+        tuning.io.packet_queue_depth,
+        actor_bus,
+        SupervisionPolicy::Restartable,
+    );
 
     // Create quiche config and connection.
     // Note: early `?` returns below are safe — `cancel_guard` cancels

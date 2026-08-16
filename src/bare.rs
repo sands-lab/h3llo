@@ -67,7 +67,7 @@ pub struct BareRxGroup {
 /// # Errors
 ///
 /// Returns [`UdpError`] if the UDP socket cannot be bound or configured.
-pub fn make_bare_rx(
+pub async fn make_bare_rx(
     listen_addr: SocketAddr,
     tun_mtu: u16,
     accepted_sources: HashSet<IpAddr>,
@@ -76,9 +76,15 @@ pub fn make_bare_rx(
     tuning: &Tuning,
     actor_bus: &ActorBusHandle,
 ) -> Result<BareRxGroup, UdpError> {
-    let _guard = actor_bus.runtime_handle(ActorRuntime::Udp).enter();
     let socket = make_server_udp_socket(listen_addr, tuning.io.socket_buffer_bytes())?;
-    let (udp_rx, _udp_tx) = udp::make_udp(socket, tun_mtu.into(), tuning.io.udp_enable_offload)?;
+    let max_udp_payload = tun_mtu.into();
+    let enable_offload = tuning.io.udp_enable_offload;
+    let (udp_rx, _udp_tx) = actor_bus
+        .run_on(ActorRuntime::Udp, move || {
+            udp::make_udp(socket, max_udp_payload, enable_offload)
+        })
+        .await
+        .map_err(|error| UdpError::Socket(format!("UDP runtime task failed: {error}")))??;
     let filter = BareRx {
         accepted_sources,
         ingress_tx,
@@ -202,20 +208,21 @@ pub(crate) async fn dial_bare_tx<P: RouteProbe>(
     )
     .await?;
 
-    let udp_send_tx = {
-        let _guard = ctx.actor_bus.runtime_handle(ActorRuntime::Udp).enter();
-        let (_rx, tx) = udp::make_udp(
-            std_socket,
-            ctx.tun_mtu.into(),
-            ctx.tuning.io.udp_enable_offload,
-        )?;
-        udp::spawn_udp_tx(
-            tx,
-            ctx.tuning.io.packet_queue_depth,
-            &ctx.actor_bus,
-            SupervisionPolicy::Restartable,
-        )
-    };
+    let max_udp_payload = ctx.tun_mtu.into();
+    let enable_offload = ctx.tuning.io.udp_enable_offload;
+    let (_udp_rx, udp_tx) = ctx
+        .actor_bus
+        .run_on(ActorRuntime::Udp, move || {
+            udp::make_udp(std_socket, max_udp_payload, enable_offload)
+        })
+        .await
+        .map_err(|error| UdpError::Socket(format!("UDP runtime task failed: {error}")))??;
+    let udp_send_tx = udp::spawn_udp_tx(
+        udp_tx,
+        ctx.tuning.io.packet_queue_depth,
+        &ctx.actor_bus,
+        SupervisionPolicy::Restartable,
+    );
     let egress_tx = spawn_bare_tx(
         udp_send_tx,
         destination,

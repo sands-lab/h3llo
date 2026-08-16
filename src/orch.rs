@@ -481,18 +481,16 @@ impl Orchestrator {
         let actor_bus = ActorBus::new().map_err(OrchestratorError::Runtime)?;
         let actor_bus_handle = actor_bus.handle();
 
-        // Setup TUN — enter guard ensures AsyncFd registers with the TUN
-        // runtime's I/O reactor. make_tun is async in signature but has no
-        // internal .await points, so the guard stays effective.
-        let (tun_reader, tun_writer) = {
-            let _guard = actor_bus_handle.runtime_handle(ActorRuntime::Tun).enter();
-            tun::make_tun(
-                &config.local.tun,
-                tuning.io.tun_tx_queue_len,
-                tuning.io.tun_enable_offload,
-            )
-            .map_err(|err| OrchestratorError::Tun(err.to_string()))?
-        };
+        let tun_config = config.local.tun.clone();
+        let tun_tx_queue_len = tuning.io.tun_tx_queue_len;
+        let tun_enable_offload = tuning.io.tun_enable_offload;
+        let (tun_reader, tun_writer) = actor_bus_handle
+            .run_on(ActorRuntime::Tun, move || {
+                tun::make_tun(&tun_config, tun_tx_queue_len, tun_enable_offload)
+            })
+            .await
+            .map_err(|error| OrchestratorError::TaskJoin(error.to_string()))?
+            .map_err(|error| OrchestratorError::Tun(error.to_string()))?;
 
         // Control plane: unbounded to prevent deadlocks from actor cycles.
         let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -529,6 +527,7 @@ impl Orchestrator {
                 tuning,
                 &actor_bus_handle,
             )
+            .await
             .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
 
             let cmd_tx = spawn_bare_rx(
@@ -560,6 +559,7 @@ impl Orchestrator {
                 ingress_tx.clone(),
                 events_tx.clone(),
             )
+            .await
             .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
 
             // spawn: infallible task creation

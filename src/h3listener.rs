@@ -148,7 +148,7 @@ pub(crate) enum DispatcherCommand {
 /// initialization. Does NOT spawn any tasks — use [`spawn_h3_dispatcher`] for
 /// that.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn make_h3_dispatcher(
+pub(crate) async fn make_h3_dispatcher(
     listen_addr: SocketAddr,
     cert_path: &Path,
     key_path: &Path,
@@ -200,11 +200,14 @@ pub(crate) fn make_h3_dispatcher(
     let max_udp_payload = usize::from(tun_mtu) + CONNECT_IP_OVERHEAD;
     let config = make_server_quiche_config(h3_tuning, max_udp_payload, &cert_path, &key_path)?;
 
-    let (udp_rx, udp_tx) = {
-        let _guard = actor_bus.runtime_handle(ActorRuntime::Udp).enter();
-        udp::make_udp(std_socket, max_udp_payload, io_tuning.udp_enable_offload)
-            .map_err(|e| ServerError::Socket(format!("make_udp: {e}")))?
-    };
+    let enable_offload = io_tuning.udp_enable_offload;
+    let (udp_rx, udp_tx) = actor_bus
+        .run_on(ActorRuntime::Udp, move || {
+            udp::make_udp(std_socket, max_udp_payload, enable_offload)
+        })
+        .await
+        .map_err(|error| ServerError::Socket(format!("UDP runtime task failed: {error}")))?
+        .map_err(|error| ServerError::Socket(format!("make_udp: {error}")))?;
 
     let group = H3DispatcherGroup {
         dispatcher: H3Dispatcher {
@@ -925,7 +928,8 @@ mod tests {
             &actor_bus.handle(),
             ingress_tx,
             events_tx,
-        );
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -979,6 +983,7 @@ mod tests {
                 ingress_tx,
                 events_tx,
             )
+            .await
             .expect("make_h3_dispatcher");
 
             let cmd_tx = spawn_h3_dispatcher(dispatcher_group, peer_tokens, &actor_bus_handle);

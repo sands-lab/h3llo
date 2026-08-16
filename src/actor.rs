@@ -146,9 +146,8 @@ pub enum ActorError {
 /// A `current_thread` Tokio runtime pinned to a dedicated OS thread.
 ///
 /// The background thread runs `Runtime::block_on`, which drives the I/O
-/// reactor and task scheduler. Tasks are submitted via [`handle()`](Self::handle)
-/// or by entering the runtime context with `handle().enter()` before creating
-/// runtime-bound I/O resources.
+/// reactor and task scheduler. `ActorBus` uses its handle internally to run
+/// actors and construct runtime-bound I/O resources.
 ///
 /// # Shutdown
 ///
@@ -196,7 +195,7 @@ impl DedicatedRuntime {
         })
     }
 
-    /// Returns a handle for spawning tasks or entering this runtime's context.
+    /// Returns the runtime handle used internally by `ActorBus`.
     pub(crate) fn handle(&self) -> &Handle {
         &self.handle
     }
@@ -290,14 +289,30 @@ impl ActorBusHandle {
         }
     }
 
-    /// Returns the Tokio handle for constructing runtime-bound I/O resources.
+    /// Runs a synchronous operation on the selected runtime.
     ///
-    /// Actor tasks must still be started with [`spawn`](Self::spawn); this
-    /// escape hatch only exists because types such as `UdpSocket` and
-    /// `AsyncFd` must be registered while the target runtime is entered.
-    #[must_use]
-    pub(crate) fn runtime_handle(&self, runtime: ActorRuntime) -> &Handle {
-        self.runtimes.get(runtime)
+    /// This is intended for short initialization that must construct an I/O
+    /// resource inside a particular runtime's reactor. Actor tasks must still
+    /// be started with [`spawn`](Self::spawn).
+    ///
+    /// # Arguments
+    ///
+    /// * `runtime` - Runtime on which the operation is executed.
+    /// * `operation` - Synchronous operation to execute.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JoinError`] if the operation panics or its task is cancelled.
+    pub(crate) async fn run_on<F, T>(
+        &self,
+        runtime: ActorRuntime,
+        operation: F,
+    ) -> Result<T, JoinError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        AbortOnDropHandle::new(self.runtimes.get(runtime).spawn(async move { operation() })).await
     }
 }
 
@@ -584,5 +599,19 @@ mod tests {
         });
         let result = join.await.expect("cross-runtime await should work");
         assert_eq!(result, "hello");
+    }
+
+    #[tokio::test]
+    async fn run_on_executes_on_selected_runtime() {
+        let bus = ActorBus::new().expect("actor bus");
+        let thread_name = bus
+            .handle()
+            .run_on(ActorRuntime::Tun, || {
+                std::thread::current().name().map(str::to_owned)
+            })
+            .await
+            .expect("operation should complete");
+
+        assert_eq!(thread_name.as_deref(), Some("h3llo-tun"));
     }
 }

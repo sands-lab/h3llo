@@ -199,7 +199,7 @@ h3llo uses a thread-per-core architecture with multiple Tokio `current_thread` r
 - **crypto_rt** (`h3llo-crypto`): Router actor and H3 engine actors (QUIC crypto, H3 session, datagram forwarding). Co-locating H3 engines with the Router eliminates cross-thread hops for routed packets.
 - **udp_rt** (`h3llo-udp`): All UDP I/O actors (BareUDP Rx/Tx and H3 transport UDP Rx/Tx).
 
-The orchestrator and control-plane actors (DNS, Route Sync, API) share the main thread's `current_thread` runtime. Cross-runtime communication uses Tokio MPSC channels, which are runtime-agnostic. `ActorBus` owns the runtime handles and supervision sets, and every production actor selects both its runtime and exit policy at spawn time. `Handle::enter()` is limited to initialization that must register an I/O resource with a particular reactor.
+The orchestrator and control-plane actors (DNS, Route Sync, API) share the main thread's `current_thread` runtime. Cross-runtime communication uses Tokio MPSC channels, which are runtime-agnostic. `ActorBus` owns the runtime handles and supervision sets, and every production actor selects both its runtime and exit policy at spawn time. Runtime-bound I/O resources are initialized through `ActorBus::run_on()` so callers never enter another runtime directly.
 
 Orchestrator responsibilities and invariants:
 - Maintain the latest configuration snapshot and H3 connection pool; receive commands from other actors through its MPSC queue.
