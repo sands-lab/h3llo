@@ -1,26 +1,27 @@
 //! Actor infrastructure: errors, runtimes, spawning, and supervision.
 //!
-//! [`ActorBus`] owns all Tokio runtimes and is the only production entry point
-//! for spawning asynchronous tasks. Supervision policy is attached to an actor
-//! instance at spawn time instead of being inferred from its error variant.
+//! [`ActorBus`] owns all Tokio runtimes and drives supervision. Actors spawn
+//! children through their [`ActorContext`], attaching supervision policy to
+//! each instance instead of inferring it from the returned error.
 
 use std::future::Future;
 use std::io;
 
+use crate::events::Event;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::error;
 
-/// Determines how the orchestrator handles an actor instance's exit.
+/// Determines how an actor owner handles an actor instance's exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisionPolicy {
     /// An unexpected exit terminates h3llo.
     ///
     /// Used for infrastructure shared by the process or a listener bundle.
     Critical,
-    /// An exit asks the orchestrator to reconcile peer connections.
+    /// An exit asks the owner to reconcile peer connections.
     ///
     /// Used for actors whose lifetime is scoped to one peer connection.
     Restartable,
@@ -43,9 +44,175 @@ pub enum ActorRuntime {
 
 /// Exit result type for all actors.
 ///
-/// - `Ok(())` indicates graceful shutdown (e.g., command channel closed).
-/// - `Err(error)` indicates an error exit requiring orchestrator action.
+/// - `Ok(())` indicates graceful shutdown (e.g., after receiving [`Event::Stop`]).
+/// - `Err(error)` indicates an error exit requiring owner action.
 pub type ActorExitResult = anyhow::Result<()>;
+
+/// Address used to send control-plane events to one actor instance.
+#[derive(Clone)]
+pub struct ActorRef {
+    name: String,
+    tx: mpsc::UnboundedSender<Event>,
+}
+
+/// Inbox and bus access owned by a running actor.
+pub struct ActorContext {
+    myself: ActorRef,
+    owner: ActorRef,
+    inbox: mpsc::UnboundedReceiver<Event>,
+    runtimes: RuntimeHandles,
+    registrations_tx: mpsc::UnboundedSender<ActorRegistration>,
+}
+
+impl ActorContext {
+    /// Returns this actor's address.
+    #[must_use]
+    pub fn myself(&self) -> &ActorRef {
+        &self.myself
+    }
+
+    /// Sends a control-plane event directly to an actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unsent event when the target actor's inbox is closed.
+    pub fn send(
+        &self,
+        target: &ActorRef,
+        message: Event,
+    ) -> Result<(), mpsc::error::SendError<Event>> {
+        target.tx.send(message)
+    }
+
+    /// Sends a control-plane event to this actor's inherited owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unsent event when the owner's inbox is closed.
+    pub fn notify_owner(&self, message: Event) -> Result<(), mpsc::error::SendError<Event>> {
+        self.owner.tx.send(message)
+    }
+
+    /// Spawns and registers an actor on the selected runtime.
+    ///
+    /// The new context inherits this context's owner. Events sent with
+    /// [`notify_owner`](Self::notify_owner) and exit notifications therefore
+    /// reach the same owner without passing an [`ActorRef`] through actor code.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Stable diagnostic name for the actor instance.
+    /// * `runtime` - Runtime on which the future is executed.
+    /// * `policy` - Action category reported when the task exits.
+    /// * `actor` - Factory receiving the child actor's context and returning its future.
+    ///
+    /// # Returns
+    ///
+    /// An address for sending control-plane events to the spawned actor.
+    #[must_use]
+    pub fn spawn<F, Fut>(
+        &self,
+        name: impl Into<String>,
+        runtime: ActorRuntime,
+        policy: SupervisionPolicy,
+        actor: F,
+    ) -> ActorRef
+    where
+        F: FnOnce(ActorContext) -> Fut,
+        Fut: Future<Output = ActorExitResult> + Send + 'static,
+    {
+        let (tx, inbox) = mpsc::unbounded_channel();
+        let actor_ref = ActorRef {
+            name: name.into(),
+            tx,
+        };
+        let ctx = Self {
+            myself: actor_ref.clone(),
+            owner: self.owner.clone(),
+            inbox,
+            runtimes: self.runtimes.clone(),
+            registrations_tx: self.registrations_tx.clone(),
+        };
+        let task = AbortOnDropHandle::new(self.runtimes.get(runtime).spawn(actor(ctx)));
+        let registration = ActorRegistration {
+            name: actor_ref.name.clone(),
+            policy,
+            owner: self.owner.clone(),
+            task,
+        };
+        if let Err(registration) = self.registrations_tx.send(registration) {
+            error!(
+                actor = %registration.0.name,
+                "actor bus closed while registering task; aborting actor"
+            );
+            // `AbortOnDropHandle` aborts the unregistered task here.
+        }
+        actor_ref
+    }
+
+    /// Runs a synchronous operation on the selected runtime.
+    ///
+    /// This is intended for short initialization that must construct an I/O
+    /// resource inside a particular runtime's reactor. Actor tasks must still
+    /// be started with [`spawn`](Self::spawn).
+    ///
+    /// # Arguments
+    ///
+    /// * `runtime` - Runtime on which the operation is executed.
+    /// * `operation` - Synchronous operation to execute.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JoinError`] if the operation panics or its task is cancelled.
+    pub(crate) async fn run_on<F, T>(
+        &self,
+        runtime: ActorRuntime,
+        operation: F,
+    ) -> Result<T, JoinError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        AbortOnDropHandle::new(self.runtimes.get(runtime).spawn(async move { operation() })).await
+    }
+
+    /// Receives the next control-plane event.
+    ///
+    /// Actors normally terminate on [`Event::Stop`]. The actor context retains
+    /// its own address, so dropping external [`ActorRef`] values does not close
+    /// the inbox while the actor is running.
+    pub async fn recv(&mut self) -> Option<Event> {
+        self.inbox.recv().await
+    }
+
+    /// Attempts to receive a control-plane event without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mpsc::error::TryRecvError::Empty`] when no message is ready,
+    /// or [`mpsc::error::TryRecvError::Disconnected`] when the inbox is closed.
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Result<Event, mpsc::error::TryRecvError> {
+        self.inbox.try_recv()
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn next_actor_exit(
+    bus: &mut ActorBus,
+    supervisor: &mut ActorContext,
+) -> ActorExit {
+    loop {
+        tokio::select! {
+            message = supervisor.recv() => {
+                if let Some(Event::ActorExited(exit)) = message {
+                    return exit;
+                }
+            }
+            result = bus.drive() => result.expect("actor bus monitor"),
+        }
+    }
+}
 
 /// A `current_thread` Tokio runtime pinned to a dedicated OS thread.
 ///
@@ -98,11 +265,6 @@ impl DedicatedRuntime {
             thread: Some(thread),
         })
     }
-
-    /// Returns the runtime handle used internally by `ActorBus`.
-    pub(crate) fn handle(&self) -> &Handle {
-        &self.handle
-    }
 }
 
 impl Drop for DedicatedRuntime {
@@ -146,82 +308,14 @@ impl RuntimeHandles {
 struct ActorRegistration {
     name: String,
     policy: SupervisionPolicy,
+    owner: ActorRef,
     task: AbortOnDropHandle<ActorExitResult>,
 }
 
-/// Cloneable actor spawning handle.
-///
-/// Every production task must be spawned through this handle so its runtime
-/// and supervision policy are registered together.
-#[derive(Clone)]
-pub struct ActorBusHandle {
-    runtimes: RuntimeHandles,
-    registrations_tx: mpsc::UnboundedSender<ActorRegistration>,
-}
-
-impl ActorBusHandle {
-    /// Spawns and registers an actor on the selected runtime.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - Stable diagnostic name for the actor instance.
-    /// * `runtime` - Runtime on which the future is executed.
-    /// * `policy` - Action category reported when the task exits.
-    /// * `future` - Actor future returning the common actor exit result.
-    pub fn spawn<F>(
-        &self,
-        name: impl Into<String>,
-        runtime: ActorRuntime,
-        policy: SupervisionPolicy,
-        future: F,
-    ) where
-        F: Future<Output = ActorExitResult> + Send + 'static,
-    {
-        let name = name.into();
-        let task = AbortOnDropHandle::new(self.runtimes.get(runtime).spawn(future));
-        if let Err(registration) =
-            self.registrations_tx
-                .send(ActorRegistration { name, policy, task })
-        {
-            error!(
-                actor = %registration.0.name,
-                "actor bus closed while registering task; aborting actor"
-            );
-            // `AbortOnDropHandle` aborts the unregistered task here.
-        }
-    }
-
-    /// Runs a synchronous operation on the selected runtime.
-    ///
-    /// This is intended for short initialization that must construct an I/O
-    /// resource inside a particular runtime's reactor. Actor tasks must still
-    /// be started with [`spawn`](Self::spawn).
-    ///
-    /// # Arguments
-    ///
-    /// * `runtime` - Runtime on which the operation is executed.
-    /// * `operation` - Synchronous operation to execute.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JoinError`] if the operation panics or its task is cancelled.
-    pub(crate) async fn run_on<F, T>(
-        &self,
-        runtime: ActorRuntime,
-        operation: F,
-    ) -> Result<T, JoinError>
-    where
-        F: FnOnce() -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        AbortOnDropHandle::new(self.runtimes.get(runtime).spawn(async move { operation() })).await
-    }
-}
-
-/// Actor exit notification returned by [`ActorBus::next_exit`].
+/// Exit notification sent to an actor's owner.
 #[derive(Debug)]
-pub struct ActorBusExit {
-    /// Stable diagnostic actor name supplied at spawn time.
+pub struct ActorExit {
+    /// Diagnostic name supplied at spawn time.
     pub name: String,
     /// Spawn-time supervision policy for this actor instance.
     pub policy: SupervisionPolicy,
@@ -231,16 +325,16 @@ pub struct ActorBusExit {
 
 /// Owns actor runtimes and supervises every production asynchronous task.
 ///
-/// The initial implementation intentionally covers only runtime ownership,
-/// spawning, and exit classification. Future work should add typed command and
-/// event endpoints, metrics handles, cancellation, and actor-group lifecycle
-/// propagation here so communication availability follows actor lifetime.
+/// TODO: Add actor-group membership and propagate group exits through the same
+/// event path. Metrics and coordinated cancellation can then share actor
+/// identity without introducing a second lifecycle registry.
 pub struct ActorBus {
     // Drop task monitors before runtimes. Their AbortOnDropHandle futures abort
     // the underlying actor tasks instead of silently detaching them.
-    tasks: JoinSet<ActorBusExit>,
+    tasks: JoinSet<()>,
+    runtimes: RuntimeHandles,
+    registrations_tx: mpsc::UnboundedSender<ActorRegistration>,
     registrations_rx: mpsc::UnboundedReceiver<ActorRegistration>,
-    handle: ActorBusHandle,
     _dedicated: Option<[DedicatedRuntime; 3]>,
 }
 
@@ -261,18 +355,16 @@ impl ActorBus {
         let udp = DedicatedRuntime::new("h3llo-udp")?;
         let runtimes = RuntimeHandles {
             main: Handle::current(),
-            tun: tun.handle().clone(),
-            crypto: crypto.handle().clone(),
-            udp: udp.handle().clone(),
+            tun: tun.handle.clone(),
+            crypto: crypto.handle.clone(),
+            udp: udp.handle.clone(),
         };
         let (registrations_tx, registrations_rx) = mpsc::unbounded_channel();
         Ok(Self {
             tasks: JoinSet::new(),
+            runtimes,
+            registrations_tx,
             registrations_rx,
-            handle: ActorBusHandle {
-                runtimes,
-                registrations_tx,
-            },
             _dedicated: Some([tun, crypto, udp]),
         })
     }
@@ -291,58 +383,72 @@ impl ActorBus {
         let (registrations_tx, registrations_rx) = mpsc::unbounded_channel();
         Self {
             tasks: JoinSet::new(),
-            registrations_rx,
-            handle: ActorBusHandle {
-                runtimes: RuntimeHandles {
-                    main: current.clone(),
-                    tun: current.clone(),
-                    crypto: current.clone(),
-                    udp: current,
-                },
-                registrations_tx,
+            runtimes: RuntimeHandles {
+                main: current.clone(),
+                tun: current.clone(),
+                crypto: current.clone(),
+                udp: current,
             },
+            registrations_tx,
+            registrations_rx,
             _dedicated: None,
         }
     }
 
-    /// Returns a cloneable actor spawning handle.
+    /// Creates an addressable mailbox for an externally driven root actor.
+    ///
+    /// The returned context is not registered as a spawned task. This is used
+    /// by the orchestrator, which is driven directly by [`crate::run`]. The
+    /// root context owns itself, and spawned contexts inherit that ownership.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Stable diagnostic name for the root actor.
     #[must_use]
-    pub fn handle(&self) -> ActorBusHandle {
-        self.handle.clone()
+    pub fn mailbox(&self, name: impl Into<String>) -> ActorContext {
+        let (tx, inbox) = mpsc::unbounded_channel();
+        let actor_ref = ActorRef {
+            name: name.into(),
+            tx,
+        };
+        ActorContext {
+            myself: actor_ref.clone(),
+            owner: actor_ref,
+            inbox,
+            runtimes: self.runtimes.clone(),
+            registrations_tx: self.registrations_tx.clone(),
+        }
     }
 
-    /// Waits for the next actor exit, registering concurrently spawned actors.
+    /// Drives actor registration and exit notification delivery.
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// The actor name, its spawn-time policy, and either its exit result or a
-    /// Tokio join error.
-    pub async fn next_exit(&mut self) -> ActorBusExit {
-        loop {
-            tokio::select! {
-                Some(registration) = self.registrations_rx.recv() => {
-                    let ActorRegistration { name, policy, task } = registration;
-                    let monitor = async move {
-                        ActorBusExit {
-                            name,
-                            policy,
-                            result: task.await,
-                        }
+    /// Returns [`JoinError`] if an internal monitor task fails.
+    pub async fn drive(&mut self) -> Result<(), JoinError> {
+        tokio::select! {
+            Some(registration) = self.registrations_rx.recv() => {
+                let ActorRegistration { name, policy, owner, task } = registration;
+                let monitor = async move {
+                    let exit = ActorExit {
+                        name,
+                        policy,
+                        result: task.await,
                     };
-                    let main = self.handle.runtimes.get(ActorRuntime::Main);
-                    self.tasks.spawn_on(monitor, main);
-                }
-                result = self.tasks.join_next(), if !self.tasks.is_empty() => {
-                    return match result {
-                        Some(Ok(exit)) => exit,
-                        Some(Err(error)) => ActorBusExit {
-                            name: "actor-monitor".to_string(),
-                            policy: SupervisionPolicy::Critical,
-                            result: Err(error),
-                        },
-                        None => unreachable!("guarded JoinSet cannot be empty"),
-                    };
-                }
+                    if let Err(error) = owner.tx.send(Event::ActorExited(exit)) {
+                        error!(
+                            owner = %owner.name,
+                            message = ?error.0,
+                            "actor owner inbox closed"
+                        );
+                    }
+                };
+                let main = self.runtimes.get(ActorRuntime::Main);
+                self.tasks.spawn_on(monitor, main);
+                Ok(())
+            }
+            result = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                result.expect("guarded JoinSet cannot be empty").map(drop)
             }
         }
     }
@@ -355,29 +461,70 @@ mod tests {
     #[tokio::test]
     async fn spawn_policy_is_independent_of_error_value() {
         let mut bus = ActorBus::on_current_runtime();
-        let handle = bus.handle();
-        handle.spawn(
+        let mut supervisor = bus.mailbox("test-supervisor");
+        let _actor_ref = supervisor.spawn(
             "listener-udp-tx",
             ActorRuntime::Main,
             SupervisionPolicy::Critical,
-            async { Err(anyhow::anyhow!("listener send failed")) },
+            |_context| async { Err(anyhow::anyhow!("listener send failed")) },
         );
 
-        let exit = bus.next_exit().await;
+        let exit = next_actor_exit(&mut bus, &mut supervisor).await;
         assert_eq!(exit.name, "listener-udp-tx");
         assert_eq!(exit.policy, SupervisionPolicy::Critical);
         assert!(matches!(exit.result, Ok(Err(_))));
 
-        handle.spawn(
+        let _actor_ref = supervisor.spawn(
             "peer-udp-tx",
             ActorRuntime::Main,
             SupervisionPolicy::Restartable,
-            async { Err(anyhow::anyhow!("peer send failed")) },
+            |_context| async { Err(anyhow::anyhow!("peer send failed")) },
         );
 
-        let exit = bus.next_exit().await;
+        let exit = next_actor_exit(&mut bus, &mut supervisor).await;
         assert_eq!(exit.name, "peer-udp-tx");
         assert_eq!(exit.policy, SupervisionPolicy::Restartable);
+        assert!(matches!(exit.result, Ok(Err(_))));
+    }
+
+    #[tokio::test]
+    async fn send_reports_closed_actor_inbox() {
+        let mut bus = ActorBus::on_current_runtime();
+        let mut supervisor = bus.mailbox("test-supervisor");
+        let actor = supervisor.spawn(
+            "short-lived",
+            ActorRuntime::Main,
+            SupervisionPolicy::Detached,
+            |_context| async { Ok(()) },
+        );
+
+        next_actor_exit(&mut bus, &mut supervisor).await;
+        assert!(supervisor.send(&actor, Event::Stop).is_err());
+    }
+
+    #[tokio::test]
+    async fn nested_actor_exit_is_reported_to_root_owner() {
+        let mut bus = ActorBus::on_current_runtime();
+        let mut owner = bus.mailbox("test-owner");
+        let _parent = owner.spawn(
+            "parent",
+            ActorRuntime::Main,
+            SupervisionPolicy::Detached,
+            |ctx| async move {
+                let _child = ctx.spawn(
+                    "child",
+                    ActorRuntime::Main,
+                    SupervisionPolicy::Critical,
+                    |_ctx| async { Err(anyhow::anyhow!("child failed")) },
+                );
+                std::future::pending::<()>().await;
+                Ok(())
+            },
+        );
+
+        let exit = next_actor_exit(&mut bus, &mut owner).await;
+        assert_eq!(exit.name, "child");
+        assert_eq!(exit.policy, SupervisionPolicy::Critical);
         assert!(matches!(exit.result, Ok(Err(_))));
     }
 
@@ -385,7 +532,7 @@ mod tests {
     async fn dedicated_runtime_spawns_and_completes_tasks() {
         let rt = DedicatedRuntime::new("test-rt").expect("test runtime");
         let result = rt
-            .handle()
+            .handle
             .spawn(async { 42 })
             .await
             .expect("task should complete");
@@ -395,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn cross_runtime_join_handle_await() {
         let rt = DedicatedRuntime::new("test-cross").expect("test runtime");
-        let join = rt.handle().spawn(async {
+        let join = rt.handle.spawn(async {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             "hello"
         });
@@ -406,8 +553,8 @@ mod tests {
     #[tokio::test]
     async fn run_on_executes_on_selected_runtime() {
         let bus = ActorBus::new().expect("actor bus");
-        let thread_name = bus
-            .handle()
+        let ctx = bus.mailbox("test-root");
+        let thread_name = ctx
             .run_on(ActorRuntime::Tun, || {
                 std::thread::current().name().map(str::to_owned)
             })

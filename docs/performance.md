@@ -33,7 +33,7 @@ Key design choices:
 - **Isolate UDP I/O on `udp_rt`**: kernel `sendmsg`/`recvmmsg` syscalls are the dominant cost in the UDP thread (see [profiling data](#profiling-insights)); isolating them prevents syscall latency from blocking TUN or crypto processing.
 - **Control plane on main thread**: orchestrator, DNS, and API are low-frequency; sharing the main thread avoids wasting a core.
 
-`ActorBus` owns every runtime and is the production task-spawning entry point. Each spawn selects a runtime explicitly; `ActorBus::run_on()` executes runtime-bound I/O initialization on the selected runtime without exposing its handle.
+`ActorBus` owns every runtime and drives supervision. Actors spawn tasks through `ActorContext::spawn`, selecting a runtime explicitly and automatically propagating the context's owner; `ActorContext::run_on()` executes runtime-bound I/O initialization on the selected runtime without exposing its handle.
 
 Profiled CPU distribution (BareUDP, 9.37 Gbps bidirectional, 4 cores):
 

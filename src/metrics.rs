@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+use crate::actor::ActorContext;
 use crate::helpers::{send_with_backpressure, SendEvent};
 
 // ---------------------------------------------------------------------------
@@ -239,20 +240,19 @@ impl Counters {
         }
     }
 
-    /// Emits a metrics snapshot via the events channel.
+    /// Emits a metrics snapshot to the actor's owner through `ActorBus`.
     ///
-    /// Returns `true` if the event was sent, `false` if the channel is closed.
+    /// Returns `true` if the event was sent, or `false` if the owner inbox is closed.
     pub(crate) fn emit(
         &self,
-        events_tx: &tokio::sync::mpsc::UnboundedSender<crate::events::Event>,
+        ctx: &ActorContext,
         peer_id: Option<&str>,
         remote_addr: Option<SocketAddr>,
     ) -> bool {
-        events_tx
-            .send(crate::events::Event::Metrics(Box::new(
-                self.snapshot(peer_id, remote_addr),
-            )))
-            .is_ok()
+        ctx.notify_owner(crate::events::Event::Metrics(Box::new(
+            self.snapshot(peer_id, remote_addr),
+        )))
+        .is_ok()
     }
 
     /// Generates a metrics snapshot with optional peer and remote address labels.
@@ -357,7 +357,7 @@ const OPENMETRICS_EOF: &str = "# EOF\n";
 
 /// Collector that owns a snapshot of metrics data for one-shot encoding.
 ///
-/// Created per scrape from the snapshot received via `ApiEvent::GetMetricsSnapshot`.
+/// Created per scrape from the snapshot received via `Event::GetMetricsSnapshot`.
 /// No `Arc`, no `Mutex` — the collector owns the `HashMap` directly.
 #[derive(Debug)]
 struct SnapshotCollector(HashMap<Labels, Metrics>);

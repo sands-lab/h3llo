@@ -7,7 +7,7 @@
 //! [`accept`](H3Engine::accept) (in [`crate::h3listener`]). Both then call
 //! [`run`](H3Engine::run) for steady-state datagram forwarding.
 
-use crate::actor::ActorExitResult;
+use crate::actor::{ActorContext, ActorExitResult, ActorRef};
 use crate::config::H3Tuning;
 use crate::events::Event;
 use crate::h3session::{
@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 // ========== Configuration Helpers ==========
@@ -250,7 +249,6 @@ pub(crate) struct EngineIo {
     pub(crate) udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     pub(crate) egress_rx: mpsc::Receiver<Vec<PooledBuf>>,
     pub(crate) ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-    pub(crate) events_tx: mpsc::UnboundedSender<Event>,
 }
 
 /// Connection metadata shared across startup and established phases.
@@ -289,15 +287,15 @@ impl RunState {
         }
     }
 
-    fn emit_metrics(&self, meta: &EngineMeta, events_tx: &mpsc::UnboundedSender<Event>) {
+    fn emit_metrics(&self, meta: &EngineMeta, ctx: &ActorContext) {
         let rx = self
             .rx_counters
             .snapshot(Some(&meta.peer_id), Some(meta.remote_addr));
         let tx = self
             .tx_counters
             .snapshot(Some(&meta.peer_id), Some(meta.remote_addr));
-        let _ = events_tx.send(Event::Metrics(Box::new(rx)));
-        let _ = events_tx.send(Event::Metrics(Box::new(tx)));
+        let _ = ctx.notify_owner(Event::Metrics(Box::new(rx)));
+        let _ = ctx.notify_owner(Event::Metrics(Box::new(tx)));
     }
 }
 
@@ -318,11 +316,11 @@ pub(crate) struct H3Engine {
     pub(crate) metrics_interval: Duration,
     pub(crate) keepalive_interval: Duration,
 
-    /// Cancels associated UDP actors when the engine finishes.
+    /// UDP receive actor owned by an outbound connection.
     ///
     /// `None` for server-side engines where UDP actors are shared
     /// across all connections by the dispatcher.
-    pub(crate) udp_cancel: Option<CancellationToken>,
+    pub(crate) udp_rx: Option<ActorRef>,
 }
 
 impl H3Engine {
@@ -348,7 +346,7 @@ impl H3Engine {
     /// Uses two pending slots for backpressure:
     /// - `pending_ingress`: IP packets from `dgram_recv` waiting for `ingress_tx` capacity.
     /// - `pending_send`: encrypted QUIC packets waiting for `udp_send_tx` capacity.
-    pub(crate) async fn run(self) -> ActorExitResult {
+    pub(crate) async fn run(self, mut ctx: ActorContext) -> ActorExitResult {
         let H3Engine {
             mut conn,
             session,
@@ -358,13 +356,12 @@ impl H3Engine {
                     udp_send_tx,
                     mut egress_rx,
                     ingress_tx,
-                    events_tx,
                 },
             meta,
             mut run_state,
             metrics_interval,
             keepalive_interval,
-            udp_cancel,
+            udp_rx,
         } = self;
         let mut session = session.expect("session present after establish/accept");
 
@@ -441,6 +438,15 @@ impl H3Engine {
                     );
                 }
 
+                message = ctx.recv() => {
+                    match message {
+                        Some(Event::Stop) | None => break Ok(()),
+                        Some(message) => {
+                            debug!(?message, peer = %meta.peer_id, "H3 engine: ignoring unexpected message");
+                        }
+                    }
+                }
+
                 permit_res = udp_send_tx.reserve(),
                     if send_pending =>
                 {
@@ -464,7 +470,7 @@ impl H3Engine {
                 }
 
                 _ = ticker.tick() => {
-                    run_state.emit_metrics(&meta, &events_tx);
+                    run_state.emit_metrics(&meta, &ctx);
                 }
             }
 
@@ -495,11 +501,11 @@ impl H3Engine {
         if let Some(send) = collect_udp_send(&mut conn, meta.max_udp_payload) {
             let _ = udp_send_tx.send(send).await;
         }
-        // Cancel the RX actor, which blocks on socket.readable().
+        // Stop the RX actor, which may otherwise block on socket readiness.
         // TX actor exits naturally when udp_send_tx is dropped at
         // function return, draining any remaining batches first.
-        if let Some(token) = udp_cancel {
-            token.cancel();
+        if let Some(udp_rx) = udp_rx {
+            let _ = ctx.send(&udp_rx, Event::Stop);
         }
         exit.context("run established HTTP/3 connection")
     }

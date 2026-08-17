@@ -3,11 +3,11 @@
 //! Provides an HTTP/1.1 server bound to a configured localhost address,
 //! serving GET/POST/DELETE /config endpoints for peer management and
 //! GET /metrics for Prometheus-compatible metrics exposition.
-//! Communicates with the orchestrator via the `Event` channel pattern.
+//! Communicates with the orchestrator through `ActorBus` events.
 
-use crate::actor::{ActorBusHandle, ActorRuntime, SupervisionPolicy};
+use crate::actor::{ActorContext, ActorRef, ActorRuntime, SupervisionPolicy};
 use crate::config::{Config, Peer};
-use crate::events::{ApiEvent, Event};
+use crate::events::Event;
 use crate::metrics::encode_metrics_snapshot;
 use anyhow::Context;
 use bytes::Bytes;
@@ -19,8 +19,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
-use tracing::info;
+use tokio::sync::oneshot;
+use tracing::{debug, info};
 
 // ---------------------------------------------------------------------------
 // HTTP API
@@ -71,41 +71,40 @@ pub(crate) async fn make_api(addr: SocketAddr) -> Result<TcpListener, std::io::E
 ///
 /// * `listener` - Bound TCP listener from `make_api`.
 /// * `api_path` - Configured base path for prefix-strip routing.
-/// * `events_tx` - Channel to send API events to the orchestrator.
-pub(crate) fn spawn_api(
-    listener: TcpListener,
-    api_path: String,
-    events_tx: mpsc::UnboundedSender<Event>,
-    actor_bus: &ActorBusHandle,
-) {
+pub(crate) fn spawn_api(listener: TcpListener, api_path: String, ctx: &ActorContext) -> ActorRef {
     let addr = listener.local_addr().unwrap_or_else(|_| {
         "0.0.0.0:0"
             .parse()
             .expect("infallible: constant literal parse")
     });
     info!(%addr, "API listener started");
-    let connection_bus = actor_bus.clone();
-    actor_bus.spawn(
+    ctx.spawn(
         format!("api[{addr}]"),
         ActorRuntime::Main,
         SupervisionPolicy::Critical,
-        async move {
+        |mut ctx| async move {
             loop {
-                let (stream, remote) = listener
-                    .accept()
-                    .await
-                    .context("accept management API connection")?;
+                let accepted = tokio::select! {
+                    result = listener.accept() => result,
+                    message = ctx.recv() => {
+                        match message {
+                            Some(Event::Stop) | None => return Ok(()),
+                            Some(message) => {
+                                debug!(?message, "API: ignoring unexpected message");
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let (stream, remote) = accepted.context("accept management API connection")?;
                 let io = TokioIo::new(stream);
-                let events_tx = events_tx.clone();
                 let api_path = api_path.clone();
-                connection_bus.spawn(
+                let _connection_ref = ctx.spawn(
                     format!("api-connection[{remote}]"),
                     ActorRuntime::Main,
                     SupervisionPolicy::Detached,
-                    async move {
-                        let svc = service_fn(|req| {
-                            handle_request(req, events_tx.clone(), api_path.clone())
-                        });
+                    |ctx| async move {
+                        let svc = service_fn(|req| handle_request(req, &ctx, api_path.clone()));
                         if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                             info!(remote = %remote, error = %e, "API connection error");
                         }
@@ -114,7 +113,7 @@ pub(crate) fn spawn_api(
                 );
             }
         },
-    );
+    )
 }
 
 fn response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
@@ -126,7 +125,7 @@ fn response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
 
 async fn handle_request(
     req: Request<Incoming>,
-    events_tx: mpsc::UnboundedSender<Event>,
+    ctx: &ActorContext,
     api_path: String,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let path = req.uri().path();
@@ -147,10 +146,10 @@ async fn handle_request(
     };
 
     let resp = match (req.method(), relative.as_str()) {
-        (&Method::GET, "/config" | "/config/") => handle_get_config(&events_tx).await,
-        (&Method::POST, "/config" | "/config/") => handle_post_config(req, &events_tx).await,
-        (&Method::DELETE, "/config" | "/config/") => handle_delete_config(req, &events_tx).await,
-        (&Method::GET, "/metrics" | "/metrics/") => handle_get_metrics(&events_tx).await,
+        (&Method::GET, "/config" | "/config/") => handle_get_config(ctx).await,
+        (&Method::POST, "/config" | "/config/") => handle_post_config(req, ctx).await,
+        (&Method::DELETE, "/config" | "/config/") => handle_delete_config(req, ctx).await,
+        (&Method::GET, "/metrics" | "/metrics/") => handle_get_metrics(ctx).await,
         _ => response(StatusCode::NOT_FOUND, "not found"),
     };
     Ok(resp)
@@ -177,11 +176,11 @@ fn yaml_config_response(config: &Config) -> Response<Full<Bytes>> {
 ///
 /// Returns the orchestrator's reply or an HTTP 500 error response.
 async fn send_and_await<T>(
-    events_tx: &mpsc::UnboundedSender<Event>,
+    ctx: &ActorContext,
     make_event: impl FnOnce(oneshot::Sender<T>) -> Event,
 ) -> Result<T, Response<Full<Bytes>>> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    events_tx.send(make_event(reply_tx)).map_err(|_| {
+    ctx.notify_owner(make_event(reply_tx)).map_err(|_| {
         response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "orchestrator unavailable",
@@ -195,21 +194,14 @@ async fn send_and_await<T>(
     })
 }
 
-async fn handle_get_config(events_tx: &mpsc::UnboundedSender<Event>) -> Response<Full<Bytes>> {
-    match send_and_await(events_tx, |reply_tx| {
-        Event::Api(ApiEvent::GetConfig { reply_tx })
-    })
-    .await
-    {
+async fn handle_get_config(ctx: &ActorContext) -> Response<Full<Bytes>> {
+    match send_and_await(ctx, |reply_tx| Event::GetConfig { reply_tx }).await {
         Ok(config) => yaml_config_response(&config),
         Err(err_resp) => err_resp,
     }
 }
 
-async fn handle_post_config(
-    req: Request<Incoming>,
-    events_tx: &mpsc::UnboundedSender<Event>,
-) -> Response<Full<Bytes>> {
+async fn handle_post_config(req: Request<Incoming>, ctx: &ActorContext) -> Response<Full<Bytes>> {
     let body = match Limited::new(req.into_body(), MAX_BODY_SIZE).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("body read error: {e}")),
@@ -221,21 +213,14 @@ async fn handle_post_config(
     };
 
     let peers = payload.peers;
-    match send_and_await(events_tx, |reply_tx| {
-        Event::Api(ApiEvent::PostConfig { peers, reply_tx })
-    })
-    .await
-    {
+    match send_and_await(ctx, |reply_tx| Event::PostConfig { peers, reply_tx }).await {
         Ok(Ok(config)) => yaml_config_response(&config),
         Ok(Err(e)) => response(StatusCode::BAD_REQUEST, &e),
         Err(err_resp) => err_resp,
     }
 }
 
-async fn handle_delete_config(
-    req: Request<Incoming>,
-    events_tx: &mpsc::UnboundedSender<Event>,
-) -> Response<Full<Bytes>> {
+async fn handle_delete_config(req: Request<Incoming>, ctx: &ActorContext) -> Response<Full<Bytes>> {
     let body = match Limited::new(req.into_body(), MAX_BODY_SIZE).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => return response(StatusCode::BAD_REQUEST, &format!("body read error: {e}")),
@@ -247,11 +232,7 @@ async fn handle_delete_config(
     };
     let peer_ids: Vec<String> = payload.peers.into_iter().map(|p| p.id).collect();
 
-    match send_and_await(events_tx, |reply_tx| {
-        Event::Api(ApiEvent::DeleteConfig { peer_ids, reply_tx })
-    })
-    .await
-    {
+    match send_and_await(ctx, |reply_tx| Event::DeleteConfig { peer_ids, reply_tx }).await {
         Ok(Ok(config)) => yaml_config_response(&config),
         Ok(Err(e)) => response(StatusCode::BAD_REQUEST, &e),
         Err(err_resp) => err_resp,
@@ -260,14 +241,10 @@ async fn handle_delete_config(
 
 /// Handles `GET /metrics` — returns `OpenMetrics` text format.
 ///
-/// Requests a raw metrics snapshot from the orchestrator via event channel,
+/// Requests a raw metrics snapshot from the orchestrator through `ActorBus`,
 /// then renders `OpenMetrics` text locally using `prometheus-client`.
-async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Response<Full<Bytes>> {
-    match send_and_await(events_tx, |reply_tx| {
-        Event::Api(ApiEvent::GetMetricsSnapshot { reply_tx })
-    })
-    .await
-    {
+async fn handle_get_metrics(ctx: &ActorContext) -> Response<Full<Bytes>> {
+    match send_and_await(ctx, |reply_tx| Event::GetMetricsSnapshot { reply_tx }).await {
         Ok(snapshot) => {
             let text = encode_metrics_snapshot(snapshot);
             Response::builder()
@@ -287,7 +264,7 @@ async fn handle_get_metrics(events_tx: &mpsc::UnboundedSender<Event>) -> Respons
 mod tests {
     use super::*;
     use crate::config::{Local, LocalDns, LocalTun, Tuning};
-    use crate::events::ApiEvent;
+    use crate::events::Event;
     use crate::metrics::{Direction, Labels, Metrics, PktCounters, Source, Stats};
     use hyper::client::conn::http1;
     use std::collections::HashMap;
@@ -340,27 +317,16 @@ mod tests {
     // ========== Real-Network Test Helpers ==========
 
     /// Spawns the API actor on an ephemeral port and returns the bound address,
-    /// the event receiver (to mock orchestrator replies), and its actor bus.
-    fn start_api(
-        api_path: &str,
-    ) -> (
-        SocketAddr,
-        mpsc::UnboundedReceiver<Event>,
-        crate::actor::ActorBus,
-    ) {
+    /// the orchestrator mailbox (to mock replies), and its actor bus.
+    fn start_api(api_path: &str) -> (SocketAddr, ActorContext, crate::actor::ActorBus) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let listener = TcpListener::from_std(listener).unwrap();
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
-        spawn_api(
-            listener,
-            api_path.to_string(),
-            events_tx,
-            &actor_bus.handle(),
-        );
-        (addr, events_rx, actor_bus)
+        let orchestrator = actor_bus.mailbox("test-orchestrator");
+        spawn_api(listener, api_path.to_string(), &orchestrator);
+        (addr, orchestrator, actor_bus)
     }
 
     /// Constructs a minimal `Config` for orchestrator mock replies.
@@ -403,12 +369,12 @@ mod tests {
         String::from_utf8(collected.to_bytes().to_vec()).unwrap()
     }
 
-    /// Receives the next event with a 2-second timeout.
-    async fn recv_event(rx: &mut mpsc::UnboundedReceiver<Event>) -> Event {
-        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+    /// Receives the next message with a 2-second timeout.
+    async fn recv_event(ctx: &mut ActorContext) -> Event {
+        tokio::time::timeout(std::time::Duration::from_secs(2), ctx.recv())
             .await
             .expect("timeout waiting for API event")
-            .expect("event channel closed unexpectedly")
+            .expect("orchestrator inbox closed unexpectedly")
     }
 
     // ========== Real-Network HTTP Tests ==========
@@ -429,7 +395,7 @@ mod tests {
         let reply_config = config.clone();
         let mock = tokio::spawn(async move {
             let event = recv_event(&mut events_rx).await;
-            if let Event::Api(ApiEvent::GetConfig { reply_tx }) = event {
+            if let Event::GetConfig { reply_tx } = event {
                 reply_tx.send(reply_config).ok();
             } else {
                 panic!("expected GetConfig, got {event:?}");
@@ -463,7 +429,7 @@ mod tests {
 
         let mock = tokio::spawn(async move {
             let event = recv_event(&mut events_rx).await;
-            if let Event::Api(ApiEvent::PostConfig { peers, reply_tx }) = event {
+            if let Event::PostConfig { peers, reply_tx } = event {
                 assert_eq!(peers.len(), 1);
                 assert_eq!(peers[0].id, "peer-1");
                 let mut config = test_config();
@@ -514,7 +480,7 @@ mod tests {
 
         let mock = tokio::spawn(async move {
             let event = recv_event(&mut events_rx).await;
-            if let Event::Api(ApiEvent::PostConfig { reply_tx, .. }) = event {
+            if let Event::PostConfig { reply_tx, .. } = event {
                 reply_tx.send(Err("validation failed".to_string())).ok();
             } else {
                 panic!("expected PostConfig, got {event:?}");
@@ -543,7 +509,7 @@ mod tests {
 
         let mock = tokio::spawn(async move {
             let event = recv_event(&mut events_rx).await;
-            if let Event::Api(ApiEvent::DeleteConfig { peer_ids, reply_tx }) = event {
+            if let Event::DeleteConfig { peer_ids, reply_tx } = event {
                 assert_eq!(peer_ids, vec!["peer-1"]);
                 reply_tx.send(Ok(test_config())).ok();
             } else {
@@ -574,7 +540,7 @@ mod tests {
 
         let mock = tokio::spawn(async move {
             let event = recv_event(&mut events_rx).await;
-            if let Event::Api(ApiEvent::GetMetricsSnapshot { reply_tx }) = event {
+            if let Event::GetMetricsSnapshot { reply_tx } = event {
                 let mut snapshot = HashMap::new();
                 let metrics = Metrics {
                     labels: Labels {
@@ -665,7 +631,7 @@ mod tests {
 
         let mock = tokio::spawn(async move {
             let event = recv_event(&mut events_rx).await;
-            if let Event::Api(ApiEvent::GetConfig { reply_tx }) = event {
+            if let Event::GetConfig { reply_tx } = event {
                 reply_tx.send(test_config()).ok();
             } else {
                 panic!("expected GetConfig, got {event:?}");
@@ -710,7 +676,7 @@ mod tests {
 
         let mock = tokio::spawn(async move {
             let event = recv_event(&mut events_rx).await;
-            if let Event::Api(ApiEvent::GetConfig { reply_tx }) = event {
+            if let Event::GetConfig { reply_tx } = event {
                 drop(reply_tx);
             } else {
                 panic!("expected GetConfig, got {event:?}");

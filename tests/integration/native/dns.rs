@@ -15,14 +15,14 @@ use std::time::Duration;
 const RESOLVER_TIMEOUT: Duration = Duration::from_secs(5);
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+use h3llo::actor::{ActorBus, ActorContext, ActorRef};
 use h3llo::config::{DnsTuning, LocalDns, Tuning};
-use h3llo::dns::{make_dns, spawn_dns, DnsCommand};
+use h3llo::dns::{make_dns, spawn_dns};
 use h3llo::events::Event;
 use h3llo::test_utils::FakeRouteProbe;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-use tokio::sync::mpsc;
 
 /// CoreDNS Corefile using the `file` plugin for deterministic zone resolution.
 const COREFILE: &str = r#"test.h3llo:53 {
@@ -85,13 +85,7 @@ async fn start_coredns() -> (ContainerAsync<GenericImage>, tempfile::TempDir, u1
 async fn spawn_resolver(
     server: SocketAddr,
     timeout: Duration,
-) -> (
-    mpsc::UnboundedSender<DnsCommand>,
-    mpsc::UnboundedReceiver<Event>,
-    h3llo::actor::ActorBus,
-) {
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-
+) -> (ActorRef, ActorContext, ActorBus) {
     // Build LocalDns config for make_dns (server is pre-parsed SocketAddr)
     let local_dns = LocalDns {
         server,
@@ -110,9 +104,10 @@ async fn spawn_resolver(
         .await
         .expect("make_dns failed");
 
-    let actor_bus = h3llo::actor::ActorBus::on_current_runtime();
-    let cmd_tx = spawn_dns(dns_actor, event_tx, &actor_bus.handle());
-    (cmd_tx, event_rx, actor_bus)
+    let actor_bus = ActorBus::on_current_runtime();
+    let event_rx = actor_bus.mailbox("test-orchestrator");
+    let dns = spawn_dns(dns_actor, &event_rx);
+    (dns, event_rx, actor_bus)
 }
 
 /// Waits for a DNS snapshot with at least `expected_count` IPs, returning the snapshot contents.
@@ -120,7 +115,7 @@ async fn spawn_resolver(
 /// Since snapshots represent complete state (not deltas), this returns the contents of the
 /// first snapshot that meets the expected count, rather than accumulating across snapshots.
 async fn collect_ip_resolved(
-    rx: &mut mpsc::UnboundedReceiver<Event>,
+    rx: &mut ActorContext,
     timeout: Duration,
     expected_count: usize,
 ) -> Vec<(String, IpAddr)> {
@@ -156,12 +151,15 @@ fn hosts(names: &[&str]) -> HashSet<String> {
 async fn dns_resolve_single_a_record() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
+    let (dns, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
-    cmd_tx
-        .send(DnsCommand::SetHostnames {
-            hosts: hosts(&["single.test.h3llo"]),
-        })
+    event_rx
+        .send(
+            &dns,
+            Event::SetHostnames {
+                hosts: hosts(&["single.test.h3llo"]),
+            },
+        )
         .unwrap();
 
     // single.test.h3llo has one A record (10.0.0.1), no AAAA
@@ -185,12 +183,15 @@ async fn dns_resolve_single_a_record() {
 async fn dns_resolve_multiple_records() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
+    let (dns, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
-    cmd_tx
-        .send(DnsCommand::SetHostnames {
-            hosts: hosts(&["multi.test.h3llo"]),
-        })
+    event_rx
+        .send(
+            &dns,
+            Event::SetHostnames {
+                hosts: hosts(&["multi.test.h3llo"]),
+            },
+        )
         .unwrap();
 
     // multi.test.h3llo has: 10.0.0.2, 10.0.0.3 (A), and 2001:db8::2 (AAAA)
@@ -218,12 +219,15 @@ async fn dns_resolve_multiple_records() {
 async fn dns_resolve_aaaa_only() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
+    let (dns, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
-    cmd_tx
-        .send(DnsCommand::SetHostnames {
-            hosts: hosts(&["ipv6only.test.h3llo"]),
-        })
+    event_rx
+        .send(
+            &dns,
+            Event::SetHostnames {
+                hosts: hosts(&["ipv6only.test.h3llo"]),
+            },
+        )
         .unwrap();
 
     // ipv6only.test.h3llo has only AAAA record: 2001:db8::1
@@ -244,12 +248,15 @@ async fn dns_resolve_aaaa_only() {
 async fn dns_resolve_nxdomain_emits_no_events() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
+    let (dns, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
-    cmd_tx
-        .send(DnsCommand::SetHostnames {
-            hosts: hosts(&["nonexistent.test.h3llo"]),
-        })
+    event_rx
+        .send(
+            &dns,
+            Event::SetHostnames {
+                hosts: hosts(&["nonexistent.test.h3llo"]),
+            },
+        )
         .unwrap();
 
     // NXDOMAIN should not emit IPs in snapshot (warning is logged at origin)
@@ -271,13 +278,16 @@ async fn dns_resolve_nxdomain_emits_no_events() {
 async fn dns_resolve_multiple_hostnames() {
     let (_container, _dir, port) = start_coredns().await;
     let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let (cmd_tx, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
+    let (dns, mut event_rx, _actor_bus) = spawn_resolver(server, RESOLVER_TIMEOUT).await;
 
     // Register multiple hostnames at once
-    cmd_tx
-        .send(DnsCommand::SetHostnames {
-            hosts: hosts(&["single.test.h3llo", "ipv6only.test.h3llo"]),
-        })
+    event_rx
+        .send(
+            &dns,
+            Event::SetHostnames {
+                hosts: hosts(&["single.test.h3llo", "ipv6only.test.h3llo"]),
+            },
+        )
         .unwrap();
 
     // Expect: single (1 A) + ipv6only (1 AAAA) = 2 IPs
