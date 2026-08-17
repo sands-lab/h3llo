@@ -14,6 +14,8 @@ concurrency:
 
 env:
   REGISTRY_IMAGE: nekonuts/h3llo
+  # Manual invalidation key for the downloaded musl-cross bundle and all musl
+  # build caches. Bump this when the pinned toolchain bundle changes.
   MUSL_CROSS_VERSION: "20250929"
   # Build record export cannot mount the runner temp directory reliably when
   # the Docker daemon and runner use different filesystem permissions.
@@ -36,6 +38,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview, rustfmt, clippy
+      # Keep lint/coverage artifacts separate from integration-test artifacts.
+      # Clippy --all-targets --all-features and llvm-cov select different Cargo
+      # units, features, dev-dependencies, and instrumentation than docker-tests.
+      # Reusing this cache there produced an exact key hit but still rebuilt
+      # almost the entire dependency graph.
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -88,6 +95,8 @@ jobs:
           path: ${{ runner.temp }}/musl-cross
           key: musl-cross-${{ env.MUSL_CROSS_VERSION }}-amd64
 
+      # rust-cache includes RUSTFLAGS in its environment hash. Keep the static
+      # CRT flag identical here and in the build step or the key will diverge.
       - name: Restore musl build cache
         uses: Swatinem/rust-cache@v2
         env:
@@ -112,6 +121,8 @@ jobs:
         with:
           name: ci-builder
           keep-state: true
+      # The Dockerfile only packages binaries built on the runner above. Cargo
+      # caching therefore stays independent of BuildKit layers and exporters.
       - name: Build Docker test image
         uses: docker/build-push-action@v7
         with:
@@ -124,6 +135,18 @@ jobs:
           platforms: linux/amd64
           load: true
 
+      # This cache must match the Cargo consumers below. rust-cache hashes CARGO_*
+      # and RUST* variables along with manifests, lockfiles, toolchain files, and
+      # .cargo/config.toml. Omitting CARGO_TARGET_DIR here previously created a
+      # different key; sharing the linux cache then hit the key but still missed
+      # usable artifacts because its feature/profile/instrumentation set differed.
+      #
+      # Only master writes: PRs can read their base branch cache, while PR-written
+      # caches are scoped to refs/pull/.../merge and cannot serve master or sibling
+      # PRs. Source-only changes still reuse dependencies because rust-cache removes
+      # workspace crate outputs before saving, so only h3llo is rebuilt.
+      # See https://github.com/Swatinem/rust-cache#cache-details and
+      # https://docs.github.com/actions/reference/workflows-and-actions/dependency-caching
       - name: Cache native test dependencies
         uses: Swatinem/rust-cache@v2
         env:
@@ -149,6 +172,8 @@ jobs:
   docker-build:
     runs-on: *runner
     timeout-minutes: 60
+    # Job-level on purpose: both rust-cache and build-musl.sh must observe the
+    # same hashed compiler flags.
     env:
       RUSTFLAGS: "-C target-feature=+crt-static"
     concurrency:
@@ -200,6 +225,8 @@ jobs:
           path: ${{ runner.temp }}/musl-cross
           key: musl-cross-${{ env.MUSL_CROSS_VERSION }}-${{ matrix.arch_label }}
 
+      # Cargo target artifacts are not portable across target triples. Keep the
+      # shared key and target directory architecture-specific.
       - name: Cache musl build dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -245,6 +272,8 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Packaging only: the named binaries context is runner-built, so QEMU is
+      # used for image assembly rather than slow cross-architecture compilation.
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7

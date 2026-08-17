@@ -26,6 +26,10 @@ pub mod udp;
 ///
 /// * `config` - Runtime configuration used to initialize all actors and transports.
 ///
+/// # Returns
+///
+/// Returns successfully when the orchestrator shuts down cleanly.
+///
 /// # Errors
 ///
 /// Returns an error when initialization fails or a critical actor exits.
