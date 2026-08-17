@@ -3,7 +3,7 @@
 //! These actors sit between the generic UDP I/O layer ([`crate::udp`]) and the
 //! router, adding BareUDP-specific behavior without touching sockets directly.
 
-use crate::actor::{ActorBusHandle, ActorRuntime, SupervisionPolicy};
+use crate::actor::{ActorContext, ActorRef, ActorRuntime, SupervisionPolicy};
 use crate::bind::{make_server_udp_socket, make_unbound_udp_socket, RouteProbe, UdpError};
 use crate::config::{PeerBare, Tuning};
 use crate::events::{ConnectedEvent, DialContext, Endpoint, Event};
@@ -15,24 +15,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_quiche::buf_factory::PooledBuf;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-
-/// Commands accepted by the `BareUDP` receive loop.
-#[derive(Debug, PartialEq, Eq)]
-pub enum BareUdpRxCommand {
-    /// Replace the accepted source IP filter set.
-    ///
-    /// "Accepted sources" controls which source IPs are permitted for inbound
-    /// `BareUDP` packets, distinct from TUN's "allowed IPs" (routing prefixes).
-    UpdateAcceptedSources(HashSet<IpAddr>),
-}
 
 /// State owned exclusively by the `BareUDP` source-filter actor.
 struct BareRx {
     accepted_sources: HashSet<IpAddr>,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-    events_tx: mpsc::UnboundedSender<Event>,
     metrics_interval: Duration,
 }
 
@@ -56,9 +44,8 @@ pub struct BareRxGroup {
 /// * `tun_mtu` - Maximum packet size accepted from the UDP receive path.
 /// * `accepted_sources` - Initial set of source IPs allowed by the filter actor.
 /// * `ingress_tx` - Router ingress channel for accepted packet batches.
-/// * `events_tx` - Orchestrator event channel used for metrics snapshots.
 /// * `tuning` - Socket, queue, offload, and metrics configuration.
-/// * `actor_bus` - Actor runtime owner used for UDP socket initialization.
+/// * `ctx` - Parent actor context used for UDP socket initialization.
 ///
 /// # Returns
 ///
@@ -72,14 +59,13 @@ pub async fn make_bare_rx(
     tun_mtu: u16,
     accepted_sources: HashSet<IpAddr>,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-    events_tx: mpsc::UnboundedSender<Event>,
     tuning: &Tuning,
-    actor_bus: &ActorBusHandle,
+    ctx: &ActorContext,
 ) -> Result<BareRxGroup, UdpError> {
     let socket = make_server_udp_socket(listen_addr, tuning.io.socket_buffer_bytes())?;
     let max_udp_payload = tun_mtu.into();
     let enable_offload = tuning.io.udp_enable_offload;
-    let (udp_rx, _udp_tx) = actor_bus
+    let (udp_rx, _udp_tx) = ctx
         .run_on(ActorRuntime::Udp, move || {
             udp::make_udp(socket, max_udp_payload, enable_offload)
         })
@@ -88,7 +74,6 @@ pub async fn make_bare_rx(
     let filter = BareRx {
         accepted_sources,
         ingress_tx,
-        events_tx,
         metrics_interval: tuning.io.metrics_push_interval,
     };
     Ok(BareRxGroup { filter, udp_rx })
@@ -101,20 +86,14 @@ pub async fn make_bare_rx(
 pub fn spawn_bare_rx(
     group: BareRxGroup,
     packet_queue_depth: usize,
-    actor_bus: &ActorBusHandle,
-) -> mpsc::UnboundedSender<BareUdpRxCommand> {
+    ctx: &ActorContext,
+) -> ActorRef {
     let BareRxGroup { filter, udp_rx } = group;
-    let (udp_output_tx, cmd_tx) = spawn_bare_filter(filter, packet_queue_depth, actor_bus);
+    let (udp_output_tx, filter_ref) = spawn_bare_filter(filter, packet_queue_depth, ctx);
 
-    udp::spawn_udp_rx(
-        udp_rx,
-        udp_output_tx,
-        CancellationToken::new(),
-        actor_bus,
-        SupervisionPolicy::Critical,
-    );
+    let _udp_rx_ref = udp::spawn_udp_rx(udp_rx, udp_output_tx, ctx, SupervisionPolicy::Critical);
 
-    cmd_tx
+    filter_ref
 }
 
 /// Spawns the `BareUDP` source-filter actor on the crypto runtime.
@@ -124,25 +103,20 @@ pub fn spawn_bare_rx(
 fn spawn_bare_filter(
     filter: BareRx,
     packet_queue_depth: usize,
-    actor_bus: &ActorBusHandle,
-) -> (
-    mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
-    mpsc::UnboundedSender<BareUdpRxCommand>,
-) {
+    ctx: &ActorContext,
+) -> (mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>, ActorRef) {
     let BareRx {
         mut accepted_sources,
         ingress_tx,
-        events_tx,
         metrics_interval,
     } = filter;
     let (input_tx, mut udp_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(packet_queue_depth);
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-    actor_bus.spawn(
+    let actor_ref = ctx.spawn(
         "bare-rx-filter",
         ActorRuntime::Crypto,
         SupervisionPolicy::Critical,
-        async move {
+        |mut ctx| async move {
             info!("bare RX filter actor started");
             let mut counters = Counters::new(Source::BareUdp, Direction::Rx);
             let mut ticker = make_interval(metrics_interval);
@@ -163,17 +137,18 @@ fn spawn_bare_filter(
                             return Ok(());
                         }
                     }
-                    cmd = cmd_rx.recv() => {
-                        let Some(command) = cmd else {
-                            info!("bare RX: command channel closed, shutting down");
-                            return Ok(());
-                        };
-                        let BareUdpRxCommand::UpdateAcceptedSources(update) = command;
-                        debug!(count = update.len(), "bare RX: accepted sources updated");
-                        accepted_sources = update;
+                    message = ctx.recv() => {
+                        match message {
+                            Some(Event::UpdateAcceptedSources { sources }) => {
+                                debug!(count = sources.len(), "bare RX: accepted sources updated");
+                                accepted_sources = sources;
+                            }
+                            Some(Event::Stop) | None => return Ok(()),
+                            Some(message) => debug!(?message, "bare RX: ignoring unexpected message"),
+                        }
                     }
                     _ = ticker.tick() => {
-                        if !counters.emit(&events_tx, None, None) {
+                        if !counters.emit(&ctx, None, None) {
                             return Ok(());
                         }
                     }
@@ -182,7 +157,7 @@ fn spawn_bare_filter(
         },
     );
 
-    (input_tx, cmd_tx)
+    (input_tx, actor_ref)
 }
 
 /// Spawns a `BareUDP` transmit adapter actor.
@@ -192,48 +167,47 @@ fn spawn_bare_filter(
 /// Returns a [`ConnectedEvent`] on success. The caller is responsible
 /// for sending the event and handling errors.
 ///
-/// `ctx.actor_bus` places socket registration and UDP TX on the UDP runtime,
-/// then places the BareUDP TX adapter on the crypto runtime.
+/// The dial actor context places socket registration and UDP TX on the UDP
+/// runtime, then places the BareUDP TX adapter on the crypto runtime.
 pub(crate) async fn dial_bare_tx<P: RouteProbe>(
     bare: &PeerBare,
-    ctx: &DialContext<P>,
+    dial: &DialContext<P>,
+    ctx: &ActorContext,
 ) -> Result<ConnectedEvent, UdpError> {
-    let destination = SocketAddr::new(ctx.dial_ip, bare.endpoint.port);
+    let destination = SocketAddr::new(dial.dial_ip, bare.endpoint.port);
     let std_socket = make_unbound_udp_socket(
         destination,
-        Some(ctx.tun_if.as_str()),
+        Some(dial.tun_if.as_str()),
         bare.bindif.as_deref(),
-        &ctx.probe,
-        ctx.tuning.io.socket_buffer_bytes(),
+        &dial.probe,
+        dial.tuning.io.socket_buffer_bytes(),
     )
     .await?;
 
-    let max_udp_payload = ctx.tun_mtu.into();
-    let enable_offload = ctx.tuning.io.udp_enable_offload;
+    let max_udp_payload = dial.tun_mtu.into();
+    let enable_offload = dial.tuning.io.udp_enable_offload;
     let (_udp_rx, udp_tx) = ctx
-        .actor_bus
         .run_on(ActorRuntime::Udp, move || {
             udp::make_udp(std_socket, max_udp_payload, enable_offload)
         })
         .await
         .map_err(|error| UdpError::Socket(format!("UDP runtime task failed: {error}")))??;
-    let udp_send_tx = udp::spawn_udp_tx(
+    let (udp_send_tx, _udp_tx_ref) = udp::spawn_udp_tx(
         udp_tx,
-        ctx.tuning.io.packet_queue_depth,
-        &ctx.actor_bus,
+        dial.tuning.io.packet_queue_depth,
+        ctx,
         SupervisionPolicy::Restartable,
     );
     let egress_tx = spawn_bare_tx(
         udp_send_tx,
         destination,
-        ctx.peer_id.clone(),
-        ctx.events_tx.clone(),
-        &ctx.tuning,
-        &ctx.actor_bus,
+        dial.peer_id.clone(),
+        &dial.tuning,
+        ctx,
     );
 
     Ok(ConnectedEvent {
-        peer_id: ctx.peer_id.clone(),
+        peer_id: dial.peer_id.clone(),
         remote_addr: destination,
         tx: egress_tx,
         endpoint: Some(Endpoint::Udp(bare.endpoint.clone())),
@@ -250,44 +224,44 @@ pub(crate) fn spawn_bare_tx(
     udp_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     destination: SocketAddr,
     peer_id: String,
-    events_tx: mpsc::UnboundedSender<Event>,
     tuning: &Tuning,
-    actor_bus: &ActorBusHandle,
+    ctx: &ActorContext,
 ) -> mpsc::Sender<Vec<PooledBuf>> {
     let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.io.packet_queue_depth);
     let metrics_interval = tuning.io.metrics_push_interval;
 
-    actor_bus.spawn(
+    let _actor_ref = ctx.spawn(
         format!("bare-tx[{peer_id}]"),
         ActorRuntime::Crypto,
         SupervisionPolicy::Restartable,
-        async move {
-        info!(peer = %peer_id, dest = %destination, "bare TX actor started");
-        let mut counters = Counters::new(Source::BareUdp, Direction::Tx);
-        let mut ticker = make_interval(metrics_interval);
+        |mut ctx| async move {
+            info!(peer = %peer_id, dest = %destination, "bare TX actor started");
+            let mut counters = Counters::new(Source::BareUdp, Direction::Tx);
+            let mut ticker = make_interval(metrics_interval);
 
-        loop {
-            tokio::select! {
-                maybe_batch = egress_rx.recv() => {
-                    let Some(packets) = maybe_batch else {
-                        info!(peer = %peer_id, "bare TX: egress channel closed, shutting down");
-                        return Ok(());
-                    };
-                    if packets.is_empty() { continue; }
-                    let (count, bytes) = batch_stats(&packets);
-                    // Record success AFTER send — avoids inflating metrics on channel close.
-                    if let Ok(()) = udp_tx.send((destination, packets)).await { counters.record_success(count, bytes) } else {
-                        info!(peer = %peer_id, "bare TX: UDP channel closed, shutting down");
-                        return Ok(());
+            loop {
+                tokio::select! {
+                    maybe_batch = egress_rx.recv() => {
+                        let Some(packets) = maybe_batch else {
+                            info!(peer = %peer_id, "bare TX: egress channel closed, shutting down");
+                            return Ok(());
+                        };
+                        if packets.is_empty() { continue; }
+                        let (count, bytes) = batch_stats(&packets);
+                        // Record success AFTER send — avoids inflating metrics on channel close.
+                        if udp_tx.send((destination, packets)).await.is_ok() { counters.record_success(count, bytes) } else {
+                            info!(peer = %peer_id, "bare TX: UDP channel closed, shutting down");
+                            return Ok(());
+                        }
                     }
-                }
-                _ = ticker.tick() => {
-                    if !counters.emit(&events_tx, Some(&peer_id), Some(destination)) {
-                        return Ok(());
+                    () = ctx.wait_for_stop() => return Ok(()),
+                    _ = ticker.tick() => {
+                        if !counters.emit(&ctx, Some(&peer_id), Some(destination)) {
+                            return Ok(());
+                        }
                     }
                 }
             }
-        }
         },
     );
 
@@ -298,7 +272,6 @@ pub(crate) fn spawn_bare_tx(
 mod tests {
     use super::*;
     use crate::config::IoTuning;
-    use crate::events::Event;
     use crate::metrics::Direction;
     use std::net::Ipv4Addr;
     use std::time::Duration;
@@ -318,13 +291,11 @@ mod tests {
     fn test_bare_rx(
         accepted_sources: HashSet<IpAddr>,
         ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
-        events_tx: mpsc::UnboundedSender<Event>,
         tuning: &Tuning,
     ) -> BareRx {
         BareRx {
             accepted_sources,
             ingress_tx,
-            events_tx,
             metrics_interval: tuning.io.metrics_push_interval,
         }
     }
@@ -332,14 +303,14 @@ mod tests {
     #[tokio::test]
     async fn bare_rx_filters_non_accepted_sources() {
         let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let orchestrator = actor_bus_owner.mailbox("test-orchestrator");
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
         let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_millis(200));
-        let filter = test_bare_rx(accepted, ingress_tx, events_tx, &tuning);
-        let (udp_tx, _cmd_tx) = spawn_bare_filter(filter, tuning.io.packet_queue_depth, &actor_bus);
+        let filter = test_bare_rx(accepted, ingress_tx, &tuning);
+        let (udp_tx, _filter_ref) =
+            spawn_bare_filter(filter, tuning.io.packet_queue_depth, &orchestrator);
 
         // Send from a non-accepted source
         let remote: SocketAddr = "192.168.1.1:5353".parse().unwrap();
@@ -356,14 +327,14 @@ mod tests {
     #[tokio::test]
     async fn bare_rx_forwards_accepted_sources() {
         let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let orchestrator = actor_bus_owner.mailbox("test-orchestrator");
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
         let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_millis(200));
-        let filter = test_bare_rx(accepted, ingress_tx, events_tx, &tuning);
-        let (udp_tx, _cmd_tx) = spawn_bare_filter(filter, tuning.io.packet_queue_depth, &actor_bus);
+        let filter = test_bare_rx(accepted, ingress_tx, &tuning);
+        let (udp_tx, _filter_ref) =
+            spawn_bare_filter(filter, tuning.io.packet_queue_depth, &orchestrator);
 
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
         let batch = vec![BufFactory::buf_from_slice(&[7, 8, 9])];
@@ -380,13 +351,13 @@ mod tests {
     #[tokio::test]
     async fn bare_rx_updates_accepted_sources() {
         let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let orchestrator = actor_bus_owner.mailbox("test-orchestrator");
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_millis(200));
-        let filter = test_bare_rx(HashSet::new(), ingress_tx, events_tx, &tuning);
-        let (udp_tx, cmd_tx) = spawn_bare_filter(filter, tuning.io.packet_queue_depth, &actor_bus);
+        let filter = test_bare_rx(HashSet::new(), ingress_tx, &tuning);
+        let (udp_tx, filter_ref) =
+            spawn_bare_filter(filter, tuning.io.packet_queue_depth, &orchestrator);
 
         // Initially no sources accepted — packet should be dropped.
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
@@ -398,13 +369,16 @@ mod tests {
         assert!(first.is_err(), "should be dropped before update");
 
         // Update accepted sources.
-        cmd_tx
-            .send(BareUdpRxCommand::UpdateAcceptedSources(HashSet::from([
-                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            ])))
+        orchestrator
+            .send(
+                &filter_ref,
+                Event::UpdateAcceptedSources {
+                    sources: HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]),
+                },
+            )
             .unwrap();
 
-        // Yield to let the actor process the command before sending the next packet.
+        // Yield to let the actor process the event before sending the next packet.
         tokio::task::yield_now().await;
 
         // Now the same source should be accepted.
@@ -422,14 +396,14 @@ mod tests {
     #[tokio::test]
     async fn bare_rx_emits_metrics() {
         let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let mut orchestrator = actor_bus_owner.mailbox("test-orchestrator");
         let (ingress_tx, mut ingress_rx) = mpsc::channel(4);
         let accepted = HashSet::from([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_millis(10));
-        let filter = test_bare_rx(accepted, ingress_tx, events_tx, &tuning);
-        let (udp_tx, _cmd_tx) = spawn_bare_filter(filter, tuning.io.packet_queue_depth, &actor_bus);
+        let filter = test_bare_rx(accepted, ingress_tx, &tuning);
+        let (udp_tx, _filter_ref) =
+            spawn_bare_filter(filter, tuning.io.packet_queue_depth, &orchestrator);
 
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
         udp_tx
@@ -441,7 +415,7 @@ mod tests {
         let _ = ingress_rx.recv().await;
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
-            while let Some(event) = events_rx.recv().await {
+            while let Some(event) = orchestrator.recv().await {
                 if let Event::Metrics(m) = event {
                     if m.labels.direction == Direction::Rx && m.stats.succeeded.packets >= 1 {
                         return Some(m);
@@ -463,19 +437,17 @@ mod tests {
     #[tokio::test]
     async fn bare_tx_tags_and_forwards() {
         let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let orchestrator = actor_bus_owner.mailbox("test-orchestrator");
         let dest: SocketAddr = "10.0.0.1:5353".parse().unwrap();
         let (udp_tx, mut udp_rx) = mpsc::channel(4);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_millis(200));
         let egress_tx = spawn_bare_tx(
             udp_tx,
             dest,
             "test-peer".to_string(),
-            events_tx,
             &tuning,
-            &actor_bus,
+            &orchestrator,
         );
 
         let batch = vec![BufFactory::buf_from_slice(&[9, 8, 7])];
@@ -495,19 +467,17 @@ mod tests {
     #[tokio::test]
     async fn bare_tx_emits_metrics() {
         let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let mut orchestrator = actor_bus_owner.mailbox("test-orchestrator");
         let dest: SocketAddr = "10.0.0.1:5353".parse().unwrap();
         let (udp_tx, mut udp_rx) = mpsc::channel(4);
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_millis(10));
         let egress_tx = spawn_bare_tx(
             udp_tx,
             dest,
             "test-peer".to_string(),
-            events_tx,
             &tuning,
-            &actor_bus,
+            &orchestrator,
         );
 
         egress_tx
@@ -519,7 +489,7 @@ mod tests {
         let _ = udp_rx.recv().await;
 
         let metrics = tokio::time::timeout(Duration::from_millis(100), async {
-            while let Some(event) = events_rx.recv().await {
+            while let Some(event) = orchestrator.recv().await {
                 if let Event::Metrics(m) = event {
                     if m.labels.direction == Direction::Tx && m.stats.succeeded.packets >= 1 {
                         return Some(m);
@@ -541,25 +511,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_rx_exits_when_cmd_channel_closed() {
+    async fn bare_rx_exits_when_stopped() {
         let mut actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let mut orchestrator = actor_bus_owner.mailbox("test-orchestrator");
         let (ingress_tx, _ingress_rx) = mpsc::channel(4);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_secs(60));
-        let filter = test_bare_rx(HashSet::new(), ingress_tx, events_tx, &tuning);
-        let (_udp_tx, cmd_tx) = spawn_bare_filter(filter, tuning.io.packet_queue_depth, &actor_bus);
+        let filter = test_bare_rx(HashSet::new(), ingress_tx, &tuning);
+        let (_udp_tx, filter_ref) =
+            spawn_bare_filter(filter, tuning.io.packet_queue_depth, &orchestrator);
 
-        // Drop cmd_tx to signal shutdown via command channel closure.
-        drop(cmd_tx);
+        orchestrator.send(&filter_ref, Event::Stop).unwrap();
 
-        let result =
-            tokio::time::timeout(Duration::from_millis(200), actor_bus_owner.next_exit()).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            crate::actor::next_actor_exit(&mut actor_bus_owner, &mut orchestrator),
+        )
+        .await;
         assert!(
             matches!(
                 result,
-                Ok(crate::actor::ActorBusExit {
+                Ok(crate::actor::ActorExit {
                     result: Ok(Ok(())),
                     ..
                 })
@@ -571,29 +543,30 @@ mod tests {
     #[tokio::test]
     async fn bare_tx_exits_when_egress_closed() {
         let mut actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let mut orchestrator = actor_bus_owner.mailbox("test-orchestrator");
         let dest: SocketAddr = "10.0.0.1:5353".parse().unwrap();
         let (udp_tx, _udp_rx) = mpsc::channel(4);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
 
         let tuning = test_tuning(Duration::from_secs(60));
         let egress_tx = spawn_bare_tx(
             udp_tx,
             dest,
             "test-peer".to_string(),
-            events_tx,
             &tuning,
-            &actor_bus,
+            &orchestrator,
         );
 
         drop(egress_tx);
 
-        let result =
-            tokio::time::timeout(Duration::from_millis(200), actor_bus_owner.next_exit()).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            crate::actor::next_actor_exit(&mut actor_bus_owner, &mut orchestrator),
+        )
+        .await;
         assert!(
             matches!(
                 result,
-                Ok(crate::actor::ActorBusExit {
+                Ok(crate::actor::ActorExit {
                     result: Ok(Ok(())),
                     ..
                 })

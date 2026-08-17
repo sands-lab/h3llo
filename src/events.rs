@@ -1,12 +1,14 @@
-//! Shared events flowing into the orchestrator.
+//! Control-plane events exchanged by actors.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
-use crate::actor::ActorBusHandle;
+use crate::actor::ActorExit;
 use crate::bind::RouteProbe;
 use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
 use crate::metrics::{Labels, Metrics};
+use crate::router::RoutingTable;
+use ipnet::IpNet;
 use tokio::sync::{mpsc, oneshot};
 use tokio_quiche::buf_factory::PooledBuf;
 
@@ -39,23 +41,12 @@ pub(crate) struct DialContext<P: RouteProbe> {
     pub tuning: Tuning,
     /// Route probe for interface selection.
     pub probe: P,
-    /// Unified actor spawning and runtime handle.
-    pub actor_bus: ActorBusHandle,
-    /// Channel for emitting events back to the orchestrator.
-    pub events_tx: mpsc::UnboundedSender<Event>,
 }
 
 #[cfg(test)]
 impl<P: RouteProbe> DialContext<P> {
     /// Creates a `DialContext` for tests with minimal boilerplate.
-    pub fn test(
-        peer_id: &str,
-        dial_ip: IpAddr,
-        tuning: Tuning,
-        events_tx: mpsc::UnboundedSender<Event>,
-        probe: P,
-        actor_bus: ActorBusHandle,
-    ) -> Self {
+    pub fn test(peer_id: &str, dial_ip: IpAddr, tuning: Tuning, probe: P) -> Self {
         Self {
             peer_id: peer_id.to_string(),
             dial_ip,
@@ -63,8 +54,6 @@ impl<P: RouteProbe> DialContext<P> {
             tun_mtu: crate::config::default_mtu(),
             tuning,
             probe,
-            actor_bus,
-            events_tx,
         }
     }
 }
@@ -95,8 +84,12 @@ impl std::fmt::Debug for ConnectedEvent {
     }
 }
 
-/// Carries high-level events emitted by modules to the orchestrator.
+/// Control-plane event exchanged through [`crate::actor::ActorBus`].
 pub enum Event {
+    /// Requests graceful actor shutdown.
+    Stop,
+    /// Notifies an actor that one of its supervised actors exited.
+    ActorExited(ActorExit),
     /// Cumulative metrics snapshot from any source (boxed to reduce enum size).
     Metrics(Box<Metrics>),
     /// Transport connection established (H3 or BareUDP).
@@ -105,53 +98,68 @@ pub enum Event {
     DialFailed(DialFailedEvent),
     /// Events originating from DNS resolution.
     Dns(DnsEvent),
-    /// Events originating from the management API.
-    Api(ApiEvent),
+    /// GET /config — orchestrator replies with the current configuration.
+    GetConfig {
+        /// Reply channel carrying the full configuration.
+        reply_tx: oneshot::Sender<Config>,
+    },
+    /// POST /config — upserts peers after orchestrator-side validation.
+    PostConfig {
+        /// Parsed peer definitions from the request body.
+        peers: Vec<Peer>,
+        /// Reply channel carrying updated configuration or a validation error.
+        reply_tx: oneshot::Sender<Result<Config, String>>,
+    },
+    /// DELETE /config — removes peers by ID.
+    DeleteConfig {
+        /// Peer IDs to remove.
+        peer_ids: Vec<String>,
+        /// Reply channel carrying updated configuration or an error.
+        reply_tx: oneshot::Sender<Result<Config, String>>,
+    },
+    /// GET /metrics — returns the raw metrics snapshot for API-side rendering.
+    GetMetricsSnapshot {
+        /// Reply channel carrying cloned metrics data.
+        reply_tx: oneshot::Sender<HashMap<Labels, Metrics>>,
+    },
+    /// Replaces the router's routing table atomically.
+    UpdateRouting {
+        /// New routing table with embedded packet senders.
+        routing: RoutingTable,
+    },
+    /// Replaces the accepted source IP set for inbound `BareUDP` packets.
+    UpdateAcceptedSources {
+        /// Complete accepted source set.
+        sources: HashSet<IpAddr>,
+    },
+    /// Replaces the peer token map used for H3 authentication.
+    UpdatePeerTokens {
+        /// Complete peer token map.
+        tokens: HashMap<String, String>,
+    },
+    /// Replaces the hostnames tracked by the DNS resolver.
+    SetHostnames {
+        /// Complete hostname set.
+        hosts: HashSet<String>,
+    },
+    /// Synchronizes host routes with the desired configuration.
+    SyncRoutes {
+        /// TUN interface addresses whose OS-managed routes must be preserved.
+        tun_addrs: Vec<IpNet>,
+        /// Desired allowed IP prefixes.
+        allowed: Vec<IpNet>,
+    },
 }
 
 impl std::fmt::Debug for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Stop => f.write_str("Stop"),
+            Self::ActorExited(exit) => f.debug_tuple("ActorExited").field(exit).finish(),
             Self::Metrics(m) => f.debug_tuple("Metrics").field(m).finish(),
             Self::Connected(e) => f.debug_tuple("Connected").field(e).finish(),
             Self::DialFailed(e) => f.debug_tuple("DialFailed").field(e).finish(),
             Self::Dns(e) => f.debug_tuple("Dns").field(e).finish(),
-            Self::Api(e) => f.debug_tuple("Api").field(e).finish(),
-        }
-    }
-}
-
-/// Events emitted by the management API actor.
-pub enum ApiEvent {
-    /// GET /config — orchestrator replies with current config snapshot.
-    GetConfig {
-        /// Reply channel carrying the full `Config` struct for API-side serialization.
-        reply_tx: oneshot::Sender<Config>,
-    },
-    /// POST /config — upsert peers; orchestrator validates and replies.
-    PostConfig {
-        /// Parsed peer definitions from the request body.
-        peers: Vec<Peer>,
-        /// Reply channel carrying updated config on success, or error string on failure.
-        reply_tx: oneshot::Sender<Result<Config, String>>,
-    },
-    /// DELETE /config — remove peers by ID; orchestrator confirms.
-    DeleteConfig {
-        /// Peer IDs to remove.
-        peer_ids: Vec<String>,
-        /// Reply channel carrying updated config on success, or error string on failure.
-        reply_tx: oneshot::Sender<Result<Config, String>>,
-    },
-    /// GET /metrics — orchestrator replies with raw metrics snapshot for API-side rendering.
-    GetMetricsSnapshot {
-        /// Reply channel carrying cloned metrics data. Rendering happens in the API actor.
-        reply_tx: oneshot::Sender<HashMap<Labels, Metrics>>,
-    },
-}
-
-impl std::fmt::Debug for ApiEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
             Self::GetConfig { .. } => f.debug_struct("GetConfig").finish_non_exhaustive(),
             Self::PostConfig { peers, .. } => f
                 .debug_struct("PostConfig")
@@ -164,6 +172,27 @@ impl std::fmt::Debug for ApiEvent {
             Self::GetMetricsSnapshot { .. } => {
                 f.debug_struct("GetMetricsSnapshot").finish_non_exhaustive()
             }
+            Self::UpdateRouting { routing } => f
+                .debug_struct("UpdateRouting")
+                .field("routing", routing)
+                .finish(),
+            Self::UpdateAcceptedSources { sources } => f
+                .debug_struct("UpdateAcceptedSources")
+                .field("sources", sources)
+                .finish(),
+            Self::UpdatePeerTokens { tokens } => f
+                .debug_struct("UpdatePeerTokens")
+                .field("tokens", tokens)
+                .finish(),
+            Self::SetHostnames { hosts } => f
+                .debug_struct("SetHostnames")
+                .field("hosts", hosts)
+                .finish(),
+            Self::SyncRoutes { tun_addrs, allowed } => f
+                .debug_struct("SyncRoutes")
+                .field("tun_addrs", tun_addrs)
+                .field("allowed", allowed)
+                .finish(),
         }
     }
 }

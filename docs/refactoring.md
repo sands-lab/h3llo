@@ -372,10 +372,10 @@ High-impact, high-effort patterns. Each typically yields -100 to -300 LOC. Apply
 - Signal: Batch state carried across loop iterations; multiple flush conditions (count, bytes, size change); adaptive flush logic.
 - Impact: Eliminates cross-iteration state, removes stale-state bugs.
 
-**M3. Principled Actor Lifecycle: Token vs. Channel-Close**
-- Choose shutdown based on blocking behavior: `CancellationToken` for I/O-bound actors, channel-close for queue-draining actors.
-- Signal: Actors blocking on `socket.readable()` (need explicit cancellation); actors calling `channel.recv()` (natural exit on drop); mixed mechanisms.
-- Impact: Correct shutdown semantics, RAII cleanup, removes intermediate structs.
+**M3. Principled Actor Lifecycle: Actor Events vs. Data-Channel Drain**
+- Send `Event::Stop` through the owner's `ActorContext` when actor ownership determines shutdown; let queue-draining actors also finish naturally when every data producer is gone.
+- Signal: Separate cancellation tokens or private control channels duplicate actor identity; dropping one data sender accidentally controls an actor shared by multiple owners.
+- Impact: Makes explicit shutdown and dead-recipient detection consistent while preserving natural completion for bounded packet pipelines.
 
 ### N. Concurrency Model
 

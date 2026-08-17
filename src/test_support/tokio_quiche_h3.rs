@@ -731,7 +731,10 @@ pub fn spawn_h3_rx(
                 }
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), Some(remote_addr));
-                    if events_tx.send(Event::Metrics(Box::new(metrics))).is_err() {
+                    if events_tx
+                        .send(Event::Metrics(Box::new(metrics)))
+                        .is_err()
+                    {
                         return Ok(());
                     }
                 }
@@ -925,7 +928,10 @@ pub fn spawn_h3_tx(
                 }
                 _ = ticker.tick() => {
                     let metrics = counters.snapshot(Some(&peer), Some(remote_addr));
-                    if events_tx.send(Event::Metrics(Box::new(metrics))).is_err() {
+                    if events_tx
+                        .send(Event::Metrics(Box::new(metrics)))
+                        .is_err()
+                    {
                         return Ok(());
                     }
                 }

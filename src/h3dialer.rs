@@ -3,11 +3,11 @@
 //! Uses a hand-rolled quiche event loop with separated UDP I/O actors.
 //! See [`dial_h3_client`] for the public entry point.
 
-use crate::actor::{ActorRuntime, SupervisionPolicy};
+use crate::actor::{ActorContext, ActorRuntime, SupervisionPolicy};
 use crate::auth::bearer_auth_header;
 use crate::bind::{make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
-use crate::events::{ConnectedEvent, DialContext, Endpoint};
+use crate::events::{ConnectedEvent, DialContext, Endpoint, Event};
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, H3Engine, RunState,
 };
@@ -21,7 +21,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 use tokio_quiche::buf_factory::PooledBuf;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 // ========== Dial Error ==========
@@ -227,8 +226,9 @@ fn make_client_quiche_config(
 /// sending the event and handling errors.
 pub(crate) async fn dial_h3_client<P: RouteProbe>(
     peer_h3: &PeerH3,
-    ctx: &DialContext<P>,
+    dial: &DialContext<P>,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+    ctx: &ActorContext,
 ) -> Result<ConnectedEvent, DialError> {
     let DialContext {
         peer_id,
@@ -237,9 +237,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
         tun_mtu,
         tuning,
         probe,
-        actor_bus,
-        events_tx,
-    } = ctx;
+    } = dial;
     let endpoint = peer_h3
         .endpoint
         .as_ref()
@@ -269,40 +267,19 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     .await
     .map_err(|e| DialError::Socket(e.to_string()))?;
 
-    let udp_cancel = CancellationToken::new();
-    let cancel_guard = udp_cancel.clone().drop_guard();
-
     let local_addr = std_socket
         .local_addr()
         .map_err(|e| DialError::Socket(format!("local_addr: {e}")))?;
     let max_udp_payload = usize::from(*tun_mtu) + CONNECT_IP_OVERHEAD;
     let enable_offload = tuning.io.udp_enable_offload;
-    let (udp_rx, udp_tx) = actor_bus
+    let (udp_rx, udp_tx) = ctx
         .run_on(ActorRuntime::Udp, move || {
             udp::make_udp(std_socket, max_udp_payload, enable_offload)
         })
         .await
         .map_err(|error| DialError::Socket(format!("UDP runtime task failed: {error}")))?
         .map_err(|error| DialError::Socket(format!("make_udp: {error}")))?;
-    let (udp_recv_tx, udp_recv_rx) =
-        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
-    udp::spawn_udp_rx(
-        udp_rx,
-        udp_recv_tx,
-        udp_cancel.clone(),
-        actor_bus,
-        SupervisionPolicy::Restartable,
-    );
-    let udp_send_tx = udp::spawn_udp_tx(
-        udp_tx,
-        tuning.io.packet_queue_depth,
-        actor_bus,
-        SupervisionPolicy::Restartable,
-    );
-
     // Create quiche config and connection.
-    // Note: early `?` returns below are safe — `cancel_guard` cancels
-    // the token on drop, causing both UDP actors to exit.
     let mut config = make_client_quiche_config(tuning, max_udp_payload)?;
     let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
     rand::rng().fill_bytes(&mut scid_bytes);
@@ -316,6 +293,16 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     )
     .map_err(|e| DialError::Handshake(format!("quiche connect: {e}")))?;
 
+    let (udp_recv_tx, udp_recv_rx) =
+        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
+    let udp_rx_ref = udp::spawn_udp_rx(udp_rx, udp_recv_tx, ctx, SupervisionPolicy::Restartable);
+    let (udp_send_tx, _udp_tx_ref) = udp::spawn_udp_tx(
+        udp_tx,
+        tuning.io.packet_queue_depth,
+        ctx,
+        SupervisionPolicy::Restartable,
+    );
+
     let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.io.packet_queue_depth);
 
     let engine = H3Engine {
@@ -327,7 +314,6 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
             udp_send_tx: udp_send_tx.clone(),
             egress_rx,
             ingress_tx,
-            events_tx: events_tx.clone(),
         },
         meta: EngineMeta {
             local_addr,
@@ -339,26 +325,30 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
 
         metrics_interval: tuning.io.metrics_push_interval,
         keepalive_interval: tuning.h3.h3_keepalive_interval,
-        udp_cancel: Some(udp_cancel),
+        udp_rx: Some(udp_rx_ref.clone()),
     };
 
-    let engine = engine
+    let engine = match engine
         .establish(
             authority,
             connect_path,
             auth_header,
             tuning.h3.h3_handshake_timeout,
         )
-        .await?;
+        .await
+    {
+        Ok(engine) => engine,
+        Err(error) => {
+            let _ = ctx.send(&udp_rx_ref, Event::Stop);
+            return Err(error);
+        }
+    };
 
-    // Engine now owns the token — disarm the caller-side guard.
-    cancel_guard.disarm();
-
-    actor_bus.spawn(
+    let _engine_ref = ctx.spawn(
         format!("h3-engine[{peer_id}@{remote_addr}]"),
         ActorRuntime::Crypto,
         SupervisionPolicy::Restartable,
-        engine.run(),
+        |ctx| engine.run(ctx),
     );
 
     Ok(ConnectedEvent {
@@ -500,28 +490,22 @@ mod tests {
     ) -> (
         ConnectedEvent,
         mpsc::Receiver<Vec<PooledBuf>>,
+        ActorContext,
         crate::actor::ActorBus,
     ) {
         let peer_h3 = test_peer_h3(bound_addr, token);
         let tuning = insecure_tuning();
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
-        let ctx = DialContext::test(
-            peer_id,
-            bound_addr.ip(),
-            tuning,
-            events_tx,
-            FakeRouteProbe::noop(),
-            actor_bus.handle(),
-        );
+        let orchestrator = actor_bus.mailbox("test-orchestrator");
+        let dial = DialContext::test(peer_id, bound_addr.ip(), tuning, FakeRouteProbe::noop());
 
-        let event = dial_h3_client(&peer_h3, &ctx, ingress_tx)
+        let event = dial_h3_client(&peer_h3, &dial, ingress_tx, &orchestrator)
             .await
             .expect("dial_h3_client failed");
 
-        (event, ingress_rx, actor_bus)
+        (event, ingress_rx, orchestrator, actor_bus)
     }
 
     // ========== h3v2 Client-Server Integration Tests ==========
@@ -534,7 +518,7 @@ mod tests {
 
         let mut server = TestServer::start(peer_tokens).await;
 
-        let (event, _ingress_rx, _actor_bus) =
+        let (event, _ingress_rx, _orchestrator, _actor_bus) =
             dial_test_client(server.bound_addr, token, peer_id).await;
 
         assert_eq!(event.peer_id, peer_id);
@@ -560,18 +544,16 @@ mod tests {
         let tuning = insecure_tuning();
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
-        let ctx = DialContext::test(
+        let orchestrator = actor_bus.mailbox("test-orchestrator");
+        let dial = DialContext::test(
             peer_id,
             server.bound_addr.ip(),
             tuning,
-            events_tx,
             FakeRouteProbe::noop(),
-            actor_bus.handle(),
         );
 
-        let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;
+        let result = dial_h3_client(&peer_h3, &dial, ingress_tx, &orchestrator).await;
 
         assert!(
             matches!(result, Err(DialError::Rejected(_))),
@@ -591,7 +573,7 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestServer::start(peer_tokens).await;
-        let (event, _ingress_rx, _actor_bus) =
+        let (event, _ingress_rx, _orchestrator, _actor_bus) =
             dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Obtain server-side connection and set up RX actor.
@@ -633,7 +615,7 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestServer::start(peer_tokens).await;
-        let (_event, mut ingress_rx, _actor_bus) =
+        let (_event, mut ingress_rx, _orchestrator, _actor_bus) =
             dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Obtain server-side connection and set up TX actor.
@@ -675,7 +657,7 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestServer::start(peer_tokens).await;
-        let (event, mut ingress_rx, _actor_bus) =
+        let (event, mut ingress_rx, _orchestrator, _actor_bus) =
             dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Set up server RX and TX actors.
@@ -734,7 +716,7 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestServer::start(peer_tokens).await;
-        let (event, _ingress_rx, mut actor_bus) =
+        let (event, _ingress_rx, mut orchestrator, mut actor_bus) =
             dial_test_client(server.bound_addr, token, peer_id).await;
 
         // Verify server accepted the connection.
@@ -745,7 +727,7 @@ mod tests {
         drop(tx);
         let engine_exit = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let exit = actor_bus.next_exit().await;
+                let exit = crate::actor::next_actor_exit(&mut actor_bus, &mut orchestrator).await;
                 if exit.name.starts_with("h3-engine[") {
                     return exit;
                 }
@@ -787,18 +769,11 @@ mod tests {
         };
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
-        let ctx = DialContext::test(
-            peer_id,
-            server.bound_addr.ip(),
-            tuning,
-            events_tx,
-            probe,
-            actor_bus.handle(),
-        );
+        let orchestrator = actor_bus.mailbox("test-orchestrator");
+        let dial = DialContext::test(peer_id, server.bound_addr.ip(), tuning, probe);
 
-        let event = dial_h3_client(&peer_h3, &ctx, ingress_tx)
+        let event = dial_h3_client(&peer_h3, &dial, ingress_tx, &orchestrator)
             .await
             .expect("dial with trusted CA should succeed");
 
@@ -821,18 +796,16 @@ mod tests {
         let tuning = Tuning::default();
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
-        let ctx = DialContext::test(
+        let orchestrator = actor_bus.mailbox("test-orchestrator");
+        let dial = DialContext::test(
             peer_id,
             server.bound_addr.ip(),
             tuning,
-            events_tx,
             FakeRouteProbe::noop(),
-            actor_bus.handle(),
         );
 
-        let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;
+        let result = dial_h3_client(&peer_h3, &dial, ingress_tx, &orchestrator).await;
 
         let err =
             result.expect_err("handshake with self-signed cert and no trusted CA should fail");

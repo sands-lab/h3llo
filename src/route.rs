@@ -3,8 +3,9 @@
 //! Provides both the core route sync logic (`sync_tun_routes`) and the route
 //! actor (`make_route` / `spawn_route`) that serializes system route updates.
 
-use crate::actor::{ActorBusHandle, ActorRuntime, SupervisionPolicy};
+use crate::actor::{ActorContext, ActorRef, ActorRuntime, SupervisionPolicy};
 use crate::bind::lookup_ifindex;
+use crate::events::Event;
 use ipnet::IpNet;
 pub use route_manager::AsyncRouteManager;
 pub use route_manager::Route;
@@ -12,8 +13,7 @@ use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use thiserror::Error;
-use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Resolves interface indexes from names.
 pub trait IfIndexResolver: Send + Sync + 'static {
@@ -60,21 +60,6 @@ impl RouteHandle for AsyncRouteManager {
     }
 }
 
-/// Commands accepted by the route sync actor.
-#[derive(Debug)]
-pub enum RouteCommand {
-    /// Synchronize system routes for the TUN interface.
-    ///
-    /// The actor serializes these updates — only one sync runs at a time.
-    /// The TUN interface name is captured in the actor at spawn time.
-    SyncRoutes {
-        /// TUN interface addresses (OS-managed routes to preserve).
-        tun_addrs: Vec<IpNet>,
-        /// Desired allowed IP prefixes.
-        allowed: Vec<IpNet>,
-    },
-}
-
 /// Route sync actor state.
 ///
 /// Created by [`make_route()`] (production) or struct literal (tests),
@@ -101,33 +86,32 @@ pub fn make_route() -> io::Result<RouteActor<AsyncRouteManager, PlatformIfIndexR
 
 /// Spawns the route sync actor task.
 ///
-/// Creates an unbounded command channel internally. The actor processes
-/// `SyncRoutes` commands sequentially, ensuring serialized route updates.
-/// Exits gracefully when all senders are dropped.
+/// The actor processes `SyncRoutes` events sequentially, ensuring serialized
+/// route updates.
 ///
 /// # Arguments
 ///
 /// * `actor` - Actor state created by [`make_route()`] or constructed directly in tests.
 /// * `tun_if` - TUN interface name, captured for the actor's lifetime.
+/// * `ctx` - Parent actor context used to spawn the actor.
 pub fn spawn_route<H: RouteHandle, R: IfIndexResolver>(
     actor: RouteActor<H, R>,
     tun_if: String,
-    actor_bus: &ActorBusHandle,
-) -> mpsc::UnboundedSender<RouteCommand> {
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+    ctx: &ActorContext,
+) -> ActorRef {
     let RouteActor {
         mut handle,
         resolver,
     } = actor;
 
-    actor_bus.spawn(
+    ctx.spawn(
         "route-sync",
         ActorRuntime::Main,
         SupervisionPolicy::Critical,
-        async move {
-            while let Some(cmd) = cmd_rx.recv().await {
-                match cmd {
-                    RouteCommand::SyncRoutes { tun_addrs, allowed } => {
+        |mut ctx| async move {
+            while let Some(message) = ctx.recv().await {
+                match message {
+                    Event::SyncRoutes { tun_addrs, allowed } => {
                         if let Err(err) =
                             sync_tun_routes(&tun_if, &tun_addrs, &allowed, &mut handle, &resolver)
                                 .await
@@ -140,13 +124,13 @@ pub fn spawn_route<H: RouteHandle, R: IfIndexResolver>(
                             );
                         }
                     }
+                    Event::Stop => return Ok(()),
+                    message => debug!(?message, "route sync: ignoring unexpected message"),
                 }
             }
             Ok(())
         },
-    );
-
-    cmd_tx
+    )
 }
 
 /// Fatal errors returned by route sync.
@@ -829,35 +813,38 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn spawn_route_processes_command_and_exits_on_drop() {
+    async fn spawn_route_processes_event_and_stops() {
         let mut actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let mut supervisor = actor_bus_owner.mailbox("test-supervisor");
         let actor = RouteActor {
             handle: FakeHandle::new(vec![]),
             resolver: FakeResolver { idx: 7 },
         };
-        let cmd_tx = spawn_route(actor, "tun0".to_string(), &actor_bus);
-        cmd_tx
-            .send(RouteCommand::SyncRoutes {
-                tun_addrs: vec![],
-                allowed: vec!["10.0.0.0/24".parse().unwrap()],
-            })
+        let route = spawn_route(actor, "tun0".to_string(), &supervisor);
+        supervisor
+            .send(
+                &route,
+                Event::SyncRoutes {
+                    tun_addrs: vec![],
+                    allowed: vec!["10.0.0.0/24".parse().unwrap()],
+                },
+            )
             .expect("send should succeed");
-        drop(cmd_tx);
+        supervisor.send(&route, Event::Stop).unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            actor_bus_owner.next_exit(),
+            crate::actor::next_actor_exit(&mut actor_bus_owner, &mut supervisor),
         )
         .await;
         assert!(
             matches!(
                 result,
-                Ok(crate::actor::ActorBusExit {
+                Ok(crate::actor::ActorExit {
                     result: Ok(Ok(())),
                     ..
                 })
             ),
-            "actor should shut down cleanly after processing command, got {result:?}"
+            "actor should shut down cleanly after processing event, got {result:?}"
         );
         assert!(!logs_contain("route sync failed"));
     }
@@ -866,28 +853,31 @@ mod tests {
     #[traced_test]
     async fn spawn_route_logs_sync_failure() {
         let mut actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let mut supervisor = actor_bus_owner.mailbox("test-supervisor");
         let actor = RouteActor {
             handle: FakeHandle::new(vec![]),
             resolver: FailingResolver,
         };
-        let cmd_tx = spawn_route(actor, "tun0".to_string(), &actor_bus);
-        cmd_tx
-            .send(RouteCommand::SyncRoutes {
-                tun_addrs: vec![],
-                allowed: vec!["10.0.0.0/24".parse().unwrap()],
-            })
+        let route = spawn_route(actor, "tun0".to_string(), &supervisor);
+        supervisor
+            .send(
+                &route,
+                Event::SyncRoutes {
+                    tun_addrs: vec![],
+                    allowed: vec!["10.0.0.0/24".parse().unwrap()],
+                },
+            )
             .expect("send should succeed");
-        drop(cmd_tx);
+        supervisor.send(&route, Event::Stop).unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            actor_bus_owner.next_exit(),
+            crate::actor::next_actor_exit(&mut actor_bus_owner, &mut supervisor),
         )
         .await;
         assert!(
             matches!(
                 result,
-                Ok(crate::actor::ActorBusExit {
+                Ok(crate::actor::ActorExit {
                     result: Ok(Ok(())),
                     ..
                 })
@@ -898,24 +888,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_route_exits_gracefully_on_sender_drop() {
+    async fn spawn_route_exits_gracefully_on_stop() {
         let mut actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let mut supervisor = actor_bus_owner.mailbox("test-supervisor");
         let actor = RouteActor {
             handle: FakeHandle::new(vec![]),
             resolver: FakeResolver { idx: 7 },
         };
-        let cmd_tx = spawn_route(actor, "tun0".to_string(), &actor_bus);
-        drop(cmd_tx);
+        let route = spawn_route(actor, "tun0".to_string(), &supervisor);
+        supervisor.send(&route, Event::Stop).unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            actor_bus_owner.next_exit(),
+            crate::actor::next_actor_exit(&mut actor_bus_owner, &mut supervisor),
         )
         .await;
         assert!(
             matches!(
                 result,
-                Ok(crate::actor::ActorBusExit {
+                Ok(crate::actor::ActorExit {
                     result: Ok(Ok(())),
                     ..
                 })
@@ -925,55 +915,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_route_returns_working_cmd_tx() {
+    async fn spawn_route_returns_working_actor_ref() {
         let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let supervisor = actor_bus_owner.mailbox("test-supervisor");
         let actor = RouteActor {
             handle: FakeHandle::new(vec![]),
             resolver: FakeResolver { idx: 7 },
         };
-        let cmd_tx = spawn_route(actor, "tun0".to_string(), &actor_bus);
-        assert!(cmd_tx
-            .send(RouteCommand::SyncRoutes {
-                tun_addrs: vec![],
-                allowed: vec!["10.0.0.0/24".parse().unwrap()],
-            })
+        let route = spawn_route(actor, "tun0".to_string(), &supervisor);
+        assert!(supervisor
+            .send(
+                &route,
+                Event::SyncRoutes {
+                    tun_addrs: vec![],
+                    allowed: vec!["10.0.0.0/24".parse().unwrap()],
+                }
+            )
             .is_ok());
     }
 
     #[tokio::test]
     #[traced_test]
-    async fn spawn_route_processes_multiple_commands_sequentially() {
+    async fn spawn_route_processes_multiple_events_sequentially() {
         let mut actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus = actor_bus_owner.handle();
+        let mut supervisor = actor_bus_owner.mailbox("test-supervisor");
         let actor = RouteActor {
             handle: FakeHandle::new(vec![]),
             resolver: FakeResolver { idx: 7 },
         };
-        let cmd_tx = spawn_route(actor, "tun0".to_string(), &actor_bus);
+        let route = spawn_route(actor, "tun0".to_string(), &supervisor);
         for prefix in &["10.0.0.0/24", "10.0.1.0/24", "10.0.2.0/24"] {
-            cmd_tx
-                .send(RouteCommand::SyncRoutes {
-                    tun_addrs: vec![],
-                    allowed: vec![prefix.parse().unwrap()],
-                })
+            supervisor
+                .send(
+                    &route,
+                    Event::SyncRoutes {
+                        tun_addrs: vec![],
+                        allowed: vec![prefix.parse().unwrap()],
+                    },
+                )
                 .expect("send should succeed");
         }
-        drop(cmd_tx);
+        supervisor.send(&route, Event::Stop).unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            actor_bus_owner.next_exit(),
+            crate::actor::next_actor_exit(&mut actor_bus_owner, &mut supervisor),
         )
         .await;
         assert!(
             matches!(
                 result,
-                Ok(crate::actor::ActorBusExit {
+                Ok(crate::actor::ActorExit {
                     result: Ok(Ok(())),
                     ..
                 })
             ),
-            "actor should process all commands and shut down cleanly, got {result:?}"
+            "actor should process all events and shut down cleanly, got {result:?}"
         );
         assert!(!logs_contain("route sync failed"));
     }

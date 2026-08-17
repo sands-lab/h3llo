@@ -5,7 +5,7 @@
 //! `(SocketAddr, Vec<PooledBuf>)` channels, tagging each batch with
 //! the remote address.
 
-use crate::actor::{ActorBusHandle, ActorRuntime, SupervisionPolicy};
+use crate::actor::{ActorContext, ActorRef, ActorRuntime, SupervisionPolicy};
 use crate::bind::UdpError;
 use crate::helpers::alloc_packet_buf;
 use crate::helpers::retry_on_transient;
@@ -19,7 +19,6 @@ use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_quiche::buf_factory::PooledBuf;
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Receive side of a shared UDP socket with quinn-udp GRO support.
@@ -82,21 +81,14 @@ pub fn make_udp(
 
 /// Spawns a UDP receive loop that tags each batch with its source address.
 ///
-/// Pure I/O actor: no filtering, no metrics, no command channel.
+/// Pure I/O actor: no filtering or metrics.
 /// Protocol-specific logic belongs in the consuming actor.
-///
-/// The `cancel` token allows the owner to signal immediate shutdown.
-/// The caller must retain a clone and cancel it when done; without
-/// cancellation the actor only exits when the output channel closes
-/// **and** a packet arrives — which may never happen after the consumer
-/// is gone, leaking the task.
 pub fn spawn_udp_rx(
     rx: UdpRx,
     output: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
-    cancel: CancellationToken,
-    actor_bus: &ActorBusHandle,
+    ctx: &ActorContext,
     policy: SupervisionPolicy,
-) {
+) -> ActorRef {
     let UdpRx {
         socket,
         state,
@@ -107,26 +99,18 @@ pub fn spawn_udp_rx(
         .map(|a| a.to_string())
         .unwrap_or_default();
 
-    actor_bus.spawn(
+    ctx.spawn(
         format!("udp-rx[{local_addr}]"),
         ActorRuntime::Udp,
         policy,
-        async move {
+        |mut ctx| async move {
         info!(addr = %local_addr, "UDP RX actor started");
         let gro_segments = state.gro_segments();
         let mut buf = vec![0u8; max_udp_payload * gro_segments];
         let mut meta = RecvMeta::default();
 
-        loop {
-            tokio::select! {
-                result = socket.readable() => {
-                    result.context("wait for UDP socket readability")?;
-                }
-                () = cancel.cancelled() => {
-                    info!(addr = %local_addr, "UDP RX: cancelled, shutting down");
-                    return Ok(());
-                }
-            }
+        while let Some(result) = ctx.run_until_stopped(socket.readable()).await {
+            result.context("wait for UDP socket readability")?;
             loop {
                 let result = socket.try_io(Interest::READABLE, || {
                     state.recv(
@@ -159,8 +143,10 @@ pub fn spawn_udp_rx(
                 }
             }
         }
+        info!(addr = %local_addr, "UDP RX: stopping");
+        Ok(())
         },
-    );
+    )
 }
 
 /// Spawns a UDP send loop with GSO support for destination-tagged batches.
@@ -176,9 +162,9 @@ pub fn spawn_udp_rx(
 pub fn spawn_udp_tx(
     tx: UdpTx,
     queue_depth: usize,
-    actor_bus: &ActorBusHandle,
+    ctx: &ActorContext,
     policy: SupervisionPolicy,
-) -> mpsc::Sender<(SocketAddr, Vec<PooledBuf>)> {
+) -> (mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>, ActorRef) {
     let (input_tx, mut input_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(queue_depth);
     let UdpTx {
         socket,
@@ -190,11 +176,11 @@ pub fn spawn_udp_tx(
         .map(|a| a.to_string())
         .unwrap_or_default();
 
-    actor_bus.spawn(
+    let actor_ref = ctx.spawn(
         format!("udp-tx[{local_addr}]"),
         ActorRuntime::Udp,
         policy,
-        async move {
+        |mut ctx| async move {
             info!(addr = %local_addr, "UDP TX actor started");
             let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
 
@@ -248,10 +234,12 @@ pub fn spawn_udp_tx(
 
                     let send_result = retry_on_transient!(
                         {
-                            socket
-                                .writable()
-                                .await
-                                .context("wait for UDP socket writability")?;
+                            let Some(result) = ctx.run_until_stopped(socket.writable()).await
+                            else {
+                                info!(addr = %local_addr, "UDP TX: stopping");
+                                return Ok(());
+                            };
+                            result.context("wait for UDP socket writability")?;
                             socket.try_io(Interest::WRITABLE, || {
                                 state.try_send(UdpSockRef::from(&*socket), &transmit)
                             })
@@ -264,6 +252,9 @@ pub fn spawn_udp_tx(
                     if let Err(err) = send_result {
                         let used_gso = gso_buf.len() > segment_size;
                         if is_non_fatal_send_error(&err, used_gso) {
+                            // Drop known non-fatal send failures without stopping
+                            // the shared TX actor. Unclassified failures propagate
+                            // because they may indicate an unusable transport.
                             // TODO: Record UDP actor send-drop metrics and rate-limit
                             // this warning when ActorBus provides metrics handles.
                             warn!(
@@ -283,7 +274,7 @@ pub fn spawn_udp_tx(
         },
     );
 
-    input_tx
+    (input_tx, actor_ref)
 }
 
 fn is_non_fatal_send_error(error: &io::Error, used_gso: bool) -> bool {
@@ -319,7 +310,6 @@ fn is_non_fatal_send_error(error: &io::Error, used_gso: bool) -> bool {
 mod tests {
     use super::*;
     use tokio_quiche::buf_factory::BufFactory;
-    use tokio_util::sync::CancellationToken;
 
     fn bind_std() -> std::net::UdpSocket {
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -336,19 +326,13 @@ mod tests {
     #[tokio::test]
     async fn udp_rx_tags_source_address() {
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus_handle = actor_bus.handle();
+        let supervisor = actor_bus.mailbox("test-supervisor");
         let std_socket = bind_std();
         let addr = std_socket.local_addr().unwrap();
         let (rx, _tx) = make_udp(std_socket, 1500, false).unwrap();
 
         let (output_tx, mut output_rx) = mpsc::channel(4);
-        spawn_udp_rx(
-            rx,
-            output_tx,
-            CancellationToken::new(),
-            &actor_bus_handle,
-            SupervisionPolicy::Detached,
-        );
+        let _udp_rx = spawn_udp_rx(rx, output_tx, &supervisor, SupervisionPolicy::Detached);
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sender_addr = sender.local_addr().unwrap();
@@ -368,13 +352,13 @@ mod tests {
     #[tokio::test]
     async fn udp_tx_sends_to_destination() {
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus_handle = actor_bus.handle();
+        let supervisor = actor_bus.mailbox("test-supervisor");
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
         let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
-        let input_tx = spawn_udp_tx(tx, 4, &actor_bus_handle, SupervisionPolicy::Detached);
+        let (input_tx, _udp_tx) = spawn_udp_tx(tx, 4, &supervisor, SupervisionPolicy::Detached);
 
         input_tx
             .send((dest, vec![BufFactory::buf_from_slice(&[9, 8, 7])]))
@@ -389,13 +373,13 @@ mod tests {
     #[tokio::test]
     async fn udp_tx_gso_batch() {
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus_handle = actor_bus.handle();
+        let supervisor = actor_bus.mailbox("test-supervisor");
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
         let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
-        let input_tx = spawn_udp_tx(tx, 4, &actor_bus_handle, SupervisionPolicy::Detached);
+        let (input_tx, _udp_tx) = spawn_udp_tx(tx, 4, &supervisor, SupervisionPolicy::Detached);
 
         // Send a batch of 3 packets.
         let batch = vec![
@@ -416,13 +400,13 @@ mod tests {
     #[tokio::test]
     async fn udp_tx_mixed_size_batch() {
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus_handle = actor_bus.handle();
+        let supervisor = actor_bus.mailbox("test-supervisor");
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
         let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
-        let input_tx = spawn_udp_tx(tx, 4, &actor_bus_handle, SupervisionPolicy::Detached);
+        let (input_tx, _udp_tx) = spawn_udp_tx(tx, 4, &supervisor, SupervisionPolicy::Detached);
 
         // Mixed sizes: run of 2-byte, then 3-byte, then back to 2-byte.
         let batch = vec![
@@ -443,19 +427,13 @@ mod tests {
     #[tokio::test]
     async fn udp_rx_exits_when_output_closed() {
         let mut actor_bus = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus_handle = actor_bus.handle();
+        let mut supervisor = actor_bus.mailbox("test-supervisor");
         let std_socket = bind_std();
         let addr = std_socket.local_addr().unwrap();
         let (rx, _tx) = make_udp(std_socket, 1500, false).unwrap();
 
         let (output_tx, output_rx) = mpsc::channel(1);
-        spawn_udp_rx(
-            rx,
-            output_tx,
-            CancellationToken::new(),
-            &actor_bus_handle,
-            SupervisionPolicy::Detached,
-        );
+        let _udp_rx = spawn_udp_rx(rx, output_tx, &supervisor, SupervisionPolicy::Detached);
 
         // Drop receiver so output channel is closed.
         drop(output_rx);
@@ -464,13 +442,15 @@ mod tests {
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sender.send_to(&[1], addr).await.unwrap();
 
-        let result =
-            tokio::time::timeout(std::time::Duration::from_millis(200), actor_bus.next_exit())
-                .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            crate::actor::next_actor_exit(&mut actor_bus, &mut supervisor),
+        )
+        .await;
         assert!(
             matches!(
                 result,
-                Ok(crate::actor::ActorBusExit {
+                Ok(crate::actor::ActorExit {
                     result: Ok(Ok(())),
                     ..
                 })
@@ -482,21 +462,23 @@ mod tests {
     #[tokio::test]
     async fn udp_tx_exits_when_input_closed() {
         let mut actor_bus = crate::actor::ActorBus::on_current_runtime();
-        let actor_bus_handle = actor_bus.handle();
+        let mut supervisor = actor_bus.mailbox("test-supervisor");
         let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
-        let input_tx = spawn_udp_tx(tx, 4, &actor_bus_handle, SupervisionPolicy::Detached);
+        let (input_tx, _udp_tx) = spawn_udp_tx(tx, 4, &supervisor, SupervisionPolicy::Detached);
 
         // Drop sender to close input channel.
         drop(input_tx);
 
-        let result =
-            tokio::time::timeout(std::time::Duration::from_millis(200), actor_bus.next_exit())
-                .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            crate::actor::next_actor_exit(&mut actor_bus, &mut supervisor),
+        )
+        .await;
         assert!(
             matches!(
                 result,
-                Ok(crate::actor::ActorBusExit {
+                Ok(crate::actor::ActorExit {
                     result: Ok(Ok(())),
                     ..
                 })

@@ -1,7 +1,7 @@
-//! DNS resolver coroutine: consumes `SetHostnames` commands, manages IP lifecycle with TTL-based expiration,
+//! DNS resolver coroutine: consumes `SetHostnames` events, manages IP lifecycle with TTL-based expiration,
 //! and emits state snapshot events on resolution changes.
 
-use crate::actor::{ActorBusHandle, ActorExitResult, ActorRuntime, SupervisionPolicy};
+use crate::actor::{ActorContext, ActorExitResult, ActorRef, ActorRuntime, SupervisionPolicy};
 use crate::bind::{make_client_udp_socket, RouteProbe, UdpError};
 use crate::config::{DnsTuning, LocalDns, Tuning};
 use crate::events::{DnsEvent, Event};
@@ -15,22 +15,9 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 const DNS_BUFFER_SIZE: usize = 1500;
-
-/// Commands accepted by the DNS resolver coroutine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DnsCommand {
-    /// Register/update the set of hostnames to monitor.
-    ///
-    /// Replaces the previous registration set entirely. The DNS module will:
-    /// - Start tracking new hostnames (issue queries)
-    /// - Continue tracking existing hostnames (refresh before TTL expiry)
-    /// - Stop tracking removed hostnames (remove from state, mark dirty)
-    SetHostnames { hosts: HashSet<String> },
-}
 
 /// Normalizes a DNS wire-format name to a hostname string.
 ///
@@ -152,8 +139,8 @@ impl DnsActor {
         }
     }
 
-    /// Emits a snapshot to the orchestrator if dirty, clearing the dirty flag.
-    fn emit_snapshot(&mut self, events_tx: &mpsc::UnboundedSender<Event>) {
+    /// Emits a snapshot to the actor owner if dirty, clearing the dirty flag.
+    fn emit_snapshot(&mut self, ctx: &ActorContext) {
         if !self.dirty {
             return;
         }
@@ -163,8 +150,8 @@ impl DnsActor {
             .iter()
             .map(|(host, entry)| (host.clone(), entry.ips.keys().copied().collect()))
             .collect();
-        if events_tx.send(Event::Dns(DnsEvent { state })).is_err() {
-            warn!("DNS: events channel closed, snapshot dropped");
+        if ctx.notify_owner(Event::Dns(DnsEvent { state })).is_err() {
+            warn!("DNS: orchestrator inbox closed, snapshot dropped");
         }
     }
 
@@ -199,12 +186,8 @@ impl DnsActor {
         true
     }
 
-    /// Runs the DNS resolver actor until its command channel closes or socket I/O fails.
-    async fn run(
-        mut self,
-        mut cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
-        events_tx: mpsc::UnboundedSender<Event>,
-    ) -> ActorExitResult {
+    /// Runs the DNS resolver actor until stopped or socket I/O fails.
+    async fn run(mut self, mut ctx: ActorContext) -> ActorExitResult {
         let refresh_interval = self.dns_tuning.dns_refresh_interval;
         let query_interval = self.dns_tuning.dns_query_interval;
 
@@ -226,11 +209,13 @@ impl DnsActor {
                 !self.queued_queries.is_empty() || !self.pending_queries.is_empty();
 
             tokio::select! {
-                maybe_cmd = cmd_rx.recv() => {
-                    match maybe_cmd {
-                        Some(DnsCommand::SetHostnames { hosts }) => {
+                message = ctx.recv() => {
+                    match message {
+                        Some(Event::SetHostnames { hosts }) => {
                             self.handle_set_hostnames(hosts);
                         }
+                        Some(Event::Stop) => return Ok(()),
+                        Some(message) => debug!(?message, "DNS: ignoring unexpected message"),
                         None => return Ok(()),
                     }
                 }
@@ -261,7 +246,7 @@ impl DnsActor {
                 }
             }
 
-            self.emit_snapshot(&events_tx);
+            self.emit_snapshot(&ctx);
         }
     }
 
@@ -485,29 +470,18 @@ pub async fn make_dns<P: RouteProbe>(
 
 /// Spawns the DNS resolver actor task.
 ///
-/// Creates an unbounded command channel internally (actor owns the receiver).
-/// Returns the command sender. The actor exits gracefully when all senders are
-/// dropped, closing the channel naturally.
-///
 /// # Arguments
 ///
 /// * `actor` - Actor state created by `make_dns()`.
-/// * `events_tx` - Unbounded channel for emitting DNS events.
-pub fn spawn_dns(
-    actor: DnsActor,
-    events_tx: mpsc::UnboundedSender<Event>,
-    actor_bus: &ActorBusHandle,
-) -> mpsc::UnboundedSender<DnsCommand> {
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+/// * `ctx` - Parent actor context used to spawn the actor.
+pub fn spawn_dns(actor: DnsActor, ctx: &ActorContext) -> ActorRef {
     let name = format!("dns-resolver[{}]", actor.server);
-    actor_bus.spawn(
+    ctx.spawn(
         name,
         ActorRuntime::Main,
         SupervisionPolicy::Critical,
-        actor.run(cmd_rx, events_tx),
-    );
-
-    cmd_tx
+        |ctx| actor.run(ctx),
+    )
 }
 
 /// Builds a query for `name` and `record_type`.
@@ -561,19 +535,25 @@ mod tests {
     use crate::bind::test_support::FakeRouteProbe;
     use hickory_proto::rr::rdata::A;
     use std::net::Ipv4Addr;
+    use tokio::sync::mpsc;
     use tokio::time;
+
+    struct TestDnsHandle {
+        ctx: ActorContext,
+        actor: ActorRef,
+    }
+
+    impl TestDnsHandle {
+        fn send(&self, message: Event) -> Result<(), mpsc::error::SendError<Event>> {
+            self.ctx.send(&self.actor, message)
+        }
+    }
 
     /// Starts a resolver coroutine wired to the provided server socket.
     async fn start_resolver(
         server: SocketAddr,
         _bindif: Option<String>,
-    ) -> (
-        mpsc::UnboundedSender<DnsCommand>,
-        mpsc::UnboundedReceiver<Event>,
-        crate::actor::ActorBus,
-    ) {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-
+    ) -> (TestDnsHandle, ActorContext, crate::actor::ActorBus) {
         // Build LocalDns config for make_dns (server is now pre-parsed SocketAddr)
         let local_dns = LocalDns {
             server,
@@ -587,8 +567,17 @@ mod tests {
             .expect("make_dns failed");
 
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
-        let cmd_tx = spawn_dns(dns_actor, event_tx, &actor_bus.handle());
-        (cmd_tx, event_rx, actor_bus)
+        let orchestrator = actor_bus.mailbox("test-orchestrator");
+        let controller = actor_bus.mailbox("test-controller");
+        let actor = spawn_dns(dns_actor, &orchestrator);
+        (
+            TestDnsHandle {
+                ctx: controller,
+                actor,
+            },
+            orchestrator,
+            actor_bus,
+        )
     }
 
     /// Creates an actor for tests that exercise synchronous state transitions.
@@ -665,9 +654,7 @@ mod tests {
     }
 
     /// Receives the next DNS snapshot event.
-    async fn next_dns_snapshot(
-        events_rx: &mut mpsc::UnboundedReceiver<Event>,
-    ) -> HashMap<String, HashSet<IpAddr>> {
+    async fn next_dns_snapshot(events_rx: &mut ActorContext) -> HashMap<String, HashSet<IpAddr>> {
         loop {
             let event = events_rx.recv().await.expect("dns event");
             if let Event::Dns(dns) = event {
@@ -680,7 +667,7 @@ mod tests {
     ///
     /// Skips snapshots where the hostname is missing or has empty IPs.
     async fn next_dns_snapshot_with_ips(
-        events_rx: &mut mpsc::UnboundedReceiver<Event>,
+        events_rx: &mut ActorContext,
         hostname: &str,
     ) -> HashMap<String, HashSet<IpAddr>> {
         loop {
@@ -703,7 +690,7 @@ mod tests {
 
         let mut hosts = HashSet::new();
         hosts.insert("example.com".to_string());
-        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+        cmd_tx.send(Event::SetHostnames { hosts }).unwrap();
 
         answer_initial_queries_with_ipv4(&socket, &[Ipv4Addr::new(1, 2, 3, 4)], 300).await;
 
@@ -721,7 +708,7 @@ mod tests {
 
         let mut hosts = HashSet::new();
         hosts.insert("example.com".to_string());
-        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+        cmd_tx.send(Event::SetHostnames { hosts }).unwrap();
 
         // First resolution
         answer_initial_queries_with_ipv4(&socket, &[Ipv4Addr::new(1, 2, 3, 4)], 300).await;
@@ -736,9 +723,7 @@ mod tests {
         // SetHostnames always marks dirty so the orchestrator can rebuild routing.
         let mut hosts2 = HashSet::new();
         hosts2.insert("example.com".to_string());
-        cmd_tx
-            .send(DnsCommand::SetHostnames { hosts: hosts2 })
-            .unwrap();
+        cmd_tx.send(Event::SetHostnames { hosts: hosts2 }).unwrap();
 
         // Should receive a snapshot (SetHostnames unconditionally marks dirty)
         let snapshot = next_dns_snapshot(&mut events_rx).await;
@@ -755,7 +740,7 @@ mod tests {
         // Register and resolve
         let mut hosts = HashSet::new();
         hosts.insert("example.com".to_string());
-        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+        cmd_tx.send(Event::SetHostnames { hosts }).unwrap();
 
         answer_initial_queries_with_ipv4(&socket, &[Ipv4Addr::new(1, 2, 3, 4)], 3600).await;
 
@@ -768,7 +753,7 @@ mod tests {
 
         // Unregister by sending empty hosts
         cmd_tx
-            .send(DnsCommand::SetHostnames {
+            .send(Event::SetHostnames {
                 hosts: HashSet::new(),
             })
             .unwrap();
@@ -792,7 +777,7 @@ mod tests {
         // Register IP literal
         let mut hosts = HashSet::new();
         hosts.insert("192.168.1.100".to_string());
-        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+        cmd_tx.send(Event::SetHostnames { hosts }).unwrap();
 
         // SetHostnames emits the snapshot immediately.
         let snapshot = next_dns_snapshot(&mut events_rx).await;
@@ -809,7 +794,7 @@ mod tests {
         // Register IPv6 literal
         let mut hosts = HashSet::new();
         hosts.insert("2001:db8::1".to_string());
-        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+        cmd_tx.send(Event::SetHostnames { hosts }).unwrap();
 
         // SetHostnames emits the snapshot immediately.
         let snapshot = next_dns_snapshot(&mut events_rx).await;
@@ -827,7 +812,7 @@ mod tests {
 
         let mut hosts = HashSet::new();
         hosts.insert("multi.example.com".to_string());
-        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+        cmd_tx.send(Event::SetHostnames { hosts }).unwrap();
 
         answer_initial_queries_with_ipv4(
             &socket,
@@ -846,8 +831,9 @@ mod tests {
     // ========== Actor Lifecycle Tests ==========
 
     #[tokio::test]
-    async fn spawn_dns_returns_working_cmd_tx() {
+    async fn spawn_dns_returns_working_actor_ref() {
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let orchestrator = actor_bus.mailbox("test-orchestrator");
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
 
@@ -862,18 +848,20 @@ mod tests {
             .await
             .expect("make_dns");
 
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let cmd_tx = spawn_dns(dns_actor, event_tx, &actor_bus.handle());
+        let dns = spawn_dns(dns_actor, &orchestrator);
 
         // Verify cmd_tx is functional
         let mut hosts = HashSet::new();
         hosts.insert("test.example".to_string());
-        assert!(cmd_tx.send(DnsCommand::SetHostnames { hosts }).is_ok());
+        assert!(orchestrator
+            .send(&dns, Event::SetHostnames { hosts })
+            .is_ok());
     }
 
     #[tokio::test]
-    async fn dns_actor_exits_when_sender_dropped() {
+    async fn dns_actor_exits_when_stopped() {
         let mut actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let mut orchestrator = actor_bus.mailbox("test-orchestrator");
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = socket.local_addr().unwrap();
 
@@ -888,17 +876,18 @@ mod tests {
             .await
             .expect("make_dns");
 
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let cmd_tx = spawn_dns(dns_actor, event_tx, &actor_bus.handle());
+        let dns = spawn_dns(dns_actor, &orchestrator);
+        orchestrator.send(&dns, Event::Stop).unwrap();
 
-        // Drop sender to signal shutdown
-        drop(cmd_tx);
-
-        let result = tokio::time::timeout(Duration::from_millis(200), actor_bus.next_exit()).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            crate::actor::next_actor_exit(&mut actor_bus, &mut orchestrator),
+        )
+        .await;
         assert!(
             matches!(
                 result,
-                Ok(crate::actor::ActorBusExit {
+                Ok(crate::actor::ActorExit {
                     result: Ok(Ok(())),
                     ..
                 })
@@ -918,7 +907,7 @@ mod tests {
 
         let mut hosts = HashSet::new();
         hosts.insert("truncated.example".to_string());
-        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+        cmd_tx.send(Event::SetHostnames { hosts }).unwrap();
 
         // Collect the two initial queries (A + AAAA).
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
@@ -969,7 +958,7 @@ mod tests {
 
         let mut hosts = HashSet::new();
         hosts.insert("truncated.example".to_string());
-        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+        cmd_tx.send(Event::SetHostnames { hosts }).unwrap();
 
         // Consume the initial empty snapshot from SetHostnames.
         let snapshot = next_dns_snapshot(&mut events_rx).await;
@@ -1011,7 +1000,7 @@ mod tests {
 
         let mut hosts = HashSet::new();
         hosts.insert("timeout.example".to_string());
-        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+        cmd_tx.send(Event::SetHostnames { hosts }).unwrap();
 
         let mut buf = vec![0u8; DNS_BUFFER_SIZE];
         let mut first_ids: HashMap<RecordType, u16> = HashMap::new();
@@ -1163,6 +1152,7 @@ mod tests {
     #[tokio::test]
     async fn queued_queries_are_paced() {
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let orchestrator = actor_bus.mailbox("test-orchestrator");
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local_dns = LocalDns {
             server: socket.local_addr().unwrap(),
@@ -1174,11 +1164,14 @@ mod tests {
         let dns_actor = make_dns(&local_dns, None, &tuning, &probe)
             .await
             .expect("make_dns");
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let cmd_tx = spawn_dns(dns_actor, events_tx, &actor_bus.handle());
+        let actor = spawn_dns(dns_actor, &orchestrator);
+        let cmd_tx = TestDnsHandle {
+            ctx: actor_bus.mailbox("test-controller"),
+            actor,
+        };
 
         cmd_tx
-            .send(DnsCommand::SetHostnames {
+            .send(Event::SetHostnames {
                 hosts: HashSet::from(["example.com".to_string()]),
             })
             .unwrap();
@@ -1201,8 +1194,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_queries_do_not_block_commands() {
+    async fn queued_queries_do_not_block_events() {
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let mut events_rx = actor_bus.mailbox("test-orchestrator");
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local_dns = LocalDns {
             server: socket.local_addr().unwrap(),
@@ -1214,18 +1208,21 @@ mod tests {
         let dns_actor = make_dns(&local_dns, None, &tuning, &probe)
             .await
             .expect("make_dns");
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let cmd_tx = spawn_dns(dns_actor, events_tx, &actor_bus.handle());
+        let actor = spawn_dns(dns_actor, &events_rx);
+        let cmd_tx = TestDnsHandle {
+            ctx: actor_bus.mailbox("test-controller"),
+            actor,
+        };
 
         cmd_tx
-            .send(DnsCommand::SetHostnames {
+            .send(Event::SetHostnames {
                 hosts: HashSet::from(["example.com".to_string()]),
             })
             .unwrap();
         let _ = next_dns_snapshot(&mut events_rx).await;
 
         cmd_tx
-            .send(DnsCommand::SetHostnames {
+            .send(Event::SetHostnames {
                 hosts: HashSet::new(),
             })
             .unwrap();
@@ -1326,7 +1323,7 @@ mod tests {
         let mut hosts = HashSet::new();
         hosts.insert("example.com".to_string());
         cmd_tx
-            .send(DnsCommand::SetHostnames {
+            .send(Event::SetHostnames {
                 hosts: hosts.clone(),
             })
             .unwrap();
@@ -1341,7 +1338,7 @@ mod tests {
         let _ = next_dns_snapshot(&mut events_rx).await;
 
         // Re-register same hostnames immediately (within refresh_interval)
-        cmd_tx.send(DnsCommand::SetHostnames { hosts }).unwrap();
+        cmd_tx.send(Event::SetHostnames { hosts }).unwrap();
 
         // Consume snapshot from second SetHostnames (always emitted)
         let _ = next_dns_snapshot(&mut events_rx).await;
