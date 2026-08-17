@@ -109,11 +109,7 @@ pub fn spawn_udp_rx(
         let mut buf = vec![0u8; max_udp_payload * gro_segments];
         let mut meta = RecvMeta::default();
 
-        loop {
-            let Some(result) = ctx.run_until_stopped(socket.readable()).await else {
-                info!(addr = %local_addr, "UDP RX: stopping");
-                return Ok(());
-            };
+        while let Some(result) = ctx.run_until_stopped(socket.readable()).await {
             result.context("wait for UDP socket readability")?;
             loop {
                 let result = socket.try_io(Interest::READABLE, || {
@@ -147,6 +143,8 @@ pub fn spawn_udp_rx(
                 }
             }
         }
+        info!(addr = %local_addr, "UDP RX: stopping");
+        Ok(())
         },
     )
 }
@@ -186,10 +184,7 @@ pub fn spawn_udp_tx(
             info!(addr = %local_addr, "UDP TX actor started");
             let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
 
-            loop {
-                let Some((dest, packets)) = input_rx.recv().await else {
-                    break;
-                };
+            while let Some((dest, packets)) = input_rx.recv().await {
                 if packets.is_empty() {
                     continue;
                 }
