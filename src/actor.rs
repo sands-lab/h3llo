@@ -422,14 +422,14 @@ impl ActorBus {
         })
     }
 
-    /// Creates an actor bus that maps every runtime class to the current runtime.
+    /// Creates a test actor bus that maps every runtime class to the current runtime.
     ///
-    /// This is intended for tests and embedders that do not need dedicated
-    /// data-plane threads.
+    /// Available to unit tests and consumers of the `test-utils` feature.
     ///
     /// # Panics
     ///
     /// Panics when called outside a Tokio runtime.
+    #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn on_current_runtime() -> Self {
         let current = Handle::current();
