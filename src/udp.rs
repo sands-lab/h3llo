@@ -203,7 +203,7 @@ pub fn spawn_udp_tx(
             info!(addr = %local_addr, "UDP TX actor started");
             let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
 
-            'batches: while let Some((dest, packets)) = input_rx.recv().await {
+            while let Some((dest, packets)) = input_rx.recv().await {
                 if packets.is_empty() {
                     continue;
                 }
@@ -280,7 +280,7 @@ pub fn spawn_udp_tx(
                                 error = %err,
                                 "UDP TX: destination send failed; dropping batch"
                             );
-                            continue 'batches;
+                            break;
                         }
                         return Err(ActorError::UdpTxSend {
                             addr: local_addr.clone(),
