@@ -126,6 +126,8 @@ jobs:
 
       - name: Restore native test cache
         uses: Swatinem/rust-cache@v2
+        env:
+          CARGO_TARGET_DIR: target/native
         with:
           cache-bin: false
           shared-key: native
