@@ -5,10 +5,11 @@
 //! GET /metrics for Prometheus-compatible metrics exposition.
 //! Communicates with the orchestrator via the `Event` channel pattern.
 
-use crate::actor::{ActorBusHandle, ActorError, ActorRuntime, SupervisionPolicy};
+use crate::actor::{ActorBusHandle, ActorRuntime, SupervisionPolicy};
 use crate::config::{Config, Peer};
 use crate::events::{ApiEvent, Event};
 use crate::metrics::encode_metrics_snapshot;
+use anyhow::Context;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
@@ -90,11 +91,10 @@ pub(crate) fn spawn_api(
         SupervisionPolicy::Critical,
         async move {
             loop {
-                let (stream, remote) =
-                    listener.accept().await.map_err(|e| ActorError::ApiServer {
-                        addr: addr.to_string(),
-                        reason: format!("accept failed: {e}"),
-                    })?;
+                let (stream, remote) = listener
+                    .accept()
+                    .await
+                    .context("accept management API connection")?;
                 let io = TokioIo::new(stream);
                 let events_tx = events_tx.clone();
                 let api_path = api_path.clone();

@@ -5,10 +5,11 @@
 //! `(SocketAddr, Vec<PooledBuf>)` channels, tagging each batch with
 //! the remote address.
 
-use crate::actor::{ActorBusHandle, ActorError, ActorRuntime, SupervisionPolicy};
+use crate::actor::{ActorBusHandle, ActorRuntime, SupervisionPolicy};
 use crate::bind::UdpError;
 use crate::helpers::alloc_packet_buf;
 use crate::helpers::retry_on_transient;
+use anyhow::Context;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::io;
 use std::io::IoSliceMut;
@@ -119,10 +120,7 @@ pub fn spawn_udp_rx(
         loop {
             tokio::select! {
                 result = socket.readable() => {
-                    result.map_err(|e| ActorError::UdpRxRecv {
-                        addr: local_addr.clone(),
-                        source: e,
-                    })?;
+                    result.context("wait for UDP socket readability")?;
                 }
                 () = cancel.cancelled() => {
                     info!(addr = %local_addr, "UDP RX: cancelled, shutting down");
@@ -156,10 +154,7 @@ pub fn spawn_udp_rx(
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
                     Err(e) => {
                         warn!(addr = %local_addr, error = %e, "UDP RX: fatal I/O error");
-                        return Err(ActorError::UdpRxRecv {
-                            addr: local_addr,
-                            source: e,
-                        });
+                        return Err(e).context("receive UDP datagrams");
                     }
                 }
             }
@@ -256,10 +251,7 @@ pub fn spawn_udp_tx(
                             socket
                                 .writable()
                                 .await
-                                .map_err(|err| ActorError::UdpTxSend {
-                                    addr: local_addr.clone(),
-                                    source: err,
-                                })?;
+                                .context("wait for UDP socket writability")?;
                             socket.try_io(Interest::WRITABLE, || {
                                 state.try_send(UdpSockRef::from(&*socket), &transmit)
                             })
@@ -282,10 +274,7 @@ pub fn spawn_udp_tx(
                             );
                             break;
                         }
-                        return Err(ActorError::UdpTxSend {
-                            addr: local_addr.clone(),
-                            source: err,
-                        });
+                        return Err(err).context("send UDP datagrams");
                     }
                 }
             }

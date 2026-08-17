@@ -1402,6 +1402,7 @@ dependencies = [
 name = "h3llo"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "enum-map",
  "foundations",

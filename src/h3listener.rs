@@ -8,7 +8,7 @@
 //!
 //! See [`make_h3_dispatcher`] + [`spawn_h3_dispatcher`] for the server entry points.
 
-use crate::actor::{ActorBusHandle, ActorError, ActorExitResult, ActorRuntime, SupervisionPolicy};
+use crate::actor::{ActorBusHandle, ActorExitResult, ActorRuntime, SupervisionPolicy};
 use crate::auth::validate_connect_auth;
 use crate::bind::make_server_udp_socket;
 use crate::config::{H3Tuning, IoTuning};
@@ -20,6 +20,7 @@ use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
 use crate::helpers::{alloc_uninit_packet_buf, make_interval};
 use crate::udp;
+use anyhow::bail;
 use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use quiche::h3::NameValue;
 use rand::Rng;
@@ -456,10 +457,7 @@ impl H3Dispatcher {
             tokio::select! {
                 maybe_batch = udp_recv_rx.recv() => {
                     let Some((remote, batch)) = maybe_batch else {
-                        return Err(ActorError::UdpRxRecv {
-                            addr: self.bound_addr.to_string(),
-                            source: std::io::Error::other("recv actor closed"),
-                        });
+                        bail!("UDP RX actor channel closed");
                     };
 
                     self.handle_udp_batch(
@@ -487,10 +485,7 @@ impl H3Dispatcher {
 
                 event = self.reload_event_rx.recv() => {
                     let Some(event) = event else {
-                        return Err(ActorError::H3Dispatcher {
-                            addr: self.bound_addr.to_string(),
-                            reason: "TLS certificate watcher event channel closed".into(),
-                        });
+                        bail!("TLS certificate watcher event channel closed");
                     };
                     match event {
                         Ok(event) if should_reload(&event) => {

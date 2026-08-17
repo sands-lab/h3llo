@@ -6,13 +6,14 @@
 //! It is compiled only in test builds and retained to verify interoperability
 //! between h3llo's production stack and tokio-quiche's high-level HTTP/3 API.
 
-use crate::actor::{ActorError, ActorExitResult};
+use crate::actor::ActorExitResult;
 use crate::auth::{bearer_auth_header, validate_connect_auth, AuthError};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::Event;
 use crate::helpers::{make_interval, send_with_backpressure, SendEvent};
 use crate::metrics::{Counters, Direction, DropReason, Source};
+use anyhow::anyhow;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -853,9 +854,8 @@ pub fn spawn_h3_tx(
         // directly for try_send/send, avoiding per-packet poll_ready+flush overhead.
         let inner_tx = datagram_tx
             .get_ref()
-            .ok_or_else(|| ActorError::H3TxSend {
-                peer_id: peer.clone(),
-                reason: "datagram channel closed before TX loop started".to_string(),
+            .ok_or_else(|| {
+                anyhow!("datagram channel for peer `{peer}` closed before TX loop started")
             })?
             .clone();
         drop(datagram_tx); // Release PollSender; inner_tx owns the only Sender handle.
@@ -914,10 +914,7 @@ pub fn spawn_h3_tx(
                             counters.record_drop(
                                 DropReason::ChannelClosed, 1, len as u64,
                             );
-                            ActorError::H3TxSend {
-                                peer_id: peer.clone(),
-                                reason: "datagram channel closed".to_string(),
-                            }
+                            anyhow!("datagram channel for peer `{peer}` closed")
                         })?;
                     }
 

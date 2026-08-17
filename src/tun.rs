@@ -1,10 +1,11 @@
 //! TUN management: device creation, read/write loops with backpressure, and metrics reporting.
 
-use crate::actor::{ActorBusHandle, ActorError, ActorRuntime, SupervisionPolicy};
+use crate::actor::{ActorBusHandle, ActorRuntime, SupervisionPolicy};
 use crate::config::{IoTuning, LocalTun};
 use crate::events::Event;
 use crate::helpers::retry_on_transient;
 use crate::metrics::{Counters, Direction, DropReason, Source};
+use anyhow::Context;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::io;
 use std::net::Ipv6Addr;
@@ -502,7 +503,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => {},
                         Err(err) => {
-                            return Err(ActorError::TunRxRecv { name: tun_name, source: err });
+                            return Err(err).context("receive packet batch from TUN interface");
                         }
                     }
                 }
@@ -571,7 +572,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                             }
                             Err(err) => {
                                 counters.record_drop(DropReason::SendError, ok_count, ok_bytes);
-                                return Err(ActorError::TunTxSend { name: tun_name, source: err });
+                                return Err(err).context("send packet batch to TUN interface");
                             }
                         }
                     }

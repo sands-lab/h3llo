@@ -33,9 +33,9 @@ Actor design principles:
 - **Message passing**: actors communicate through typed `mpsc::channel` queues; the `Event` enum and command types define the message protocol.
 - **Async select loop**: each actor runs a `tokio::select!` loop over its input channels, I/O sources, and timers.
 - **Timer policy**: periodic actor timers use `helpers::make_interval`, which preserves Tokio's immediate first tick and applies `MissedTickBehavior::Delay`. Actors explicitly consume the first tick when their initial action must wait one full period (for example, DNS refresh and H3 keepalive); missed periods never produce catch-up bursts.
-- **Supervision**: `ActorBus` owns the runtimes and is the only production spawn entry point. Every actor selects its runtime and `Critical`, `Restartable`, or `Detached` policy at spawn time; the policy is not inferred from `ActorError`. `ActorBus` reports exits to the Orchestrator, which applies process failure, peer reconciliation, or logging respectively. Actors return `ActorExitResult`:
+- **Supervision**: `ActorBus` owns the runtimes and is the only production spawn entry point. Every actor registers a diagnostic name and selects its runtime and `Critical`, `Restartable`, or `Detached` policy at spawn time; supervision is independent of the returned error. `ActorBus` reports exits to the Orchestrator, which applies process failure, peer reconciliation, or logging respectively. Actors return `ActorExitResult`:
   - `Ok(())` for graceful shutdown (e.g., command channel closed)
-  - `Err(ActorError)` for I/O errors requiring orchestrator action
+  - `Err(anyhow::Error)` for failures with operation context and the original error chain
   A `Critical` actor exiting for any reason terminates the process. A `Restartable` actor exit triggers Orchestrator reconciliation even when the actor returned `Ok(())`; a `Detached` task exit is only logged. Route Sync failures are warnings at origin. If initialization fails, the orchestrator degrades to no system route management.
 - **Graceful shutdown**: when all senders to an actor's command channel are dropped, `recv()` returns `None`. The actor detects this and exits its event loop gracefully.
 

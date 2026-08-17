@@ -6,29 +6,28 @@
 //!
 //! Exit code 0 = all checks passed, 1 = failure.
 
+use anyhow::{bail, Context, Result};
 use ipnet::IpNet;
 use std::process::{Command, Stdio};
 use tokio::process::Command as AsyncCommand;
 
-fn main() {
+fn main() -> Result<()> {
     // Skip gracefully when not running with CAP_NET_ADMIN (e.g., during `cargo test`
     // on the host). The orchestrator in native/tun.rs runs this inside a privileged
     // container where TUN creation succeeds.
     if !has_net_admin() {
         eprintln!("SKIP: CAP_NET_ADMIN not available (not in privileged container)");
-        return;
+        return Ok(());
     }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("failed to build tokio runtime");
+        .context("build Tokio runtime")?;
 
-    if let Err(e) = rt.block_on(run_checks()) {
-        eprintln!("FAIL: {e}");
-        std::process::exit(1);
-    }
+    rt.block_on(run_checks())?;
     eprintln!("OK: all TUN checks passed");
+    Ok(())
 }
 
 /// Checks whether the process has CAP_NET_ADMIN by reading effective capabilities.
@@ -48,17 +47,25 @@ fn has_net_admin() -> bool {
     false
 }
 
-async fn run_checks() -> Result<(), String> {
-    check_device_creation().await?;
-    check_multi_address().await?;
-    check_mtu_configuration().await?;
-    check_tx_queue_len().await?;
-    check_send_recv().await?;
+async fn run_checks() -> Result<()> {
+    check_device_creation()
+        .await
+        .context("device creation check")?;
+    check_multi_address()
+        .await
+        .context("multiple address check")?;
+    check_mtu_configuration()
+        .await
+        .context("MTU configuration check")?;
+    check_tx_queue_len()
+        .await
+        .context("TX queue length check")?;
+    check_send_recv().await.context("send and receive check")?;
     Ok(())
 }
 
 /// Verifies TUN device creation via `make_tun()` and interface visibility.
-async fn check_device_creation() -> Result<(), String> {
+async fn check_device_creation() -> Result<()> {
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun0".to_string(),
         addrs: vec!["10.99.0.1/32".parse().unwrap()],
@@ -70,23 +77,23 @@ async fn check_device_creation() -> Result<(), String> {
         h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
-    .map_err(|e| format!("device_creation: make_tun failed: {e}"))?;
+    .context("create TUN device `itun0`")?;
 
     let output = Command::new("ip")
         .args(["link", "show", "itun0"])
         .output()
-        .map_err(|e| format!("device_creation: ip command failed: {e}"))?;
+        .context("inspect TUN device `itun0`")?;
 
     if !output.status.success() {
-        return Err(format!(
-            "device_creation: interface itun0 not visible: {}",
+        bail!(
+            "interface `itun0` is not visible: {}",
             String::from_utf8_lossy(&output.stderr)
-        ));
+        );
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.contains("itun0") {
-        return Err("device_creation: ip link output missing itun0".to_string());
+        bail!("ip link output does not contain `itun0`");
     }
 
     eprintln!("  check_device_creation: PASS");
@@ -99,7 +106,7 @@ fn has_ipv6_support() -> bool {
 }
 
 /// Verifies multiple IPv4 (and IPv6 if available) addresses are assigned correctly.
-async fn check_multi_address() -> Result<(), String> {
+async fn check_multi_address() -> Result<()> {
     let ipv6_available = has_ipv6_support();
     if !ipv6_available {
         eprintln!("  note: IPv6 not available, testing IPv4 only");
@@ -125,12 +132,12 @@ async fn check_multi_address() -> Result<(), String> {
         h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
-    .map_err(|e| format!("multi_address: make_tun failed: {e}"))?;
+    .context("create TUN device `itun1`")?;
 
     let output = Command::new("ip")
         .args(["addr", "show", "itun1"])
         .output()
-        .map_err(|e| format!("multi_address: ip addr failed: {e}"))?;
+        .context("inspect addresses on `itun1`")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     eprintln!("  ip addr show itun1:\n{stdout}");
@@ -140,7 +147,7 @@ async fn check_multi_address() -> Result<(), String> {
         // from substring matches (e.g., "10.99.1.1" matching "10.99.1.10").
         let addr_str = expected.to_string();
         if !stdout.contains(&addr_str) {
-            return Err(format!("multi_address: missing address {addr_str}"));
+            bail!("missing address `{addr_str}`");
         }
     }
 
@@ -149,24 +156,24 @@ async fn check_multi_address() -> Result<(), String> {
 }
 
 /// Verifies TUN TX queue length is configured correctly on the TUN device.
-async fn check_tx_queue_len() -> Result<(), String> {
+async fn check_tx_queue_len() -> Result<()> {
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun4".to_string(),
         addrs: vec!["10.99.4.1/32".parse().unwrap()],
         mtu: h3llo::config::default_mtu(),
     };
 
-    let (_reader, _writer) = h3llo::tun::make_tun(&local_tun, Some(2000), true)
-        .map_err(|e| format!("tx_queue_len: make_tun failed: {e}"))?;
+    let (_reader, _writer) =
+        h3llo::tun::make_tun(&local_tun, Some(2000), true).context("create TUN device `itun4`")?;
 
     let output = Command::new("ip")
         .args(["link", "show", "itun4"])
         .output()
-        .map_err(|e| format!("tx_queue_len: ip command failed: {e}"))?;
+        .context("inspect TUN device `itun4`")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.contains("qlen 2000") {
-        return Err(format!("tx_queue_len: expected 'qlen 2000' in: {stdout}"));
+        bail!("expected `qlen 2000` in: {stdout}");
     }
 
     eprintln!("  check_tx_queue_len: PASS");
@@ -178,7 +185,7 @@ async fn check_tx_queue_len() -> Result<(), String> {
 /// Creates a TUN device via `make_tun()`, disables rp_filter, adds a route for
 /// a remote IP through the TUN, spawns a userspace ICMP echo responder using batch API,
 /// and runs `ping` to verify round-trip data flow through `TunRx::recv_batch()` and `TunTx::send_batch()`.
-async fn check_send_recv() -> Result<(), String> {
+async fn check_send_recv() -> Result<()> {
     use h3llo::tun::{TunRx, TunTx};
 
     let local_tun = h3llo::config::LocalTun {
@@ -192,7 +199,7 @@ async fn check_send_recv() -> Result<(), String> {
         h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
-    .map_err(|e| format!("send_recv: make_tun failed: {e}"))?;
+    .context("create TUN device `itun3`")?;
 
     // Disable rp_filter to allow ICMP replies from non-local source.
     // Write directly to /proc/sys since sysctl binary may not be available.
@@ -201,19 +208,19 @@ async fn check_send_recv() -> Result<(), String> {
         "/proc/sys/net/ipv4/conf/itun3/rp_filter",
     ] {
         std::fs::write(path, "0")
-            .map_err(|e| format!("send_recv: failed to set rp_filter ({path}): {e}"))?;
+            .with_context(|| format!("disable reverse-path filtering via `{path}`"))?;
     }
 
     // Add route so 10.99.3.2 traffic goes through TUN
     let route = Command::new("ip")
         .args(["route", "add", "10.99.3.2/32", "dev", "itun3"])
         .output()
-        .map_err(|e| format!("send_recv: ip route add failed: {e}"))?;
+        .context("add test route through `itun3`")?;
     if !route.status.success() {
-        return Err(format!(
-            "send_recv: ip route add failed: {}",
+        bail!(
+            "failed to add test route: {}",
             String::from_utf8_lossy(&route.stderr)
-        ));
+        );
     }
 
     // Spawn ICMP echo responder using batch API
@@ -292,16 +299,14 @@ async fn check_send_recv() -> Result<(), String> {
         .stderr(Stdio::piped())
         .output()
         .await
-        .map_err(|e| format!("send_recv: ping failed to execute: {e}"))?;
+        .context("execute ping through `itun3`")?;
 
     responder.abort();
 
     if !ping.status.success() {
         let stdout = String::from_utf8_lossy(&ping.stdout);
         let stderr = String::from_utf8_lossy(&ping.stderr);
-        return Err(format!(
-            "send_recv: ping 10.99.3.2 failed:\n{stdout}{stderr}"
-        ));
+        bail!("ping 10.99.3.2 failed:\n{stdout}{stderr}");
     }
 
     eprintln!("  check_send_recv: PASS");
@@ -320,7 +325,7 @@ fn internet_checksum(data: &[u8]) -> u16 {
 }
 
 /// Verifies MTU is configured correctly on the TUN device.
-async fn check_mtu_configuration() -> Result<(), String> {
+async fn check_mtu_configuration() -> Result<()> {
     let local_tun = h3llo::config::LocalTun {
         ifname: "itun2".to_string(),
         addrs: vec!["10.99.2.1/32".parse().unwrap()],
@@ -332,18 +337,16 @@ async fn check_mtu_configuration() -> Result<(), String> {
         h3llo::config::Tuning::default().io.tun_tx_queue_len,
         true,
     )
-    .map_err(|e| format!("mtu_configuration: make_tun failed: {e}"))?;
+    .context("create TUN device `itun2`")?;
 
     let output = Command::new("ip")
         .args(["link", "show", "itun2"])
         .output()
-        .map_err(|e| format!("mtu_configuration: ip link failed: {e}"))?;
+        .context("inspect TUN device `itun2`")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.contains("mtu 1280") {
-        return Err(format!(
-            "mtu_configuration: expected 'mtu 1280' in: {stdout}"
-        ));
+        bail!("expected `mtu 1280` in: {stdout}");
     }
 
     eprintln!("  check_mtu_configuration: PASS");

@@ -6,6 +6,7 @@
 //!
 //! Exit code 0 = all checks passed, 1 = failure.
 
+use anyhow::{bail, Context, Result};
 use h3llo::bind::lookup_ifindex;
 use h3llo::route::{
     ipnet_from_route, sync_tun_routes, AsyncRouteManager, PlatformIfIndexResolver, Route,
@@ -13,22 +14,20 @@ use h3llo::route::{
 use ipnet::IpNet;
 use std::process::Command;
 
-fn main() {
+fn main() -> Result<()> {
     if !has_net_admin() {
         eprintln!("SKIP: CAP_NET_ADMIN not available (not in privileged container)");
-        return;
+        return Ok(());
     }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("failed to build tokio runtime");
+        .context("build Tokio runtime")?;
 
-    if let Err(e) = rt.block_on(run_checks()) {
-        eprintln!("FAIL: {e}");
-        std::process::exit(1);
-    }
+    rt.block_on(run_checks())?;
     eprintln!("OK: all route checks passed");
+    Ok(())
 }
 
 /// Checks whether the process has CAP_NET_ADMIN by reading effective capabilities.
@@ -48,14 +47,16 @@ fn has_net_admin() -> bool {
     false
 }
 
-async fn run_checks() -> Result<(), String> {
-    check_basic().await?;
-    check_default_split().await?;
+async fn run_checks() -> Result<()> {
+    check_basic().await.context("basic route sync check")?;
+    check_default_split()
+        .await
+        .context("default route split check")?;
     Ok(())
 }
 
 /// Verifies basic route sync: adds routes, confirms via kernel listing, then cleans up.
-async fn check_basic() -> Result<(), String> {
+async fn check_basic() -> Result<()> {
     setup_dummy("dummy0")?;
 
     let allowed: Vec<IpNet> = vec![
@@ -63,8 +64,7 @@ async fn check_basic() -> Result<(), String> {
         "10.99.1.0/24".parse().unwrap(),
     ];
     let tun_addrs: Vec<IpNet> = vec![];
-    let mut handle =
-        AsyncRouteManager::new().map_err(|e| format!("basic: AsyncRouteManager::new: {e}"))?;
+    let mut handle = AsyncRouteManager::new().context("create route manager")?;
 
     sync_tun_routes(
         "dummy0",
@@ -74,15 +74,13 @@ async fn check_basic() -> Result<(), String> {
         &PlatformIfIndexResolver,
     )
     .await
-    .map_err(|e| format!("basic: sync_tun_routes: {e}"))?;
+    .context("synchronize routes")?;
 
     // Self-verify: list routes and check expected prefixes are present on dummy0
     let installed = routes_on_interface(&mut handle, "dummy0").await?;
     for prefix in &allowed {
         if !installed.contains(prefix) {
-            return Err(format!(
-                "basic: expected {prefix} in kernel routes, got: {installed:?}"
-            ));
+            bail!("expected {prefix} in kernel routes, got: {installed:?}");
         }
     }
     eprintln!("  check_basic: verified {allowed:?} installed on dummy0");
@@ -96,14 +94,12 @@ async fn check_basic() -> Result<(), String> {
         &PlatformIfIndexResolver,
     )
     .await
-    .map_err(|e| format!("basic cleanup: sync_tun_routes: {e}"))?;
+    .context("remove synchronized routes")?;
 
     let remaining = routes_on_interface(&mut handle, "dummy0").await?;
     for prefix in &allowed {
         if remaining.contains(prefix) {
-            return Err(format!(
-                "basic: {prefix} still present after cleanup: {remaining:?}"
-            ));
+            bail!("{prefix} still present after cleanup: {remaining:?}");
         }
     }
     eprintln!("  check_basic: verified routes removed after cleanup");
@@ -112,13 +108,12 @@ async fn check_basic() -> Result<(), String> {
 }
 
 /// Verifies default route splitting: 0.0.0.0/0 becomes two /1 routes.
-async fn check_default_split() -> Result<(), String> {
+async fn check_default_split() -> Result<()> {
     setup_dummy("dummy1")?;
 
     let allowed: Vec<IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
     let tun_addrs: Vec<IpNet> = vec![];
-    let mut handle = AsyncRouteManager::new()
-        .map_err(|e| format!("default_split: AsyncRouteManager::new: {e}"))?;
+    let mut handle = AsyncRouteManager::new().context("create route manager")?;
 
     sync_tun_routes(
         "dummy1",
@@ -128,16 +123,14 @@ async fn check_default_split() -> Result<(), String> {
         &PlatformIfIndexResolver,
     )
     .await
-    .map_err(|e| format!("default_split: sync_tun_routes: {e}"))?;
+    .context("synchronize split default route")?;
 
     // Self-verify: both /1 halves should be installed (default route is split)
     let installed = routes_on_interface(&mut handle, "dummy1").await?;
     let lower_half: IpNet = "0.0.0.0/1".parse().unwrap();
     let upper_half: IpNet = "128.0.0.0/1".parse().unwrap();
     if !installed.contains(&lower_half) || !installed.contains(&upper_half) {
-        return Err(format!(
-            "default_split: expected both /1 halves, got: {installed:?}"
-        ));
+        bail!("expected both /1 halves, got: {installed:?}");
     }
     eprintln!("  check_default_split: verified 0.0.0.0/1 and 128.0.0.0/1 installed on dummy1");
     eprintln!("  check_default_split: PASS");
@@ -145,15 +138,12 @@ async fn check_default_split() -> Result<(), String> {
 }
 
 /// Lists route prefixes currently installed on the named interface.
-async fn routes_on_interface(
-    handle: &mut AsyncRouteManager,
-    ifname: &str,
-) -> Result<Vec<IpNet>, String> {
-    let ifindex = lookup_ifindex(ifname).ok_or_else(|| format!("interface {ifname} not found"))?;
+async fn routes_on_interface(handle: &mut AsyncRouteManager, ifname: &str) -> Result<Vec<IpNet>> {
+    let ifindex = lookup_ifindex(ifname).with_context(|| format!("find interface `{ifname}`"))?;
     let all_routes: Vec<Route> = handle
         .list()
         .await
-        .map_err(|e| format!("routes_on_interface: list failed: {e}"))?;
+        .with_context(|| format!("list routes on interface `{ifname}`"))?;
     let prefixes: Vec<IpNet> = all_routes
         .iter()
         .filter(|r| r.if_index() == Some(ifindex))
@@ -163,22 +153,20 @@ async fn routes_on_interface(
 }
 
 /// Creates a dummy network interface and brings it up.
-fn setup_dummy(name: &str) -> Result<(), String> {
+fn setup_dummy(name: &str) -> Result<()> {
     let add = Command::new("ip")
         .args(["link", "add", name, "type", "dummy"])
         .status()
-        .map_err(|e| format!("setup_dummy({name}): ip link add: {e}"))?;
+        .with_context(|| format!("create dummy interface `{name}`"))?;
     if !add.success() {
-        return Err(format!(
-            "setup_dummy({name}): failed to create dummy interface"
-        ));
+        bail!("failed to create dummy interface `{name}`");
     }
     let up = Command::new("ip")
         .args(["link", "set", name, "up"])
         .status()
-        .map_err(|e| format!("setup_dummy({name}): ip link set up: {e}"))?;
+        .with_context(|| format!("bring dummy interface `{name}` up"))?;
     if !up.success() {
-        return Err(format!("setup_dummy({name}): failed to bring up interface"));
+        bail!("failed to bring dummy interface `{name}` up");
     }
     Ok(())
 }
