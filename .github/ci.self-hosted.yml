@@ -14,6 +14,7 @@ concurrency:
 
 env:
   REGISTRY_IMAGE: nekonuts/h3llo
+  MUSL_CROSS_VERSION: "20250929"
   # Build record export cannot mount the runner temp directory reliably when
   # the Docker daemon and runner use different filesystem permissions.
   DOCKER_BUILD_SUMMARY: false
@@ -30,6 +31,7 @@ jobs:
         run: |
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target/native" >> "$GITHUB_ENV"
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,6 +40,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+          shared-key: native
+          workspaces: ". -> target/native"
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Cargo fmt
@@ -66,6 +71,41 @@ jobs:
         run: |
           echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+
+      - name: Install cross-build dependencies
+        run: |
+          sudo flock /var/lock/h3llo-apt.lock sh -c \
+            'apt-get update && apt-get install -y cmake make perl golang-go git clang libclang-dev xz-utils jq'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Restore musl-cross toolchain
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/musl-cross
+          key: musl-cross-${{ env.MUSL_CROSS_VERSION }}-amd64
+
+      - name: Restore musl build cache
+        uses: Swatinem/rust-cache@v2
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        with:
+          cache-bin: false
+          prefix-key: v0-rust-musl-${{ env.MUSL_CROSS_VERSION }}
+          shared-key: musl-amd64
+          workspaces: ". -> target/musl/amd64"
+          save-if: false
+
+      - name: Build musl test binaries
+        env:
+          CARGO_TARGET_DIR: target/musl/amd64
+          MUSL_CROSS_ROOT: ${{ runner.temp }}/musl-cross
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: scripts/build-musl.sh amd64 "${{ runner.temp }}/binary-out"
+
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v4
@@ -76,21 +116,30 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          build-contexts: binaries=${{ runner.temp }}/binary-out
           builder: ${{ steps.buildx.outputs.name }}
           push: false
           tags: h3llo:test
           target: test
           platforms: linux/amd64
           load: true
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache Rust dependencies
+
+      - name: Restore native test cache
         uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+          shared-key: native
+          workspaces: ". -> target/native"
+          save-if: false
+
       - name: Run integration tests
+        env:
+          CARGO_TARGET_DIR: target/native
         run: cargo test --test integration --features test-utils -- --ignored --nocapture
+
       - name: Run E2E tests
+        env:
+          CARGO_TARGET_DIR: target/native
         run: cargo test --test e2e -- --ignored --nocapture
 
   # Serialize each architecture across workflow runs because named builders
@@ -98,6 +147,8 @@ jobs:
   docker-build:
     runs-on: *runner
     timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-C target-feature=+crt-static"
     concurrency:
       group: buildx-${{ matrix.arch_label }}
       cancel-in-progress: false
@@ -107,10 +158,13 @@ jobs:
         include:
           - platform: linux/amd64
             arch_label: amd64
+            rust_target: x86_64-unknown-linux-musl
           - platform: linux/arm64
             arch_label: arm64
+            rust_target: aarch64-unknown-linux-musl
           - platform: linux/riscv64
             arch_label: riscv64
+            rust_target: riscv64gc-unknown-linux-musl
     steps:
       # Concurrent runner services can share HOME, so each architecture needs
       # an independent Buildx configuration directory.
@@ -121,6 +175,50 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Set Rust directories
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+
+      - name: Install cross-build dependencies
+        run: |
+          sudo flock /var/lock/h3llo-apt.lock sh -c \
+            'apt-get update && apt-get install -y cmake make perl golang-go git clang libclang-dev xz-utils jq'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Restore musl-cross toolchain
+        id: musl-cross-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/musl-cross
+          key: musl-cross-${{ env.MUSL_CROSS_VERSION }}-${{ matrix.arch_label }}
+
+      - name: Cache musl build dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v0-rust-musl-${{ env.MUSL_CROSS_VERSION }}
+          shared-key: musl-${{ matrix.arch_label }}
+          workspaces: ". -> target/musl/${{ matrix.arch_label }}"
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Build musl binaries
+        env:
+          CARGO_TARGET_DIR: target/musl/${{ matrix.arch_label }}
+          MUSL_CROSS_ROOT: ${{ runner.temp }}/musl-cross
+        run: scripts/build-musl.sh "${{ matrix.arch_label }}" "${{ runner.temp }}/binary-out"
+
+      - name: Save musl-cross toolchain
+        if: github.ref == 'refs/heads/master' && steps.musl-cross-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/musl-cross
+          key: musl-cross-${{ env.MUSL_CROSS_VERSION }}-${{ matrix.arch_label }}
 
       - name: Docker meta
         id: meta
@@ -150,6 +248,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          build-contexts: binaries=${{ runner.temp }}/binary-out
           builder: ${{ steps.buildx.outputs.name }}
           platforms: ${{ matrix.platform }}
           target: runtime
@@ -173,27 +272,19 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Export binary
-        if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          builder: ${{ steps.buildx.outputs.name }}
-          platforms: ${{ matrix.platform }}
-          target: export
-          outputs: type=local,dest=${{ runner.temp }}/binary-out
-
-      - name: Rename binary artifact
+      - name: Prepare binary artifact
         if: github.event_name != 'pull_request'
         run: |
-          mv "${{ runner.temp }}/binary-out/h3llo" \
-             "${{ runner.temp }}/binary-out/h3llo-linux-${{ matrix.arch_label }}"
+          mkdir -p "${{ runner.temp }}/release"
+          cp "${{ runner.temp }}/binary-out/h3llo" \
+             "${{ runner.temp }}/release/h3llo-linux-${{ matrix.arch_label }}"
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         if: github.event_name != 'pull_request'
         with:
           name: binary-${{ matrix.arch_label }}
-          path: ${{ runner.temp }}/binary-out/h3llo-linux-${{ matrix.arch_label }}
+          path: ${{ runner.temp }}/release/h3llo-linux-${{ matrix.arch_label }}
           if-no-files-found: error
           retention-days: 1
 

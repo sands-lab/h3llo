@@ -77,13 +77,22 @@ Multi-node BareUDP testing using Docker containers with real TUN devices.
 
 1. Docker daemon running
 2. Docker Buildx installed (`docker buildx version` to verify)
-3. QEMU user-mode emulation registered (for multi-arch builds):
+3. Rustup plus the host build dependencies installed:
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y cmake make perl golang-go git clang libclang-dev xz-utils jq
+   ```
+4. QEMU user-mode emulation registered when packaging a non-native image:
    ```bash
    docker run --privileged --rm tonistiigi/binfmt --install all
    ```
-4. Build the test image:
+5. Build the static binaries on the host, then package the test image:
    ```bash
-   docker buildx build --target test -t h3llo:test --load .
+   CARGO_TARGET_DIR=target/musl/amd64 \
+     scripts/build-musl.sh amd64 .tmp/musl-amd64
+   docker buildx build \
+     --build-context binaries=.tmp/musl-amd64 \
+     --platform linux/amd64 --target test -t h3llo:test --load .
    ```
    **Rebuild required**: The test image embeds compiled h3llo and test binaries.
    You must rebuild after any change to `src/`, `tests/integration/container/`,
@@ -91,7 +100,11 @@ Multi-node BareUDP testing using Docker containers with real TUN devices.
 
    For a specific platform (cross-compilation):
    ```bash
-   docker buildx build --platform linux/arm64 --target runtime -t h3llo:arm64 --load .
+   CARGO_TARGET_DIR=target/musl/arm64 \
+     scripts/build-musl.sh arm64 .tmp/musl-arm64
+   docker buildx build \
+     --build-context binaries=.tmp/musl-arm64 \
+     --platform linux/arm64 --target runtime -t h3llo:arm64 --load .
    ```
 
 ### Running Tests
@@ -201,24 +214,26 @@ or port conflicts.
 When tests with real side effects are needed:
 1. Write test as standalone binary in `tests/integration/container/`
 2. Add `[[test]]` entry with `harness = false` in Cargo.toml
-3. Test binaries are built into the Docker `test` image during `docker buildx build`
-4. Native orchestrator in `tests/integration/native/` runs the pre-built binary
-5. Uses `WaitFor::Exit` to wait for container exit and verify exit code
+3. Test binaries are cross-compiled on the host with `scripts/build-musl.sh`
+4. The packaging-only Dockerfile copies them into the Docker `test` image
+5. Native orchestrator in `tests/integration/native/` runs the pre-built binary
+6. Uses `WaitFor::Exit` to wait for container exit and verify exit code
 
 #### Static Binary Injection
 
-Container test binaries are built inside Docker with the appropriate musl target to produce
-fully static executables. Static musl binaries run on any Linux distribution without
-runtime library dependencies, eliminating GLIBC version compatibility concerns.
+Container test binaries are built directly on the host with the appropriate musl target.
+The Dockerfile only packages the resulting static executables, which run without GLIBC
+runtime dependencies.
 
 Supported cross-compilation targets:
 - `x86_64-unknown-linux-musl` (linux/amd64)
 - `aarch64-unknown-linux-musl` (linux/arm64)
 - `riscv64gc-unknown-linux-musl` (linux/riscv64)
 
-The Dockerfile automatically selects the correct musl-cross toolchain from
-[cross-tools/musl-cross](https://github.com/cross-tools/musl-cross) based on
-the Docker `TARGETARCH` build argument.
+The build script selects the matching toolchain from
+[cross-tools/musl-cross](https://github.com/cross-tools/musl-cross) based on its
+`amd64`, `arm64`, or `riscv64` argument. `MUSL_CROSS_VERSION` selects the pinned
+release and is also part of the CI cache namespace.
 
 The global allocator is set to mimalloc for musl builds to avoid potential performance
 issues with musl's default allocator in multi-threaded workloads.
@@ -241,7 +256,9 @@ Data-path test uses a userspace ICMP echo responder:
 
 ```bash
 # Build test image with embedded binaries
-docker buildx build --target test -t h3llo:test --load .
+CARGO_TARGET_DIR=target/musl/amd64 scripts/build-musl.sh amd64 .tmp/musl-amd64
+docker buildx build --build-context binaries=.tmp/musl-amd64 \
+  --platform linux/amd64 --target test -t h3llo:test --load .
 
 # Run TUN integration tests
 cargo test --test integration -- tun --ignored --nocapture
@@ -262,7 +279,9 @@ Scenarios:
 
 ```bash
 # Build test image with embedded binaries
-docker buildx build --target test -t h3llo:test --load .
+CARGO_TARGET_DIR=target/musl/amd64 scripts/build-musl.sh amd64 .tmp/musl-amd64
+docker buildx build --build-context binaries=.tmp/musl-amd64 \
+  --platform linux/amd64 --target test -t h3llo:test --load .
 
 # Run route integration tests
 cargo test --test integration -- route --ignored --nocapture
