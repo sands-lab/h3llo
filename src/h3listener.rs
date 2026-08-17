@@ -3,12 +3,12 @@
 //! Architecture:
 //! - **UDP RX actor** (I/O thread): GRO-aware recv, emits `(SocketAddr, Vec<PooledBuf>)`.
 //! - **Server UDP TX actor** (I/O thread): shared send actor for all connections.
-//! - **`H3Dispatcher`** (`crypto_rt`): CID routing, connection acceptance, and certificate rotation.
-//! - **`H3Engine`** (`crypto_rt`): per-connection unified QUIC/H3 engine with ingress + egress.
+//! - **`H3Dispatcher`** (crypto runtime): CID routing, connection acceptance, and certificate rotation.
+//! - **`H3Engine`** (crypto runtime): per-connection unified QUIC/H3 engine with ingress + egress.
 //!
 //! See [`make_h3_dispatcher`] + [`spawn_h3_dispatcher`] for the server entry points.
 
-use crate::actor::{ActorError, ActorExitResult};
+use crate::actor::{ActorBusHandle, ActorError, ActorExitResult, ActorRuntime, SupervisionPolicy};
 use crate::auth::validate_connect_auth;
 use crate::bind::make_server_udp_socket;
 use crate::config::{H3Tuning, IoTuning};
@@ -27,7 +27,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 use tokio_quiche::buf_factory::PooledBuf;
@@ -149,14 +148,14 @@ pub(crate) enum DispatcherCommand {
 /// initialization. Does NOT spawn any tasks — use [`spawn_h3_dispatcher`] for
 /// that.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn make_h3_dispatcher(
+pub(crate) async fn make_h3_dispatcher(
     listen_addr: SocketAddr,
     cert_path: &Path,
     key_path: &Path,
     tun_mtu: u16,
     io_tuning: &IoTuning,
     h3_tuning: &H3Tuning,
-    udp_rt: &RuntimeHandle,
+    actor_bus: &ActorBusHandle,
     ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
 ) -> Result<(H3DispatcherGroup, SocketAddr), ServerError> {
@@ -201,11 +200,14 @@ pub(crate) fn make_h3_dispatcher(
     let max_udp_payload = usize::from(tun_mtu) + CONNECT_IP_OVERHEAD;
     let config = make_server_quiche_config(h3_tuning, max_udp_payload, &cert_path, &key_path)?;
 
-    let (udp_rx, udp_tx) = {
-        let _guard = udp_rt.enter();
-        udp::make_udp(std_socket, max_udp_payload, io_tuning.udp_enable_offload)
-            .map_err(|e| ServerError::Socket(format!("make_udp: {e}")))?
-    };
+    let enable_offload = io_tuning.udp_enable_offload;
+    let (udp_rx, udp_tx) = actor_bus
+        .run_on(ActorRuntime::Udp, move || {
+            udp::make_udp(std_socket, max_udp_payload, enable_offload)
+        })
+        .await
+        .map_err(|error| ServerError::Socket(format!("UDP runtime task failed: {error}")))?
+        .map_err(|error| ServerError::Socket(format!("make_udp: {error}")))?;
 
     let group = H3DispatcherGroup {
         dispatcher: H3Dispatcher {
@@ -346,13 +348,15 @@ impl H3Engine {
                                     .accepted_peer_id
                                     .take()
                                     .expect("peer_id set by server handler");
-                                self.flush_send();
+                                self.flush_send()
+                                    .map_err(|error| ServerError::Accept(error.to_string()))?;
                                 self.meta.peer_id = peer_id;
                                 return Ok(self);
                             }
                             Ok(ConnectProgress::Pending) => {}
                             Err(e) => {
-                                self.flush_send();
+                                self.flush_send()
+                                    .map_err(|error| ServerError::Accept(error.to_string()))?;
                                 return Err(ServerError::Accept(e.into_actor_reason()));
                             }
                         }
@@ -374,12 +378,14 @@ impl H3Engine {
                         "server handshake timeout state"
                     );
                     self.conn.close(true, 0, b"handshake timeout").ok();
-                    self.flush_send();
+                    self.flush_send()
+                        .map_err(|error| ServerError::Accept(error.to_string()))?;
                     return Err(ServerError::Accept("handshake timeout".into()));
                 }
             }
 
-            self.flush_send();
+            self.flush_send()
+                .map_err(|error| ServerError::Accept(error.to_string()))?;
             reset_timer(timer.as_mut(), &self.conn);
 
             if self.conn.is_closed() {
@@ -432,6 +438,7 @@ impl H3Dispatcher {
         udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
         mut cmd_rx: mpsc::UnboundedReceiver<DispatcherCommand>,
         mut peer_tokens: HashMap<String, String>,
+        actor_bus: ActorBusHandle,
     ) -> ActorExitResult {
         let mut cleanup_ticker = make_interval(Duration::from_secs(1));
         let debounce = time::sleep(Duration::MAX);
@@ -455,7 +462,13 @@ impl H3Dispatcher {
                         });
                     };
 
-                    self.handle_udp_batch(remote, batch, &peer_tokens, &udp_send_tx).await;
+                    self.handle_udp_batch(
+                        remote,
+                        batch,
+                        &peer_tokens,
+                        &udp_send_tx,
+                        &actor_bus,
+                    ).await;
                 }
 
                 _ = cleanup_ticker.tick() => {
@@ -556,6 +569,7 @@ impl H3Dispatcher {
         mut batch: Vec<PooledBuf>,
         peer_tokens: &HashMap<String, String>,
         udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+        actor_bus: &ActorBusHandle,
     ) {
         let Some(header) = ServerPacketHeader::parse(&mut batch) else {
             debug!(%remote, "dispatcher: failed to parse packet header, dropping batch");
@@ -569,7 +583,7 @@ impl H3Dispatcher {
             return;
         }
 
-        self.accept_and_spawn(remote, batch, header, peer_tokens, udp_send_tx);
+        self.accept_and_spawn(remote, batch, header, peer_tokens, udp_send_tx, actor_bus);
     }
 
     fn accept_and_spawn(
@@ -579,6 +593,7 @@ impl H3Dispatcher {
         header: ServerPacketHeader,
         peer_tokens: &HashMap<String, String>,
         udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+        actor_bus: &ActorBusHandle,
     ) {
         if header.hdr_ty != quiche::Type::Initial {
             debug!(%remote, ty = ?header.hdr_ty, "dispatcher: dropping non-Initial packet for unknown CID");
@@ -680,67 +695,64 @@ impl H3Dispatcher {
 
         // Send initial handshake output (ServerHello) synchronously before
         // spawning the task, preserving current timing behavior.
-        engine.flush_send();
+        if let Err(error) = engine.flush_send() {
+            warn!(%remote, %error, "server handshake output unavailable");
+            return;
+        }
 
-        // Spawn per-connection actor (detached — cleanup via sender liveness).
-        tokio::spawn(async move {
-            let engine = match engine.accept(&peer_tokens, handshake_timeout).await {
-                Ok(engine) => engine,
-                Err(e) => {
-                    warn!(%remote, error = %e, "server handshake failed");
+        actor_bus.spawn(
+            format!("h3-server-connection[{remote}]"),
+            ActorRuntime::Crypto,
+            SupervisionPolicy::Restartable,
+            async move {
+                let engine = match engine.accept(&peer_tokens, handshake_timeout).await {
+                    Ok(engine) => engine,
+                    Err(e) => {
+                        warn!(%remote, error = %e, "server handshake failed");
+                        return Ok(());
+                    }
+                };
+
+                info!(
+                    peer_id = %engine.meta.peer_id,
+                    %remote,
+                    "server: CONNECT-IP established"
+                );
+
+                if engine
+                    .io
+                    .events_tx
+                    .send(Event::Connected(ConnectedEvent {
+                        peer_id: engine.meta.peer_id.clone(),
+                        remote_addr: remote,
+                        tx: egress_tx,
+                        endpoint: None,
+                    }))
+                    .is_err()
+                {
+                    warn!(peer_id = %engine.meta.peer_id, %remote, "events channel closed; aborting connection");
                     return Ok(());
                 }
-            };
 
-            info!(
-                peer_id = %engine.meta.peer_id,
-                %remote,
-                "server: CONNECT-IP established"
-            );
-
-            if engine
-                .io
-                .events_tx
-                .send(Event::Connected(ConnectedEvent {
-                    peer_id: engine.meta.peer_id.clone(),
-                    remote_addr: remote,
-                    tx: egress_tx,
-                    endpoint: None,
-                    main_handle: None,
-                    udp_tx_handle: None,
-                    udp_rx_handle: None,
-                }))
-                .is_err()
-            {
-                warn!(peer_id = %engine.meta.peer_id, %remote, "events channel closed; aborting connection");
-                return Ok(());
-            }
-
-            engine.run().await
-        });
+                engine.run().await
+            },
+        );
     }
 }
 
 // ========== Spawn ==========
 
-/// Spawns the H3 dispatcher: UDP I/O actors on `udp_rt`, dispatcher on `crypto_rt`.
+/// Spawns the H3 dispatcher and its shared UDP I/O actors.
 ///
 /// Consumes the [`H3DispatcherGroup`] from [`make_h3_dispatcher`], spawns
 /// UDP RX/TX actors, then spawns the CID-routing dispatcher loop.
 ///
-/// Returns command sender, dispatcher/UDP-RX/UDP-TX join handles, and bound address.
+/// Returns the dispatcher command sender.
 pub(crate) fn spawn_h3_dispatcher(
     group: H3DispatcherGroup,
     peer_tokens: HashMap<String, String>,
-    udp_rt: &RuntimeHandle,
-    crypto_rt: &RuntimeHandle,
-) -> (
-    mpsc::UnboundedSender<DispatcherCommand>,
-    tokio::task::JoinHandle<ActorExitResult>,
-    tokio::task::JoinHandle<ActorExitResult>,
-    tokio::task::JoinHandle<ActorExitResult>,
-    SocketAddr,
-) {
+    actor_bus: &ActorBusHandle,
+) -> mpsc::UnboundedSender<DispatcherCommand> {
     let H3DispatcherGroup {
         dispatcher,
         udp_rx,
@@ -749,22 +761,39 @@ pub(crate) fn spawn_h3_dispatcher(
     let bound_addr = dispatcher.bound_addr;
     let packet_queue_depth = dispatcher.io_tuning.packet_queue_depth;
 
-    // Spawn UDP actors on udp_rt.
-    let (udp_recv_rx, udp_send_tx, udp_rx_handle, udp_tx_handle) = {
-        let _guard = udp_rt.enter();
-        let (udp_recv_tx, udp_recv_rx) =
-            mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(packet_queue_depth);
-        let cancel = CancellationToken::new();
-        let rx_handle = udp::spawn_udp_rx(udp_rx, udp_recv_tx, cancel);
-        let (udp_send_tx, tx_handle) = udp::spawn_udp_tx(udp_tx, packet_queue_depth);
-        (udp_recv_rx, udp_send_tx, rx_handle, tx_handle)
-    };
+    let (udp_recv_tx, udp_recv_rx) =
+        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(packet_queue_depth);
+    let cancel = CancellationToken::new();
+    udp::spawn_udp_rx(
+        udp_rx,
+        udp_recv_tx,
+        cancel,
+        actor_bus,
+        SupervisionPolicy::Critical,
+    );
+    let udp_send_tx = udp::spawn_udp_tx(
+        udp_tx,
+        packet_queue_depth,
+        actor_bus,
+        SupervisionPolicy::Critical,
+    );
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-    let handle = crypto_rt.spawn(dispatcher.run(udp_recv_rx, udp_send_tx, cmd_rx, peer_tokens));
+    actor_bus.spawn(
+        format!("h3-dispatcher[{bound_addr}]"),
+        ActorRuntime::Crypto,
+        SupervisionPolicy::Critical,
+        dispatcher.run(
+            udp_recv_rx,
+            udp_send_tx,
+            cmd_rx,
+            peer_tokens,
+            actor_bus.clone(),
+        ),
+    );
 
-    (cmd_tx, handle, udp_rx_handle, udp_tx_handle, bound_addr)
+    cmd_tx
 }
 
 /// Shared test utilities for H3v2 listener integration tests across modules.
@@ -883,12 +912,12 @@ mod tests {
 
     #[tokio::test]
     async fn make_h3_dispatcher_rejects_missing_cert() {
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let io = IoTuning::default();
         let h3 = H3Tuning::default();
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let (ingress_tx, _ingress_rx) = mpsc::channel(1);
-        let rt = tokio::runtime::Handle::current();
         let result = make_h3_dispatcher(
             addr,
             Path::new("/nonexistent/cert.pem"),
@@ -896,10 +925,11 @@ mod tests {
             1400,
             &io,
             &h3,
-            &rt,
+            &actor_bus.handle(),
             ingress_tx,
             events_tx,
-        );
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -928,9 +958,7 @@ mod tests {
         ingress_rx: mpsc::Receiver<Vec<PooledBuf>>,
         bound_addr: SocketAddr,
         certs: TestCertBundle,
-        _handle: tokio::task::JoinHandle<ActorExitResult>,
-        _udp_rx_handle: tokio::task::JoinHandle<ActorExitResult>,
-        _udp_tx_handle: tokio::task::JoinHandle<ActorExitResult>,
+        actor_bus: crate::actor::ActorBus,
     }
 
     impl TestH3Server {
@@ -941,7 +969,8 @@ mod tests {
             let h3 = H3Tuning::default();
             let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
             let (events_tx, events_rx) = mpsc::unbounded_channel();
-            let rt = tokio::runtime::Handle::current();
+            let actor_bus = crate::actor::ActorBus::on_current_runtime();
+            let actor_bus_handle = actor_bus.handle();
 
             let (dispatcher_group, bound_addr) = make_h3_dispatcher(
                 listen_addr,
@@ -950,14 +979,14 @@ mod tests {
                 default_mtu(),
                 &io,
                 &h3,
-                &rt,
+                &actor_bus_handle,
                 ingress_tx,
                 events_tx,
             )
+            .await
             .expect("make_h3_dispatcher");
 
-            let (cmd_tx, handle, udp_rx_handle, udp_tx_handle, _) =
-                spawn_h3_dispatcher(dispatcher_group, peer_tokens, &rt, &rt);
+            let cmd_tx = spawn_h3_dispatcher(dispatcher_group, peer_tokens, &actor_bus_handle);
 
             // Give dispatcher time to start accepting.
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -968,9 +997,7 @@ mod tests {
                 ingress_rx,
                 bound_addr,
                 certs,
-                _handle: handle,
-                _udp_rx_handle: udp_rx_handle,
-                _udp_tx_handle: udp_tx_handle,
+                actor_bus,
             }
         }
     }
@@ -1001,7 +1028,11 @@ mod tests {
         bound_addr: SocketAddr,
         token: &str,
         peer_id: &str,
-    ) -> (ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
+    ) -> (
+        ConnectedEvent,
+        mpsc::Receiver<Vec<PooledBuf>>,
+        crate::actor::ActorBus,
+    ) {
         let tuning = insecure_tuning();
         dial_new_client_with_tuning(bound_addr, token, peer_id, tuning).await
     }
@@ -1011,24 +1042,30 @@ mod tests {
         token: &str,
         peer_id: &str,
         tuning: Tuning,
-    ) -> (ConnectedEvent, mpsc::Receiver<Vec<PooledBuf>>) {
+    ) -> (
+        ConnectedEvent,
+        mpsc::Receiver<Vec<PooledBuf>>,
+        crate::actor::ActorBus,
+    ) {
         let peer_h3 = test_peer_h3(bound_addr, token);
 
         let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let ctx = DialContext::test(
             peer_id,
             bound_addr.ip(),
             tuning,
             events_tx,
             FakeRouteProbe::noop(),
+            actor_bus.handle(),
         );
 
         let event = dial_h3_client(&peer_h3, &ctx, ingress_tx)
             .await
             .expect("dial_h3_client failed");
 
-        (event, ingress_rx)
+        (event, ingress_rx, actor_bus)
     }
 
     fn trusted_tuning(cert_path: &Path) -> Tuning {
@@ -1148,7 +1185,8 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let server = TestH3Server::start(peer_tokens).await;
-        let (event, _ingress_rx) = dial_new_client(server.bound_addr, token, peer_id).await;
+        let (event, _ingress_rx, _client_bus) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
 
         assert_eq!(event.peer_id, peer_id);
         assert_eq!(event.remote_addr, server.bound_addr);
@@ -1163,7 +1201,7 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let server = TestH3Server::start(peer_tokens).await;
-        let (existing, _existing_ingress_rx) =
+        let (existing, _existing_ingress_rx, _existing_actor_bus) =
             dial_new_client(server.bound_addr, token, peer_id).await;
 
         for _ in 0..2 {
@@ -1171,7 +1209,7 @@ mod tests {
             replace_credentials(&server, &replacement);
             wait_for_certificate_reload().await;
 
-            let (new_connection, _new_ingress_rx) = dial_new_client_with_tuning(
+            let (new_connection, _new_ingress_rx, _new_actor_bus) = dial_new_client_with_tuning(
                 server.bound_addr,
                 token,
                 peer_id,
@@ -1204,7 +1242,7 @@ mod tests {
             .expect("replace certificate only");
         wait_for_certificate_reload().await;
 
-        let (old_config_connection, _old_ingress_rx) = dial_new_client_with_tuning(
+        let (old_config_connection, _old_ingress_rx, _old_actor_bus) = dial_new_client_with_tuning(
             server.bound_addr,
             token,
             peer_id,
@@ -1217,13 +1255,14 @@ mod tests {
             .expect("replace matching private key");
         wait_for_certificate_reload().await;
 
-        let (recovered_connection, _recovered_ingress_rx) = dial_new_client_with_tuning(
-            server.bound_addr,
-            token,
-            peer_id,
-            trusted_tuning(replacement.cert_path()),
-        )
-        .await;
+        let (recovered_connection, _recovered_ingress_rx, _recovered_actor_bus) =
+            dial_new_client_with_tuning(
+                server.bound_addr,
+                token,
+                peer_id,
+                trusted_tuning(replacement.cert_path()),
+            )
+            .await;
         assert_eq!(recovered_connection.peer_id, peer_id);
 
         drop(server.cmd_tx);
@@ -1243,12 +1282,14 @@ mod tests {
 
         let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let ctx = DialContext::test(
             peer_id,
             server.bound_addr.ip(),
             tuning,
             events_tx,
             FakeRouteProbe::noop(),
+            actor_bus.handle(),
         );
 
         let result = dial_h3_client(&peer_h3, &ctx, ingress_tx).await;
@@ -1268,7 +1309,8 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestH3Server::start(peer_tokens).await;
-        let (event, _ingress_rx) = dial_new_client(server.bound_addr, token, peer_id).await;
+        let (event, _ingress_rx, _client_bus) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
 
         // Send test packet via new client.
         let test_packet = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1));
@@ -1334,7 +1376,8 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestH3Server::start(peer_tokens).await;
-        let (_cli_event, mut ingress_rx) = dial_new_client(server.bound_addr, token, peer_id).await;
+        let (_cli_event, mut ingress_rx, _client_bus) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
         let event = await_connected(&mut server.events_rx).await;
 
         // Verify event fields carry correct connection metadata.
@@ -1421,7 +1464,8 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestH3Server::start(peer_tokens).await;
-        let (cli_event, mut ingress_rx) = dial_new_client(server.bound_addr, token, peer_id).await;
+        let (cli_event, mut ingress_rx, _client_bus) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
         let event = await_connected(&mut server.events_rx).await;
 
         // Client → Server
@@ -1461,24 +1505,29 @@ mod tests {
         let token = "sd-listener-tk12";
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
-        let server = TestH3Server::start(peer_tokens).await;
+        let mut server = TestH3Server::start(peer_tokens).await;
 
         // Verify a client can connect.
-        let (event, _ingress_rx) = dial_new_client(server.bound_addr, token, peer_id).await;
+        let (event, _ingress_rx, _client_bus) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
         assert_eq!(event.peer_id, peer_id);
 
         // Drop command sender to trigger listener shutdown.
-        let handle = server._handle;
         drop(server.cmd_tx);
 
-        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+        let exit = tokio::time::timeout(Duration::from_secs(2), server.actor_bus.next_exit())
             .await
-            .expect("listener did not terminate in time")
-            .expect("listener task panicked");
+            .expect("listener did not terminate in time");
         assert!(
-            result.is_ok(),
-            "listener should shut down gracefully: {:?}",
-            result,
+            matches!(
+                exit,
+                crate::actor::ActorBusExit {
+                    policy: SupervisionPolicy::Critical,
+                    result: Ok(Ok(())),
+                    ..
+                }
+            ),
+            "listener should shut down gracefully: {exit:?}",
         );
     }
 
@@ -1489,37 +1538,26 @@ mod tests {
         let peer_tokens = HashMap::from([(peer_id.to_string(), token.to_string())]);
 
         let mut server = TestH3Server::start(peer_tokens).await;
-        let (cli_event, _ingress_rx) = dial_new_client(server.bound_addr, token, peer_id).await;
+        let (cli_event, _ingress_rx, mut client_bus) =
+            dial_new_client(server.bound_addr, token, peer_id).await;
 
         let _event = await_connected(&mut server.events_rx).await;
 
         // Drop the egress sender to trigger client shutdown.
-        let ConnectedEvent {
-            tx,
-            main_handle,
-            udp_rx_handle,
-            udp_tx_handle,
-            ..
-        } = cli_event;
+        let ConnectedEvent { tx, .. } = cli_event;
         drop(tx);
-        let engine_handle = main_handle.expect("client main_handle present");
-        let udp_rx_handle = udp_rx_handle.expect("client udp_rx_handle present");
-        let udp_tx_handle = udp_tx_handle.expect("client udp_tx_handle present");
 
-        // Engine handle should terminate cleanly within a reasonable timeout.
-        let engine_result = tokio::time::timeout(Duration::from_secs(5), engine_handle)
-            .await
-            .expect("engine_handle did not terminate in time")
-            .expect("engine task panicked");
-        assert!(
-            engine_result.is_ok(),
-            "engine exited with error: {:?}",
-            engine_result,
-        );
-
-        // UDP actors may be aborted by the engine or complete on their own.
-        let _ = tokio::time::timeout(Duration::from_secs(2), udp_rx_handle).await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), udp_tx_handle).await;
+        let engine_exit = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let exit = client_bus.next_exit().await;
+                if exit.name.starts_with("h3-engine[") {
+                    return exit;
+                }
+            }
+        })
+        .await
+        .expect("engine actor did not terminate in time");
+        assert!(matches!(engine_exit.result, Ok(Ok(()))));
 
         drop(server.cmd_tx);
     }

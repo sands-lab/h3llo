@@ -208,9 +208,9 @@ Routine, low-risk patterns. Each typically yields -5 to -50 LOC.
 - Impact: Net 0 LOC, but fixes correctness bugs and improves readability.
 
 **F5. Ownership Refinement on Hot Paths**
-- Unnecessary clones, unnecessary reference counts, hot-path `.expect()`, spawned tasks where `Handle::enter()` suffices.
-- Fix: `drop(outer_wrapper)` to release refcount after extracting inner sender. `.take()` at run entry to eliminate per-iteration unwrap. `Handle::enter()` for sync-only I/O registration without spawning.
-- Signal: `.expect("we know this is Some")` inside a tight loop; `handle.spawn(async { ... }).await` with no `.await` points inside; `PollSender` wrapper kept alive after extracting inner `Sender`.
+- Unnecessary clones, unnecessary reference counts, hot-path `.expect()`, or direct runtime-handle access for runtime-bound initialization.
+- Fix: `drop(outer_wrapper)` to release refcount after extracting inner sender. `.take()` at run entry to eliminate per-iteration unwrap. Use the runtime owner's synchronous-operation API for I/O registration instead of exposing a Tokio handle.
+- Signal: `.expect("we know this is Some")` inside a tight loop; callers entering another runtime directly; `PollSender` wrapper kept alive after extracting inner `Sender`.
 - Impact: -5 to -15 LOC, eliminates hot-path overhead.
 
 **F6. Stale State Cleanup on Lifecycle Events**
@@ -385,7 +385,7 @@ High-impact, high-effort patterns. Each typically yields -100 to -300 LOC. Apply
 - Impact: Eliminates Mutex, fully aligns with actor model.
 
 **N2. Thread-Per-Core with Runtime Affinity**
-- Replace multi-threaded runtime with dedicated single-threaded runtimes per concern, using `Handle::enter()` guards.
+- Replace the multi-threaded runtime with dedicated single-threaded runtimes per concern. Centralize task placement and runtime-bound initialization in the runtime owner.
 - Signal: `multi_thread` runtime with data-plane actors; `AsyncFd` needing reactor affinity; cross-thread hops in profiling.
 - Impact: Eliminates cross-thread task migration on hot paths.
 

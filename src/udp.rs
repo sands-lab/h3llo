@@ -5,7 +5,7 @@
 //! `(SocketAddr, Vec<PooledBuf>)` channels, tagging each batch with
 //! the remote address.
 
-use crate::actor::{ActorError, ActorExitResult};
+use crate::actor::{ActorBusHandle, ActorError, ActorRuntime, SupervisionPolicy};
 use crate::bind::UdpError;
 use crate::helpers::alloc_packet_buf;
 use crate::helpers::retry_on_transient;
@@ -17,7 +17,6 @@ use std::sync::Arc;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_quiche::buf_factory::PooledBuf;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -94,7 +93,9 @@ pub fn spawn_udp_rx(
     rx: UdpRx,
     output: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     cancel: CancellationToken,
-) -> JoinHandle<ActorExitResult> {
+    actor_bus: &ActorBusHandle,
+    policy: SupervisionPolicy,
+) {
     let UdpRx {
         socket,
         state,
@@ -105,7 +106,11 @@ pub fn spawn_udp_rx(
         .map(|a| a.to_string())
         .unwrap_or_default();
 
-    tokio::spawn(async move {
+    actor_bus.spawn(
+        format!("udp-rx[{local_addr}]"),
+        ActorRuntime::Udp,
+        policy,
+        async move {
         info!(addr = %local_addr, "UDP RX actor started");
         let gro_segments = state.gro_segments();
         let mut buf = vec![0u8; max_udp_payload * gro_segments];
@@ -159,13 +164,15 @@ pub fn spawn_udp_rx(
                 }
             }
         }
-    })
+        },
+    );
 }
 
 /// Spawns a UDP send loop with GSO support for destination-tagged batches.
 ///
 /// Pure I/O actor: no metrics, no protocol awareness.
-/// Returns the input sender and join handle.
+/// Returns the input sender. Lifecycle monitoring remains internal to
+/// `ActorBus`.
 ///
 /// Exits when the input channel closes, draining all remaining batches
 /// first. This guarantees that final packets (e.g. QUIC `CONNECTION_CLOSE`)
@@ -174,10 +181,9 @@ pub fn spawn_udp_rx(
 pub fn spawn_udp_tx(
     tx: UdpTx,
     queue_depth: usize,
-) -> (
-    mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
-    JoinHandle<ActorExitResult>,
-) {
+    actor_bus: &ActorBusHandle,
+    policy: SupervisionPolicy,
+) -> mpsc::Sender<(SocketAddr, Vec<PooledBuf>)> {
     let (input_tx, mut input_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(queue_depth);
     let UdpTx {
         socket,
@@ -189,83 +195,135 @@ pub fn spawn_udp_tx(
         .map(|a| a.to_string())
         .unwrap_or_default();
 
-    let handle = tokio::spawn(async move {
-        info!(addr = %local_addr, "UDP TX actor started");
-        let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
-        let max_segs = if enable_offload {
-            state.max_gso_segments()
-        } else {
-            1
-        };
+    actor_bus.spawn(
+        format!("udp-tx[{local_addr}]"),
+        ActorRuntime::Udp,
+        policy,
+        async move {
+            info!(addr = %local_addr, "UDP TX actor started");
+            let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
 
-        while let Some((dest, packets)) = input_rx.recv().await {
-            if packets.is_empty() {
-                continue;
-            }
-            // Split batch into consecutive runs of same-sized packets.
-            // GSO requires uniform segment_size per sendmsg; QUIC batches
-            // may mix sizes (e.g. 1393 vs 1394, data vs ACK).
-            // Max UDP payload per sendmsg: IPv4 Total Length (16-bit)
-            // includes the IP header, IPv6 Payload Length does not.
-            let max_udp_payload: usize = if dest.is_ipv4() {
-                65535 - 20 - 8 // 65507
-            } else {
-                65535 - 8 // 65527
-            };
-            let mut pos = 0;
-
-            while pos < packets.len() {
-                let segment_size = packets[pos].len();
-                debug_assert!(segment_size > 0, "GSO must not produce empty packets");
-                let max_segs_run = max_segs.min(max_udp_payload / segment_size).max(1);
-
-                gso_buf.clear();
-
-                // Accumulate consecutive same-sized packets up to max_segs.
-                while pos < packets.len()
-                    && packets[pos].len() == segment_size
-                    && gso_buf.len() / segment_size < max_segs_run
-                {
-                    gso_buf.extend_from_slice(&packets[pos]);
-                    pos += 1;
+            while let Some((dest, packets)) = input_rx.recv().await {
+                if packets.is_empty() {
+                    continue;
                 }
-
-                let transmit = Transmit {
-                    destination: dest,
-                    ecn: None,
-                    contents: &gso_buf,
-                    segment_size: Some(segment_size),
-                    src_ip: None,
+                // Split batch into consecutive runs of same-sized packets.
+                // GSO requires uniform segment_size per sendmsg; QUIC batches
+                // may mix sizes (e.g. 1393 vs 1394, data vs ACK).
+                // Max UDP payload per sendmsg: IPv4 Total Length (16-bit)
+                // includes the IP header, IPv6 Payload Length does not.
+                let max_udp_payload: usize = if dest.is_ipv4() {
+                    65535 - 20 - 8 // 65507
+                } else {
+                    65535 - 8 // 65527
                 };
+                let mut pos = 0;
 
-                retry_on_transient!(
+                while pos < packets.len() {
+                    let segment_size = packets[pos].len();
+                    debug_assert!(segment_size > 0, "GSO must not produce empty packets");
+                    // Quinn disables GSO after certain driver errors, so this
+                    // value must be refreshed instead of cached for the actor's
+                    // full lifetime.
+                    let max_segs = if enable_offload {
+                        state.max_gso_segments()
+                    } else {
+                        1
+                    };
+                    let max_segs_run = max_segs.min(max_udp_payload / segment_size).max(1);
+
+                    gso_buf.clear();
+
+                    // Accumulate consecutive same-sized packets up to max_segs.
+                    while pos < packets.len()
+                        && packets[pos].len() == segment_size
+                        && gso_buf.len() / segment_size < max_segs_run
                     {
-                        socket
-                            .writable()
-                            .await
-                            .map_err(|err| ActorError::UdpTxSend {
-                                addr: local_addr.clone(),
-                                source: err,
-                            })?;
-                        socket.try_io(Interest::WRITABLE, || {
-                            state.try_send(UdpSockRef::from(&*socket), &transmit)
-                        })
-                    },
-                    |_dur| {
-                        // No metrics at this layer; protocol actor tracks congestion.
+                        gso_buf.extend_from_slice(&packets[pos]);
+                        pos += 1;
                     }
-                )
-                .map_err(|err| ActorError::UdpTxSend {
-                    addr: local_addr.clone(),
-                    source: err,
-                })?;
-            }
-        }
-        info!(addr = %local_addr, "UDP TX: input channel closed, shutting down");
-        Ok(())
-    });
 
-    (input_tx, handle)
+                    let transmit = Transmit {
+                        destination: dest,
+                        ecn: None,
+                        contents: &gso_buf,
+                        segment_size: Some(segment_size),
+                        src_ip: None,
+                    };
+
+                    let send_result = retry_on_transient!(
+                        {
+                            socket
+                                .writable()
+                                .await
+                                .map_err(|err| ActorError::UdpTxSend {
+                                    addr: local_addr.clone(),
+                                    source: err,
+                                })?;
+                            socket.try_io(Interest::WRITABLE, || {
+                                state.try_send(UdpSockRef::from(&*socket), &transmit)
+                            })
+                        },
+                        |_dur| {
+                            // No metrics at this layer; protocol actor tracks congestion.
+                        }
+                    );
+
+                    if let Err(err) = send_result {
+                        let used_gso = gso_buf.len() > segment_size;
+                        if is_non_fatal_send_error(&err, used_gso) {
+                            // TODO: Record UDP actor send-drop metrics and rate-limit
+                            // this warning when ActorBus provides metrics handles.
+                            warn!(
+                                addr = %local_addr,
+                                %dest,
+                                error = %err,
+                                "UDP TX: destination send failed; dropping batch"
+                            );
+                            break;
+                        }
+                        return Err(ActorError::UdpTxSend {
+                            addr: local_addr.clone(),
+                            source: err,
+                        });
+                    }
+                }
+            }
+            info!(addr = %local_addr, "UDP TX: input channel closed, shutting down");
+            Ok(())
+        },
+    );
+
+    input_tx
+}
+
+fn is_non_fatal_send_error(error: &io::Error, used_gso: bool) -> bool {
+    let non_fatal_kind = matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::TimedOut
+    );
+
+    #[cfg(unix)]
+    {
+        let raw_error = error.raw_os_error();
+        non_fatal_kind
+            || matches!(raw_error, Some(libc::EMSGSIZE | libc::ENOBUFS))
+            || (used_gso && raw_error == Some(libc::EIO))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = used_gso;
+        non_fatal_kind
+    }
 }
 
 #[cfg(test)]
@@ -288,12 +346,20 @@ mod tests {
 
     #[tokio::test]
     async fn udp_rx_tags_source_address() {
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus_handle = actor_bus.handle();
         let std_socket = bind_std();
         let addr = std_socket.local_addr().unwrap();
         let (rx, _tx) = make_udp(std_socket, 1500, false).unwrap();
 
         let (output_tx, mut output_rx) = mpsc::channel(4);
-        let handle = spawn_udp_rx(rx, output_tx, CancellationToken::new());
+        spawn_udp_rx(
+            rx,
+            output_tx,
+            CancellationToken::new(),
+            &actor_bus_handle,
+            SupervisionPolicy::Detached,
+        );
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sender_addr = sender.local_addr().unwrap();
@@ -308,18 +374,18 @@ mod tests {
         assert_eq!(remote, sender_addr);
         assert_eq!(batch.len(), 1);
         assert_eq!(&batch[0][..], &[1, 2, 3]);
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn udp_tx_sends_to_destination() {
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus_handle = actor_bus.handle();
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
         let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
-        let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
+        let input_tx = spawn_udp_tx(tx, 4, &actor_bus_handle, SupervisionPolicy::Detached);
 
         input_tx
             .send((dest, vec![BufFactory::buf_from_slice(&[9, 8, 7])]))
@@ -329,18 +395,18 @@ mod tests {
         let mut buf = vec![0u8; 64];
         let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..len], &[9, 8, 7]);
-
-        tx_handle.abort();
     }
 
     #[tokio::test]
     async fn udp_tx_gso_batch() {
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus_handle = actor_bus.handle();
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
         let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
-        let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
+        let input_tx = spawn_udp_tx(tx, 4, &actor_bus_handle, SupervisionPolicy::Detached);
 
         // Send a batch of 3 packets.
         let batch = vec![
@@ -356,18 +422,18 @@ mod tests {
             let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
             assert_eq!(&buf[..len], &expected);
         }
-
-        tx_handle.abort();
     }
 
     #[tokio::test]
     async fn udp_tx_mixed_size_batch() {
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus_handle = actor_bus.handle();
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dest = receiver.local_addr().unwrap();
 
         let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
-        let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
+        let input_tx = spawn_udp_tx(tx, 4, &actor_bus_handle, SupervisionPolicy::Detached);
 
         // Mixed sizes: run of 2-byte, then 3-byte, then back to 2-byte.
         let batch = vec![
@@ -383,18 +449,24 @@ mod tests {
             let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
             assert_eq!(&buf[..len], expected);
         }
-
-        tx_handle.abort();
     }
 
     #[tokio::test]
     async fn udp_rx_exits_when_output_closed() {
+        let mut actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus_handle = actor_bus.handle();
         let std_socket = bind_std();
         let addr = std_socket.local_addr().unwrap();
         let (rx, _tx) = make_udp(std_socket, 1500, false).unwrap();
 
         let (output_tx, output_rx) = mpsc::channel(1);
-        let handle = spawn_udp_rx(rx, output_tx, CancellationToken::new());
+        spawn_udp_rx(
+            rx,
+            output_tx,
+            CancellationToken::new(),
+            &actor_bus_handle,
+            SupervisionPolicy::Detached,
+        );
 
         // Drop receiver so output channel is closed.
         drop(output_rx);
@@ -403,26 +475,90 @@ mod tests {
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sender.send_to(&[1], addr).await.unwrap();
 
-        let result = tokio::time::timeout(std::time::Duration::from_millis(200), handle).await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), actor_bus.next_exit())
+                .await;
         assert!(
-            matches!(result, Ok(Ok(Ok(())))),
+            matches!(
+                result,
+                Ok(crate::actor::ActorBusExit {
+                    result: Ok(Ok(())),
+                    ..
+                })
+            ),
             "udp_rx should exit gracefully when output closed, got {result:?}"
         );
     }
 
     #[tokio::test]
     async fn udp_tx_exits_when_input_closed() {
+        let mut actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus_handle = actor_bus.handle();
         let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
 
-        let (input_tx, tx_handle) = spawn_udp_tx(tx, 4);
+        let input_tx = spawn_udp_tx(tx, 4, &actor_bus_handle, SupervisionPolicy::Detached);
 
         // Drop sender to close input channel.
         drop(input_tx);
 
-        let result = tokio::time::timeout(std::time::Duration::from_millis(200), tx_handle).await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), actor_bus.next_exit())
+                .await;
         assert!(
-            matches!(result, Ok(Ok(Ok(())))),
+            matches!(
+                result,
+                Ok(crate::actor::ActorBusExit {
+                    result: Ok(Ok(())),
+                    ..
+                })
+            ),
             "udp_tx should exit gracefully when input closed, got {result:?}"
         );
+    }
+
+    #[test]
+    fn destination_errors_are_non_fatal() {
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::NetworkDown,
+            io::ErrorKind::AddrNotAvailable,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(is_non_fatal_send_error(&io::Error::from(kind), false));
+        }
+        assert!(!is_non_fatal_send_error(
+            &io::Error::from(io::ErrorKind::PermissionDenied),
+            false,
+        ));
+        assert!(!is_non_fatal_send_error(
+            &io::Error::from(io::ErrorKind::BrokenPipe),
+            false,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_datagram_and_gso_errors_are_non_fatal() {
+        assert!(is_non_fatal_send_error(
+            &io::Error::from_raw_os_error(libc::EMSGSIZE),
+            false,
+        ));
+        assert!(is_non_fatal_send_error(
+            &io::Error::from_raw_os_error(libc::ENOBUFS),
+            false,
+        ));
+        assert!(is_non_fatal_send_error(
+            &io::Error::from_raw_os_error(libc::EIO),
+            true,
+        ));
+        assert!(!is_non_fatal_send_error(
+            &io::Error::from_raw_os_error(libc::EIO),
+            false,
+        ));
     }
 }

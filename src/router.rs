@@ -4,7 +4,7 @@
 //! Also owns the routing table data structures (`RoutingTable`, `RouteEntry`,
 //! `RouteMatch`, `RoutingError`) used for longest-prefix-match lookups.
 
-use crate::actor::ActorExitResult;
+use crate::actor::{ActorBusHandle, ActorRuntime, SupervisionPolicy};
 use crate::config::{LocalTun, Peer};
 use crate::events::Event;
 use crate::helpers::{batch_stats, make_interval, send_with_backpressure, SendEvent};
@@ -16,7 +16,6 @@ use std::net::IpAddr;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_quiche::buf_factory::PooledBuf;
 use tracing::warn;
 
@@ -332,19 +331,11 @@ pub enum RouterCommand {
     },
 }
 
-/// Handles returned by [`spawn_router`].
-pub type RouterHandles = (
-    mpsc::Sender<Vec<PooledBuf>>,
-    mpsc::Sender<Vec<PooledBuf>>,
-    mpsc::UnboundedSender<RouterCommand>,
-    JoinHandle<ActorExitResult>,
-);
-
 /// Spawns the router actor.
 ///
 /// Creates two bounded data-plane channels (output from TUN, ingress from
 /// transport peers) and an unbounded command channel internally. Returns
-/// senders and handle.
+/// senders.
 ///
 /// # Arguments
 ///
@@ -359,48 +350,58 @@ pub fn spawn_router(
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
     packet_queue_depth: usize,
-) -> RouterHandles {
+    actor_bus: &ActorBusHandle,
+) -> (
+    mpsc::Sender<Vec<PooledBuf>>,
+    mpsc::Sender<Vec<PooledBuf>>,
+    mpsc::UnboundedSender<RouterCommand>,
+) {
     let (output_tx, mut output_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
     let (ingress_tx, mut ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-    let handle = tokio::spawn(async move {
-        let mut counters = Counters::new(Source::Router, Direction::Rx);
-        let mut ticker = make_interval(interval);
+    actor_bus.spawn(
+        "router",
+        ActorRuntime::Crypto,
+        SupervisionPolicy::Critical,
+        async move {
+            let mut counters = Counters::new(Source::Router, Direction::Rx);
+            let mut ticker = make_interval(interval);
 
-        loop {
-            tokio::select! {
-                batch = output_rx.recv() => {
-                    let Some(packets) = batch else {
-                        return Ok(());
-                    };
-                    handle_output_batch(packets, &routing, &mut counters).await;
-                }
-                batch = ingress_rx.recv() => {
-                    let Some(packets) = batch else {
-                        return Ok(());
-                    };
-                    handle_ingress_batch(
-                        packets, &routing, &input_tx, &mut counters,
-                    ).await;
-                }
-                cmd = cmd_rx.recv() => {
-                    let Some(command) = cmd else {
-                        return Ok(());
-                    };
-                    let RouterCommand::UpdateRouting { routing: new_routing } = command;
-                    routing = new_routing;
-                }
-                _ = ticker.tick() => {
-                    if !counters.emit(&events_tx, None, None) {
-                        return Ok(());
+            loop {
+                tokio::select! {
+                    batch = output_rx.recv() => {
+                        let Some(packets) = batch else {
+                            return Ok(());
+                        };
+                        handle_output_batch(packets, &routing, &mut counters).await;
+                    }
+                    batch = ingress_rx.recv() => {
+                        let Some(packets) = batch else {
+                            return Ok(());
+                        };
+                        handle_ingress_batch(
+                            packets, &routing, &input_tx, &mut counters,
+                        ).await;
+                    }
+                    cmd = cmd_rx.recv() => {
+                        let Some(command) = cmd else {
+                            return Ok(());
+                        };
+                        let RouterCommand::UpdateRouting { routing: new_routing } = command;
+                        routing = new_routing;
+                    }
+                    _ = ticker.tick() => {
+                        if !counters.emit(&events_tx, None, None) {
+                            return Ok(());
+                        }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 
-    (output_tx, ingress_tx, cmd_tx, handle)
+    (output_tx, ingress_tx, cmd_tx)
 }
 
 /// Handles an output batch (from TUN Rx): first-packet routing, no TTL mutation.
@@ -858,6 +859,8 @@ mod tests {
 
     #[tokio::test]
     async fn routing_update_replaces_table() {
+        let actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus_handle = actor_bus.handle();
         let (peer1_tx, _peer1_rx) = mpsc::channel(4);
         let (peer2_tx, mut peer2_rx) = mpsc::channel(4);
         let (input_tx, _input_rx) = mpsc::channel(4);
@@ -865,8 +868,14 @@ mod tests {
 
         let routing = make_test_routing("peer1", "10.0.0.0/8".parse().unwrap(), peer1_tx);
 
-        let (output_tx, _ingress_tx, cmd_tx, handle) =
-            spawn_router(routing, input_tx, events_tx, Duration::from_secs(60), 16);
+        let (output_tx, _ingress_tx, cmd_tx) = spawn_router(
+            routing,
+            input_tx,
+            events_tx,
+            Duration::from_secs(60),
+            16,
+            &actor_bus_handle,
+        );
 
         // Update routing to point to peer2
         let new_routing = make_test_routing("peer2", "10.0.0.0/8".parse().unwrap(), peer2_tx);
@@ -888,26 +897,38 @@ mod tests {
 
         let received = peer2_rx.recv().await.expect("peer2 should receive");
         assert_eq!(received.len(), 1);
-
-        handle.abort();
     }
 
     #[tokio::test]
     async fn router_exits_when_senders_dropped() {
+        let mut actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let actor_bus_handle = actor_bus.handle();
         let (input_tx, _input_rx) = mpsc::channel(4);
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let routing = RoutingTable::new();
 
-        let (output_tx, ingress_tx, cmd_tx, handle) =
-            spawn_router(routing, input_tx, events_tx, Duration::from_secs(60), 16);
+        let (output_tx, ingress_tx, cmd_tx) = spawn_router(
+            routing,
+            input_tx,
+            events_tx,
+            Duration::from_secs(60),
+            16,
+            &actor_bus_handle,
+        );
 
         drop(output_tx);
         drop(ingress_tx);
         drop(cmd_tx);
 
-        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        let result = tokio::time::timeout(Duration::from_millis(200), actor_bus.next_exit()).await;
         assert!(
-            matches!(result, Ok(Ok(Ok(())))),
+            matches!(
+                result,
+                Ok(crate::actor::ActorBusExit {
+                    result: Ok(Ok(())),
+                    ..
+                })
+            ),
             "router should shut down cleanly, got {:?}",
             result
         );
