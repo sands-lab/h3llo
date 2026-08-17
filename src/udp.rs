@@ -184,7 +184,20 @@ pub fn spawn_udp_tx(
             info!(addr = %local_addr, "UDP TX actor started");
             let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
 
-            while let Some((dest, packets)) = input_rx.recv().await {
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    () = ctx.wait_for_stop() => {
+                        // Reject new batches, then drain those already buffered.
+                        input_rx.close();
+                        input_rx.recv().await
+                    }
+                    batch = input_rx.recv() => batch,
+                };
+                let Some((dest, packets)) = next else {
+                    break;
+                };
+
                 if packets.is_empty() {
                     continue;
                 }
@@ -234,12 +247,10 @@ pub fn spawn_udp_tx(
 
                     let send_result = retry_on_transient!(
                         {
-                            let Some(result) = ctx.run_until_stopped(socket.writable()).await
-                            else {
-                                info!(addr = %local_addr, "UDP TX: stopping");
-                                return Ok(());
-                            };
-                            result.context("wait for UDP socket writability")?;
+                            socket
+                                .writable()
+                                .await
+                                .context("wait for UDP socket writability")?;
                             socket.try_io(Interest::WRITABLE, || {
                                 state.try_send(UdpSockRef::from(&*socket), &transmit)
                             })
@@ -269,7 +280,7 @@ pub fn spawn_udp_tx(
                     }
                 }
             }
-            info!(addr = %local_addr, "UDP TX: input channel closed, shutting down");
+            info!(addr = %local_addr, "UDP TX: stopping");
             Ok(())
         },
     );
@@ -309,6 +320,7 @@ fn is_non_fatal_send_error(error: &io::Error, used_gso: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::Event;
     use tokio_quiche::buf_factory::BufFactory;
 
     fn bind_std() -> std::net::UdpSocket {
@@ -484,6 +496,48 @@ mod tests {
                 })
             ),
             "udp_tx should exit gracefully when input closed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_tx_drains_buffered_batch_when_stopped() {
+        let mut actor_bus = crate::actor::ActorBus::on_current_runtime();
+        let mut supervisor = actor_bus.mailbox("test-supervisor");
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = receiver.local_addr().unwrap();
+        let (_rx, tx) = make_udp(bind_std(), 1500, false).unwrap();
+
+        let (input_tx, udp_tx) = spawn_udp_tx(tx, 4, &supervisor, SupervisionPolicy::Detached);
+        input_tx
+            .send((dest, vec![BufFactory::buf_from_slice(&[9, 8, 7])]))
+            .await
+            .unwrap();
+        supervisor.send(&udp_tx, Event::Stop).unwrap();
+
+        let mut buf = [0; 64];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("buffered batch should be sent before shutdown")
+        .unwrap();
+        assert_eq!(&buf[..len], &[9, 8, 7]);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            crate::actor::next_actor_exit(&mut actor_bus, &mut supervisor),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Ok(crate::actor::ActorExit {
+                    result: Ok(Ok(())),
+                    ..
+                })
+            ),
+            "udp_tx should exit after draining, got {result:?}"
         );
     }
 
