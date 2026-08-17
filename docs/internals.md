@@ -37,7 +37,7 @@ Actor design principles:
   - `Ok(())` for graceful shutdown (for example, after `Event::Stop`)
   - `Err(anyhow::Error)` for failures with operation context and the original error chain
   A `Critical` actor exiting for any reason terminates the process. A `Restartable` actor exit triggers Orchestrator reconciliation even when the actor returned `Ok(())`; a `Detached` task exit is only logged. Route Sync failures are warnings at origin. If initialization fails, the orchestrator degrades to no system route management.
-- **Graceful shutdown**: owners send `Event::Stop` through their `ActorContext`. Queue-draining actors may also finish when all producers of a bounded data channel are dropped. Dropping unrelated `ActorRef` clones does not implicitly stop an actor.
+- **Graceful shutdown**: owners send `Event::Stop` through their `ActorContext`. Stop-only actors use `ActorContext::wait_for_stop` in multi-branch `tokio::select!` loops or `ActorContext::run_until_stopped` around external I/O whose lifetime is not tied to the actor graph. Internal channel operations complete normally to preserve backpressure and surface endpoint closure. Actors that accept other control events handle them explicitly. Queue-draining actors may also finish when all producers of a bounded data channel are dropped. Dropping unrelated `ActorRef` clones does not implicitly stop an actor.
 
 #### Actor Initialization Pattern (make + spawn)
 

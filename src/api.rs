@@ -20,7 +20,7 @@ use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tracing::{debug, info};
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // HTTP API
@@ -84,17 +84,8 @@ pub(crate) fn spawn_api(listener: TcpListener, api_path: String, ctx: &ActorCont
         SupervisionPolicy::Critical,
         |mut ctx| async move {
             loop {
-                let accepted = tokio::select! {
-                    result = listener.accept() => result,
-                    message = ctx.recv() => {
-                        match message {
-                            Some(Event::Stop) | None => return Ok(()),
-                            Some(message) => {
-                                debug!(?message, "API: ignoring unexpected message");
-                                continue;
-                            }
-                        }
-                    }
+                let Some(accepted) = ctx.run_until_stopped(listener.accept()).await else {
+                    return Ok(());
                 };
                 let (stream, remote) = accepted.context("accept management API connection")?;
                 let io = TokioIo::new(stream);

@@ -438,14 +438,7 @@ impl H3Engine {
                     );
                 }
 
-                message = ctx.recv() => {
-                    match message {
-                        Some(Event::Stop) | None => break Ok(()),
-                        Some(message) => {
-                            debug!(?message, peer = %meta.peer_id, "H3 engine: ignoring unexpected message");
-                        }
-                    }
-                }
+                () = ctx.wait_for_stop() => break Ok(()),
 
                 permit_res = udp_send_tx.reserve(),
                     if send_pending =>

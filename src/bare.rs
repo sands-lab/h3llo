@@ -235,38 +235,33 @@ pub(crate) fn spawn_bare_tx(
         ActorRuntime::Crypto,
         SupervisionPolicy::Restartable,
         |mut ctx| async move {
-        info!(peer = %peer_id, dest = %destination, "bare TX actor started");
-        let mut counters = Counters::new(Source::BareUdp, Direction::Tx);
-        let mut ticker = make_interval(metrics_interval);
+            info!(peer = %peer_id, dest = %destination, "bare TX actor started");
+            let mut counters = Counters::new(Source::BareUdp, Direction::Tx);
+            let mut ticker = make_interval(metrics_interval);
 
-        loop {
-            tokio::select! {
-                maybe_batch = egress_rx.recv() => {
-                    let Some(packets) = maybe_batch else {
-                        info!(peer = %peer_id, "bare TX: egress channel closed, shutting down");
-                        return Ok(());
-                    };
-                    if packets.is_empty() { continue; }
-                    let (count, bytes) = batch_stats(&packets);
-                    // Record success AFTER send — avoids inflating metrics on channel close.
-                    if let Ok(()) = udp_tx.send((destination, packets)).await { counters.record_success(count, bytes) } else {
-                        info!(peer = %peer_id, "bare TX: UDP channel closed, shutting down");
-                        return Ok(());
+            loop {
+                tokio::select! {
+                    maybe_batch = egress_rx.recv() => {
+                        let Some(packets) = maybe_batch else {
+                            info!(peer = %peer_id, "bare TX: egress channel closed, shutting down");
+                            return Ok(());
+                        };
+                        if packets.is_empty() { continue; }
+                        let (count, bytes) = batch_stats(&packets);
+                        // Record success AFTER send — avoids inflating metrics on channel close.
+                        if udp_tx.send((destination, packets)).await.is_ok() { counters.record_success(count, bytes) } else {
+                            info!(peer = %peer_id, "bare TX: UDP channel closed, shutting down");
+                            return Ok(());
+                        }
                     }
-                }
-                message = ctx.recv() => {
-                    match message {
-                        Some(Event::Stop) | None => return Ok(()),
-                        Some(message) => debug!(?message, peer = %peer_id, "bare TX: ignoring unexpected message"),
-                    }
-                }
-                _ = ticker.tick() => {
-                    if !counters.emit(&ctx, Some(&peer_id), Some(destination)) {
-                        return Ok(());
+                    () = ctx.wait_for_stop() => return Ok(()),
+                    _ = ticker.tick() => {
+                        if !counters.emit(&ctx, Some(&peer_id), Some(destination)) {
+                            return Ok(());
+                        }
                     }
                 }
             }
-        }
         },
     );
 

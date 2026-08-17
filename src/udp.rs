@@ -7,7 +7,6 @@
 
 use crate::actor::{ActorContext, ActorRef, ActorRuntime, SupervisionPolicy};
 use crate::bind::UdpError;
-use crate::events::Event;
 use crate::helpers::alloc_packet_buf;
 use crate::helpers::retry_on_transient;
 use anyhow::Context;
@@ -20,7 +19,7 @@ use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_quiche::buf_factory::PooledBuf;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Receive side of a shared UDP socket with quinn-udp GRO support.
 #[derive(Debug)]
@@ -111,22 +110,11 @@ pub fn spawn_udp_rx(
         let mut meta = RecvMeta::default();
 
         loop {
-            tokio::select! {
-                result = socket.readable() => {
-                    result.context("wait for UDP socket readability")?;
-                }
-                message = ctx.recv() => {
-                    match message {
-                        Some(Event::Stop) | None => {
-                            info!(addr = %local_addr, "UDP RX: stopping");
-                            return Ok(());
-                        }
-                        Some(message) => {
-                            debug!(?message, addr = %local_addr, "UDP RX: ignoring unexpected message");
-                        }
-                    }
-                }
-            }
+            let Some(result) = ctx.run_until_stopped(socket.readable()).await else {
+                info!(addr = %local_addr, "UDP RX: stopping");
+                return Ok(());
+            };
+            result.context("wait for UDP socket readability")?;
             loop {
                 let result = socket.try_io(Interest::READABLE, || {
                     state.recv(
@@ -199,19 +187,7 @@ pub fn spawn_udp_tx(
             let mut gso_buf = Vec::with_capacity(u16::MAX as usize);
 
             loop {
-                let next = tokio::select! {
-                    batch = input_rx.recv() => batch,
-                    message = ctx.recv() => {
-                        match message {
-                            Some(Event::Stop) | None => break,
-                            Some(message) => {
-                                debug!(?message, addr = %local_addr, "UDP TX: ignoring unexpected message");
-                                continue;
-                            }
-                        }
-                    }
-                };
-                let Some((dest, packets)) = next else {
+                let Some((dest, packets)) = input_rx.recv().await else {
                     break;
                 };
                 if packets.is_empty() {
@@ -263,10 +239,12 @@ pub fn spawn_udp_tx(
 
                     let send_result = retry_on_transient!(
                         {
-                            socket
-                                .writable()
-                                .await
-                                .context("wait for UDP socket writability")?;
+                            let Some(result) = ctx.run_until_stopped(socket.writable()).await
+                            else {
+                                info!(addr = %local_addr, "UDP TX: stopping");
+                                return Ok(());
+                            };
+                            result.context("wait for UDP socket writability")?;
                             socket.try_io(Interest::WRITABLE, || {
                                 state.try_send(UdpSockRef::from(&*socket), &transmit)
                             })

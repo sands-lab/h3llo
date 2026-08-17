@@ -12,7 +12,7 @@ use tokio::runtime::{Builder, Handle};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::task::AbortOnDropHandle;
-use tracing::error;
+use tracing::{debug, error};
 
 /// Determines how an actor owner handles an actor instance's exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +183,59 @@ impl ActorContext {
     /// the inbox while the actor is running.
     pub async fn recv(&mut self) -> Option<Event> {
         self.inbox.recv().await
+    }
+
+    /// Waits until the actor receives a stop event or its inbox closes.
+    ///
+    /// Non-stop events are logged and discarded. This method must only be
+    /// used by actors whose control inbox accepts no events other than
+    /// [`Event::Stop`].
+    pub async fn wait_for_stop(&mut self) {
+        loop {
+            match self.recv().await {
+                Some(Event::Stop) | None => return,
+                Some(event) => {
+                    debug!(
+                        actor = %self.myself.name,
+                        ?event,
+                        "actor ignoring unexpected event"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Runs an external asynchronous operation until it completes or the actor stops.
+    ///
+    /// Stop takes priority when both branches are ready. The operation future
+    /// is dropped when stopping wins, so callers must ensure that cancelling
+    /// the operation is valid during actor shutdown.
+    ///
+    /// This method is intended for external I/O whose lifetime is not governed
+    /// by actor-owned channels. Internal channel operations should complete
+    /// normally so they preserve backpressure and report endpoint closure.
+    ///
+    /// Non-stop events are logged and discarded. This method must only be
+    /// used by actors whose control inbox accepts no events other than
+    /// [`Event::Stop`].
+    ///
+    /// # Arguments
+    ///
+    /// * `operation` - Future to run while listening for a stop event.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(output)` when the operation completes, or `None` when the
+    /// actor stops first.
+    pub async fn run_until_stopped<F>(&mut self, operation: F) -> Option<F::Output>
+    where
+        F: Future,
+    {
+        tokio::select! {
+            biased;
+            () = self.wait_for_stop() => None,
+            output = operation => Some(output),
+        }
     }
 
     /// Attempts to receive a control-plane event without waiting.
@@ -562,5 +615,27 @@ mod tests {
             .expect("operation should complete");
 
         assert_eq!(thread_name.as_deref(), Some("h3llo-tun"));
+    }
+
+    #[tokio::test]
+    async fn run_until_stopped_ignores_other_events_and_prioritizes_stop() {
+        let bus = ActorBus::on_current_runtime();
+        let mut ctx = bus.mailbox("test-root");
+        let actor = ctx.myself().clone();
+        ctx.send(
+            &actor,
+            Event::SetHostnames {
+                hosts: Default::default(),
+            },
+        )
+        .unwrap();
+
+        let output = ctx.run_until_stopped(async { 42 }).await;
+        assert_eq!(output, Some(42));
+
+        ctx.send(&actor, Event::Stop).unwrap();
+
+        let output = ctx.run_until_stopped(async { 42 }).await;
+        assert_eq!(output, None);
     }
 }

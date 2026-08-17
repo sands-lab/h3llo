@@ -2,6 +2,7 @@
 
 use crate::actor::{ActorContext, ActorRef, ActorRuntime, SupervisionPolicy};
 use crate::config::{IoTuning, LocalTun};
+#[cfg(test)]
 use crate::events::Event;
 use crate::helpers::retry_on_transient;
 use crate::metrics::{Counters, Direction, DropReason, Source};
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
@@ -505,12 +506,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                         }
                     }
                 }
-                message = ctx.recv() => {
-                    match message {
-                        Some(Event::Stop) | None => return Ok(()),
-                        Some(message) => debug!(?message, tun = %tun_name, "TUN RX: ignoring unexpected message"),
-                    }
-                }
+                () = ctx.wait_for_stop() => return Ok(()),
                 _ = ticker.tick() => {
                     if !counters.emit(&ctx, None, None) {
                         return Ok(());
@@ -569,7 +565,11 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                             continue;
                         }
 
-                        match tun.send_batch(&mut tun_bufs).await {
+                        let Some(result) = ctx.run_until_stopped(tun.send_batch(&mut tun_bufs)).await
+                        else {
+                            return Ok(());
+                        };
+                        match result {
                             Ok(_) => {
                                 counters.record_success(ok_count, ok_bytes);
                             }
@@ -579,12 +579,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                             }
                         }
                     }
-                    message = ctx.recv() => {
-                        match message {
-                            Some(Event::Stop) | None => return Ok(()),
-                            Some(message) => debug!(?message, tun = %tun_name, "TUN TX: ignoring unexpected message"),
-                        }
-                    }
+                    () = ctx.wait_for_stop() => return Ok(()),
                     _ = ticker.tick() => {
                         if !counters.emit(&ctx, None, None) {
                             return Ok(());
