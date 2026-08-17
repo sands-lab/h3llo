@@ -124,15 +124,15 @@ jobs:
           platforms: linux/amd64
           load: true
 
-      - name: Restore native test cache
+      - name: Cache native test dependencies
         uses: Swatinem/rust-cache@v2
         env:
           CARGO_TARGET_DIR: target/native
         with:
           cache-bin: false
-          shared-key: native
+          shared-key: native-tests
           workspaces: ". -> target/native"
-          save-if: false
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Run integration tests
         env:
