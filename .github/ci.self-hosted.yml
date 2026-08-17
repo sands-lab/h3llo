@@ -1,3 +1,5 @@
+# Backup workflow for persistent self-hosted runners.
+# Copy this file to .github/workflows/ci.yml to activate it.
 name: CI
 
 on:
@@ -12,14 +14,22 @@ concurrency:
 
 env:
   REGISTRY_IMAGE: nekonuts/h3llo
+  # Build record export cannot mount the runner temp directory reliably when
+  # the Docker daemon and runner use different filesystem permissions.
+  DOCKER_BUILD_SUMMARY: false
+  DOCKER_BUILD_RECORD_UPLOAD: false
 
 jobs:
   linux:
-    runs-on: ubuntu-24.04
+    runs-on: &runner self-hosted
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Set Rust directories
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -44,23 +54,34 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
 
   docker-tests:
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 30
+    concurrency:
+      group: docker-tests
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Set Rust directories
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          name: ci-builder
+          keep-state: true
       - name: Build Docker test image
         uses: docker/build-push-action@v6
         with:
           context: .
+          builder: ${{ steps.buildx.outputs.name }}
           push: false
           tags: h3llo:test
           target: test
           platforms: linux/amd64
           load: true
-          cache-from: type=registry,ref=${{ env.REGISTRY_IMAGE }}:buildcache-amd64
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies
@@ -72,11 +93,14 @@ jobs:
       - name: Run E2E tests
         run: cargo test --test e2e -- --ignored --nocapture
 
-  # Build multi-arch Docker images in parallel with lint and test jobs.
-  # Runs on PRs too (for cross-compilation validation) but skips push.
+  # Serialize each architecture across workflow runs because named builders
+  # retain mutable state on the persistent runner.
   docker-build:
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 60
+    concurrency:
+      group: buildx-${{ matrix.arch_label }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -88,6 +112,13 @@ jobs:
           - platform: linux/riscv64
             arch_label: riscv64
     steps:
+      # Concurrent runner services can share HOME, so each architecture needs
+      # an independent Buildx configuration directory.
+      - name: Isolate Docker config per arch
+        run: |
+          mkdir -p "$HOME/.docker-${{ matrix.arch_label }}"
+          echo "DOCKER_CONFIG=$HOME/.docker-${{ matrix.arch_label }}" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -101,7 +132,11 @@ jobs:
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          name: builder-${{ matrix.arch_label }}
+          keep-state: true
 
       - name: Login to Docker Hub
         if: github.event_name != 'pull_request'
@@ -115,13 +150,12 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          builder: ${{ steps.buildx.outputs.name }}
           platforms: ${{ matrix.platform }}
           target: runtime
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ env.REGISTRY_IMAGE }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
-          cache-from: type=registry,ref=${{ env.REGISTRY_IMAGE }}:buildcache-${{ matrix.arch_label }}
-          cache-to: ${{ github.ref == 'refs/heads/master' && format('type=registry,ref={0}:buildcache-{1},mode=max', env.REGISTRY_IMAGE, matrix.arch_label) || '' }}
 
       - name: Export digest
         if: github.event_name != 'pull_request'
@@ -143,6 +177,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          builder: ${{ steps.buildx.outputs.name }}
           platforms: ${{ matrix.platform }}
           target: export
           outputs: type=local,dest=${{ runner.temp }}/binary-out
@@ -161,11 +196,9 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Merge per-arch digests into a single multi-arch manifest list on Docker Hub.
-  # Gates behind ALL jobs: builds must succeed AND tests must pass.
   docker-merge:
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 10
     needs: [docker-build, linux, docker-tests]
     steps:
@@ -208,11 +241,9 @@ jobs:
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
 
-  # Create a GitHub release when a version tag is pushed or master is updated.
-  # Gates behind docker-merge, which transitively requires all builds and tests.
   release:
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/master'
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 10
     needs: [docker-merge]
     permissions:

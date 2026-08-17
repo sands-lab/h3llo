@@ -6,11 +6,9 @@
 #
 # Supported platforms: linux/amd64, linux/arm64, linux/riscv64
 #
-# Uses cargo-chef for Docker layer caching of dependencies, plus BuildKit
-# cache mounts to persist cargo registry and compilation artifacts across
-# builds on the same host. The two mechanisms are complementary:
-#   - cargo-chef: separates dependency compilation into a cached Docker layer
-#   - cache mounts: persist compiled artifacts across layer cache misses
+# Uses cargo-chef to place dependency compilation in an exportable Docker
+# layer. CI imports and exports that layer through a registry cache because
+# GitHub-hosted runners do not preserve local BuildKit state between jobs.
 #
 # Targets:
 #   runtime (default) - Minimal Alpine production image
@@ -23,8 +21,8 @@
 #   docker buildx build --target export --output type=local,dest=./out .
 #   docker buildx build --platform linux/amd64 --target test -t h3llo:test --load .
 
-# Stage 1: Chef - Install cargo-chef on native build platform (no QEMU emulation)
-FROM --platform=$BUILDPLATFORM rust:slim-trixie AS chef
+# Stage 1: Chef - Run cargo-chef on the native build platform (no QEMU emulation)
+FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:0.1.78-rust-slim-trixie AS chef
 
 # Map Docker TARGETARCH to Rust target triple and musl-cross toolchain name.
 # TARGETARCH is set automatically by buildx (amd64, arm64, riscv64).
@@ -84,7 +82,6 @@ RUN RUST_TARGET=$(cat /tmp/rust-target) && \
       echo "export BORING_BSSL_SYSROOT=\"/opt/cross-toolchain/${TOOLCHAIN}/sysroot\""; \
     } > /tmp/cross-env.sh
 
-RUN cargo install cargo-chef --locked
 WORKDIR /app
 
 # Stage 2: Planner - Generate dependency recipe
@@ -96,27 +93,18 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 3: Builder - Build dependencies then application
 FROM --platform=$BUILDPLATFORM chef AS builder
-ARG TARGETARCH
 COPY --from=planner /app/recipe.json recipe.json
-# Build dependencies (cached as long as recipe.json unchanged)
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=registry-$TARGETARCH \
-    --mount=type=cache,target=/usr/local/cargo/git,id=git-$TARGETARCH \
-    --mount=type=cache,target=/app/target,sharing=locked,id=target-$TARGETARCH \
-    . /tmp/cross-env.sh && \
-    cargo chef cook --release --target "$RUST_TARGET" --recipe-path recipe.json
-# Build application and test binaries.
-# Cache mount contents are NOT stored in image layers — we must copy
-# artifacts to /app/out/ within this same RUN instruction.
-# Use --message-format=json to extract exact binary paths; glob-based
-# extraction breaks when stale artifacts accumulate in cache mounts.
+# Build all dependencies in the layer so remote BuildKit caches retain them.
+RUN . /tmp/cross-env.sh && \
+    cargo chef cook --release --tests --all-features \
+        --target "$RUST_TARGET" --recipe-path recipe.json
+# Build application and test binaries. Use Cargo JSON output to extract exact
+# binary paths instead of relying on hash-suffixed filenames.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY benches ./benches
 COPY tests ./tests
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=registry-$TARGETARCH \
-    --mount=type=cache,target=/usr/local/cargo/git,id=git-$TARGETARCH \
-    --mount=type=cache,target=/app/target,sharing=locked,id=target-$TARGETARCH \
-    . /tmp/cross-env.sh && \
+RUN . /tmp/cross-env.sh && \
     set -e && \
     cargo build --release --target "$RUST_TARGET" --bin h3llo && \
     TUN_BIN=$(cargo test --test integration-container-tun --release \
