@@ -565,11 +565,7 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
                             continue;
                         }
 
-                        let Some(result) = ctx.run_until_stopped(tun.send_batch(&mut tun_bufs)).await
-                        else {
-                            return Ok(());
-                        };
-                        match result {
+                        match tun.send_batch(&mut tun_bufs).await {
                             Ok(_) => {
                                 counters.record_success(ok_count, ok_bytes);
                             }
