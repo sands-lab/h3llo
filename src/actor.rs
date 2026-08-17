@@ -7,7 +7,6 @@
 use std::future::Future;
 use std::io;
 
-use thiserror::Error;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
@@ -45,103 +44,8 @@ pub enum ActorRuntime {
 /// Exit result type for all actors.
 ///
 /// - `Ok(())` indicates graceful shutdown (e.g., command channel closed).
-/// - `Err(ActorError)` indicates an error exit requiring orchestrator action.
-pub type ActorExitResult = Result<(), ActorError>;
-
-/// Unified actor error type for orchestrator supervision.
-///
-/// Captures the actor identity and exit reason. Designed to be simple
-/// (no per-actor subtypes) while still enabling pattern matching.
-#[derive(Debug, Error)]
-pub enum ActorError {
-    /// TUN receive loop exited with I/O error.
-    #[error("tun_rx[{name}]: recv failed: {source}")]
-    TunRxRecv {
-        /// TUN interface name.
-        name: String,
-        /// Underlying I/O error.
-        source: io::Error,
-    },
-
-    /// TUN transmit loop exited with I/O error.
-    #[error("tun_tx[{name}]: send failed: {source}")]
-    TunTxSend {
-        /// TUN interface name.
-        name: String,
-        /// Underlying I/O error.
-        source: io::Error,
-    },
-
-    /// UDP receive loop exited with I/O error.
-    #[error("udp_rx[{addr}]: recv failed: {source}")]
-    UdpRxRecv {
-        /// Local socket address of the UDP actor.
-        addr: String,
-        /// Underlying I/O error.
-        source: io::Error,
-    },
-
-    /// UDP transmit loop exited with I/O error.
-    #[error("udp_tx[{addr}]: send failed: {source}")]
-    UdpTxSend {
-        /// Local socket address of the UDP actor.
-        addr: String,
-        /// Underlying I/O error.
-        source: io::Error,
-    },
-
-    /// DNS resolver exited with I/O error.
-    #[error("dns_resolver[{server}]: recv failed: {source}")]
-    DnsRecv {
-        /// DNS server address.
-        server: String,
-        /// Underlying I/O error.
-        source: io::Error,
-    },
-
-    /// HTTP/3 transmit failed.
-    #[error("h3_tx[{peer_id}]: send failed: {reason}")]
-    H3TxSend {
-        /// Peer identifier.
-        peer_id: String,
-        /// Failure reason.
-        reason: String,
-    },
-
-    /// H3 engine actor exited with error.
-    #[error("h3[{peer_id}]: {reason}")]
-    H3Engine {
-        /// Peer identifier.
-        peer_id: String,
-        /// Failure reason.
-        reason: String,
-    },
-
-    /// H3 dispatcher actor exited unexpectedly.
-    #[error("h3_dispatcher[{addr}]: {reason}")]
-    H3Dispatcher {
-        /// Listener address.
-        addr: String,
-        /// Failure reason.
-        reason: String,
-    },
-
-    /// Management API server exited with I/O error.
-    #[error("api[{addr}]: server failed: {reason}")]
-    ApiServer {
-        /// Listen address.
-        addr: String,
-        /// Failure reason.
-        reason: String,
-    },
-
-    /// Router actor exited unexpectedly.
-    #[error("router: fatal error: {reason}")]
-    RouterFailed {
-        /// Failure reason.
-        reason: String,
-    },
-}
+/// - `Err(error)` indicates an error exit requiring orchestrator action.
+pub type ActorExitResult = anyhow::Result<()>;
 
 /// A `current_thread` Tokio runtime pinned to a dedicated OS thread.
 ///
@@ -448,101 +352,33 @@ impl ActorBus {
 mod tests {
     use super::*;
 
-    #[test]
-    fn actor_error_display_includes_context() {
-        let err = ActorError::TunRxRecv {
-            name: "tun0".to_string(),
-            source: io::Error::other("test"),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("tun_rx"));
-        assert!(msg.contains("tun0"));
-        assert!(msg.contains("recv failed"));
-    }
-
-    #[test]
-    fn actor_error_udp_tx_includes_addr() {
-        let err = ActorError::UdpTxSend {
-            addr: "192.168.1.1:5353".to_string(),
-            source: io::Error::other("test"),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("udp_tx"));
-        assert!(msg.contains("192.168.1.1:5353"));
-    }
-
-    #[test]
-    fn actor_error_dns_recv_includes_server() {
-        let err = ActorError::DnsRecv {
-            server: "8.8.8.8:53".to_string(),
-            source: io::Error::new(io::ErrorKind::TimedOut, "timeout"),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("dns_resolver"));
-        assert!(msg.contains("8.8.8.8:53"));
-        assert!(msg.contains("recv failed"));
-    }
-
-    #[test]
-    fn actor_error_h3_tx_includes_peer() {
-        let err = ActorError::H3TxSend {
-            peer_id: "node-3".to_string(),
-            reason: "flow control blocked".to_string(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("h3_tx"));
-        assert!(msg.contains("node-3"));
-        assert!(msg.contains("flow control blocked"));
-    }
-
-    #[test]
-    fn actor_error_h3_dispatcher_includes_addr() {
-        let err = ActorError::H3Dispatcher {
-            addr: "0.0.0.0:443".into(),
-            reason: "watcher channel closed".into(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("h3_dispatcher[0.0.0.0:443]"));
-        assert!(msg.contains("watcher channel closed"));
-    }
-
     #[tokio::test]
-    async fn spawn_policy_is_independent_of_error_variant() {
+    async fn spawn_policy_is_independent_of_error_value() {
         let mut bus = ActorBus::on_current_runtime();
         let handle = bus.handle();
         handle.spawn(
             "listener-udp-tx",
             ActorRuntime::Main,
             SupervisionPolicy::Critical,
-            async {
-                Err(ActorError::UdpTxSend {
-                    addr: "0.0.0.0:443".into(),
-                    source: io::Error::other("test"),
-                })
-            },
+            async { Err(anyhow::anyhow!("listener send failed")) },
         );
 
         let exit = bus.next_exit().await;
         assert_eq!(exit.name, "listener-udp-tx");
         assert_eq!(exit.policy, SupervisionPolicy::Critical);
-        assert!(matches!(exit.result, Ok(Err(ActorError::UdpTxSend { .. }))));
+        assert!(matches!(exit.result, Ok(Err(_))));
 
         handle.spawn(
             "peer-udp-tx",
             ActorRuntime::Main,
             SupervisionPolicy::Restartable,
-            async {
-                Err(ActorError::UdpTxSend {
-                    addr: "192.0.2.1:443".into(),
-                    source: io::Error::other("test"),
-                })
-            },
+            async { Err(anyhow::anyhow!("peer send failed")) },
         );
 
         let exit = bus.next_exit().await;
         assert_eq!(exit.name, "peer-udp-tx");
         assert_eq!(exit.policy, SupervisionPolicy::Restartable);
-        assert!(matches!(exit.result, Ok(Err(ActorError::UdpTxSend { .. }))));
+        assert!(matches!(exit.result, Ok(Err(_))));
     }
 
     #[tokio::test]

@@ -14,11 +14,25 @@ pub mod h3listener;
 pub mod h3session;
 mod helpers;
 pub mod metrics;
-pub mod orch;
+mod orch;
 pub mod route;
 pub mod router;
 pub mod tun;
 pub mod udp;
+
+/// Runs h3llo with the supplied validated configuration.
+///
+/// # Arguments
+///
+/// * `config` - Runtime configuration used to initialize all actors and transports.
+///
+/// # Errors
+///
+/// Returns an error when initialization fails or a critical actor exits.
+pub async fn run(config: config::Config) -> anyhow::Result<()> {
+    let orchestrator = orch::Orchestrator::new(config).await?;
+    orchestrator.run().await
+}
 
 /// Test-only support modules that depend on crate internals.
 #[cfg(test)]

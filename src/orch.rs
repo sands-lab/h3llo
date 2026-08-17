@@ -1,8 +1,6 @@
 //! Runtime orchestration for `BareUDP` and HTTP/3 transports.
 
-use crate::actor::{
-    ActorBus, ActorBusExit, ActorBusHandle, ActorError, ActorRuntime, SupervisionPolicy,
-};
+use crate::actor::{ActorBus, ActorBusExit, ActorBusHandle, ActorRuntime, SupervisionPolicy};
 use crate::api;
 use crate::bare::{dial_bare_tx, make_bare_rx, spawn_bare_rx, BareUdpRxCommand};
 use crate::bind::{DefaultRouteProbe, RouteProbe};
@@ -18,13 +16,13 @@ use crate::metrics::{log_quic_metrics, log_transport_metrics, Direction, Labels,
 use crate::route::{make_route, spawn_route, RouteCommand};
 use crate::router::{spawn_router, RouterCommand, RoutingTable};
 use crate::tun;
+use anyhow::{bail, Context, Result};
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::{Duration, Instant};
-use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_quiche::buf_factory::PooledBuf;
 use tracing::{debug, error, info, warn};
@@ -299,44 +297,12 @@ fn report_dial<E: std::fmt::Display, P: RouteProbe>(
     }
 }
 
-/// Errors returned by the orchestrator.
-#[derive(Debug, Error)]
-pub enum OrchestratorError {
-    /// `BareUDP` listen host could not be resolved.
-    #[error("failed to resolve bare listen host '{host}': {reason}")]
-    ListenResolveFailed { host: String, reason: String },
-    /// HTTP/3 listener failed to start.
-    #[error("h3 listener failed: {0}")]
-    H3Listener(String),
-    /// Management API failed to initialize.
-    #[error("api server failed to start: {0}")]
-    ApiInit(String),
-    /// DNS resolver failed to initialize.
-    #[error("dns resolver failed to initialize: {0}")]
-    DnsInit(String),
-    /// TUN setup failed.
-    #[error("tun setup failed: {0}")]
-    Tun(String),
-    /// UDP socket setup failed.
-    #[error("udp socket setup failed: {0}")]
-    Udp(String),
-    /// Actor runtime initialization failed.
-    #[error("actor runtime initialization failed: {0}")]
-    Runtime(std::io::Error),
-    /// An actor exited with an error.
-    #[error("actor error: {0}")]
-    ActorError(#[from] ActorError),
-    /// A runtime task failed to join (panic or cancel).
-    #[error("runtime task join failed: {0}")]
-    TaskJoin(String),
-}
-
 /// Runtime orchestrator for `BareUDP` and HTTP/3 transports.
 ///
 /// Manages child actors with selective supervision:
 /// - Critical actors (TUN, BareUDP-Rx, H3-Listener): failure causes immediate exit
 /// - Peer actors (BareUDP-Tx, H3-Engine): failure triggers maintenance cycle (prune + reconnect)
-pub struct Orchestrator {
+pub(crate) struct Orchestrator {
     events_rx: mpsc::UnboundedReceiver<Event>,
     events_tx: mpsc::UnboundedSender<Event>,
     actor_bus: ActorBus,
@@ -470,15 +436,14 @@ impl Orchestrator {
     ///
     /// # Errors
     ///
-    /// Returns `OrchestratorError` when initialization fails.
-    ///
-    pub async fn new(config: Config) -> Result<Self, OrchestratorError> {
+    /// Returns an error when initialization fails.
+    pub(crate) async fn new(config: Config) -> Result<Self> {
         let tuning = &config.tuning;
         let tun_if = config.local.tun.ifname.clone();
         let tun_mtu = config.local.tun.mtu;
         let manage_routes = config.local.table;
 
-        let actor_bus = ActorBus::new().map_err(OrchestratorError::Runtime)?;
+        let actor_bus = ActorBus::new().context("initialize actor runtimes")?;
         let actor_bus_handle = actor_bus.handle();
 
         let tun_config = config.local.tun.clone();
@@ -489,8 +454,8 @@ impl Orchestrator {
                 tun::make_tun(&tun_config, tun_tx_queue_len, tun_enable_offload)
             })
             .await
-            .map_err(|error| OrchestratorError::TaskJoin(error.to_string()))?
-            .map_err(|error| OrchestratorError::Tun(error.to_string()))?;
+            .context("join TUN setup task")?
+            .context("set up TUN device")?;
 
         // Control plane: unbounded to prevent deadlocks from actor cycles.
         let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -528,7 +493,7 @@ impl Orchestrator {
                 &actor_bus_handle,
             )
             .await
-            .map_err(|err| OrchestratorError::Udp(err.to_string()))?;
+            .with_context(|| format!("set up BareUDP listener on {listen_addr}"))?;
 
             let cmd_tx = spawn_bare_rx(
                 bare_rx_group,
@@ -560,7 +525,7 @@ impl Orchestrator {
                 events_tx.clone(),
             )
             .await
-            .map_err(|e| OrchestratorError::H3Listener(e.to_string()))?;
+            .with_context(|| format!("set up HTTP/3 listener on {listen_addr}"))?;
 
             // spawn: infallible task creation
             // Initial peer tokens are empty; sync_peers_to_actors() populates them
@@ -582,7 +547,7 @@ impl Orchestrator {
         let probe = DefaultRouteProbe;
         let dns_actor = make_dns(&config.local.dns, Some(tun_if.as_str()), tuning, &probe)
             .await
-            .map_err(|err| OrchestratorError::DnsInit(err.to_string()))?;
+            .with_context(|| format!("set up DNS resolver for {}", config.local.dns.server))?;
 
         // Spawn DNS actor task (infallible)
         let dns_cmd_tx = spawn_dns(dns_actor, events_tx.clone(), &actor_bus_handle);
@@ -617,7 +582,7 @@ impl Orchestrator {
                 resolve_listen_addr(&local_api.listen.host, local_api.listen.port)?;
             let api_listener = api::make_api(api_listen_addr)
                 .await
-                .map_err(|e| OrchestratorError::ApiInit(e.to_string()))?;
+                .with_context(|| format!("bind management API to {api_listen_addr}"))?;
             api::spawn_api(
                 api_listener,
                 local_api.listen.path.clone(),
@@ -655,8 +620,8 @@ impl Orchestrator {
     ///
     /// # Errors
     ///
-    /// Returns `OrchestratorError` when a child task exits unexpectedly.
-    pub async fn run(mut self) -> Result<(), OrchestratorError> {
+    /// Returns an error when a child task exits unexpectedly.
+    pub(crate) async fn run(mut self) -> Result<()> {
         // Reconcile at the configured interval to detect closed channels and
         // attempt reconnection for uncovered IPs.
         let mut reconcile_ticker = make_interval(self.tuning.reconcile_interval);
@@ -696,7 +661,7 @@ impl Orchestrator {
     }
 
     /// Handles an actor exit according to its spawn-time supervision policy.
-    fn handle_actor_exit(&mut self, exit: ActorBusExit) -> Result<(), OrchestratorError> {
+    fn handle_actor_exit(&mut self, exit: ActorBusExit) -> Result<()> {
         let ActorBusExit {
             name,
             policy,
@@ -705,19 +670,10 @@ impl Orchestrator {
         match policy {
             SupervisionPolicy::Critical => match result {
                 Ok(Err(actor_error)) => {
-                    error!(actor = %name, error = %actor_error, "critical actor failed");
-                    Err(OrchestratorError::ActorError(actor_error))
+                    Err(actor_error).with_context(|| format!("critical actor `{name}` failed"))
                 }
-                Ok(Ok(())) => {
-                    error!(actor = %name, "critical actor exited unexpectedly");
-                    Err(OrchestratorError::TaskJoin(format!(
-                        "critical actor {name} exited unexpectedly"
-                    )))
-                }
-                Err(error) => {
-                    error!(actor = %name, %error, "critical actor failed to join");
-                    Err(OrchestratorError::TaskJoin(error.to_string()))
-                }
+                Ok(Ok(())) => bail!("critical actor `{name}` exited unexpectedly"),
+                Err(error) => Err(error).with_context(|| format!("join critical actor `{name}`")),
             },
             SupervisionPolicy::Restartable => {
                 match result {
@@ -725,7 +681,7 @@ impl Orchestrator {
                         info!(actor = %name, "peer actor exited; reconciling");
                     }
                     Ok(Err(actor_error)) => {
-                        warn!(actor = %name, error = %actor_error, "peer actor failed; reconciling");
+                        warn!(actor = %name, error = ?actor_error, "peer actor failed; reconciling");
                     }
                     Err(error) => {
                         warn!(actor = %name, %error, "peer actor failed to join; reconciling");
@@ -740,7 +696,7 @@ impl Orchestrator {
                         debug!(actor = %name, "detached task completed");
                     }
                     Ok(Err(actor_error)) => {
-                        warn!(actor = %name, error = %actor_error, "detached task failed");
+                        warn!(actor = %name, error = ?actor_error, "detached task failed");
                     }
                     Err(error) => {
                         warn!(actor = %name, %error, "detached task failed to join");
@@ -1032,7 +988,7 @@ fn strip_ipv6_brackets(host: &str) -> &str {
 ///
 /// Handles IPv6 bracket notation (e.g., "[`::1`]" -> "`::1`") for compatibility with
 /// both UDP and H3 endpoint formats.
-fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, OrchestratorError> {
+fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr> {
     use std::net::ToSocketAddrs;
 
     // Strip IPv6 bracket notation (safe no-op for non-bracketed hosts)
@@ -1045,20 +1001,13 @@ fn resolve_listen_addr(host: &str, port: u16) -> Result<SocketAddr, Orchestrator
 
     // Synchronous DNS lookup for hostname
     let addr_str = format!("{host}:{port}");
-    let mut addrs =
-        addr_str
-            .to_socket_addrs()
-            .map_err(|err| OrchestratorError::ListenResolveFailed {
-                host: host.to_string(),
-                reason: err.to_string(),
-            })?;
+    let mut addrs = addr_str
+        .to_socket_addrs()
+        .with_context(|| format!("resolve listen address `{addr_str}`"))?;
 
     let first = addrs
         .next()
-        .ok_or_else(|| OrchestratorError::ListenResolveFailed {
-            host: host.to_string(),
-            reason: "no resolved addresses".to_string(),
-        })?;
+        .with_context(|| format!("listen address `{addr_str}` resolved to no addresses"))?;
     if addrs.next().is_some() {
         warn!("listen resolved multiple addresses for {host}; using {first}");
     }
@@ -1288,25 +1237,26 @@ mod tests {
         }))
     }
 
-    #[test]
-    fn orchestrator_error_includes_actor_context() {
-        // Verify that OrchestratorError::ActorError includes actor context
+    #[tokio::test]
+    async fn critical_actor_error_preserves_context() {
         use std::io;
 
-        let actor_err = ActorError::TunRxRecv {
-            name: "tun0".to_string(),
-            source: io::Error::other("test error"),
+        let (mut orch, _handles) = TestableOrchestratorBuilder::default().build();
+        let actor_error = anyhow::Error::new(io::Error::other("test error"))
+            .context("receive packet batch from TUN interface");
+        let exit = ActorBusExit {
+            name: "tun-rx".to_string(),
+            policy: SupervisionPolicy::Critical,
+            result: Ok(Err(actor_error)),
         };
-        let error = OrchestratorError::ActorError(actor_err);
-        let error_msg = error.to_string();
-        assert!(
-            error_msg.contains("tun_rx"),
-            "error message should contain actor type"
-        );
-        assert!(
-            error_msg.contains("tun0"),
-            "error message should contain interface name"
-        );
+
+        let error = orch
+            .handle_actor_exit(exit)
+            .expect_err("critical actor failure should stop the orchestrator");
+        let message = format!("{error:#}");
+        assert!(message.contains("critical actor `tun-rx` failed"));
+        assert!(message.contains("receive packet batch from TUN interface"));
+        assert!(message.contains("test error"));
     }
 
     // ========== collect_allowed_ips tests ==========
@@ -1329,43 +1279,6 @@ mod tests {
         let peers: Vec<Peer> = vec![];
         let result = collect_allowed_ips(&peers);
         assert!(result.is_empty());
-    }
-
-    // ========== OrchestratorError tests ==========
-
-    #[test]
-    fn orchestrator_error_listen_resolve_failed() {
-        let error = OrchestratorError::ListenResolveFailed {
-            host: "example.com".to_string(),
-            reason: "dns timeout".to_string(),
-        };
-        let msg = error.to_string();
-        assert!(msg.contains("example.com"));
-        assert!(msg.contains("dns timeout"));
-    }
-
-    #[test]
-    fn orchestrator_error_dns_init() {
-        let error = OrchestratorError::DnsInit("socket bind failed".to_string());
-        assert!(error.to_string().contains("socket bind failed"));
-    }
-
-    #[test]
-    fn orchestrator_error_tun() {
-        let error = OrchestratorError::Tun("device creation failed".to_string());
-        assert!(error.to_string().contains("device creation failed"));
-    }
-
-    #[test]
-    fn orchestrator_error_udp() {
-        let error = OrchestratorError::Udp("address in use".to_string());
-        assert!(error.to_string().contains("address in use"));
-    }
-
-    #[test]
-    fn orchestrator_error_task_join() {
-        let error = OrchestratorError::TaskJoin("task panicked".to_string());
-        assert!(error.to_string().contains("task panicked"));
     }
 
     // ========== resolve_listen_addr tests ==========

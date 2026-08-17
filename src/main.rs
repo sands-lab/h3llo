@@ -4,55 +4,28 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use anyhow::{bail, Context, Result};
 use h3llo::config::Config;
-use h3llo::orch::Orchestrator;
 use std::env;
 use std::fs::File;
-use std::path::PathBuf;
-use tracing::error;
+use std::path::{Path, PathBuf};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn main() -> Result<()> {
     init_logging();
 
-    let config_path = match parse_config_path() {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("{err}");
-            eprintln!("Usage: h3llo -c <config.yaml>");
-            std::process::exit(2);
-        }
-    };
+    let config_path = parse_config_path()?;
+    run(&config_path).await
+}
 
-    let file = match File::open(&config_path) {
-        Ok(file) => file,
-        Err(err) => {
-            error!("failed to open config {}: {}", config_path.display(), err);
-            std::process::exit(1);
-        }
-    };
+async fn run(config_path: &Path) -> Result<()> {
+    let file = File::open(config_path)
+        .with_context(|| format!("open configuration file `{}`", config_path.display()))?;
+    let config = Config::load_from_reader(file)
+        .with_context(|| format!("load configuration from `{}`", config_path.display()))?;
 
-    let config = match Config::load_from_reader(file) {
-        Ok(config) => config,
-        Err(err) => {
-            error!("failed to load config {}: {}", config_path.display(), err);
-            std::process::exit(1);
-        }
-    };
-
-    let orchestrator = match Orchestrator::new(config).await {
-        Ok(o) => o,
-        Err(err) => {
-            error!("orchestrator initialization failed: {err}");
-            std::process::exit(1);
-        }
-    };
-
-    if let Err(err) = orchestrator.run().await {
-        error!("orchestrator runtime failed: {err}");
-        std::process::exit(1);
-    }
+    h3llo::run(config).await.context("run h3llo")
 }
 
 fn init_logging() {
@@ -94,7 +67,7 @@ fn init_logging() {
 }
 
 /// Parses the config file path from command-line arguments (`-c` / `--config`).
-fn parse_config_path() -> Result<PathBuf, String> {
+fn parse_config_path() -> Result<PathBuf> {
     let mut args = env::args().skip(1);
     let mut config_path = None;
 
@@ -105,16 +78,14 @@ fn parse_config_path() -> Result<PathBuf, String> {
         {
             config_path = Some(PathBuf::from(value));
         } else if matches!(arg.as_str(), "-c" | "--config") {
-            let value = args
-                .next()
-                .ok_or_else(|| "missing value for -c/--config".to_string())?;
+            let value = args.next().context("missing value for -c/--config")?;
             config_path = Some(PathBuf::from(value));
         } else {
-            return Err(format!("unknown argument: {arg}"));
+            bail!("unknown argument: {arg}");
         }
     }
 
-    config_path.ok_or_else(|| "missing -c/--config".to_string())
+    config_path.context("missing -c/--config")
 }
 
 #[cfg(test)]

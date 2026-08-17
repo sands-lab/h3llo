@@ -1,11 +1,12 @@
 //! DNS resolver coroutine: consumes `SetHostnames` commands, manages IP lifecycle with TTL-based expiration,
 //! and emits state snapshot events on resolution changes.
 
-use crate::actor::{ActorBusHandle, ActorError, ActorExitResult, ActorRuntime, SupervisionPolicy};
+use crate::actor::{ActorBusHandle, ActorExitResult, ActorRuntime, SupervisionPolicy};
 use crate::bind::{make_client_udp_socket, RouteProbe, UdpError};
 use crate::config::{DnsTuning, LocalDns, Tuning};
 use crate::events::{DnsEvent, Event};
 use crate::helpers::make_interval;
+use anyhow::Context;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use rand::RngExt;
@@ -204,7 +205,6 @@ impl DnsActor {
         mut cmd_rx: mpsc::UnboundedReceiver<DnsCommand>,
         events_tx: mpsc::UnboundedSender<Event>,
     ) -> ActorExitResult {
-        let server_str = self.server.to_string();
         let refresh_interval = self.dns_tuning.dns_refresh_interval;
         let query_interval = self.dns_tuning.dns_query_interval;
 
@@ -242,7 +242,7 @@ impl DnsActor {
                         Ok(_) => {}
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                         Err(err) => {
-                            return Err(ActorError::DnsRecv { server: server_str, source: err });
+                            return Err(err).context("receive DNS response");
                         }
                     }
                 }
@@ -499,8 +499,9 @@ pub fn spawn_dns(
     actor_bus: &ActorBusHandle,
 ) -> mpsc::UnboundedSender<DnsCommand> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let name = format!("dns-resolver[{}]", actor.server);
     actor_bus.spawn(
-        "dns-resolver",
+        name,
         ActorRuntime::Main,
         SupervisionPolicy::Critical,
         actor.run(cmd_rx, events_tx),

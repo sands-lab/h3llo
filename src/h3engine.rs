@@ -7,7 +7,7 @@
 //! [`accept`](H3Engine::accept) (in [`crate::h3listener`]). Both then call
 //! [`run`](H3Engine::run) for steady-state datagram forwarding.
 
-use crate::actor::{ActorError, ActorExitResult};
+use crate::actor::ActorExitResult;
 use crate::config::H3Tuning;
 use crate::events::Event;
 use crate::h3session::{
@@ -15,6 +15,7 @@ use crate::h3session::{
 };
 use crate::helpers::{alloc_uninit_packet_buf, make_interval};
 use crate::metrics::{Counters, Direction, DropReason, Source};
+use anyhow::{anyhow, bail, Context};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -335,10 +336,7 @@ impl H3Engine {
             match self.io.udp_send_tx.try_send(send) {
                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(ActorError::H3TxSend {
-                        peer_id: self.meta.peer_id.clone(),
-                        reason: "UDP TX actor channel closed".to_string(),
-                    });
+                    bail!("UDP TX actor channel closed");
                 }
             }
         }
@@ -377,7 +375,7 @@ impl H3Engine {
         let timer = time::sleep(conn.timeout().unwrap_or(MAX_TIMEOUT));
         tokio::pin!(timer);
 
-        let exit: Result<(), String> = loop {
+        let exit: ActorExitResult = loop {
             let ingress_pending = run_state.pending_ingress.is_some();
             let send_pending = run_state.pending_send.is_some();
 
@@ -399,7 +397,7 @@ impl H3Engine {
                         &mut |_, _, _, _| Ok(HeaderAction::Ignore),
                     ) {
                         Ok(ConnectProgress::Pending | ConnectProgress::Ready) => {}
-                        Err(err) => break Err(err.into_actor_reason()),
+                        Err(err) => break Err(anyhow!(err.into_actor_reason())),
                     }
 
                     let batch = collect_router_ingress(
@@ -478,7 +476,7 @@ impl H3Engine {
                             run_state.pending_send = Some((dest, PendingBatch::new(b)));
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            break Err("UDP TX channel closed".into())
+                            break Err(anyhow!("UDP TX actor channel closed"))
                         }
                     }
                 }
@@ -486,7 +484,7 @@ impl H3Engine {
             reset_timer(timer.as_mut(), &conn);
 
             if conn.is_closed() {
-                break Err("QUIC connection closed".into());
+                break Err(anyhow!("QUIC connection closed"));
             }
         };
 
@@ -503,10 +501,7 @@ impl H3Engine {
         if let Some(token) = udp_cancel {
             token.cancel();
         }
-        exit.map_err(|reason| ActorError::H3Engine {
-            peer_id: meta.peer_id.clone(),
-            reason,
-        })
+        exit.context("run established HTTP/3 connection")
     }
 }
 

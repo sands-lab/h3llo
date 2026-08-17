@@ -154,7 +154,7 @@ Routine, low-risk patterns. Each typically yields -5 to -50 LOC.
 
 **E1. Silent Drops → Explicit Error Responses/Logging**
 - `let _ = channel.send(msg)` silently discards errors; auth failures silently drop requests; errors logged but not propagated.
-- Fix: `if sender.send(msg).is_err() { warn!("...") }`. Auth failures get HTTP 400/401 responses. Channel-closed conditions return `ActorError`.
+- Fix: `if sender.send(msg).is_err() { warn!("...") }`. Auth failures get HTTP 400/401 responses. Fatal actor channel closures return an error with operation context through `ActorExitResult`.
 - Signal: `let _ = ...send()` pattern; missing `DropReason::ChannelClosed` metrics; functions returning `()` when they can fail.
 - Impact: +2 to +5 LOC per site, but critical for production observability.
 
