@@ -96,7 +96,7 @@ FROM --platform=$BUILDPLATFORM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Build all dependencies in the layer so remote BuildKit caches retain them.
 RUN . /tmp/cross-env.sh && \
-    cargo chef cook --release --tests --all-features \
+    cargo chef cook --release --tests \
         --target "$RUST_TARGET" --recipe-path recipe.json
 # Build application and test binaries. Use Cargo JSON output to extract exact
 # binary paths instead of relying on hash-suffixed filenames.
