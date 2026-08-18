@@ -53,6 +53,26 @@ pub type ActorExitResult = anyhow::Result<()>;
 pub struct ActorRef {
     name: String,
     tx: mpsc::UnboundedSender<Event>,
+    links_tx: mpsc::UnboundedSender<ActorRef>,
+}
+
+impl ActorRef {
+    /// Links two actors so either actor's exit stops the other.
+    ///
+    /// Linking is bidirectional. If either actor has already exited, the
+    /// surviving actor is stopped immediately.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - Actor that shares this actor's lifetime.
+    pub fn link(&self, other: &Self) {
+        if self.links_tx.send(other.clone()).is_err() {
+            let _ = other.tx.send(Event::Stop);
+        }
+        if other.links_tx.send(self.clone()).is_err() {
+            let _ = self.tx.send(Event::Stop);
+        }
+    }
 }
 
 /// Inbox and bus access owned by a running actor.
@@ -122,9 +142,11 @@ impl ActorContext {
         Fut: Future<Output = ActorExitResult> + Send + 'static,
     {
         let (tx, inbox) = mpsc::unbounded_channel();
+        let (links_tx, links_rx) = mpsc::unbounded_channel();
         let actor_ref = ActorRef {
             name: name.into(),
             tx,
+            links_tx,
         };
         let ctx = Self {
             myself: actor_ref.clone(),
@@ -138,6 +160,7 @@ impl ActorContext {
             name: actor_ref.name.clone(),
             policy,
             owner: self.owner.clone(),
+            links_rx,
             task,
         };
         if let Err(registration) = self.registrations_tx.send(registration) {
@@ -362,6 +385,7 @@ struct ActorRegistration {
     name: String,
     policy: SupervisionPolicy,
     owner: ActorRef,
+    links_rx: mpsc::UnboundedReceiver<ActorRef>,
     task: AbortOnDropHandle<ActorExitResult>,
 }
 
@@ -378,9 +402,8 @@ pub struct ActorExit {
 
 /// Owns actor runtimes and supervises every production asynchronous task.
 ///
-/// TODO: Add actor-group membership and propagate group exits through the same
-/// event path. Metrics and coordinated cancellation can then share actor
-/// identity without introducing a second lifecycle registry.
+/// TODO: Route metrics and coordinated cancellation through the same actor
+/// identity when those features require lifecycle-aware delivery.
 pub struct ActorBus {
     // Drop task monitors before runtimes. Their AbortOnDropHandle futures abort
     // the underlying actor tasks instead of silently detaching them.
@@ -460,9 +483,11 @@ impl ActorBus {
     #[must_use]
     pub fn mailbox(&self, name: impl Into<String>) -> ActorContext {
         let (tx, inbox) = mpsc::unbounded_channel();
+        let (links_tx, _links_rx) = mpsc::unbounded_channel();
         let actor_ref = ActorRef {
             name: name.into(),
             tx,
+            links_tx,
         };
         ActorContext {
             myself: actor_ref.clone(),
@@ -481,12 +506,17 @@ impl ActorBus {
     pub async fn drive(&mut self) -> Result<(), JoinError> {
         tokio::select! {
             Some(registration) = self.registrations_rx.recv() => {
-                let ActorRegistration { name, policy, owner, task } = registration;
+                let ActorRegistration { name, policy, owner, mut links_rx, task } = registration;
                 let monitor = async move {
+                    let result = task.await;
+                    links_rx.close();
+                    while let Some(linked) = links_rx.recv().await {
+                        let _ = linked.tx.send(Event::Stop);
+                    }
                     let exit = ActorExit {
                         name,
                         policy,
-                        result: task.await,
+                        result,
                     };
                     if let Err(error) = owner.tx.send(Event::ActorExited(exit)) {
                         error!(
@@ -553,6 +583,67 @@ mod tests {
 
         next_actor_exit(&mut bus, &mut supervisor).await;
         assert!(supervisor.send(&actor, Event::Stop).is_err());
+    }
+
+    #[tokio::test]
+    async fn actor_exit_stops_linked_actor() {
+        let mut bus = ActorBus::on_current_runtime();
+        let mut supervisor = bus.mailbox("test-supervisor");
+        let first = supervisor.spawn(
+            "first",
+            ActorRuntime::Main,
+            SupervisionPolicy::Detached,
+            |_ctx| async { Err(anyhow::anyhow!("actor failed")) },
+        );
+        let second = supervisor.spawn(
+            "second",
+            ActorRuntime::Main,
+            SupervisionPolicy::Detached,
+            |mut ctx| async move {
+                ctx.wait_for_stop().await;
+                Ok(())
+            },
+        );
+        first.link(&second);
+
+        let mut exited = [
+            next_actor_exit(&mut bus, &mut supervisor).await,
+            next_actor_exit(&mut bus, &mut supervisor).await,
+        ];
+        exited.sort_by(|left, right| left.name.cmp(&right.name));
+
+        assert_eq!(exited[0].name, "first");
+        assert_eq!(exited[1].name, "second");
+        assert!(matches!(exited[0].result.as_ref(), Ok(Err(_))));
+        assert!(matches!(exited[1].result.as_ref(), Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn linking_exited_actor_stops_live_actor() {
+        let mut bus = ActorBus::on_current_runtime();
+        let mut supervisor = bus.mailbox("test-supervisor");
+        let exited = supervisor.spawn(
+            "exited",
+            ActorRuntime::Main,
+            SupervisionPolicy::Detached,
+            |_ctx| async { Ok(()) },
+        );
+        next_actor_exit(&mut bus, &mut supervisor).await;
+
+        let live = supervisor.spawn(
+            "live",
+            ActorRuntime::Main,
+            SupervisionPolicy::Detached,
+            |mut ctx| async move {
+                ctx.wait_for_stop().await;
+                Ok(())
+            },
+        );
+        exited.link(&live);
+
+        let exit = next_actor_exit(&mut bus, &mut supervisor).await;
+        assert_eq!(exit.name, "live");
+        assert!(matches!(exit.result, Ok(Ok(()))));
     }
 
     #[tokio::test]
