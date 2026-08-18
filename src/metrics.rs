@@ -71,7 +71,7 @@ pub enum DropReason {
     NoRoute,
     /// No peer channel available for the route.
     NoPeerChannel,
-    /// `PooledBuf` lacked headroom for datagram prefix insertion.
+    /// `DgramBuffer` lacked headroom for datagram prefix insertion.
     NoHeadroom,
     /// QUIC DATAGRAM queue is full. TX: precise (`dgram_send` returned Done).
     /// RX: heuristic — may over-count when non-datagram packets arrive while

@@ -8,9 +8,9 @@ use crate::bind::RouteProbe;
 use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
 use crate::metrics::{Labels, Metrics};
 use crate::router::RoutingTable;
+use datagram_socket::DgramBuffer;
 use ipnet::IpNet;
 use tokio::sync::{mpsc, oneshot};
-use tokio_quiche::buf_factory::PooledBuf;
 
 /// Endpoint type discriminator for bound connections.
 ///
@@ -69,7 +69,7 @@ pub struct ConnectedEvent {
     /// Remote socket address.
     pub remote_addr: SocketAddr,
     /// Channel for sending IP packet batches to the peer.
-    pub tx: mpsc::Sender<Vec<PooledBuf>>,
+    pub tx: mpsc::Sender<Vec<DgramBuffer>>,
     /// Configured endpoint (present for outbound connections, absent for inbound).
     pub endpoint: Option<Endpoint>,
 }

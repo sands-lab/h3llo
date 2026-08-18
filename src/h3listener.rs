@@ -1,7 +1,7 @@
 //! H3 CONNECT-IP server: CID-based dispatcher with per-connection `H3Engine`.
 //!
 //! Architecture:
-//! - **UDP RX actor** (I/O thread): GRO-aware recv, emits `(SocketAddr, Vec<PooledBuf>)`.
+//! - **UDP RX actor** (I/O thread): GRO-aware recv, emits `(SocketAddr, Vec<DgramBuffer>)`.
 //! - **Server UDP TX actor** (I/O thread): shared send actor for all connections.
 //! - **`H3Dispatcher`** (crypto runtime): CID routing, connection acceptance, and certificate rotation.
 //! - **`H3Engine`** (crypto runtime): per-connection unified QUIC/H3 engine with ingress + egress.
@@ -21,6 +21,7 @@ use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction,
 use crate::helpers::{alloc_uninit_packet_buf, make_interval};
 use crate::udp;
 use anyhow::bail;
+use datagram_socket::DgramBuffer;
 use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use quiche::h3::NameValue;
 use rand::Rng;
@@ -30,7 +31,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
-use tokio_quiche::buf_factory::PooledBuf;
 use tracing::{debug, info, warn};
 
 // ========== Server Error ==========
@@ -149,7 +149,7 @@ pub(crate) async fn make_h3_dispatcher(
     io_tuning: &IoTuning,
     h3_tuning: &H3Tuning,
     ctx: &ActorContext,
-    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+    ingress_tx: mpsc::Sender<Vec<DgramBuffer>>,
 ) -> Result<(H3DispatcherGroup, SocketAddr), ServerError> {
     let std_socket = make_server_udp_socket(listen_addr, io_tuning.socket_buffer_bytes())
         .map_err(|e| ServerError::Socket(e.to_string()))?;
@@ -234,8 +234,9 @@ struct ServerPacketHeader {
 }
 
 impl ServerPacketHeader {
-    fn parse(batch: &mut [PooledBuf]) -> Option<Self> {
-        let hdr = quiche::Header::from_slice(batch.first_mut()?, quiche::MAX_CONN_ID_LEN).ok()?;
+    fn parse(batch: &mut [DgramBuffer]) -> Option<Self> {
+        let hdr = quiche::Header::from_slice(batch.first_mut()?.as_mut(), quiche::MAX_CONN_ID_LEN)
+            .ok()?;
         Some(Self {
             dcid: hdr.dcid.as_ref().to_vec(),
             hdr_ty: hdr.ty,
@@ -405,7 +406,7 @@ struct H3Dispatcher {
     bound_addr: SocketAddr,
     config: quiche::Config,
     max_udp_payload: usize,
-    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
+    ingress_tx: mpsc::Sender<Vec<DgramBuffer>>,
     io_tuning: IoTuning,
     h3_tuning: H3Tuning,
     /// Kept alive so native filesystem watches remain registered.
@@ -414,7 +415,7 @@ struct H3Dispatcher {
     cert_path: PathBuf,
     key_path: PathBuf,
     /// Maps each registered CID directly to the per-connection packet sender.
-    cid_table: HashMap<Vec<u8>, mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>>,
+    cid_table: HashMap<Vec<u8>, mpsc::Sender<(SocketAddr, Vec<DgramBuffer>)>>,
 }
 
 fn should_reload(event: &NotifyEvent) -> bool {
@@ -424,8 +425,8 @@ fn should_reload(event: &NotifyEvent) -> bool {
 impl H3Dispatcher {
     async fn run(
         mut self,
-        mut udp_recv_rx: mpsc::Receiver<(SocketAddr, Vec<PooledBuf>)>,
-        udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+        mut udp_recv_rx: mpsc::Receiver<(SocketAddr, Vec<DgramBuffer>)>,
+        udp_send_tx: mpsc::Sender<(SocketAddr, Vec<DgramBuffer>)>,
         mut peer_tokens: HashMap<String, String>,
         mut ctx: ActorContext,
     ) -> ActorExitResult {
@@ -551,9 +552,9 @@ impl H3Dispatcher {
     async fn handle_udp_batch(
         &mut self,
         remote: SocketAddr,
-        mut batch: Vec<PooledBuf>,
+        mut batch: Vec<DgramBuffer>,
         peer_tokens: &HashMap<String, String>,
-        udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+        udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<DgramBuffer>)>,
         ctx: &ActorContext,
     ) {
         let Some(header) = ServerPacketHeader::parse(&mut batch) else {
@@ -574,10 +575,10 @@ impl H3Dispatcher {
     fn accept_and_spawn(
         &mut self,
         remote: SocketAddr,
-        batch: Vec<PooledBuf>,
+        batch: Vec<DgramBuffer>,
         header: ServerPacketHeader,
         peer_tokens: &HashMap<String, String>,
-        udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+        udp_send_tx: &mpsc::Sender<(SocketAddr, Vec<DgramBuffer>)>,
         ctx: &ActorContext,
     ) {
         if header.hdr_ty != quiche::Type::Initial {
@@ -599,7 +600,7 @@ impl H3Dispatcher {
             if let Ok(len) = quiche::negotiate_version(
                 &quiche::ConnectionId::from_ref(&header.client_scid),
                 &quiche::ConnectionId::from_ref(&header.dcid),
-                &mut pkt,
+                pkt.as_mut(),
             ) {
                 pkt.truncate(len);
                 if udp_send_tx.try_send((remote, vec![pkt])).is_err() {
@@ -645,14 +646,14 @@ impl H3Dispatcher {
 
         // Create per-connection channels.
         let depth = self.io_tuning.packet_queue_depth;
-        let (packet_tx, packet_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(depth);
+        let (packet_tx, packet_rx) = mpsc::channel::<(SocketAddr, Vec<DgramBuffer>)>(depth);
 
         // Register CIDs before spawning actor so subsequent packets route correctly.
         // TODO: Track NEW_CONNECTION_ID / RETIRE_CONNECTION_ID for CID rotation.
         for cid in [header.dcid, scid_bytes.to_vec()] {
             self.cid_table.insert(cid, packet_tx.clone());
         }
-        let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(depth);
+        let (egress_tx, egress_rx) = mpsc::channel::<Vec<DgramBuffer>>(depth);
         let peer_tokens = peer_tokens.clone();
         let handshake_timeout = self.h3_tuning.h3_handshake_timeout;
 
@@ -743,7 +744,7 @@ pub(crate) fn spawn_h3_dispatcher(
     let packet_queue_depth = dispatcher.io_tuning.packet_queue_depth;
 
     let (udp_recv_tx, udp_recv_rx) =
-        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(packet_queue_depth);
+        mpsc::channel::<(SocketAddr, Vec<DgramBuffer>)>(packet_queue_depth);
     let udp_rx_ref = udp::spawn_udp_rx(udp_rx, udp_recv_tx, ctx, SupervisionPolicy::Critical);
     let (udp_send_tx, udp_tx_ref) =
         udp::spawn_udp_tx(udp_tx, packet_queue_depth, ctx, SupervisionPolicy::Critical);
@@ -907,9 +908,9 @@ mod tests {
     use crate::test_support::tokio_quiche_h3::{
         dial_h3, spawn_h3_rx, spawn_h3_tx, DialError as OldDialError, H3Connection,
     };
+    use datagram_socket::DgramBuffer;
     use std::net::Ipv4Addr;
     use test_support::await_connected;
-    use tokio_quiche::buf_factory::PooledBuf;
 
     // ========== Test Harness ==========
 
@@ -917,7 +918,7 @@ mod tests {
     struct TestH3Server {
         dispatcher: ActorRef,
         events_rx: ActorContext,
-        ingress_rx: mpsc::Receiver<Vec<PooledBuf>>,
+        ingress_rx: mpsc::Receiver<Vec<DgramBuffer>>,
         bound_addr: SocketAddr,
         certs: TestCertBundle,
         actor_bus: crate::actor::ActorBus,
@@ -929,7 +930,7 @@ mod tests {
             let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let io = IoTuning::default();
             let h3 = H3Tuning::default();
-            let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+            let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
             let actor_bus = crate::actor::ActorBus::on_current_runtime();
             let events_rx = actor_bus.mailbox("test-orchestrator");
 
@@ -994,7 +995,7 @@ mod tests {
         peer_id: &str,
     ) -> (
         ConnectedEvent,
-        mpsc::Receiver<Vec<PooledBuf>>,
+        mpsc::Receiver<Vec<DgramBuffer>>,
         ActorContext,
         crate::actor::ActorBus,
     ) {
@@ -1009,13 +1010,13 @@ mod tests {
         tuning: Tuning,
     ) -> (
         ConnectedEvent,
-        mpsc::Receiver<Vec<PooledBuf>>,
+        mpsc::Receiver<Vec<DgramBuffer>>,
         ActorContext,
         crate::actor::ActorBus,
     ) {
         let peer_h3 = test_peer_h3(bound_addr, token);
 
-        let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let orchestrator = actor_bus.mailbox("test-orchestrator");
         let dial = DialContext::test(peer_id, bound_addr.ip(), tuning, FakeRouteProbe::noop());
@@ -1130,7 +1131,7 @@ mod tests {
             .expect("channel closed");
 
         assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &test_packet[..]);
+        assert_eq!(batch[0].as_ref(), &test_packet[..]);
 
         server.stop();
     }
@@ -1241,7 +1242,7 @@ mod tests {
         let peer_h3 = test_peer_h3(server.bound_addr, wrong_token);
         let tuning = insecure_tuning();
 
-        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let orchestrator = actor_bus.mailbox("test-orchestrator");
         let dial = DialContext::test(
@@ -1283,7 +1284,7 @@ mod tests {
             .expect("channel closed");
 
         assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &test_packet[..]);
+        assert_eq!(batch[0].as_ref(), &test_packet[..]);
 
         server.stop();
     }
@@ -1303,7 +1304,7 @@ mod tests {
         // Set up old client RX actor.
         let (client_rx, _client_tx) = conn.into_actors();
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let (client_ingress_tx, mut client_ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (client_ingress_tx, mut client_ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
         let _rx_handle = spawn_h3_rx(
             client_rx,
             client_ingress_tx,
@@ -1323,7 +1324,7 @@ mod tests {
             .expect("channel closed");
 
         assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &test_packet[..]);
+        assert_eq!(batch[0].as_ref(), &test_packet[..]);
 
         server.stop();
     }
@@ -1354,7 +1355,7 @@ mod tests {
             .expect("channel closed");
 
         assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &test_packet[..]);
+        assert_eq!(batch[0].as_ref(), &test_packet[..]);
 
         server.stop();
     }
@@ -1380,7 +1381,7 @@ mod tests {
             256,
             Duration::from_secs(20),
         );
-        let (client_ingress_tx, mut client_ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
+        let (client_ingress_tx, mut client_ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
         let _rx_handle = spawn_h3_rx(
             client_rx,
             client_ingress_tx,
@@ -1398,7 +1399,7 @@ mod tests {
             .await
             .expect("timeout c2s")
             .expect("closed");
-        assert_eq!(&batch[0][..], &packet_c2s[..]);
+        assert_eq!(batch[0].as_ref(), &packet_c2s[..]);
 
         // Server → Client
         let packet_s2c = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
@@ -1411,7 +1412,7 @@ mod tests {
             .await
             .expect("timeout s2c")
             .expect("closed");
-        assert_eq!(&batch[0][..], &packet_s2c[..]);
+        assert_eq!(batch[0].as_ref(), &packet_s2c[..]);
 
         server.stop();
     }
@@ -1438,7 +1439,7 @@ mod tests {
             .await
             .expect("timeout c2s")
             .expect("closed");
-        assert_eq!(&batch[0][..], &packet_c2s[..]);
+        assert_eq!(batch[0].as_ref(), &packet_c2s[..]);
 
         // Server → Client
         let packet_s2c = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
@@ -1451,7 +1452,7 @@ mod tests {
             .await
             .expect("timeout s2c")
             .expect("closed");
-        assert_eq!(&batch[0][..], &packet_s2c[..]);
+        assert_eq!(batch[0].as_ref(), &packet_s2c[..]);
 
         server.stop();
     }
