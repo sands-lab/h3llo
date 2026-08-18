@@ -674,7 +674,6 @@ impl H3Dispatcher {
             run_state: RunState::new(),
             metrics_interval: self.io_tuning.metrics_push_interval,
             keepalive_interval: self.h3_tuning.h3_keepalive_interval,
-            udp_rx: None,
         };
 
         // Send initial handshake output (ServerHello) synchronously before
@@ -745,16 +744,20 @@ pub(crate) fn spawn_h3_dispatcher(
 
     let (udp_recv_tx, udp_recv_rx) =
         mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(packet_queue_depth);
-    let _udp_rx_ref = udp::spawn_udp_rx(udp_rx, udp_recv_tx, ctx, SupervisionPolicy::Critical);
-    let (udp_send_tx, _udp_tx_ref) =
+    let udp_rx_ref = udp::spawn_udp_rx(udp_rx, udp_recv_tx, ctx, SupervisionPolicy::Critical);
+    let (udp_send_tx, udp_tx_ref) =
         udp::spawn_udp_tx(udp_tx, packet_queue_depth, ctx, SupervisionPolicy::Critical);
 
-    ctx.spawn(
+    let dispatcher_ref = ctx.spawn(
         format!("h3-dispatcher[{bound_addr}]"),
         ActorRuntime::Crypto,
         SupervisionPolicy::Critical,
         |ctx| dispatcher.run(udp_recv_rx, udp_send_tx, peer_tokens, ctx),
-    )
+    );
+    dispatcher_ref.link(&udp_rx_ref);
+    dispatcher_ref.link(&udp_tx_ref);
+    udp_rx_ref.link(&udp_tx_ref);
+    dispatcher_ref
 }
 
 /// Shared test utilities for H3v2 listener integration tests across modules.

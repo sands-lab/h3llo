@@ -91,7 +91,8 @@ pub fn spawn_bare_rx(
     let BareRxGroup { filter, udp_rx } = group;
     let (udp_output_tx, filter_ref) = spawn_bare_filter(filter, packet_queue_depth, ctx);
 
-    let _udp_rx_ref = udp::spawn_udp_rx(udp_rx, udp_output_tx, ctx, SupervisionPolicy::Critical);
+    let udp_rx_ref = udp::spawn_udp_rx(udp_rx, udp_output_tx, ctx, SupervisionPolicy::Critical);
+    filter_ref.link(&udp_rx_ref);
 
     filter_ref
 }
@@ -192,19 +193,20 @@ pub(crate) async fn dial_bare_tx<P: RouteProbe>(
         })
         .await
         .map_err(|error| UdpError::Socket(format!("UDP runtime task failed: {error}")))??;
-    let (udp_send_tx, _udp_tx_ref) = udp::spawn_udp_tx(
+    let (udp_send_tx, udp_tx_ref) = udp::spawn_udp_tx(
         udp_tx,
         dial.tuning.io.packet_queue_depth,
         ctx,
         SupervisionPolicy::Restartable,
     );
-    let egress_tx = spawn_bare_tx(
+    let (egress_tx, bare_tx_ref) = spawn_bare_tx(
         udp_send_tx,
         destination,
         dial.peer_id.clone(),
         &dial.tuning,
         ctx,
     );
+    udp_tx_ref.link(&bare_tx_ref);
 
     Ok(ConnectedEvent {
         peer_id: dial.peer_id.clone(),
@@ -220,17 +222,19 @@ pub(crate) async fn dial_bare_tx<P: RouteProbe>(
 /// peer's destination address, and forwards to the UDP TX actor.
 /// Records metrics after successful channel send to avoid inflating
 /// counters when the downstream actor is unavailable.
+///
+/// Returns the router-facing sender and the adapter actor address.
 pub(crate) fn spawn_bare_tx(
     udp_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     destination: SocketAddr,
     peer_id: String,
     tuning: &Tuning,
     ctx: &ActorContext,
-) -> mpsc::Sender<Vec<PooledBuf>> {
+) -> (mpsc::Sender<Vec<PooledBuf>>, ActorRef) {
     let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.io.packet_queue_depth);
     let metrics_interval = tuning.io.metrics_push_interval;
 
-    let _actor_ref = ctx.spawn(
+    let actor_ref = ctx.spawn(
         format!("bare-tx[{peer_id}]"),
         ActorRuntime::Crypto,
         SupervisionPolicy::Restartable,
@@ -265,7 +269,7 @@ pub(crate) fn spawn_bare_tx(
         },
     );
 
-    egress_tx
+    (egress_tx, actor_ref)
 }
 
 #[cfg(test)]
@@ -442,7 +446,7 @@ mod tests {
         let (udp_tx, mut udp_rx) = mpsc::channel(4);
 
         let tuning = test_tuning(Duration::from_millis(200));
-        let egress_tx = spawn_bare_tx(
+        let (egress_tx, _actor_ref) = spawn_bare_tx(
             udp_tx,
             dest,
             "test-peer".to_string(),
@@ -472,7 +476,7 @@ mod tests {
         let (udp_tx, mut udp_rx) = mpsc::channel(4);
 
         let tuning = test_tuning(Duration::from_millis(10));
-        let egress_tx = spawn_bare_tx(
+        let (egress_tx, _actor_ref) = spawn_bare_tx(
             udp_tx,
             dest,
             "test-peer".to_string(),
@@ -548,7 +552,7 @@ mod tests {
         let (udp_tx, _udp_rx) = mpsc::channel(4);
 
         let tuning = test_tuning(Duration::from_secs(60));
-        let egress_tx = spawn_bare_tx(
+        let (egress_tx, _actor_ref) = spawn_bare_tx(
             udp_tx,
             dest,
             "test-peer".to_string(),

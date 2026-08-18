@@ -7,7 +7,7 @@
 //! [`accept`](H3Engine::accept) (in [`crate::h3listener`]). Both then call
 //! [`run`](H3Engine::run) for steady-state datagram forwarding.
 
-use crate::actor::{ActorContext, ActorExitResult, ActorRef};
+use crate::actor::{ActorContext, ActorExitResult};
 use crate::config::H3Tuning;
 use crate::events::Event;
 use crate::h3session::{
@@ -315,12 +315,6 @@ pub(crate) struct H3Engine {
 
     pub(crate) metrics_interval: Duration,
     pub(crate) keepalive_interval: Duration,
-
-    /// UDP receive actor owned by an outbound connection.
-    ///
-    /// `None` for server-side engines where UDP actors are shared
-    /// across all connections by the dispatcher.
-    pub(crate) udp_rx: Option<ActorRef>,
 }
 
 impl H3Engine {
@@ -361,7 +355,6 @@ impl H3Engine {
             mut run_state,
             metrics_interval,
             keepalive_interval,
-            udp_rx,
         } = self;
         let mut session = session.expect("session present after establish/accept");
 
@@ -493,12 +486,6 @@ impl H3Engine {
         conn.close(true, 0, b"").ok();
         if let Some(send) = collect_udp_send(&mut conn, meta.max_udp_payload) {
             let _ = udp_send_tx.send(send).await;
-        }
-        // Stop the RX actor, which may otherwise block on socket readiness.
-        // TX actor exits naturally when udp_send_tx is dropped at
-        // function return, draining any remaining batches first.
-        if let Some(udp_rx) = udp_rx {
-            let _ = ctx.send(&udp_rx, Event::Stop);
         }
         exit.context("run established HTTP/3 connection")
     }

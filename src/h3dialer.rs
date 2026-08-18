@@ -7,7 +7,7 @@ use crate::actor::{ActorContext, ActorRuntime, SupervisionPolicy};
 use crate::auth::bearer_auth_header;
 use crate::bind::{make_unbound_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
-use crate::events::{ConnectedEvent, DialContext, Endpoint, Event};
+use crate::events::{ConnectedEvent, DialContext, Endpoint};
 use crate::h3engine::{
     apply_transport_config, handle_udp_recv, reset_timer, EngineIo, EngineMeta, H3Engine, RunState,
 };
@@ -296,12 +296,13 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     let (udp_recv_tx, udp_recv_rx) =
         mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
     let udp_rx_ref = udp::spawn_udp_rx(udp_rx, udp_recv_tx, ctx, SupervisionPolicy::Restartable);
-    let (udp_send_tx, _udp_tx_ref) = udp::spawn_udp_tx(
+    let (udp_send_tx, udp_tx_ref) = udp::spawn_udp_tx(
         udp_tx,
         tuning.io.packet_queue_depth,
         ctx,
         SupervisionPolicy::Restartable,
     );
+    udp_rx_ref.link(&udp_tx_ref);
 
     let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.io.packet_queue_depth);
 
@@ -325,31 +326,25 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
 
         metrics_interval: tuning.io.metrics_push_interval,
         keepalive_interval: tuning.h3.h3_keepalive_interval,
-        udp_rx: Some(udp_rx_ref.clone()),
     };
 
-    let engine = match engine
+    let engine = engine
         .establish(
             authority,
             connect_path,
             auth_header,
             tuning.h3.h3_handshake_timeout,
         )
-        .await
-    {
-        Ok(engine) => engine,
-        Err(error) => {
-            let _ = ctx.send(&udp_rx_ref, Event::Stop);
-            return Err(error);
-        }
-    };
+        .await?;
 
-    let _engine_ref = ctx.spawn(
+    let engine_ref = ctx.spawn(
         format!("h3-engine[{peer_id}@{remote_addr}]"),
         ActorRuntime::Crypto,
         SupervisionPolicy::Restartable,
         |ctx| engine.run(ctx),
     );
+    engine_ref.link(&udp_rx_ref);
+    engine_ref.link(&udp_tx_ref);
 
     Ok(ConnectedEvent {
         peer_id: peer_id.clone(),
