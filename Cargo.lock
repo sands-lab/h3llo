@@ -400,7 +400,7 @@ dependencies = [
 [[package]]
 name = "buffer-pool"
 version = "0.2.1"
-source = "git+https://github.com/Tonny-Gu/quiche?branch=remove-pooled-buf-metrics#d8120d6c6f514919d68b6a38e41cc536c64c62a9"
+source = "git+https://github.com/Tonny-Gu/quiche?branch=master#f413e4312e6c30157eeb891be9a20a293e5e7a9c"
 dependencies = [
  "crossbeam",
 ]
@@ -745,7 +745,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "datagram-socket"
 version = "0.8.0"
-source = "git+https://github.com/Tonny-Gu/quiche?branch=master#b432089c3467a5523091380bb8c6826678022156"
+source = "git+https://github.com/Tonny-Gu/quiche?branch=master#f413e4312e6c30157eeb891be9a20a293e5e7a9c"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2503,7 +2503,7 @@ dependencies = [
 [[package]]
 name = "octets"
 version = "0.3.6"
-source = "git+https://github.com/Tonny-Gu/quiche?branch=master#b432089c3467a5523091380bb8c6826678022156"
+source = "git+https://github.com/Tonny-Gu/quiche?branch=master#f413e4312e6c30157eeb891be9a20a293e5e7a9c"
 
 [[package]]
 name = "oid-registry"
@@ -2911,7 +2911,7 @@ dependencies = [
 [[package]]
 name = "qlog"
 version = "0.18.0"
-source = "git+https://github.com/Tonny-Gu/quiche?branch=master#b432089c3467a5523091380bb8c6826678022156"
+source = "git+https://github.com/Tonny-Gu/quiche?branch=master#f413e4312e6c30157eeb891be9a20a293e5e7a9c"
 dependencies = [
  "flate2",
  "foundations",
@@ -2940,7 +2940,7 @@ dependencies = [
 [[package]]
 name = "quiche"
 version = "0.29.3"
-source = "git+https://github.com/Tonny-Gu/quiche?branch=master#b432089c3467a5523091380bb8c6826678022156"
+source = "git+https://github.com/Tonny-Gu/quiche?branch=master#f413e4312e6c30157eeb891be9a20a293e5e7a9c"
 dependencies = [
  "boring",
  "bytes",
@@ -3772,7 +3772,7 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 [[package]]
 name = "task-killswitch"
 version = "0.2.1"
-source = "git+https://github.com/Tonny-Gu/quiche?branch=master#b432089c3467a5523091380bb8c6826678022156"
+source = "git+https://github.com/Tonny-Gu/quiche?branch=master#f413e4312e6c30157eeb891be9a20a293e5e7a9c"
 dependencies = [
  "dashmap",
  "parking_lot",
@@ -3976,7 +3976,7 @@ dependencies = [
 [[package]]
 name = "tokio-quiche"
 version = "0.19.1"
-source = "git+https://github.com/Tonny-Gu/quiche?branch=master#b432089c3467a5523091380bb8c6826678022156"
+source = "git+https://github.com/Tonny-Gu/quiche?branch=master#f413e4312e6c30157eeb891be9a20a293e5e7a9c"
 dependencies = [
  "anyhow",
  "boring",

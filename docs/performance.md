@@ -155,7 +155,7 @@ Configuration:
 
 ### Upstream Patches
 
-h3llo patches quiche-family crates to [`Tonny-Gu/quiche:master`](https://github.com/Tonny-Gu/quiche/tree/master) and directly pins `buffer-pool` to [`Tonny-Gu/quiche:remove-pooled-buf-metrics`](https://github.com/Tonny-Gu/quiche/tree/remove-pooled-buf-metrics). These forks provide two performance-critical changes:
+h3llo patches all quiche-family crates, including `buffer-pool`, to [`Tonny-Gu/quiche:master`](https://github.com/Tonny-Gu/quiche/tree/master). This fork provides two performance-critical changes:
 
 #### buffer-pool Prometheus Removal
 
