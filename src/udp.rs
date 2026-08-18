@@ -2,7 +2,7 @@
 //!
 //! Provides GRO-aware receive and GSO-aware send loops that both `BareUDP`
 //! and H3v2 transports share. The actors communicate via
-//! `(SocketAddr, Vec<DgramBuffer>)` channels, tagging each batch with
+//! `(SocketAddr, Vec<PooledBuf>)` channels, tagging each batch with
 //! the remote address.
 
 use crate::actor::{ActorContext, ActorRef, ActorRuntime, SupervisionPolicy};
@@ -10,7 +10,7 @@ use crate::bind::UdpError;
 use crate::helpers::alloc_packet_buf;
 use crate::helpers::retry_on_transient;
 use anyhow::Context;
-use datagram_socket::DgramBuffer;
+use buffer_pool::PooledBuf;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::io;
 use std::io::IoSliceMut;
@@ -85,7 +85,7 @@ pub fn make_udp(
 /// Protocol-specific logic belongs in the consuming actor.
 pub fn spawn_udp_rx(
     rx: UdpRx,
-    output: mpsc::Sender<(SocketAddr, Vec<DgramBuffer>)>,
+    output: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     ctx: &ActorContext,
     policy: SupervisionPolicy,
 ) -> ActorRef {
@@ -125,7 +125,7 @@ pub fn spawn_udp_rx(
                     Ok(_) => {
                         let remote = meta.addr;
                         let stride = meta.stride.min(meta.len);
-                        let batch: Vec<DgramBuffer> = buf[..meta.len]
+                        let batch: Vec<PooledBuf> = buf[..meta.len]
                             .chunks(stride)
                             .map(alloc_packet_buf)
                             .collect();
@@ -164,8 +164,8 @@ pub fn spawn_udp_tx(
     queue_depth: usize,
     ctx: &ActorContext,
     policy: SupervisionPolicy,
-) -> (mpsc::Sender<(SocketAddr, Vec<DgramBuffer>)>, ActorRef) {
-    let (input_tx, mut input_rx) = mpsc::channel::<(SocketAddr, Vec<DgramBuffer>)>(queue_depth);
+) -> (mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>, ActorRef) {
+    let (input_tx, mut input_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(queue_depth);
     let UdpTx {
         socket,
         state,
@@ -233,7 +233,7 @@ pub fn spawn_udp_tx(
                         && packets[pos].len() == segment_size
                         && gso_buf.len() / segment_size < max_segs_run
                     {
-                        gso_buf.extend_from_slice(packets[pos].as_ref());
+                        gso_buf.extend_from_slice(&packets[pos]);
                         pos += 1;
                     }
 
@@ -357,7 +357,7 @@ mod tests {
 
         assert_eq!(remote, sender_addr);
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].as_ref(), &[1, 2, 3]);
+        assert_eq!(&batch[0][..], &[1, 2, 3]);
     }
 
     #[tokio::test]
@@ -372,7 +372,7 @@ mod tests {
         let (input_tx, _udp_tx) = spawn_udp_tx(tx, 4, &supervisor, SupervisionPolicy::Detached);
 
         input_tx
-            .send((dest, vec![DgramBuffer::from_slice(&[9, 8, 7])]))
+            .send((dest, vec![alloc_packet_buf(&[9, 8, 7])]))
             .await
             .unwrap();
 
@@ -394,9 +394,9 @@ mod tests {
 
         // Send a batch of 3 packets.
         let batch = vec![
-            DgramBuffer::from_slice(&[1, 2]),
-            DgramBuffer::from_slice(&[3, 4]),
-            DgramBuffer::from_slice(&[5, 6]),
+            alloc_packet_buf(&[1, 2]),
+            alloc_packet_buf(&[3, 4]),
+            alloc_packet_buf(&[5, 6]),
         ];
         input_tx.send((dest, batch)).await.unwrap();
 
@@ -421,10 +421,10 @@ mod tests {
 
         // Mixed sizes: run of 2-byte, then 3-byte, then back to 2-byte.
         let batch = vec![
-            DgramBuffer::from_slice(&[1, 2]),
-            DgramBuffer::from_slice(&[3, 4]),
-            DgramBuffer::from_slice(&[5, 6, 7]),
-            DgramBuffer::from_slice(&[8, 9]),
+            alloc_packet_buf(&[1, 2]),
+            alloc_packet_buf(&[3, 4]),
+            alloc_packet_buf(&[5, 6, 7]),
+            alloc_packet_buf(&[8, 9]),
         ];
         input_tx.send((dest, batch)).await.unwrap();
 
@@ -508,7 +508,7 @@ mod tests {
 
         let (input_tx, udp_tx) = spawn_udp_tx(tx, 4, &supervisor, SupervisionPolicy::Detached);
         input_tx
-            .send((dest, vec![DgramBuffer::from_slice(&[9, 8, 7])]))
+            .send((dest, vec![alloc_packet_buf(&[9, 8, 7])]))
             .await
             .unwrap();
         supervisor.send(&udp_tx, Event::Stop).unwrap();

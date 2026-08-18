@@ -15,7 +15,7 @@ use crate::route::{make_route, spawn_route};
 use crate::router::{spawn_router, RoutingTable};
 use crate::tun;
 use anyhow::{bail, Context, Result};
-use datagram_socket::DgramBuffer;
+use buffer_pool::PooledBuf;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -35,7 +35,7 @@ struct ActiveConn {
     /// Destination socket address.
     dest: SocketAddr,
     /// TX channel for sending packet batches.
-    tx: mpsc::Sender<Vec<DgramBuffer>>,
+    tx: mpsc::Sender<Vec<PooledBuf>>,
     /// Latest cumulative RX metrics for this connection.
     rx_metrics: Option<Metrics>,
     /// Latest cumulative TX metrics for this connection.
@@ -106,7 +106,7 @@ impl PeerEntry {
     }
 
     /// Returns the preferred TX channel (first bound) or `None` if no active connections.
-    fn preferred_tx(&self) -> Option<&mpsc::Sender<Vec<DgramBuffer>>> {
+    fn preferred_tx(&self) -> Option<&mpsc::Sender<Vec<PooledBuf>>> {
         self.bounds.first().map(|b| &b.tx)
     }
 
@@ -175,7 +175,7 @@ impl PeerEntry {
         tun_mtu: u16,
         tuning: &Tuning,
         ctx: &ActorContext,
-        ingress_tx: &mpsc::Sender<Vec<DgramBuffer>>,
+        ingress_tx: &mpsc::Sender<Vec<PooledBuf>>,
     ) {
         if self.resolved_ips.is_empty() {
             return;
@@ -309,7 +309,7 @@ pub(crate) struct Orchestrator {
     /// Unified peer state: config + active bound.
     peers: HashMap<String, PeerEntry>,
     router: ActorRef,
-    ingress_tx: mpsc::Sender<Vec<DgramBuffer>>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     bare_rx: Option<ActorRef>,
     /// H3v2 listener actor (if listening).
     h3_listener: Option<ActorRef>,
@@ -320,7 +320,7 @@ pub(crate) struct Orchestrator {
     /// Route sync actor (None when `local.table` is false or initialization failed).
     route: Option<ActorRef>,
     /// Input channel (TUN TX) for local host routes in the routing table.
-    input_tx: mpsc::Sender<Vec<DgramBuffer>>,
+    input_tx: mpsc::Sender<Vec<PooledBuf>>,
     /// Stored local config (TUN addrs, routing, GET /config snapshot).
     local: Local,
 
@@ -395,7 +395,7 @@ impl Orchestrator {
     /// 2. System routes via route actor (if available)
     fn update_routing(&self) {
         let peer_configs = self.peer_configs();
-        let peer_txs: HashMap<String, mpsc::Sender<Vec<DgramBuffer>>> = self
+        let peer_txs: HashMap<String, mpsc::Sender<Vec<PooledBuf>>> = self
             .peers
             .iter()
             .filter_map(|(id, e)| e.preferred_tx().map(|tx| (id.clone(), tx.clone())))
@@ -883,7 +883,7 @@ impl Orchestrator {
         peer_id: &str,
         endpoint: Option<Endpoint>,
         dest: SocketAddr,
-        tx: mpsc::Sender<Vec<DgramBuffer>>,
+        tx: mpsc::Sender<Vec<PooledBuf>>,
     ) {
         let Some(entry) = self.peers.get_mut(peer_id) else {
             warn!(peer = %peer_id, addr = %dest, "connection for unknown peer");
@@ -1059,7 +1059,7 @@ mod test_support {
             mut self,
             peer_id: &str,
             dest: SocketAddr,
-            tx: mpsc::Sender<Vec<DgramBuffer>>,
+            tx: mpsc::Sender<Vec<PooledBuf>>,
         ) -> Self {
             if let Some(entry) = self.peers.get_mut(peer_id) {
                 let endpoint = entry.config_endpoint();
@@ -2226,7 +2226,7 @@ mod tests {
         entry.resolved_ips.insert(ip);
 
         // First call should mark IP as in-flight
-        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(1);
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(1);
         entry.try_connect(
             "test0",
             1393,
@@ -2239,7 +2239,7 @@ mod tests {
 
         // Second immediate call should skip (in-flight)
         let attempt_before = entry.dials[&ip].attempt;
-        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(1);
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(1);
         entry.try_connect(
             "test0",
             1393,
@@ -2268,7 +2268,7 @@ mod tests {
             },
         );
 
-        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(1);
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(1);
         entry.try_connect(
             "test0",
             1393,
@@ -2299,7 +2299,7 @@ mod tests {
             },
         );
 
-        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(1);
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(1);
         entry.try_connect(
             "test0",
             1393,

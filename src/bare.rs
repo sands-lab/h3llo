@@ -10,7 +10,7 @@ use crate::events::{ConnectedEvent, DialContext, Endpoint, Event};
 use crate::helpers::{batch_stats, make_interval};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::udp;
-use datagram_socket::DgramBuffer;
+use buffer_pool::PooledBuf;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -20,7 +20,7 @@ use tracing::{debug, info};
 /// State owned exclusively by the `BareUDP` source-filter actor.
 struct BareRx {
     accepted_sources: HashSet<IpAddr>,
-    ingress_tx: mpsc::Sender<Vec<DgramBuffer>>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     metrics_interval: Duration,
 }
 
@@ -58,7 +58,7 @@ pub async fn make_bare_rx(
     listen_addr: SocketAddr,
     tun_mtu: u16,
     accepted_sources: HashSet<IpAddr>,
-    ingress_tx: mpsc::Sender<Vec<DgramBuffer>>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     tuning: &Tuning,
     ctx: &ActorContext,
 ) -> Result<BareRxGroup, UdpError> {
@@ -105,14 +105,13 @@ fn spawn_bare_filter(
     filter: BareRx,
     packet_queue_depth: usize,
     ctx: &ActorContext,
-) -> (mpsc::Sender<(SocketAddr, Vec<DgramBuffer>)>, ActorRef) {
+) -> (mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>, ActorRef) {
     let BareRx {
         mut accepted_sources,
         ingress_tx,
         metrics_interval,
     } = filter;
-    let (input_tx, mut udp_rx) =
-        mpsc::channel::<(SocketAddr, Vec<DgramBuffer>)>(packet_queue_depth);
+    let (input_tx, mut udp_rx) = mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(packet_queue_depth);
 
     let actor_ref = ctx.spawn(
         "bare-rx-filter",
@@ -219,21 +218,20 @@ pub(crate) async fn dial_bare_tx<P: RouteProbe>(
 
 /// Spawns the `BareUDP` destination-stamping transmit actor.
 ///
-/// Receives `Vec<DgramBuffer>` from the router, stamps each batch with the
+/// Receives `Vec<PooledBuf>` from the router, stamps each batch with the
 /// peer's destination address, and forwards to the UDP TX actor.
 /// Records metrics after successful channel send to avoid inflating
 /// counters when the downstream actor is unavailable.
 ///
 /// Returns the router-facing sender and the adapter actor address.
 pub(crate) fn spawn_bare_tx(
-    udp_tx: mpsc::Sender<(SocketAddr, Vec<DgramBuffer>)>,
+    udp_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
     destination: SocketAddr,
     peer_id: String,
     tuning: &Tuning,
     ctx: &ActorContext,
-) -> (mpsc::Sender<Vec<DgramBuffer>>, ActorRef) {
-    let (egress_tx, mut egress_rx) =
-        mpsc::channel::<Vec<DgramBuffer>>(tuning.io.packet_queue_depth);
+) -> (mpsc::Sender<Vec<PooledBuf>>, ActorRef) {
+    let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.io.packet_queue_depth);
     let metrics_interval = tuning.io.metrics_push_interval;
 
     let actor_ref = ctx.spawn(
@@ -278,6 +276,7 @@ pub(crate) fn spawn_bare_tx(
 mod tests {
     use super::*;
     use crate::config::IoTuning;
+    use crate::helpers::alloc_packet_buf;
     use crate::metrics::Direction;
     use std::net::Ipv4Addr;
     use std::time::Duration;
@@ -295,7 +294,7 @@ mod tests {
 
     fn test_bare_rx(
         accepted_sources: HashSet<IpAddr>,
-        ingress_tx: mpsc::Sender<Vec<DgramBuffer>>,
+        ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
         tuning: &Tuning,
     ) -> BareRx {
         BareRx {
@@ -319,7 +318,7 @@ mod tests {
 
         // Send from a non-accepted source
         let remote: SocketAddr = "192.168.1.1:5353".parse().unwrap();
-        let batch = vec![DgramBuffer::from_slice(&[1, 2, 3])];
+        let batch = vec![alloc_packet_buf(&[1, 2, 3])];
         udp_tx.send((remote, batch)).await.unwrap();
 
         let result = tokio::time::timeout(Duration::from_millis(50), ingress_rx.recv()).await;
@@ -342,7 +341,7 @@ mod tests {
             spawn_bare_filter(filter, tuning.io.packet_queue_depth, &orchestrator);
 
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
-        let batch = vec![DgramBuffer::from_slice(&[7, 8, 9])];
+        let batch = vec![alloc_packet_buf(&[7, 8, 9])];
         udp_tx.send((remote, batch)).await.unwrap();
 
         let received = tokio::time::timeout(Duration::from_millis(100), ingress_rx.recv())
@@ -350,7 +349,7 @@ mod tests {
             .expect("should receive within timeout")
             .expect("channel should carry message");
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].as_ref(), &[7, 8, 9]);
+        assert_eq!(&received[0][..], &[7, 8, 9]);
     }
 
     #[tokio::test]
@@ -367,7 +366,7 @@ mod tests {
         // Initially no sources accepted — packet should be dropped.
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
         udp_tx
-            .send((remote, vec![DgramBuffer::from_slice(&[1])]))
+            .send((remote, vec![alloc_packet_buf(&[1])]))
             .await
             .unwrap();
         let first = tokio::time::timeout(Duration::from_millis(50), ingress_rx.recv()).await;
@@ -388,14 +387,14 @@ mod tests {
 
         // Now the same source should be accepted.
         udp_tx
-            .send((remote, vec![DgramBuffer::from_slice(&[2])]))
+            .send((remote, vec![alloc_packet_buf(&[2])]))
             .await
             .unwrap();
         let batch = tokio::time::timeout(Duration::from_millis(100), ingress_rx.recv())
             .await
             .expect("should arrive after update")
             .expect("channel should carry message");
-        assert_eq!(batch[0].as_ref(), &[2]);
+        assert_eq!(&batch[0][..], &[2]);
     }
 
     #[tokio::test]
@@ -412,7 +411,7 @@ mod tests {
 
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
         udp_tx
-            .send((remote, vec![DgramBuffer::from_slice(&[1, 2, 3, 4])]))
+            .send((remote, vec![alloc_packet_buf(&[1, 2, 3, 4])]))
             .await
             .unwrap();
 
@@ -455,7 +454,7 @@ mod tests {
             &orchestrator,
         );
 
-        let batch = vec![DgramBuffer::from_slice(&[9, 8, 7])];
+        let batch = vec![alloc_packet_buf(&[9, 8, 7])];
         egress_tx.send(batch).await.unwrap();
 
         let (tagged_dest, packets) =
@@ -466,7 +465,7 @@ mod tests {
 
         assert_eq!(tagged_dest, dest);
         assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].as_ref(), &[9, 8, 7]);
+        assert_eq!(&packets[0][..], &[9, 8, 7]);
     }
 
     #[tokio::test]
@@ -486,7 +485,7 @@ mod tests {
         );
 
         egress_tx
-            .send(vec![DgramBuffer::from_slice(&[5, 4, 3, 2])])
+            .send(vec![alloc_packet_buf(&[5, 4, 3, 2])])
             .await
             .unwrap();
 

@@ -5,7 +5,7 @@
 //! progress/failure types shared by [`crate::h3dialer`] and
 //! [`crate::h3listener`].
 
-use datagram_socket::DgramBuffer;
+use buffer_pool::PooledBuf;
 use octets::{varint_len, varint_parse_len, Octets, OctetsMut};
 use std::time::Duration;
 use tracing::debug;
@@ -238,13 +238,12 @@ impl ConnectIpDatagramCodec {
         &self.qsi_buf[..self.qsi_len]
     }
 
-    pub(crate) fn prepend(&self, packet: &mut DgramBuffer) -> bool {
-        packet.try_add_prefix(&[CONTEXT_ID_IP]).is_ok()
-            && packet.try_add_prefix(self.qsi_bytes()).is_ok()
+    pub(crate) fn prepend(&self, packet: &mut PooledBuf) -> bool {
+        packet.add_prefix(&[CONTEXT_ID_IP]) && packet.add_prefix(self.qsi_bytes())
     }
 
-    pub(crate) fn strip(&self, packet: &mut DgramBuffer) -> bool {
-        let Some((qsi, qsi_len)) = decode_qsi(packet.as_ref()) else {
+    pub(crate) fn strip(&self, packet: &mut PooledBuf) -> bool {
+        let Some((qsi, qsi_len)) = decode_qsi(packet) else {
             return false;
         };
         if qsi != self.expected_qsi || qsi_len != self.qsi_len {
@@ -252,14 +251,14 @@ impl ConnectIpDatagramCodec {
         }
 
         let prefix_len = qsi_len + 1;
-        if packet.len() < prefix_len || packet.as_ref()[qsi_len] != CONTEXT_ID_IP {
+        if packet.len() < prefix_len || packet[qsi_len] != CONTEXT_ID_IP {
             return false;
         }
         if packet.len() == prefix_len {
             return false;
         }
 
-        packet.advance(prefix_len);
+        packet.pop_front(prefix_len);
         true
     }
 }
@@ -378,10 +377,10 @@ mod tests {
         let (qsi_buf, qsi_len) = encode_qsi(0);
 
         let mut buf = alloc_packet_buf(ip_payload);
-        assert!(buf.try_add_prefix(&[CONTEXT_ID_IP]).is_ok());
-        assert!(buf.try_add_prefix(&qsi_buf[..qsi_len]).is_ok());
+        assert!(buf.add_prefix(&[CONTEXT_ID_IP]));
+        assert!(buf.add_prefix(&qsi_buf[..qsi_len]));
 
-        let data = buf.as_ref();
+        let data = &buf[..];
         let (qsi, qsi_len) = decode_qsi(data).expect("valid QSI");
         assert_eq!(qsi, 0);
         assert_eq!(data[qsi_len], CONTEXT_ID_IP);
@@ -447,9 +446,9 @@ mod tests {
         let codec = ConnectIpDatagramCodec::new(0);
         let mut buf = alloc_packet_buf(b"payload");
         assert!(codec.prepend(&mut buf));
-        assert_eq!(buf.as_ref()[0], 0x00); // QSI
-        assert_eq!(buf.as_ref()[1], CONTEXT_ID_IP); // Context ID
-        assert_eq!(&buf.as_ref()[2..], b"payload");
+        assert_eq!(buf[0], 0x00); // QSI
+        assert_eq!(buf[1], CONTEXT_ID_IP); // Context ID
+        assert_eq!(&buf[2..], b"payload");
     }
 
     #[test]
@@ -457,15 +456,15 @@ mod tests {
         let codec = ConnectIpDatagramCodec::new(0);
         let mut framed = vec![0x00, CONTEXT_ID_IP];
         framed.extend_from_slice(b"ip packet");
-        let mut buf = DgramBuffer::from(framed);
+        let mut buf = alloc_packet_buf(&framed);
         assert!(codec.strip(&mut buf));
-        assert_eq!(buf.as_ref(), b"ip packet");
+        assert_eq!(&buf[..], b"ip packet");
     }
 
     #[test]
     fn codec_strip_rejects_wrong_qsi() {
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = DgramBuffer::from(vec![0x01, CONTEXT_ID_IP, 0xFF]);
+        let mut buf = alloc_packet_buf(&[0x01, CONTEXT_ID_IP, 0xFF]);
         assert!(!codec.strip(&mut buf));
     }
 
@@ -473,35 +472,35 @@ mod tests {
     fn codec_strip_rejects_non_canonical_qsi() {
         // QSI=0 encoded as 2-byte varint 0x4000 instead of canonical 1-byte 0x00.
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = DgramBuffer::from(vec![0x40, 0x00, CONTEXT_ID_IP, 0xFF]);
+        let mut buf = alloc_packet_buf(&[0x40, 0x00, CONTEXT_ID_IP, 0xFF]);
         assert!(!codec.strip(&mut buf));
     }
 
     #[test]
     fn codec_strip_rejects_wrong_context_id() {
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = DgramBuffer::from(vec![0x00, 0x01, 0xFF]);
+        let mut buf = alloc_packet_buf(&[0x00, 0x01, 0xFF]);
         assert!(!codec.strip(&mut buf));
     }
 
     #[test]
     fn codec_strip_rejects_empty_payload() {
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = DgramBuffer::from(vec![0x00, CONTEXT_ID_IP]);
+        let mut buf = alloc_packet_buf(&[0x00, CONTEXT_ID_IP]);
         assert!(!codec.strip(&mut buf));
     }
 
     #[test]
     fn codec_strip_rejects_too_short() {
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = DgramBuffer::from(vec![0x00]);
+        let mut buf = alloc_packet_buf(&[0x00]);
         assert!(!codec.strip(&mut buf));
     }
 
     #[test]
     fn codec_strip_rejects_empty_buffer() {
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = DgramBuffer::from(vec![]);
+        let mut buf = alloc_packet_buf(&[]);
         assert!(!codec.strip(&mut buf));
     }
 
@@ -515,13 +514,13 @@ mod tests {
                 codec.prepend(&mut buf),
                 "prepend failed for sid={stream_id}"
             );
-            let framed_data = buf.as_ref().to_vec();
-            let mut recv_buf = DgramBuffer::from(framed_data);
+            let framed_data = buf[..].to_vec();
+            let mut recv_buf = alloc_packet_buf(&framed_data);
             assert!(
                 codec.strip(&mut recv_buf),
                 "strip failed for sid={stream_id}"
             );
-            assert_eq!(recv_buf.as_ref(), payload);
+            assert_eq!(&recv_buf[..], payload);
         }
     }
 

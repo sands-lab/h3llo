@@ -7,9 +7,7 @@ use crate::events::Event;
 use crate::helpers::retry_on_transient;
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use anyhow::Context;
-#[cfg(target_os = "linux")]
-use bytes::BufMut;
-use datagram_socket::DgramBuffer;
+use buffer_pool::PooledBuf;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::io;
 use std::net::Ipv6Addr;
@@ -21,33 +19,33 @@ use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
-/// Headroom reserved in every datapath `DgramBuffer`.
+#[cfg(test)]
+use crate::helpers::MAX_PACKET_BUFFER_SIZE;
+/// Headroom reserved in every datapath `PooledBuf`.
 ///
 use crate::helpers::{
     alloc_packet_buf, alloc_uninit_packet_buf, batch_stats, make_interval, HEADROOM,
 };
+use datagram_socket::MAX_DATAGRAM_SIZE;
 
 // Compile-time guard: TunBuf::prepend_hdr relies on HEADROOM being sufficient
-// to prepend a zeroed virtio_net_hdr without allocation.
+// to prepend a zeroed virtio_net_hdr via add_prefix without allocation.
 #[cfg(target_os = "linux")]
 const _: () = assert!(
     HEADROOM >= VIRTIO_NET_HDR_LEN,
     "HEADROOM must be >= VIRTIO_NET_HDR_LEN for zero-copy TUN TX"
 );
 
-#[cfg(target_os = "linux")]
-const MAX_GRO_BUFFER_SIZE: usize = VIRTIO_NET_HDR_LEN + u16::MAX as usize;
-
-/// Zero-copy wrapper around [`DgramBuffer`] for TUN I/O (RX and TX).
+/// Zero-copy wrapper around [`PooledBuf`] for TUN I/O (RX and TX).
 ///
-/// RX: [`TunBuf::alloc_uninit`] allocates with headroom; [`into_packet`](Self::into_packet) truncates.
-/// TX: `From<DgramBuffer>` constructs; [`TunTx::send_batch`] prepends `virtio_net_hdr`.
-pub struct TunBuf(DgramBuffer);
+/// RX: [`TunBuf::alloc_uninit`] allocates with headroom; [`into_pooled`](Self::into_pooled) truncates.
+/// TX: `From<PooledBuf>` constructs; [`TunTx::send_batch`] prepends `virtio_net_hdr`.
+pub struct TunBuf(PooledBuf);
 
 impl TunBuf {
-    /// Allocates a packet buffer sized for `mtu` with [`HEADROOM`] bytes reserved.
+    /// Allocates a pooled buffer sized for `mtu` with [`HEADROOM`] bytes reserved.
     ///
-    /// The caller must call [`into_packet`](Self::into_packet) after filling
+    /// The caller must call [`into_pooled`](Self::into_pooled) after filling
     /// to set the actual length.
     ///
     /// # Arguments
@@ -58,30 +56,31 @@ impl TunBuf {
         Self(alloc_uninit_packet_buf(mtu))
     }
 
-    /// Truncates to `len` bytes and returns the underlying packet buffer.
+    /// Truncates to `len` bytes and returns the underlying [`PooledBuf`].
     #[must_use]
-    pub fn into_packet(mut self, len: usize) -> DgramBuffer {
+    pub fn into_pooled(mut self, len: usize) -> PooledBuf {
         debug_assert!(
             len <= self.0.len(),
-            "into_packet: len {len} exceeds buffer visible length {}",
+            "into_pooled: len {len} exceeds buffer visible length {}",
             self.0.len()
         );
         self.0.truncate(len);
         self.0
     }
 
-    /// Reserves the maximum GRO buffer size on the first expansion.
+    /// Ensures capacity for `additional` bytes, upgrading to a max-capacity
+    /// pooled buffer when the current buffer crosses the single-datagram
+    /// threshold. This avoids incremental Vec reallocations during GRO
+    /// coalescing on the TUN TX path.
     #[cfg(target_os = "linux")]
-    fn reserve_for_gro(&mut self, additional: usize) {
-        if self.0.spare_capacity() >= additional {
-            return;
+    fn buf_extend(&mut self, additional: usize) {
+        let current_len = self.0.len();
+        if current_len <= MAX_DATAGRAM_SIZE && current_len + additional > MAX_DATAGRAM_SIZE {
+            let mut new_buf = alloc_uninit_packet_buf(MAX_DATAGRAM_SIZE);
+            new_buf.truncate(current_len);
+            new_buf[..current_len].copy_from_slice(&self.0);
+            self.0 = new_buf;
         }
-
-        let (mut data, headroom) = std::mem::take(&mut self.0).into_parts();
-        let required = data.len() + additional;
-        let target = required.max(headroom + MAX_GRO_BUFFER_SIZE);
-        data.reserve_exact(target - data.len());
-        self.0 = DgramBuffer::from_vec_with_headroom(data, headroom);
     }
 
     /// Prepends a zeroed `virtio_net_hdr` using headroom when available,
@@ -90,37 +89,37 @@ impl TunBuf {
     #[cfg(target_os = "linux")]
     fn prepend_hdr(&mut self) {
         let zeroed = [0u8; VIRTIO_NET_HDR_LEN];
-        if self.0.try_add_prefix(&zeroed).is_err() {
-            let mut buf = alloc_packet_buf(self.0.as_ref());
-            let result = buf.try_add_prefix(&zeroed);
-            debug_assert!(result.is_ok(), "alloc_packet_buf guarantees HEADROOM bytes");
+        if !self.0.add_prefix(&zeroed) {
+            let mut buf = alloc_packet_buf(&self.0);
+            let ok = buf.add_prefix(&zeroed);
+            debug_assert!(ok, "alloc_packet_buf guarantees HEADROOM bytes");
             self.0 = buf;
         }
     }
 }
 
-impl From<DgramBuffer> for TunBuf {
-    fn from(packet: DgramBuffer) -> Self {
+impl From<PooledBuf> for TunBuf {
+    fn from(packet: PooledBuf) -> Self {
         Self(packet)
     }
 }
 
 impl AsRef<[u8]> for TunBuf {
     fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
+        &self.0
     }
 }
 
 impl AsMut<[u8]> for TunBuf {
     fn as_mut(&mut self) -> &mut [u8] {
-        self.0.as_mut()
+        &mut self.0
     }
 }
 
 #[cfg(target_os = "linux")]
 impl tun_rs::ExpandBuffer for TunBuf {
     fn buf_capacity(&self) -> usize {
-        // DgramBuffer is backed by a growable Vec<u8>, so GRO can always
+        // PooledBuf is backed by a growable Vec<u8>, so GRO can always
         // extend it via buf_extend_from_slice(). Return usize::MAX to
         // let the GRO coalescing logic merge same-flow packets into GSO
         // super-packets (capped at ~65535 bytes by IP total length).
@@ -132,14 +131,14 @@ impl tun_rs::ExpandBuffer for TunBuf {
         if new_len <= current {
             self.0.truncate(new_len);
         } else {
-            self.reserve_for_gro(new_len - current);
-            self.0.put_bytes(val, new_len - current);
+            self.buf_extend(new_len - current);
+            self.0.extend(std::iter::repeat_n(&val, new_len - current));
         }
     }
 
     fn buf_extend_from_slice(&mut self, src: &[u8]) {
-        self.reserve_for_gro(src.len());
-        self.0.put_slice(src);
+        self.buf_extend(src.len());
+        self.0.extend(src.iter());
     }
 }
 
@@ -354,7 +353,7 @@ impl TunRx for TunReader {
     #[cfg(target_os = "linux")]
     fn scratch_buf_size(&self) -> usize {
         if self.offload {
-            MAX_GRO_BUFFER_SIZE
+            VIRTIO_NET_HDR_LEN + u16::MAX as usize
         } else {
             self.mtu
         }
@@ -456,7 +455,7 @@ fn split_addrs_by_version(addrs: &[IpNet]) -> (Vec<Ipv4Net>, Vec<Ipv6Net>) {
 /// * `io_tuning` - I/O tuning parameters (uses `metrics_push_interval`).
 pub(crate) fn spawn_tun_rx<T: TunRx>(
     mut tun: T,
-    output_tx: mpsc::Sender<Vec<DgramBuffer>>,
+    output_tx: mpsc::Sender<Vec<PooledBuf>>,
     io_tuning: &IoTuning,
     ctx: &ActorContext,
 ) -> ActorRef {
@@ -489,7 +488,7 @@ pub(crate) fn spawn_tun_rx<T: TunRx>(
                                 if sizes[i] > 0 {
                                     batch.push(
                                         std::mem::replace(&mut bufs[i], TunBuf::alloc_uninit(mtu))
-                                            .into_packet(sizes[i]),
+                                            .into_pooled(sizes[i]),
                                     );
                                 }
                             }
@@ -528,9 +527,9 @@ pub(crate) fn spawn_tun_tx<T: TunTx>(
     mut tun: T,
     io_tuning: &IoTuning,
     ctx: &ActorContext,
-) -> mpsc::Sender<Vec<DgramBuffer>> {
+) -> mpsc::Sender<Vec<PooledBuf>> {
     // Actor creates and owns its data-plane channel receiver
-    let (input_tx, mut input_rx) = mpsc::channel::<Vec<DgramBuffer>>(io_tuning.packet_queue_depth);
+    let (input_tx, mut input_rx) = mpsc::channel::<Vec<PooledBuf>>(io_tuning.packet_queue_depth);
     let tun_name = tun.name().to_string();
     let metrics_push_interval = io_tuning.metrics_push_interval;
 
@@ -775,7 +774,7 @@ mod tests {
         let actor_bus_owner = crate::actor::ActorBus::on_current_runtime();
         let mut orchestrator = actor_bus_owner.mailbox("test-orchestrator");
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem0", 64);
-        let (output_tx, mut output_rx) = mpsc::channel::<Vec<DgramBuffer>>(4);
+        let (output_tx, mut output_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
@@ -795,7 +794,7 @@ mod tests {
             .await
             .expect("router should receive message");
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].as_ref(), &ipv4_packet[..]);
+        assert_eq!(&batch[0][..], &ipv4_packet[..]);
 
         let mut snapshot = None;
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
@@ -834,11 +833,11 @@ mod tests {
         );
 
         input_tx
-            .send(vec![DgramBuffer::from_slice(&[0, 1, 2, 3, 4, 5])])
+            .send(vec![alloc_packet_buf(&[0, 1, 2, 3, 4, 5])])
             .await
             .unwrap();
         input_tx
-            .send(vec![DgramBuffer::from_slice(&[9, 9, 9])])
+            .send(vec![alloc_packet_buf(&[9, 9, 9])])
             .await
             .unwrap();
 
@@ -894,7 +893,7 @@ mod tests {
         );
 
         input_tx
-            .send(vec![DgramBuffer::from_slice(&[1, 2, 3])])
+            .send(vec![alloc_packet_buf(&[1, 2, 3])])
             .await
             .unwrap();
 
@@ -944,7 +943,7 @@ mod tests {
 
         // Verify input_tx is functional by sending a batch
         assert!(input_tx
-            .send(vec![DgramBuffer::from_slice(&[1, 2, 3])])
+            .send(vec![alloc_packet_buf(&[1, 2, 3])])
             .await
             .is_ok());
     }
@@ -1003,7 +1002,7 @@ mod tests {
         // Verifies that the batch-aware spawn_tun_rx loop works
         // correctly when recv_batch falls back to single-packet recv.
         let (rx_tun, _tx_tun, inject_tx, _output_rx) = memory_tun("mem-batch-fb", 64);
-        let (output_tx, mut output_rx) = mpsc::channel::<Vec<DgramBuffer>>(4);
+        let (output_tx, mut output_rx) = mpsc::channel::<Vec<PooledBuf>>(4);
 
         let ipv4_packet = make_ipv4_packet(Ipv4Addr::new(192, 0, 2, 1));
 
@@ -1023,7 +1022,7 @@ mod tests {
             .await
             .expect("packet should be forwarded to router");
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].as_ref(), &ipv4_packet[..]);
+        assert_eq!(&batch[0][..], &ipv4_packet[..]);
     }
 
     #[tokio::test]
@@ -1045,7 +1044,7 @@ mod tests {
     #[tokio::test]
     async fn memory_tun_tx_send_batch_delivers_packet() {
         let (_rx, mut tx, _inject, mut output) = memory_tun("mem-tx-batch", 64);
-        let mut batch = [TunBuf::from(DgramBuffer::from_slice(&[4, 5, 6]))];
+        let mut batch = [TunBuf::from(alloc_packet_buf(&[4, 5, 6]))];
         tx.send_batch(&mut batch).await.unwrap();
         let received = output.recv().await.unwrap();
         assert_eq!(received, vec![4, 5, 6]);
@@ -1065,49 +1064,70 @@ mod tests {
     // ========== TunBuf Tests ==========
 
     #[test]
-    fn tun_buf_into_packet_truncates() {
+    fn tun_buf_into_pooled_truncates() {
         let mut tun_buf = TunBuf::alloc_uninit(1400);
         tun_buf.as_mut()[..4].copy_from_slice(&[1, 2, 3, 4]);
-        let packet = tun_buf.into_packet(4);
-        assert_eq!(packet.as_ref(), &[1, 2, 3, 4]);
+        let pooled = tun_buf.into_pooled(4);
+        assert_eq!(&pooled[..], &[1, 2, 3, 4]);
     }
 
     #[test]
     fn tun_buf_new_has_headroom() {
         let tun_buf = TunBuf::alloc_uninit(1400);
-        let mut buf = tun_buf.into_packet(0);
-        assert!(buf.try_add_prefix(&[0u8; HEADROOM]).is_ok());
+        let mut buf = tun_buf.into_pooled(0);
+        assert!(buf.add_prefix(&[0u8; HEADROOM]));
     }
 
     #[test]
-    fn alloc_uninit_packet_buf_has_requested_length_and_headroom() {
-        let length = 1400;
-        let buf = alloc_uninit_packet_buf(length);
-        assert_eq!(buf.len(), length);
+    fn alloc_uninit_packet_buf_small_uses_datagram_pool() {
+        let buf = alloc_uninit_packet_buf(1400);
+        // Datagram pool: visible = MAX_DGRAM_SIZE - HEADROOM = 1490
+        assert_eq!(buf.len(), MAX_DATAGRAM_SIZE - HEADROOM);
         let mut buf = buf;
         buf.truncate(0);
-        assert!(buf.try_add_prefix(&[0u8; HEADROOM]).is_ok());
+        assert!(buf.add_prefix(&[0u8; HEADROOM]));
+    }
+
+    #[test]
+    fn alloc_uninit_packet_buf_large_uses_generic_pool() {
+        let buf = alloc_uninit_packet_buf(MAX_DATAGRAM_SIZE);
+        assert_eq!(buf.len(), MAX_PACKET_BUFFER_SIZE - HEADROOM);
+        let mut buf = buf;
+        buf.truncate(0);
+        assert!(buf.add_prefix(&[0u8; HEADROOM]));
     }
 
     #[test]
     fn alloc_packet_buf_small_has_correct_data_and_headroom() {
         let data = [1u8, 2, 3, 4, 5];
         let buf = alloc_packet_buf(&data);
-        assert_eq!(buf.as_ref(), &data);
+        assert_eq!(&buf[..], &data);
         let mut buf = buf;
-        assert!(buf.try_add_prefix(&[0u8; HEADROOM]).is_ok());
+        assert!(buf.add_prefix(&[0u8; HEADROOM]));
+    }
+
+    #[test]
+    fn alloc_uninit_packet_buf_boundary() {
+        // Exactly at the threshold: length + HEADROOM == MAX_DGRAM_SIZE
+        let boundary_len = MAX_DATAGRAM_SIZE - HEADROOM;
+        let buf = alloc_uninit_packet_buf(boundary_len);
+        assert_eq!(buf.len(), boundary_len);
+
+        // One byte over: falls back to generic pool
+        let buf = alloc_uninit_packet_buf(boundary_len + 1);
+        assert_eq!(buf.len(), MAX_PACKET_BUFFER_SIZE - HEADROOM);
     }
 
     #[test]
     fn tun_buf_from_wraps_unchanged() {
-        let buf = DgramBuffer::from_slice(&[10, 20]);
+        let buf = alloc_packet_buf(&[10, 20]);
         let tun_buf = TunBuf::from(buf);
         assert_eq!(tun_buf.as_ref(), &[10, 20]);
     }
 
     #[test]
     fn tun_buf_as_mut_modifies_payload() {
-        let buf = DgramBuffer::from_slice(&[10, 20, 30]);
+        let buf = alloc_packet_buf(&[10, 20, 30]);
         let mut tun_buf = TunBuf::from(buf);
         tun_buf.as_mut()[0] = 99;
         assert_eq!(tun_buf.as_ref()[0], 99);
@@ -1115,32 +1135,62 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn tun_buf_expand_preserves_data() {
-        let data = vec![0xABu8; 1500];
-        let buf = DgramBuffer::from_slice(&data);
+    fn tun_buf_expand_upgrades_buffer_on_threshold_crossing() {
+        let small_data = vec![0xABu8; MAX_DATAGRAM_SIZE];
+        let buf = alloc_packet_buf(&small_data);
         let mut tun_buf = TunBuf::from(buf);
-        assert!(tun_buf.0.len() + tun_buf.0.spare_capacity() < MAX_GRO_BUFFER_SIZE);
+        assert_eq!(tun_buf.as_ref().len(), MAX_DATAGRAM_SIZE);
 
         let extra = [0xCDu8; 100];
         tun_rs::ExpandBuffer::buf_extend_from_slice(&mut tun_buf, &extra);
 
         let result = tun_buf.as_ref();
-        assert_eq!(&result[..1500], &data);
-        assert_eq!(&result[1500..], &extra);
-        assert!(tun_buf.0.len() + tun_buf.0.spare_capacity() >= MAX_GRO_BUFFER_SIZE);
+        assert_eq!(result.len(), MAX_DATAGRAM_SIZE + 100);
+        assert_eq!(&result[..MAX_DATAGRAM_SIZE], &small_data[..]);
+        assert_eq!(&result[MAX_DATAGRAM_SIZE..], &extra[..]);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn tun_buf_resize_fills_new_bytes() {
-        let small_data = vec![0xABu8; 500];
-        let buf = DgramBuffer::from_slice(&small_data);
+    fn tun_buf_expand_no_upgrade_when_already_large() {
+        let large_data = vec![0xABu8; MAX_DATAGRAM_SIZE + 1];
+        let buf = alloc_packet_buf(&large_data);
         let mut tun_buf = TunBuf::from(buf);
 
-        tun_rs::ExpandBuffer::buf_resize(&mut tun_buf, 1600, 0xFF);
+        let extra = [0xCDu8; 50];
+        tun_rs::ExpandBuffer::buf_extend_from_slice(&mut tun_buf, &extra);
 
         let result = tun_buf.as_ref();
-        assert_eq!(result.len(), 1600);
+        assert_eq!(result.len(), MAX_DATAGRAM_SIZE + 1 + 50);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_buf_expand_no_upgrade_when_below_threshold() {
+        let small_data = vec![0xABu8; 100];
+        let buf = alloc_packet_buf(&small_data);
+        let mut tun_buf = TunBuf::from(buf);
+
+        let extra = [0xCDu8; 50];
+        tun_rs::ExpandBuffer::buf_extend_from_slice(&mut tun_buf, &extra);
+
+        let result = tun_buf.as_ref();
+        assert_eq!(result.len(), 150);
+        assert_eq!(&result[..100], &small_data[..]);
+        assert_eq!(&result[100..], &extra[..]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_buf_resize_triggers_upgrade() {
+        let small_data = vec![0xABu8; 500];
+        let buf = alloc_packet_buf(&small_data);
+        let mut tun_buf = TunBuf::from(buf);
+
+        tun_rs::ExpandBuffer::buf_resize(&mut tun_buf, MAX_DATAGRAM_SIZE + 100, 0xFF);
+
+        let result = tun_buf.as_ref();
+        assert_eq!(result.len(), MAX_DATAGRAM_SIZE + 100);
         assert_eq!(&result[..500], &small_data[..]);
         assert!(result[500..].iter().all(|&b| b == 0xFF));
     }
@@ -1159,7 +1209,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn tun_buf_prepend_hdr_fallback_without_headroom() {
-        let buf = DgramBuffer::from_slice(&[5, 6, 7]);
+        let buf = alloc_packet_buf(&[5, 6, 7]);
         let mut tun_buf = TunBuf::from(buf);
         tun_buf.prepend_hdr();
         let data = tun_buf.as_ref();

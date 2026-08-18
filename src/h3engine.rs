@@ -16,7 +16,7 @@ use crate::h3session::{
 use crate::helpers::{alloc_uninit_packet_buf, make_interval};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use anyhow::{anyhow, bail, Context};
-use datagram_socket::DgramBuffer;
+use buffer_pool::PooledBuf;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -64,7 +64,7 @@ pub(crate) fn apply_transport_config(
 /// avoiding an intermediate copy through a shared receive buffer.
 pub(crate) fn handle_udp_recv(
     conn: &mut quiche::Connection,
-    batch: Vec<DgramBuffer>,
+    batch: Vec<PooledBuf>,
     info: quiche::RecvInfo,
     mut rx_counters: Option<&mut Counters>,
 ) {
@@ -77,7 +77,7 @@ pub(crate) fn handle_udp_recv(
                 c.record_drop(DropReason::QueueFull, 1, 0);
             }
         }
-        match conn.recv(pkt.as_mut(), info) {
+        match conn.recv(&mut pkt, info) {
             Ok(_) | Err(quiche::Error::Done) => {}
             Err(e) => {
                 debug!(error = ?e, "quiche recv (non-fatal)");
@@ -99,14 +99,14 @@ pub(crate) fn collect_router_ingress(
     max_udp_payload: usize,
     counters: &mut Counters,
     codec: &ConnectIpDatagramCodec,
-) -> Vec<DgramBuffer> {
+) -> Vec<PooledBuf> {
     let mut batch = Vec::new();
     let mut ok_pkts: u64 = 0;
     let mut ok_bytes: u64 = 0;
 
     loop {
         let mut buf = alloc_uninit_packet_buf(max_udp_payload);
-        match conn.dgram_recv(buf.as_mut()) {
+        match conn.dgram_recv(&mut buf) {
             Ok(len) => {
                 buf.truncate(len);
 
@@ -140,13 +140,13 @@ pub(crate) fn collect_router_ingress(
 /// Tracks when the batch first became pending (for congestion duration metrics).
 pub(crate) struct PendingBatch {
     /// The buffered packet batch.
-    pub(crate) batch: Vec<DgramBuffer>,
+    pub(crate) batch: Vec<PooledBuf>,
     /// When the batch first became pending (for congestion duration tracking).
     pub(crate) since: Instant,
 }
 
 impl PendingBatch {
-    pub(crate) fn new(batch: Vec<DgramBuffer>) -> Self {
+    pub(crate) fn new(batch: Vec<PooledBuf>) -> Self {
         Self {
             batch,
             since: Instant::now(),
@@ -164,12 +164,12 @@ impl PendingBatch {
 fn collect_udp_send(
     conn: &mut quiche::Connection,
     max_udp_payload: usize,
-) -> Option<(SocketAddr, Vec<DgramBuffer>)> {
+) -> Option<(SocketAddr, Vec<PooledBuf>)> {
     let mut batch = Vec::new();
     let mut dest = None;
     loop {
         let mut buf = alloc_uninit_packet_buf(max_udp_payload);
-        match conn.send(buf.as_mut()) {
+        match conn.send(&mut buf) {
             Ok((len, send_info)) => {
                 buf.truncate(len);
                 batch.push(buf);
@@ -201,7 +201,7 @@ fn collect_udp_send(
 /// With cc=none the queue rarely fills; accepting the drop avoids retry complexity.
 pub(crate) fn handle_router_egress(
     conn: &mut quiche::Connection,
-    packets: Vec<DgramBuffer>,
+    packets: Vec<PooledBuf>,
     codec: &ConnectIpDatagramCodec,
     counters: &mut Counters,
 ) {
@@ -214,7 +214,7 @@ pub(crate) fn handle_router_egress(
             counters.record_drop(DropReason::NoHeadroom, 1, pkt_len);
             continue;
         }
-        match conn.dgram_send(pkt.as_ref()) {
+        match conn.dgram_send(&pkt) {
             Ok(()) => {
                 ok_pkts += 1;
                 ok_bytes += pkt_len;
@@ -245,10 +245,10 @@ pub(crate) fn reset_timer(timer: std::pin::Pin<&mut time::Sleep>, conn: &quiche:
 
 /// Channels owned by the engine actor.
 pub(crate) struct EngineIo {
-    pub(crate) udp_recv_rx: mpsc::Receiver<(SocketAddr, Vec<DgramBuffer>)>,
-    pub(crate) udp_send_tx: mpsc::Sender<(SocketAddr, Vec<DgramBuffer>)>,
-    pub(crate) egress_rx: mpsc::Receiver<Vec<DgramBuffer>>,
-    pub(crate) ingress_tx: mpsc::Sender<Vec<DgramBuffer>>,
+    pub(crate) udp_recv_rx: mpsc::Receiver<(SocketAddr, Vec<PooledBuf>)>,
+    pub(crate) udp_send_tx: mpsc::Sender<(SocketAddr, Vec<PooledBuf>)>,
+    pub(crate) egress_rx: mpsc::Receiver<Vec<PooledBuf>>,
+    pub(crate) ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
 }
 
 /// Connection metadata shared across startup and established phases.

@@ -11,10 +11,10 @@ use crate::auth::{bearer_auth_header, validate_connect_auth, AuthError};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::Event;
-use crate::helpers::{make_interval, send_with_backpressure, SendEvent};
+use crate::helpers::{alloc_packet_buf, make_interval, send_with_backpressure, SendEvent};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use anyhow::anyhow;
-#[cfg(test)]
+use buffer_pool::PooledBuf;
 use datagram_socket::DgramBuffer;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
@@ -669,7 +669,7 @@ pub struct H3Rx {
 /// Receives datagrams from the inbound channel and forwards IP packets
 /// (after stripping Context ID 0) to the router actor. Uses a
 /// `recv()` + `try_recv()` drain pattern to batch all immediately-ready
-/// frames into a single `Vec<DgramBuffer>`, mirroring tokio-quiche's
+/// frames into a single `Vec<PooledBuf>`, mirroring tokio-quiche's
 /// synchronous `gather_data_from_quiche_conn` loop.
 ///
 /// # Arguments
@@ -681,7 +681,7 @@ pub struct H3Rx {
 #[must_use]
 pub fn spawn_h3_rx(
     rx: H3Rx,
-    ingress_tx: mpsc::Sender<Vec<DgramBuffer>>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     events_tx: mpsc::UnboundedSender<Event>,
     interval: Duration,
 ) -> JoinHandle<ActorExitResult> {
@@ -703,7 +703,7 @@ pub fn spawn_h3_rx(
                         return Ok(());
                     };
 
-                    let mut batch: Vec<DgramBuffer> = Vec::with_capacity(H3_RX_BATCH_SIZE);
+                    let mut batch: Vec<PooledBuf> = Vec::with_capacity(H3_RX_BATCH_SIZE);
                     let mut ok_pkts: u64 = 0;
                     let mut ok_bytes: u64 = 0;
 
@@ -748,7 +748,7 @@ pub fn spawn_h3_rx(
 fn handle_inbound_frame(
     peer: &str,
     inbound_frame: InboundFrame,
-    batch: &mut Vec<DgramBuffer>,
+    batch: &mut Vec<PooledBuf>,
     ok_pkts: &mut u64,
     ok_bytes: &mut u64,
     counters: &mut Counters,
@@ -761,7 +761,7 @@ fn handle_inbound_frame(
             }
             dgram.advance(1);
             let len = dgram.len() as u64;
-            batch.push(dgram);
+            batch.push(alloc_packet_buf(dgram.as_ref()));
             *ok_pkts += 1;
             *ok_bytes += len;
         }
@@ -812,7 +812,7 @@ impl std::fmt::Debug for H3Tx {
 /// # Batch Counting
 ///
 /// Uses `try_send` on the underlying `mpsc::Sender` for non-blocking sends.
-/// All packets that succeed via `try_send` within a single `Vec<DgramBuffer>`
+/// All packets that succeed via `try_send` within a single `Vec<PooledBuf>`
 /// form one batch. When the channel is full (`TrySendError::Full`), the
 /// current sub-batch is flushed, the blocked packet is sent via
 /// `Sender::send().await` (recording queue-full duration), and a new
@@ -834,8 +834,8 @@ pub fn spawn_h3_tx(
     interval: Duration,
     packet_queue_depth: usize,
     keepalive_interval: Duration,
-) -> (mpsc::Sender<Vec<DgramBuffer>>, JoinHandle<ActorExitResult>) {
-    let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<DgramBuffer>>(packet_queue_depth);
+) -> (mpsc::Sender<Vec<PooledBuf>>, JoinHandle<ActorExitResult>) {
+    let (egress_tx, mut egress_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
 
     let H3Tx {
         peer_id,
@@ -885,11 +885,14 @@ pub fn spawn_h3_tx(
                     for mut packet in packets {
                         let len = packet.len();
                         // Zero-copy: prepend Context ID using reserved headroom.
-                        if packet.try_add_prefix(&[CONTEXT_ID_IP]).is_err() {
+                        if !packet.add_prefix(&[CONTEXT_ID_IP]) {
                             counters.record_drop(DropReason::NoHeadroom, 1, len as u64);
                             continue;
                         }
-                        let frame = OutboundFrame::Datagram(packet, flow_id);
+                        let frame = OutboundFrame::Datagram(
+                            DgramBuffer::from_slice(&packet),
+                            flow_id,
+                        );
 
                         send_with_backpressure(&inner_tx, frame, |event| match event {
                             SendEvent::Fast => {
@@ -1218,20 +1221,18 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ========== DgramBuffer Datagram Encoding Tests ==========
+    // ========== Datagram Encoding Tests ==========
 
     #[test]
     fn dgram_buffer_headroom_encode_prepends_context_id() {
-        use crate::helpers::alloc_packet_buf;
-
         let payload = b"test payload";
         let mut buf = alloc_packet_buf(payload);
-        assert_eq!(buf.as_ref(), payload);
+        assert_eq!(&buf[..], payload);
 
         // Encode: prepend Context ID using headroom
-        assert!(buf.try_add_prefix(&[CONTEXT_ID_IP]).is_ok());
-        assert_eq!(buf.as_ref()[0], 0x00);
-        assert_eq!(&buf.as_ref()[1..], payload);
+        assert!(buf.add_prefix(&[CONTEXT_ID_IP]));
+        assert_eq!(buf[0], 0x00);
+        assert_eq!(&buf[1..], payload);
     }
 
     #[test]
@@ -1257,18 +1258,16 @@ mod tests {
 
     #[test]
     fn dgram_buffer_roundtrip_encode_decode() {
-        use crate::helpers::alloc_packet_buf;
-
         let original = b"ip packet data";
         let mut buf = alloc_packet_buf(original);
 
         // Encode: prepend Context ID
-        assert!(buf.try_add_prefix(&[CONTEXT_ID_IP]).is_ok());
+        assert!(buf.add_prefix(&[CONTEXT_ID_IP]));
 
         // Decode: strip Context ID
-        assert_eq!(buf.as_ref()[0], CONTEXT_ID_IP);
-        buf.advance(1);
-        assert_eq!(buf.as_ref(), original);
+        assert_eq!(buf[0], CONTEXT_ID_IP);
+        buf.pop_front(1);
+        assert_eq!(&buf[..], original);
     }
 
     #[test]
@@ -1778,7 +1777,7 @@ mod tests {
         let (server_rx, _server_tx) = server_connection.into_actors();
 
         // Server RX actor
-        let (server_router_tx, mut server_router_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
+        let (server_router_tx, mut server_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _server_rx_handle =
             spawn_h3_rx(server_rx, server_router_tx, events_tx, metrics_interval);
 
@@ -1852,7 +1851,7 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (s2c_router_tx, mut s2c_router_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
+        let (s2c_router_tx, mut s2c_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _client_rx_handle = spawn_h3_rx(
             client_rx,
             s2c_router_tx,
@@ -1872,7 +1871,7 @@ mod tests {
             Duration::from_secs(20),
         );
 
-        let (c2s_router_tx, mut c2s_router_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
+        let (c2s_router_tx, mut c2s_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _server_rx_handle = spawn_h3_rx(server_rx, c2s_router_tx, events_tx, metrics_interval);
 
         // Test client -> server
@@ -1998,7 +1997,7 @@ mod tests {
 
         // Send a batch of 5 packets — capacity=64 so all try_send succeed.
         let payload = vec![0u8; 100];
-        let batch: Vec<DgramBuffer> = (0..5).map(|_| alloc_packet_buf(&payload)).collect();
+        let batch: Vec<PooledBuf> = (0..5).map(|_| alloc_packet_buf(&payload)).collect();
         egress_tx.send(batch).await.unwrap();
 
         // Wait for a metrics tick.
@@ -2069,7 +2068,7 @@ mod tests {
 
         // Send batch of 3 packets with capacity=1 -> at least 2 backpressure events.
         let payload = vec![0u8; 100];
-        let batch: Vec<DgramBuffer> = (0..3).map(|_| alloc_packet_buf(&payload)).collect();
+        let batch: Vec<PooledBuf> = (0..3).map(|_| alloc_packet_buf(&payload)).collect();
         egress_tx.send(batch).await.unwrap();
 
         // Wait for metrics.

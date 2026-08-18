@@ -14,7 +14,7 @@ use crate::h3engine::{
 use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
 use crate::udp;
-use datagram_socket::DgramBuffer;
+use buffer_pool::PooledBuf;
 use quiche::h3::NameValue;
 use rand::Rng;
 use std::net::SocketAddr;
@@ -227,7 +227,7 @@ fn make_client_quiche_config(
 pub(crate) async fn dial_h3_client<P: RouteProbe>(
     peer_h3: &PeerH3,
     dial: &DialContext<P>,
-    ingress_tx: mpsc::Sender<Vec<DgramBuffer>>,
+    ingress_tx: mpsc::Sender<Vec<PooledBuf>>,
     ctx: &ActorContext,
 ) -> Result<ConnectedEvent, DialError> {
     let DialContext {
@@ -294,7 +294,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     .map_err(|e| DialError::Handshake(format!("quiche connect: {e}")))?;
 
     let (udp_recv_tx, udp_recv_rx) =
-        mpsc::channel::<(SocketAddr, Vec<DgramBuffer>)>(tuning.io.packet_queue_depth);
+        mpsc::channel::<(SocketAddr, Vec<PooledBuf>)>(tuning.io.packet_queue_depth);
     let udp_rx_ref = udp::spawn_udp_rx(udp_rx, udp_recv_tx, ctx, SupervisionPolicy::Restartable);
     let (udp_send_tx, udp_tx_ref) = udp::spawn_udp_tx(
         udp_tx,
@@ -304,7 +304,7 @@ pub(crate) async fn dial_h3_client<P: RouteProbe>(
     );
     udp_rx_ref.link(&udp_tx_ref);
 
-    let (egress_tx, egress_rx) = mpsc::channel::<Vec<DgramBuffer>>(tuning.io.packet_queue_depth);
+    let (egress_tx, egress_rx) = mpsc::channel::<Vec<PooledBuf>>(tuning.io.packet_queue_depth);
 
     let engine = H3Engine {
         conn,
@@ -484,14 +484,14 @@ mod tests {
         peer_id: &str,
     ) -> (
         ConnectedEvent,
-        mpsc::Receiver<Vec<DgramBuffer>>,
+        mpsc::Receiver<Vec<PooledBuf>>,
         ActorContext,
         crate::actor::ActorBus,
     ) {
         let peer_h3 = test_peer_h3(bound_addr, token);
         let tuning = insecure_tuning();
 
-        let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
+        let (ingress_tx, ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let orchestrator = actor_bus.mailbox("test-orchestrator");
         let dial = DialContext::test(peer_id, bound_addr.ip(), tuning, FakeRouteProbe::noop());
@@ -538,7 +538,7 @@ mod tests {
         let peer_h3 = test_peer_h3(server.bound_addr, wrong_token);
         let tuning = insecure_tuning();
 
-        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let orchestrator = actor_bus.mailbox("test-orchestrator");
         let dial = DialContext::test(
@@ -574,7 +574,7 @@ mod tests {
         // Obtain server-side connection and set up RX actor.
         let server_connection = await_server_connection(&mut server.connection_rx).await;
         let (server_rx, _server_tx) = server_connection.into_actors();
-        let (server_router_tx, mut server_router_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
+        let (server_router_tx, mut server_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let (srv_events_tx, _srv_events_rx) = mpsc::unbounded_channel();
         let _server_rx_handle = spawn_h3_rx(
             server_rx,
@@ -595,7 +595,7 @@ mod tests {
             .expect("channel closed");
 
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].as_ref(), &test_packet[..]);
+        assert_eq!(&batch[0][..], &test_packet[..]);
 
         drop(server.cmd_tx);
     }
@@ -637,7 +637,7 @@ mod tests {
             .expect("channel closed");
 
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].as_ref(), &test_packet[..]);
+        assert_eq!(&batch[0][..], &test_packet[..]);
 
         drop(server.cmd_tx);
     }
@@ -660,7 +660,7 @@ mod tests {
         let (server_rx, server_tx) = server_connection.into_actors();
         let (srv_events_tx, _srv_events_rx) = mpsc::unbounded_channel();
 
-        let (c2s_router_tx, mut c2s_router_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
+        let (c2s_router_tx, mut c2s_router_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let _server_rx_handle = spawn_h3_rx(
             server_rx,
             c2s_router_tx,
@@ -687,7 +687,7 @@ mod tests {
             .await
             .expect("timeout c2s")
             .expect("channel closed");
-        assert_eq!(batch_c2s[0].as_ref(), &packet_c2s[..]);
+        assert_eq!(&batch_c2s[0][..], &packet_c2s[..]);
 
         // Server -> Client
         let packet_s2c = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
@@ -699,7 +699,7 @@ mod tests {
             .await
             .expect("timeout s2c")
             .expect("channel closed");
-        assert_eq!(batch_s2c[0].as_ref(), &packet_s2c[..]);
+        assert_eq!(&batch_s2c[0][..], &packet_s2c[..]);
 
         drop(server.cmd_tx);
     }
@@ -763,7 +763,7 @@ mod tests {
             ..Tuning::default()
         };
 
-        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let orchestrator = actor_bus.mailbox("test-orchestrator");
         let dial = DialContext::test(peer_id, server.bound_addr.ip(), tuning, probe);
@@ -790,7 +790,7 @@ mod tests {
         let peer_h3 = test_peer_h3(server.bound_addr, token);
         let tuning = Tuning::default();
 
-        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(16);
+        let (ingress_tx, _ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(16);
         let actor_bus = crate::actor::ActorBus::on_current_runtime();
         let orchestrator = actor_bus.mailbox("test-orchestrator");
         let dial = DialContext::test(

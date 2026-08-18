@@ -9,7 +9,7 @@ use crate::config::{LocalTun, Peer};
 use crate::events::Event;
 use crate::helpers::{batch_stats, make_interval, send_with_backpressure, SendEvent};
 use crate::metrics::{Counters, Direction, DropReason, Source};
-use datagram_socket::DgramBuffer;
+use buffer_pool::PooledBuf;
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
 use std::collections::HashMap;
@@ -143,7 +143,7 @@ pub struct RouteEntry {
     /// Identifier of the peer owning the prefix.
     pub peer_id: String,
     /// Channel to send packet batches to this peer.
-    pub tx: mpsc::Sender<Vec<DgramBuffer>>,
+    pub tx: mpsc::Sender<Vec<PooledBuf>>,
 }
 
 impl std::fmt::Debug for RouteEntry {
@@ -162,7 +162,7 @@ pub struct RouteMatch<'a> {
     /// Identifier of the peer selected by the lookup.
     pub peer_id: &'a str,
     /// Channel to send packet batches to this peer.
-    pub tx: &'a mpsc::Sender<Vec<DgramBuffer>>,
+    pub tx: &'a mpsc::Sender<Vec<PooledBuf>>,
 }
 
 /// In-memory routing table supporting IPv4 and IPv6 longest-prefix matches.
@@ -211,9 +211,9 @@ impl RoutingTable {
     /// Returns `RoutingError::ConflictingPrefix` when a peer prefix conflicts with another peer.
     pub fn make(
         peers: &[Peer],
-        peer_txs: &HashMap<String, mpsc::Sender<Vec<DgramBuffer>>>,
+        peer_txs: &HashMap<String, mpsc::Sender<Vec<PooledBuf>>>,
         local_tun: &LocalTun,
-        input_tx: &mpsc::Sender<Vec<DgramBuffer>>,
+        input_tx: &mpsc::Sender<Vec<PooledBuf>>,
     ) -> Result<Self, RoutingError> {
         let mut table = RoutingTable::new();
 
@@ -334,17 +334,17 @@ pub enum RoutingError {
 /// * `packet_queue_depth` - Bounded capacity for each data-plane channel.
 pub fn spawn_router(
     mut routing: RoutingTable,
-    input_tx: mpsc::Sender<Vec<DgramBuffer>>,
+    input_tx: mpsc::Sender<Vec<PooledBuf>>,
     interval: Duration,
     packet_queue_depth: usize,
     ctx: &ActorContext,
 ) -> (
-    mpsc::Sender<Vec<DgramBuffer>>,
-    mpsc::Sender<Vec<DgramBuffer>>,
+    mpsc::Sender<Vec<PooledBuf>>,
+    mpsc::Sender<Vec<PooledBuf>>,
     ActorRef,
 ) {
-    let (output_tx, mut output_rx) = mpsc::channel::<Vec<DgramBuffer>>(packet_queue_depth);
-    let (ingress_tx, mut ingress_rx) = mpsc::channel::<Vec<DgramBuffer>>(packet_queue_depth);
+    let (output_tx, mut output_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
+    let (ingress_tx, mut ingress_rx) = mpsc::channel::<Vec<PooledBuf>>(packet_queue_depth);
 
     let actor_ref = ctx.spawn(
         "router",
@@ -394,7 +394,7 @@ pub fn spawn_router(
 
 /// Handles an output batch (from TUN Rx): first-packet routing, no TTL mutation.
 async fn handle_output_batch(
-    batch: Vec<DgramBuffer>,
+    batch: Vec<PooledBuf>,
     routing: &RoutingTable,
     counters: &mut Counters,
 ) {
@@ -403,7 +403,7 @@ async fn handle_output_batch(
     let Some(first) = batch.first() else {
         return;
     };
-    let Some(dest) = extract_dst_ip(first.as_ref()) else {
+    let Some(dest) = extract_dst_ip(first) else {
         counters.record_drop(DropReason::InvalidIpVersion, pkt_count, total_bytes);
         return;
     };
@@ -423,16 +423,16 @@ async fn handle_output_batch(
 /// `same_channel()` for TUN detection, and old-TTL return semantics
 /// (`Some(1)` signals expired).
 async fn handle_ingress_batch(
-    mut batch: Vec<DgramBuffer>,
+    mut batch: Vec<PooledBuf>,
     routing: &RoutingTable,
-    input_tx: &mpsc::Sender<Vec<DgramBuffer>>,
+    input_tx: &mpsc::Sender<Vec<PooledBuf>>,
     counters: &mut Counters,
 ) {
     // Process batch by draining consecutive groups from the front.
     // After each drain, indices shift — but we always drain from index 0
     // because previous groups have been removed.
     while !batch.is_empty() {
-        let Some(dst) = extract_dst_ip(batch[0].as_ref()) else {
+        let Some(dst) = extract_dst_ip(&batch[0]) else {
             let pkt = batch.remove(0);
             counters.record_drop(DropReason::InvalidIpVersion, 1, pkt.len() as u64);
             continue;
@@ -441,7 +441,7 @@ async fn handle_ingress_batch(
         // Find consecutive run with same dst IP (starting from index 0).
         let mut group_end = 1;
         while group_end < batch.len() {
-            if extract_dst_ip(batch[group_end].as_ref()) != Some(dst) {
+            if extract_dst_ip(&batch[group_end]) != Some(dst) {
                 break;
             }
             group_end += 1;
@@ -449,7 +449,7 @@ async fn handle_ingress_batch(
 
         // Drain the group out of the batch.
         // When the entire batch shares the same dst, take the whole Vec in O(1).
-        let group: Vec<DgramBuffer> = if group_end == batch.len() {
+        let group: Vec<PooledBuf> = if group_end == batch.len() {
             std::mem::take(&mut batch)
         } else {
             batch.drain(..group_end).collect()
@@ -478,7 +478,7 @@ async fn handle_ingress_batch(
         let mut forward = Vec::with_capacity(group.len());
         let mut expired = Vec::new();
         for mut pkt in group {
-            match decrement_ttl(pkt.as_mut()) {
+            match decrement_ttl(&mut pkt) {
                 Some(0 | 1) => {
                     // TTL expired (was 0 or 1); forward to TUN for ICMP.
                     expired.push(pkt);
@@ -529,7 +529,7 @@ mod tests {
     fn make_test_routing(
         peer_id: &str,
         prefix: IpNet,
-        tx: mpsc::Sender<Vec<DgramBuffer>>,
+        tx: mpsc::Sender<Vec<PooledBuf>>,
     ) -> RoutingTable {
         let mut table = RoutingTable::new();
         table
@@ -561,7 +561,7 @@ mod tests {
     }
 
     /// Creates dummy peer TX channels for routing table tests.
-    fn dummy_peer_txs(peer_ids: &[&str]) -> HashMap<String, mpsc::Sender<Vec<DgramBuffer>>> {
+    fn dummy_peer_txs(peer_ids: &[&str]) -> HashMap<String, mpsc::Sender<Vec<PooledBuf>>> {
         peer_ids
             .iter()
             .map(|id| {
@@ -674,7 +674,7 @@ mod tests {
 
         let received = peer_rx.recv().await.expect("batch should arrive");
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].as_ref(), &pkt_data[..]);
+        assert_eq!(&received[0][..], &pkt_data[..]);
     }
 
     #[tokio::test]
@@ -778,7 +778,7 @@ mod tests {
         let received = input_rx.recv().await.expect("tun should receive");
         assert_eq!(received.len(), 1);
         // TTL should be unchanged (5, not decremented to 4)
-        assert_eq!(received[0].as_ref()[8], 5);
+        assert_eq!(received[0][8], 5);
     }
 
     #[tokio::test]
@@ -797,7 +797,7 @@ mod tests {
         let received = peer_rx.recv().await.expect("peer should receive");
         assert_eq!(received.len(), 1);
         // TTL should be decremented from 64 to 63
-        assert_eq!(received[0].as_ref()[8], 63);
+        assert_eq!(received[0][8], 63);
     }
 
     #[tokio::test]
@@ -842,7 +842,7 @@ mod tests {
 
         let received = peer_rx.recv().await.expect("peer should receive");
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].as_ref()[7], 127); // hop limit decremented
+        assert_eq!(received[0][7], 127); // hop limit decremented
     }
 
     #[tokio::test]

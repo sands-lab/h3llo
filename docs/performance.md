@@ -84,7 +84,7 @@ Software GSO/GRO can be further accelerated by NIC hardware offload. When `tx-ud
 
 ### Zero-Copy Buffer Pool
 
-Data-plane buffers are allocated from tokio-quiche's `BufFactory` pool and reused across the entire packet lifecycle without reallocation. The pool has two tiers: a 1.5 KB datagram pool (64K total entries) for typical packets, and a 64 KB generic pool (64 total entries) for oversized payloads.
+Data-plane buffers are allocated from two h3llo-owned static `buffer-pool` instances and reused across the packet lifecycle. The pool has two tiers: a 1.5 KB datagram pool (64K retained entries) for typical packets, and a 64 KB generic pool (64 retained entries) for oversized payloads.
 
 #### Headroom Layout
 
@@ -92,8 +92,7 @@ Every data-plane `PooledBuf` reserves 10 bytes of prepend space at the front:
 
 ```
 [ 10B prepend space ][ packet payload ]
- └── 9B DGRAM_PREFIX reserve from tokio-quiche `BufFactory`
- └── 1B extra reserve carved out by h3llo
+ └── reserved directly by h3llo's packet allocator
 ```
 
 This prepend space enables zero-copy operations at two points:
@@ -118,7 +117,7 @@ Typical IP packets (≤ MTU 1291) always land in the datagram pool, reducing per
 
 - `TunBuf::alloc_uninit(mtu)` allocates from the datagram pool with headroom, ready for kernel `recv`.
 - `into_pooled(len)` truncates to the actual received length and unwraps the inner `PooledBuf` — zero-copy from kernel to packet channel.
-- `prepend_hdr()` prepends the `virtio_net_hdr` using headroom; falls back to alloc+copy only when headroom is absent (e.g., test buffers created without headroom).
+- `prepend_hdr()` prepends the `virtio_net_hdr` using headroom; it falls back to alloc+copy only for externally constructed buffers without headroom.
 
 When TUN GRO is enabled, tun-rs coalesces same-flow packets by extending a `TunBuf` via the `ExpandBuffer` trait. This creates a tension: individual packets are allocated from the small 1.5 KB datagram pool for memory efficiency, but GRO coalescing can grow a buffer well beyond that size (up to ~65535 bytes for a full GSO super-packet).
 
@@ -133,8 +132,9 @@ When TUN GRO is enabled, tun-rs coalesces same-flow packets by extending a `TunB
 | TUN RX → channel | `TunBuf::alloc_uninit` → kernel fills → `into_pooled` | Yes |
 | H3 TX encoding | `ConnectIpDatagramCodec::prepend` consumes prepend space | Yes |
 | TUN TX writing | `TunBuf::prepend_hdr` consumes headroom | Yes |
+| QUIC DATAGRAM extraction | `dgram_recv` fills `alloc_uninit_packet_buf` | Yes |
 | H3 RX decoding | `ConnectIpDatagramCodec::strip` removes QSI + Context ID | Yes |
-| BareUDP/H3 RX | `alloc_packet_buf` (copy into pooled buffer) | Copy once |
+| UDP socket RX | `alloc_packet_buf` splits the shared GRO receive buffer | Copy once |
 
 ### Batch Channel Transmission
 
@@ -155,7 +155,7 @@ Configuration:
 
 ### Upstream Patches
 
-h3llo uses a patched quiche monorepo ([`Tonny-Gu/quiche:remove-pooled-buf-metrics`](https://github.com/Tonny-Gu/quiche/tree/remove-pooled-buf-metrics)) with two performance-critical changes:
+h3llo patches quiche-family crates to [`Tonny-Gu/quiche:master`](https://github.com/Tonny-Gu/quiche/tree/master) and directly pins `buffer-pool` to [`Tonny-Gu/quiche:remove-pooled-buf-metrics`](https://github.com/Tonny-Gu/quiche/tree/remove-pooled-buf-metrics). These forks provide two performance-critical changes:
 
 #### buffer-pool Prometheus Removal
 
