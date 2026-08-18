@@ -14,13 +14,13 @@ use crate::h3engine::{
 use crate::h3session::CONNECT_IP_OVERHEAD;
 use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction, MAX_TIMEOUT};
 use crate::udp;
+use buffer_pool::PooledBuf;
 use quiche::h3::NameValue;
 use rand::Rng;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
-use tokio_quiche::buf_factory::PooledBuf;
 use tracing::{debug, warn};
 
 // ========== Dial Error ==========

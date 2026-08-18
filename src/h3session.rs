@@ -5,9 +5,9 @@
 //! progress/failure types shared by [`crate::h3dialer`] and
 //! [`crate::h3listener`].
 
+use buffer_pool::PooledBuf;
 use octets::{varint_len, varint_parse_len, Octets, OctetsMut};
 use std::time::Duration;
-use tokio_quiche::buf_factory::PooledBuf;
 use tracing::debug;
 
 /// Context ID for IP payloads per RFC 9484 (always 0 for CONNECT-IP).
@@ -370,7 +370,6 @@ mod tests {
     use crate::config::H3Tuning;
     use crate::h3engine::apply_transport_config;
     use crate::helpers::alloc_packet_buf;
-    use tokio_quiche::buf_factory::BufFactory;
 
     #[test]
     fn datagram_framing_encode_decode() {
@@ -457,7 +456,7 @@ mod tests {
         let codec = ConnectIpDatagramCodec::new(0);
         let mut framed = vec![0x00, CONTEXT_ID_IP];
         framed.extend_from_slice(b"ip packet");
-        let mut buf = BufFactory::dgram_from_vec(framed);
+        let mut buf = alloc_packet_buf(&framed);
         assert!(codec.strip(&mut buf));
         assert_eq!(&buf[..], b"ip packet");
     }
@@ -465,7 +464,7 @@ mod tests {
     #[test]
     fn codec_strip_rejects_wrong_qsi() {
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = BufFactory::dgram_from_vec(vec![0x01, CONTEXT_ID_IP, 0xFF]);
+        let mut buf = alloc_packet_buf(&[0x01, CONTEXT_ID_IP, 0xFF]);
         assert!(!codec.strip(&mut buf));
     }
 
@@ -473,35 +472,35 @@ mod tests {
     fn codec_strip_rejects_non_canonical_qsi() {
         // QSI=0 encoded as 2-byte varint 0x4000 instead of canonical 1-byte 0x00.
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = BufFactory::dgram_from_vec(vec![0x40, 0x00, CONTEXT_ID_IP, 0xFF]);
+        let mut buf = alloc_packet_buf(&[0x40, 0x00, CONTEXT_ID_IP, 0xFF]);
         assert!(!codec.strip(&mut buf));
     }
 
     #[test]
     fn codec_strip_rejects_wrong_context_id() {
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = BufFactory::dgram_from_vec(vec![0x00, 0x01, 0xFF]);
+        let mut buf = alloc_packet_buf(&[0x00, 0x01, 0xFF]);
         assert!(!codec.strip(&mut buf));
     }
 
     #[test]
     fn codec_strip_rejects_empty_payload() {
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = BufFactory::dgram_from_vec(vec![0x00, CONTEXT_ID_IP]);
+        let mut buf = alloc_packet_buf(&[0x00, CONTEXT_ID_IP]);
         assert!(!codec.strip(&mut buf));
     }
 
     #[test]
     fn codec_strip_rejects_too_short() {
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = BufFactory::dgram_from_vec(vec![0x00]);
+        let mut buf = alloc_packet_buf(&[0x00]);
         assert!(!codec.strip(&mut buf));
     }
 
     #[test]
     fn codec_strip_rejects_empty_buffer() {
         let codec = ConnectIpDatagramCodec::new(0);
-        let mut buf = BufFactory::dgram_from_vec(vec![]);
+        let mut buf = alloc_packet_buf(&[]);
         assert!(!codec.strip(&mut buf));
     }
 
@@ -516,7 +515,7 @@ mod tests {
                 "prepend failed for sid={stream_id}"
             );
             let framed_data = buf[..].to_vec();
-            let mut recv_buf = BufFactory::dgram_from_vec(framed_data);
+            let mut recv_buf = alloc_packet_buf(&framed_data);
             assert!(
                 codec.strip(&mut recv_buf),
                 "strip failed for sid={stream_id}"

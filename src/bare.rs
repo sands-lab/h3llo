@@ -10,11 +10,11 @@ use crate::events::{ConnectedEvent, DialContext, Endpoint, Event};
 use crate::helpers::{batch_stats, make_interval};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use crate::udp;
+use buffer_pool::PooledBuf;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_quiche::buf_factory::PooledBuf;
 use tracing::{debug, info};
 
 /// State owned exclusively by the `BareUDP` source-filter actor.
@@ -276,10 +276,10 @@ pub(crate) fn spawn_bare_tx(
 mod tests {
     use super::*;
     use crate::config::IoTuning;
+    use crate::helpers::alloc_packet_buf;
     use crate::metrics::Direction;
     use std::net::Ipv4Addr;
     use std::time::Duration;
-    use tokio_quiche::buf_factory::BufFactory;
 
     fn test_tuning(interval: Duration) -> Tuning {
         Tuning {
@@ -318,7 +318,7 @@ mod tests {
 
         // Send from a non-accepted source
         let remote: SocketAddr = "192.168.1.1:5353".parse().unwrap();
-        let batch = vec![BufFactory::buf_from_slice(&[1, 2, 3])];
+        let batch = vec![alloc_packet_buf(&[1, 2, 3])];
         udp_tx.send((remote, batch)).await.unwrap();
 
         let result = tokio::time::timeout(Duration::from_millis(50), ingress_rx.recv()).await;
@@ -341,7 +341,7 @@ mod tests {
             spawn_bare_filter(filter, tuning.io.packet_queue_depth, &orchestrator);
 
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
-        let batch = vec![BufFactory::buf_from_slice(&[7, 8, 9])];
+        let batch = vec![alloc_packet_buf(&[7, 8, 9])];
         udp_tx.send((remote, batch)).await.unwrap();
 
         let received = tokio::time::timeout(Duration::from_millis(100), ingress_rx.recv())
@@ -366,7 +366,7 @@ mod tests {
         // Initially no sources accepted — packet should be dropped.
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
         udp_tx
-            .send((remote, vec![BufFactory::buf_from_slice(&[1])]))
+            .send((remote, vec![alloc_packet_buf(&[1])]))
             .await
             .unwrap();
         let first = tokio::time::timeout(Duration::from_millis(50), ingress_rx.recv()).await;
@@ -387,7 +387,7 @@ mod tests {
 
         // Now the same source should be accepted.
         udp_tx
-            .send((remote, vec![BufFactory::buf_from_slice(&[2])]))
+            .send((remote, vec![alloc_packet_buf(&[2])]))
             .await
             .unwrap();
         let batch = tokio::time::timeout(Duration::from_millis(100), ingress_rx.recv())
@@ -411,7 +411,7 @@ mod tests {
 
         let remote: SocketAddr = "10.0.0.1:5353".parse().unwrap();
         udp_tx
-            .send((remote, vec![BufFactory::buf_from_slice(&[1, 2, 3, 4])]))
+            .send((remote, vec![alloc_packet_buf(&[1, 2, 3, 4])]))
             .await
             .unwrap();
 
@@ -454,7 +454,7 @@ mod tests {
             &orchestrator,
         );
 
-        let batch = vec![BufFactory::buf_from_slice(&[9, 8, 7])];
+        let batch = vec![alloc_packet_buf(&[9, 8, 7])];
         egress_tx.send(batch).await.unwrap();
 
         let (tagged_dest, packets) =
@@ -485,7 +485,7 @@ mod tests {
         );
 
         egress_tx
-            .send(vec![BufFactory::buf_from_slice(&[5, 4, 3, 2])])
+            .send(vec![alloc_packet_buf(&[5, 4, 3, 2])])
             .await
             .unwrap();
 

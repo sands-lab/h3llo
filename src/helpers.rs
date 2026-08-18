@@ -1,9 +1,20 @@
 //! Helpers for actor timers, transient I/O retries, channel backpressure,
 //! and headroom-aware packet buffer allocation.
 
+use buffer_pool::{ConsumeBuffer, Pool, PooledBuf};
+use datagram_socket::MAX_DATAGRAM_SIZE;
 use std::time::{Duration, Instant};
 use tokio::time::{self, Interval, MissedTickBehavior};
-use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
+
+const POOL_SHARDS: usize = 8;
+const BUFFER_POOL_SIZE: usize = 64;
+const DATAGRAM_POOL_SIZE: usize = 64 * 1024;
+pub(crate) const MAX_PACKET_BUFFER_SIZE: usize = 64 * 1024;
+
+type PacketPool = Pool<POOL_SHARDS, ConsumeBuffer>;
+
+static BUFFER_POOL: PacketPool = PacketPool::new(BUFFER_POOL_SIZE, MAX_PACKET_BUFFER_SIZE);
+static DATAGRAM_POOL: PacketPool = PacketPool::new(DATAGRAM_POOL_SIZE, MAX_DATAGRAM_SIZE);
 
 /// Creates an interval that delays its schedule after missed ticks.
 ///
@@ -21,52 +32,48 @@ pub(crate) fn make_interval(period: Duration) -> Interval {
 
 /// Reserved headroom bytes at the start of every packet buffer.
 ///
-/// 9 bytes tokio-quiche `DGRAM_PREFIX` (flow ID + flow context encoding) +
-/// 1 byte CONNECT-IP Context ID (0x00). If tokio-quiche `DGRAM_PREFIX`
-/// changes, this value must be updated accordingly.
+/// This covers both the 10-byte Linux `virtio_net_hdr` and the CONNECT-IP
+/// prefix (up to 8 bytes of QSI plus the 1-byte Context ID).
 ///
 /// All packet-producing paths (TUN RX, `BareUDP` RX) reserve this headroom
 /// so downstream consumers (H3 TX, TUN TX) can prepend headers in-place.
 pub(crate) const HEADROOM: usize = 10;
 
-/// Allocates an uninitialized pooled buffer with [`HEADROOM`] bytes reserved,
-/// selecting the smallest pool that fits `length + HEADROOM`.
+/// Allocates an uninitialized pooled buffer with [`HEADROOM`] bytes reserved.
 ///
-/// Uses the datagram pool (≤ [`BufFactory::MAX_DGRAM_SIZE`] bytes) for typical
-/// packets and falls back to the generic pool for oversized payloads.
-///
-/// The returned buffer's visible length is `pool_capacity - HEADROOM`, which
-/// may exceed `length`. Callers must [`truncate`](PooledBuf::truncate) to the
-/// actual payload size.
+/// The datagram pool handles typical packets; oversized requests use the
+/// generic packet pool. The visible length is the selected pool capacity minus
+/// [`HEADROOM`] and may exceed `length`, so callers must truncate it after the
+/// output operation reports the initialized length.
 ///
 /// # Arguments
 ///
 /// * `length` - Expected payload size (excluding headroom).
 pub(crate) fn alloc_uninit_packet_buf(length: usize) -> PooledBuf {
-    if length + HEADROOM <= BufFactory::MAX_DGRAM_SIZE {
-        let mut buf = BufFactory::get_max_datagram();
-        // get_max_datagram() reserves an internal prefix (DGRAM_PREFIX) that
-        // may differ from our HEADROOM.  Compute and consume the difference.
-        let dgram_headroom = BufFactory::MAX_DGRAM_SIZE - buf.len();
-        if dgram_headroom < HEADROOM {
-            buf.pop_front(HEADROOM - dgram_headroom);
-        }
-        buf
+    // TODO: Migrate the production packet type to DgramBuffer only after both
+    // quiche packet serialization and TUN receive paths accept BufMut, or an
+    // equivalent uninitialized-output API. Until then, PooledBuf avoids
+    // zero-filling every packet before those paths overwrite its contents.
+    let (pool, capacity) = if length + HEADROOM <= MAX_DATAGRAM_SIZE {
+        (&DATAGRAM_POOL, MAX_DATAGRAM_SIZE)
     } else {
-        let mut buf = BufFactory::get_max_buf();
+        (&BUFFER_POOL, MAX_PACKET_BUFFER_SIZE)
+    };
+
+    pool.get_with(|buf| {
+        buf.expand(capacity);
         buf.pop_front(HEADROOM);
-        buf
-    }
+    })
 }
 
 /// Allocates a pooled buffer with headroom for in-place header prepending.
 ///
 /// Data starts at offset `HEADROOM`, leaving room for downstream consumers
-/// to prepend headers via `add_prefix` without reallocation.
+/// to prepend headers without reallocation.
 pub(crate) fn alloc_packet_buf(data: &[u8]) -> PooledBuf {
     let mut buf = alloc_uninit_packet_buf(data.len());
     buf.truncate(data.len());
-    buf[..data.len()].copy_from_slice(data);
+    buf.copy_from_slice(data);
     buf
 }
 

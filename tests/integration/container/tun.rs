@@ -282,8 +282,9 @@ async fn check_send_recv() -> Result<()> {
             packet[10] = (ip_cksum >> 8) as u8;
             packet[11] = (ip_cksum & 0xFF) as u8;
 
-            let pkt_buf = tokio_quiche::buf_factory::BufFactory::buf_from_slice(&packet[..len]);
-            let mut send_bufs = [h3llo::tun::TunBuf::from(pkt_buf)];
+            let mut pkt_buf = h3llo::tun::TunBuf::alloc_uninit(len);
+            pkt_buf.as_mut()[..len].copy_from_slice(&packet[..len]);
+            let mut send_bufs = [h3llo::tun::TunBuf::from(pkt_buf.into_pooled(len))];
             let _ = writer.send_batch(&mut send_bufs).await;
         }
     });

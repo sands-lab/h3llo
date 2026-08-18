@@ -11,13 +11,15 @@ test-utils = []
 
 [dependencies]
 anyhow = "1"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 socket2 = "0.6"
-quinn-udp = "0.5"
-hickory-proto = { version = "0.25", default-features = false }
+quinn-udp = "0.6"
+datagram-socket = "0.8"
+buffer-pool = { git = "https://github.com/Tonny-Gu/quiche", branch = "master" }
+hickory-proto = { version = "0.26", default-features = false }
 url = "2"
 libc = "0.2"
 ipnet = { version = "2", features = ["serde"] }
@@ -25,10 +27,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tun-rs = { version = "2", features = ["async"] }
 ipnet-trie = "0.3"
-tokio-quiche = "0.15"
-quiche = "0.25"
+tokio-quiche = "0.19"
+quiche = "0.29"
 futures-util = "0.3"
-prometheus-client = "0.24"
+prometheus-client = "0.25"
 foundations = { version = "5", default-features = false, features = ["metrics", "logging", "tracing-rs-compat"] }
 rustls-pemfile = "2"
 http = "1"
@@ -40,9 +42,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 rand = "0.10"
 tokio-util = "0.7"
-humantime-serde = "1.1.1"
-enum-map = "2.7.3"
-notify = "8.2"
+humantime-serde = "1"
+enum-map = "3"
+notify = "8"
 
 # Use mimalloc for musl targets to avoid musl's slow default allocator.
 # Purge tuning is done via MIMALLOC_PURGE_DELAY=0 env var in the Dockerfile.
@@ -52,7 +54,7 @@ mimalloc = { version = "0.1", features = ["override"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "process"] }
 hyper = { version = "1", features = ["client"] }
-testcontainers = "0.27"
+testcontainers = "0.28"
 tempfile = "3"
 tracing-test = "0.2"
 rand = "0.10"
@@ -61,7 +63,7 @@ serde_json = "1"
 tokio-util = "0.7"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-route_manager = { version = "0.2.9", features = ["async"] }
+route_manager = { version = "0.2", features = ["async"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -102,7 +104,7 @@ harness = false
 # - quiche: "none" congestion control algorithm
 # - tokio-quiche: must match patched quiche API
 [patch.crates-io]
-datagram-socket = { git = "https://github.com/Tonny-Gu/quiche", branch = "remove-pooled-buf-metrics" }
-octets = { git = "https://github.com/Tonny-Gu/quiche", branch = "remove-pooled-buf-metrics" }
-quiche = { git = "https://github.com/Tonny-Gu/quiche", branch = "remove-pooled-buf-metrics" }
-tokio-quiche = { git = "https://github.com/Tonny-Gu/quiche", branch = "remove-pooled-buf-metrics" }
+datagram-socket = { git = "https://github.com/Tonny-Gu/quiche", branch = "master" }
+octets = { git = "https://github.com/Tonny-Gu/quiche", branch = "master" }
+quiche = { git = "https://github.com/Tonny-Gu/quiche", branch = "master" }
+tokio-quiche = { git = "https://github.com/Tonny-Gu/quiche", branch = "master" }

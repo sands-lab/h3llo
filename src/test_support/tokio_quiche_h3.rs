@@ -11,9 +11,11 @@ use crate::auth::{bearer_auth_header, validate_connect_auth, AuthError};
 use crate::bind::{make_client_udp_socket, make_server_udp_socket, RouteProbe};
 use crate::config::{PeerH3, Tuning};
 use crate::events::Event;
-use crate::helpers::{make_interval, send_with_backpressure, SendEvent};
+use crate::helpers::{alloc_packet_buf, make_interval, send_with_backpressure, SendEvent};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use anyhow::anyhow;
+use buffer_pool::PooledBuf;
+use datagram_socket::DgramBuffer;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use std::collections::HashMap;
@@ -23,9 +25,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
-#[cfg(test)]
-use tokio_quiche::buf_factory::BufFactory;
-use tokio_quiche::buf_factory::PooledBuf;
 use tokio_quiche::http3::driver::{
     ClientH3Driver, ClientH3Event, H3Event, InboundFrame, InboundFrameStream, NewClientRequest,
     OutboundFrame, OutboundFrameSender, ServerH3Driver, ServerH3Event,
@@ -756,23 +755,23 @@ fn handle_inbound_frame(
 ) {
     match inbound_frame {
         InboundFrame::Datagram(mut dgram) => {
-            if dgram.is_empty() || dgram[0] != CONTEXT_ID_IP {
+            if dgram.is_empty() || dgram.as_ref()[0] != CONTEXT_ID_IP {
                 counters.record_drop(DropReason::InvalidFraming, 1, dgram.len() as u64);
                 return;
             }
-            dgram.pop_front(1);
+            dgram.advance(1);
             let len = dgram.len() as u64;
-            batch.push(dgram);
+            batch.push(alloc_packet_buf(dgram.as_ref()));
             *ok_pkts += 1;
             *ok_bytes += len;
         }
-        InboundFrame::Body(pooled_buf, _fin) => {
+        InboundFrame::Body(buffer, _fin) => {
             warn!(
                 peer = %peer,
-                len = pooled_buf.len(),
+                len = buffer.len(),
                 "received unexpected Body frame on CONNECT-IP stream"
             );
-            counters.record_drop(DropReason::InvalidFraming, 1, pooled_buf.len() as u64);
+            counters.record_drop(DropReason::InvalidFraming, 1, buffer.len() as u64);
         }
     }
 }
@@ -890,7 +889,10 @@ pub fn spawn_h3_tx(
                             counters.record_drop(DropReason::NoHeadroom, 1, len as u64);
                             continue;
                         }
-                        let frame = OutboundFrame::Datagram(packet, flow_id);
+                        let frame = OutboundFrame::Datagram(
+                            DgramBuffer::from_slice(&packet),
+                            flow_id,
+                        );
 
                         send_with_backpressure(&inner_tx, frame, |event| match event {
                             SendEvent::Fast => {
@@ -1219,12 +1221,10 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ========== PooledBuf Datagram Encoding Tests ==========
+    // ========== Datagram Encoding Tests ==========
 
     #[test]
-    fn pooled_buf_headroom_encode_prepends_context_id() {
-        use crate::helpers::alloc_packet_buf;
-
+    fn dgram_buffer_headroom_encode_prepends_context_id() {
         let payload = b"test payload";
         let mut buf = alloc_packet_buf(payload);
         assert_eq!(&buf[..], payload);
@@ -1236,30 +1236,28 @@ mod tests {
     }
 
     #[test]
-    fn pooled_buf_decode_strips_context_id() {
+    fn dgram_buffer_decode_strips_context_id() {
         let data = [0x00, 1, 2, 3, 4];
-        let mut dgram = BufFactory::dgram_from_vec(data.to_vec());
-        assert!(!dgram.is_empty() && dgram[0] == CONTEXT_ID_IP);
-        dgram.pop_front(1);
-        assert_eq!(&dgram[..], &[1, 2, 3, 4]);
+        let mut dgram = DgramBuffer::from(data.to_vec());
+        assert!(!dgram.is_empty() && dgram.as_ref()[0] == CONTEXT_ID_IP);
+        dgram.advance(1);
+        assert_eq!(dgram.as_ref(), &[1, 2, 3, 4]);
     }
 
     #[test]
-    fn pooled_buf_decode_rejects_empty() {
-        let dgram = BufFactory::dgram_from_vec(vec![]);
+    fn dgram_buffer_decode_rejects_empty() {
+        let dgram = DgramBuffer::from(vec![]);
         assert!(dgram.is_empty());
     }
 
     #[test]
-    fn pooled_buf_decode_rejects_wrong_context_id() {
-        let dgram = BufFactory::dgram_from_vec(vec![0x01, 1, 2, 3]);
-        assert!(dgram[0] != CONTEXT_ID_IP);
+    fn dgram_buffer_decode_rejects_wrong_context_id() {
+        let dgram = DgramBuffer::from(vec![0x01, 1, 2, 3]);
+        assert!(dgram.as_ref()[0] != CONTEXT_ID_IP);
     }
 
     #[test]
-    fn pooled_buf_roundtrip_encode_decode() {
-        use crate::helpers::alloc_packet_buf;
-
+    fn dgram_buffer_roundtrip_encode_decode() {
         let original = b"ip packet data";
         let mut buf = alloc_packet_buf(original);
 
@@ -1796,7 +1794,7 @@ mod tests {
             .expect("channel closed");
 
         assert_eq!(batch.len(), 1);
-        assert_eq!(&batch[0][..], &test_packet[..]);
+        assert_eq!(batch[0].as_ref(), &test_packet[..]);
 
         drop(cmd_tx);
     }
@@ -1888,7 +1886,7 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
         assert_eq!(batch_c2s.len(), 1);
-        assert_eq!(&batch_c2s[0][..], &packet_c2s[..]);
+        assert_eq!(batch_c2s[0].as_ref(), &packet_c2s[..]);
 
         // Test server -> client
         let packet_s2c = make_ipv4_packet(Ipv4Addr::new(10, 0, 0, 2));
@@ -1902,7 +1900,7 @@ mod tests {
             .expect("timeout")
             .expect("channel closed");
         assert_eq!(batch_s2c.len(), 1);
-        assert_eq!(&batch_s2c[0][..], &packet_s2c[..]);
+        assert_eq!(batch_s2c[0].as_ref(), &packet_s2c[..]);
 
         drop(cmd_tx);
     }

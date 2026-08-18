@@ -9,6 +9,7 @@ use crate::config::{LocalTun, Peer};
 use crate::events::Event;
 use crate::helpers::{batch_stats, make_interval, send_with_backpressure, SendEvent};
 use crate::metrics::{Counters, Direction, DropReason, Source};
+use buffer_pool::PooledBuf;
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
 use std::collections::HashMap;
@@ -16,7 +17,6 @@ use std::net::IpAddr;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio_quiche::buf_factory::PooledBuf;
 use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------

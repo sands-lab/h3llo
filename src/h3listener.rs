@@ -21,6 +21,7 @@ use crate::h3session::{ConnectFailure, ConnectProgress, H3Session, HeaderAction,
 use crate::helpers::{alloc_uninit_packet_buf, make_interval};
 use crate::udp;
 use anyhow::bail;
+use buffer_pool::PooledBuf;
 use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use quiche::h3::NameValue;
 use rand::Rng;
@@ -30,7 +31,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
-use tokio_quiche::buf_factory::PooledBuf;
 use tracing::{debug, info, warn};
 
 // ========== Server Error ==========
@@ -907,9 +907,9 @@ mod tests {
     use crate::test_support::tokio_quiche_h3::{
         dial_h3, spawn_h3_rx, spawn_h3_tx, DialError as OldDialError, H3Connection,
     };
+    use buffer_pool::PooledBuf;
     use std::net::Ipv4Addr;
     use test_support::await_connected;
-    use tokio_quiche::buf_factory::PooledBuf;
 
     // ========== Test Harness ==========
 

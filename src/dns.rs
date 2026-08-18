@@ -307,12 +307,9 @@ impl DnsActor {
         let result: Result<PendingQuery, String> = async {
             let name = Name::from_ascii(&query.hostname).map_err(|err| err.to_string())?;
 
-            let mut message = Message::new();
             let id = rand::rng().random::<u16>();
-            message.set_id(id);
-            message.set_message_type(MessageType::Query);
-            message.set_op_code(OpCode::Query);
-            message.set_recursion_desired(true);
+            let mut message = Message::new(id, MessageType::Query, OpCode::Query);
+            message.metadata.recursion_desired = true;
             message.add_query(record_type_query(name, query.record_type));
 
             let outbound = message.to_vec().map_err(|err| err.to_string())?;
@@ -351,7 +348,7 @@ impl DnsActor {
             }
         };
 
-        let Some(question) = message.queries().first() else {
+        let Some(question) = message.queries.first() else {
             warn!("dns: response with empty question section");
             return;
         };
@@ -360,11 +357,11 @@ impl DnsActor {
             hostname: normalize_dns_name(question.name()),
             record_type: question.query_type(),
         };
-        let id = message.id();
+        let id = message.metadata.id;
 
         // Treat truncated responses as packet loss: leave the pending entry
         // untouched so the timeout handler retries it.
-        if message.truncated() {
+        if message.metadata.truncation {
             if self.hostnames.contains_key(&query.hostname) {
                 warn!(host = %query.hostname, "dns: response truncated, will retry");
             } else {
@@ -386,9 +383,9 @@ impl DnsActor {
 
         let records = extract_records(message, record_type);
 
-        if message.response_code() == ResponseCode::NoError && records.is_empty() {
+        if message.metadata.response_code == ResponseCode::NoError && records.is_empty() {
             if let Some(got) = message
-                .answers()
+                .answers
                 .iter()
                 .map(Record::record_type)
                 .find(|&got| got != record_type)
@@ -496,10 +493,10 @@ fn record_type_query(name: Name, record_type: RecordType) -> Query {
 fn extract_records(message: &Message, expected: RecordType) -> Vec<(IpAddr, u32)> {
     let mut records: HashMap<IpAddr, u32> = HashMap::new();
 
-    for answer in message.answers() {
-        let (ip, ttl) = match answer.data() {
-            RData::A(addr) if expected == RecordType::A => (IpAddr::V4(addr.0), answer.ttl()),
-            RData::AAAA(addr) if expected == RecordType::AAAA => (IpAddr::V6(addr.0), answer.ttl()),
+    for answer in &message.answers {
+        let (ip, ttl) = match &answer.data {
+            RData::A(addr) if expected == RecordType::A => (IpAddr::V4(addr.0), answer.ttl),
+            RData::AAAA(addr) if expected == RecordType::AAAA => (IpAddr::V6(addr.0), answer.ttl),
             _ => continue,
         };
 
@@ -511,7 +508,7 @@ fn extract_records(message: &Message, expected: RecordType) -> Vec<(IpAddr, u32)
 
 /// Logs DNS response warnings at origin (not sent as events).
 fn log_response_warnings(message: &Message, host: &str) {
-    match message.response_code() {
+    match message.metadata.response_code {
         ResponseCode::NoError => {}
         ResponseCode::NXDomain => {
             warn!(host = %host, "dns: NXDOMAIN response");
@@ -524,7 +521,7 @@ fn log_response_warnings(message: &Message, host: &str) {
         }
     }
 
-    if !message.recursion_available() {
+    if !message.metadata.recursion_available {
         warn!(host = %host, "dns: recursion unavailable");
     }
 }
@@ -601,12 +598,9 @@ mod tests {
         response_code: ResponseCode,
         answers: Vec<Record>,
     ) -> Vec<u8> {
-        let mut response = Message::new();
-        response.set_id(id);
-        response.set_message_type(MessageType::Response);
-        response.set_op_code(OpCode::Query);
-        response.set_response_code(response_code);
-        response.set_recursion_available(true);
+        let mut response = Message::response(id, OpCode::Query);
+        response.metadata.response_code = response_code;
+        response.metadata.recursion_available = true;
         response.add_query(query);
         for answer in answers {
             response.add_answer(answer);
@@ -616,13 +610,10 @@ mod tests {
 
     /// Builds a truncated DNS response (TC bit set, no answers).
     fn build_truncated_response(id: u16, query: Query) -> Vec<u8> {
-        let mut response = Message::new();
-        response.set_id(id);
-        response.set_message_type(MessageType::Response);
-        response.set_op_code(OpCode::Query);
-        response.set_response_code(ResponseCode::NoError);
-        response.set_recursion_available(true);
-        response.set_truncated(true);
+        let mut response = Message::response(id, OpCode::Query);
+        response.metadata.response_code = ResponseCode::NoError;
+        response.metadata.recursion_available = true;
+        response.metadata.truncation = true;
         response.add_query(query);
         response.to_vec().unwrap()
     }
@@ -637,7 +628,7 @@ mod tests {
         for _ in 0..2 {
             let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
             let request = Message::from_vec(&buf[..len]).unwrap();
-            let query = request.queries().first().cloned().unwrap();
+            let query = request.queries.first().cloned().unwrap();
             let answers = if query.query_type() == RecordType::A {
                 addresses
                     .iter()
@@ -648,7 +639,8 @@ mod tests {
             } else {
                 Vec::new()
             };
-            let response = build_response(request.id(), query, ResponseCode::NoError, answers);
+            let response =
+                build_response(request.metadata.id, query, ResponseCode::NoError, answers);
             socket.send_to(&response, peer).await.unwrap();
         }
     }
@@ -915,10 +907,10 @@ mod tests {
         for _ in 0..2 {
             let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
             let request = Message::from_vec(&buf[..len]).unwrap();
-            let query = request.queries().first().cloned().unwrap();
-            original_ids.insert(query.query_type(), request.id());
+            let query = request.queries.first().cloned().unwrap();
+            original_ids.insert(query.query_type(), request.metadata.id);
 
-            let data = build_truncated_response(request.id(), query);
+            let data = build_truncated_response(request.metadata.id, query);
             socket.send_to(&data, peer).await.unwrap();
         }
 
@@ -929,8 +921,8 @@ mod tests {
         for _ in 0..2 {
             let (len, _peer) = socket.recv_from(&mut buf).await.unwrap();
             let message = Message::from_vec(&buf[..len]).unwrap();
-            let query = message.queries().first().cloned().unwrap();
-            retry_ids.insert(query.query_type(), message.id());
+            let query = message.queries.first().cloned().unwrap();
+            retry_ids.insert(query.query_type(), message.metadata.id);
         }
 
         // Retry must use new transaction IDs.
@@ -975,9 +967,9 @@ mod tests {
         for _ in 0..2 {
             let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
             let request = Message::from_vec(&buf[..len]).unwrap();
-            let query = request.queries().first().cloned().unwrap();
+            let query = request.queries.first().cloned().unwrap();
 
-            let data = build_truncated_response(request.id(), query);
+            let data = build_truncated_response(request.metadata.id, query);
             socket.send_to(&data, peer).await.unwrap();
         }
 
@@ -1007,8 +999,8 @@ mod tests {
         for _ in 0..2 {
             let (len, _peer) = socket.recv_from(&mut buf).await.unwrap();
             let message = Message::from_vec(&buf[..len]).unwrap();
-            let query = message.queries().first().cloned().unwrap();
-            first_ids.insert(query.query_type(), message.id());
+            let query = message.queries.first().cloned().unwrap();
+            first_ids.insert(query.query_type(), message.metadata.id);
         }
 
         // Wait for timeout and retry
@@ -1018,8 +1010,8 @@ mod tests {
         for _ in 0..2 {
             let (len, _peer) = socket.recv_from(&mut buf).await.unwrap();
             let message = Message::from_vec(&buf[..len]).unwrap();
-            let query = message.queries().first().cloned().unwrap();
-            retry_ids.insert(query.query_type(), message.id());
+            let query = message.queries.first().cloned().unwrap();
+            retry_ids.insert(query.query_type(), message.metadata.id);
         }
 
         assert_ne!(first_ids.get(&RecordType::A), retry_ids.get(&RecordType::A));

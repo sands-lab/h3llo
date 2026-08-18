@@ -8,9 +8,9 @@ use crate::bind::RouteProbe;
 use crate::config::{Config, H3Endpoint, Peer, Tuning, UdpEndpoint};
 use crate::metrics::{Labels, Metrics};
 use crate::router::RoutingTable;
+use buffer_pool::PooledBuf;
 use ipnet::IpNet;
 use tokio::sync::{mpsc, oneshot};
-use tokio_quiche::buf_factory::PooledBuf;
 
 /// Endpoint type discriminator for bound connections.
 ///

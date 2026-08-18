@@ -10,6 +10,7 @@ use crate::bind::UdpError;
 use crate::helpers::alloc_packet_buf;
 use crate::helpers::retry_on_transient;
 use anyhow::Context;
+use buffer_pool::PooledBuf;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use std::io;
 use std::io::IoSliceMut;
@@ -18,7 +19,6 @@ use std::sync::Arc;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio_quiche::buf_factory::PooledBuf;
 use tracing::{info, warn};
 
 /// Receive side of a shared UDP socket with quinn-udp GRO support.
@@ -321,7 +321,6 @@ fn is_non_fatal_send_error(error: &io::Error, used_gso: bool) -> bool {
 mod tests {
     use super::*;
     use crate::events::Event;
-    use tokio_quiche::buf_factory::BufFactory;
 
     fn bind_std() -> std::net::UdpSocket {
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -373,7 +372,7 @@ mod tests {
         let (input_tx, _udp_tx) = spawn_udp_tx(tx, 4, &supervisor, SupervisionPolicy::Detached);
 
         input_tx
-            .send((dest, vec![BufFactory::buf_from_slice(&[9, 8, 7])]))
+            .send((dest, vec![alloc_packet_buf(&[9, 8, 7])]))
             .await
             .unwrap();
 
@@ -395,9 +394,9 @@ mod tests {
 
         // Send a batch of 3 packets.
         let batch = vec![
-            BufFactory::buf_from_slice(&[1, 2]),
-            BufFactory::buf_from_slice(&[3, 4]),
-            BufFactory::buf_from_slice(&[5, 6]),
+            alloc_packet_buf(&[1, 2]),
+            alloc_packet_buf(&[3, 4]),
+            alloc_packet_buf(&[5, 6]),
         ];
         input_tx.send((dest, batch)).await.unwrap();
 
@@ -422,10 +421,10 @@ mod tests {
 
         // Mixed sizes: run of 2-byte, then 3-byte, then back to 2-byte.
         let batch = vec![
-            BufFactory::buf_from_slice(&[1, 2]),
-            BufFactory::buf_from_slice(&[3, 4]),
-            BufFactory::buf_from_slice(&[5, 6, 7]),
-            BufFactory::buf_from_slice(&[8, 9]),
+            alloc_packet_buf(&[1, 2]),
+            alloc_packet_buf(&[3, 4]),
+            alloc_packet_buf(&[5, 6, 7]),
+            alloc_packet_buf(&[8, 9]),
         ];
         input_tx.send((dest, batch)).await.unwrap();
 
@@ -509,7 +508,7 @@ mod tests {
 
         let (input_tx, udp_tx) = spawn_udp_tx(tx, 4, &supervisor, SupervisionPolicy::Detached);
         input_tx
-            .send((dest, vec![BufFactory::buf_from_slice(&[9, 8, 7])]))
+            .send((dest, vec![alloc_packet_buf(&[9, 8, 7])]))
             .await
             .unwrap();
         supervisor.send(&udp_tx, Event::Stop).unwrap();

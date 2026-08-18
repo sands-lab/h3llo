@@ -15,6 +15,7 @@ use crate::route::{make_route, spawn_route};
 use crate::router::{spawn_router, RoutingTable};
 use crate::tun;
 use anyhow::{bail, Context, Result};
+use buffer_pool::PooledBuf;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -22,7 +23,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio_quiche::buf_factory::PooledBuf;
 use tracing::{debug, error, info, warn};
 
 /// A single active connection bound to a peer.

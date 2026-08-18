@@ -16,11 +16,11 @@ use crate::h3session::{
 use crate::helpers::{alloc_uninit_packet_buf, make_interval};
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use anyhow::{anyhow, bail, Context};
+use buffer_pool::PooledBuf;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time;
-use tokio_quiche::buf_factory::PooledBuf;
 use tracing::{debug, warn};
 
 // ========== Configuration Helpers ==========

@@ -7,23 +7,26 @@ use crate::events::Event;
 use crate::helpers::retry_on_transient;
 use crate::metrics::{Counters, Direction, DropReason, Source};
 use anyhow::Context;
+use buffer_pool::PooledBuf;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::io;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
 use tracing::{info, warn};
 use tun_rs::{AsyncDevice, DeviceBuilder, Layer};
 #[cfg(target_os = "linux")]
 use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 
+#[cfg(test)]
+use crate::helpers::MAX_PACKET_BUFFER_SIZE;
 /// Headroom reserved in every datapath `PooledBuf`.
 ///
 use crate::helpers::{
     alloc_packet_buf, alloc_uninit_packet_buf, batch_stats, make_interval, HEADROOM,
 };
+use datagram_socket::MAX_DATAGRAM_SIZE;
 
 // Compile-time guard: TunBuf::prepend_hdr relies on HEADROOM being sufficient
 // to prepend a zeroed virtio_net_hdr via add_prefix without allocation.
@@ -72,10 +75,8 @@ impl TunBuf {
     #[cfg(target_os = "linux")]
     fn buf_extend(&mut self, additional: usize) {
         let current_len = self.0.len();
-        if current_len <= BufFactory::MAX_DGRAM_SIZE
-            && current_len + additional > BufFactory::MAX_DGRAM_SIZE
-        {
-            let mut new_buf = BufFactory::get_max_buf();
+        if current_len <= MAX_DATAGRAM_SIZE && current_len + additional > MAX_DATAGRAM_SIZE {
+            let mut new_buf = alloc_uninit_packet_buf(MAX_DATAGRAM_SIZE);
             new_buf.truncate(current_len);
             new_buf[..current_len].copy_from_slice(&self.0);
             self.0 = new_buf;
@@ -832,11 +833,11 @@ mod tests {
         );
 
         input_tx
-            .send(vec![BufFactory::buf_from_slice(&[0, 1, 2, 3, 4, 5])])
+            .send(vec![alloc_packet_buf(&[0, 1, 2, 3, 4, 5])])
             .await
             .unwrap();
         input_tx
-            .send(vec![BufFactory::buf_from_slice(&[9, 9, 9])])
+            .send(vec![alloc_packet_buf(&[9, 9, 9])])
             .await
             .unwrap();
 
@@ -892,7 +893,7 @@ mod tests {
         );
 
         input_tx
-            .send(vec![BufFactory::buf_from_slice(&[1, 2, 3])])
+            .send(vec![alloc_packet_buf(&[1, 2, 3])])
             .await
             .unwrap();
 
@@ -942,7 +943,7 @@ mod tests {
 
         // Verify input_tx is functional by sending a batch
         assert!(input_tx
-            .send(vec![BufFactory::buf_from_slice(&[1, 2, 3])])
+            .send(vec![alloc_packet_buf(&[1, 2, 3])])
             .await
             .is_ok());
     }
@@ -1043,7 +1044,7 @@ mod tests {
     #[tokio::test]
     async fn memory_tun_tx_send_batch_delivers_packet() {
         let (_rx, mut tx, _inject, mut output) = memory_tun("mem-tx-batch", 64);
-        let mut batch = [TunBuf::from(BufFactory::buf_from_slice(&[4, 5, 6]))];
+        let mut batch = [TunBuf::from(alloc_packet_buf(&[4, 5, 6]))];
         tx.send_batch(&mut batch).await.unwrap();
         let received = output.recv().await.unwrap();
         assert_eq!(received, vec![4, 5, 6]);
@@ -1081,7 +1082,7 @@ mod tests {
     fn alloc_uninit_packet_buf_small_uses_datagram_pool() {
         let buf = alloc_uninit_packet_buf(1400);
         // Datagram pool: visible = MAX_DGRAM_SIZE - HEADROOM = 1490
-        assert_eq!(buf.len(), BufFactory::MAX_DGRAM_SIZE - HEADROOM);
+        assert_eq!(buf.len(), MAX_DATAGRAM_SIZE - HEADROOM);
         let mut buf = buf;
         buf.truncate(0);
         assert!(buf.add_prefix(&[0u8; HEADROOM]));
@@ -1089,8 +1090,8 @@ mod tests {
 
     #[test]
     fn alloc_uninit_packet_buf_large_uses_generic_pool() {
-        let buf = alloc_uninit_packet_buf(BufFactory::MAX_DGRAM_SIZE);
-        assert_eq!(buf.len(), BufFactory::MAX_BUF_SIZE - HEADROOM);
+        let buf = alloc_uninit_packet_buf(MAX_DATAGRAM_SIZE);
+        assert_eq!(buf.len(), MAX_PACKET_BUFFER_SIZE - HEADROOM);
         let mut buf = buf;
         buf.truncate(0);
         assert!(buf.add_prefix(&[0u8; HEADROOM]));
@@ -1108,25 +1109,25 @@ mod tests {
     #[test]
     fn alloc_uninit_packet_buf_boundary() {
         // Exactly at the threshold: length + HEADROOM == MAX_DGRAM_SIZE
-        let boundary_len = BufFactory::MAX_DGRAM_SIZE - HEADROOM;
+        let boundary_len = MAX_DATAGRAM_SIZE - HEADROOM;
         let buf = alloc_uninit_packet_buf(boundary_len);
         assert_eq!(buf.len(), boundary_len);
 
         // One byte over: falls back to generic pool
         let buf = alloc_uninit_packet_buf(boundary_len + 1);
-        assert_eq!(buf.len(), BufFactory::MAX_BUF_SIZE - HEADROOM);
+        assert_eq!(buf.len(), MAX_PACKET_BUFFER_SIZE - HEADROOM);
     }
 
     #[test]
     fn tun_buf_from_wraps_unchanged() {
-        let buf = BufFactory::buf_from_slice(&[10, 20]);
+        let buf = alloc_packet_buf(&[10, 20]);
         let tun_buf = TunBuf::from(buf);
         assert_eq!(tun_buf.as_ref(), &[10, 20]);
     }
 
     #[test]
     fn tun_buf_as_mut_modifies_payload() {
-        let buf = BufFactory::buf_from_slice(&[10, 20, 30]);
+        let buf = alloc_packet_buf(&[10, 20, 30]);
         let mut tun_buf = TunBuf::from(buf);
         tun_buf.as_mut()[0] = 99;
         assert_eq!(tun_buf.as_ref()[0], 99);
@@ -1135,39 +1136,39 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn tun_buf_expand_upgrades_buffer_on_threshold_crossing() {
-        let small_data = vec![0xABu8; BufFactory::MAX_DGRAM_SIZE];
-        let buf = BufFactory::buf_from_slice(&small_data);
+        let small_data = vec![0xABu8; MAX_DATAGRAM_SIZE];
+        let buf = alloc_packet_buf(&small_data);
         let mut tun_buf = TunBuf::from(buf);
-        assert_eq!(tun_buf.as_ref().len(), BufFactory::MAX_DGRAM_SIZE);
+        assert_eq!(tun_buf.as_ref().len(), MAX_DATAGRAM_SIZE);
 
         let extra = [0xCDu8; 100];
         tun_rs::ExpandBuffer::buf_extend_from_slice(&mut tun_buf, &extra);
 
         let result = tun_buf.as_ref();
-        assert_eq!(result.len(), BufFactory::MAX_DGRAM_SIZE + 100);
-        assert_eq!(&result[..BufFactory::MAX_DGRAM_SIZE], &small_data[..]);
-        assert_eq!(&result[BufFactory::MAX_DGRAM_SIZE..], &extra[..]);
+        assert_eq!(result.len(), MAX_DATAGRAM_SIZE + 100);
+        assert_eq!(&result[..MAX_DATAGRAM_SIZE], &small_data[..]);
+        assert_eq!(&result[MAX_DATAGRAM_SIZE..], &extra[..]);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn tun_buf_expand_no_upgrade_when_already_large() {
-        let large_data = vec![0xABu8; BufFactory::MAX_DGRAM_SIZE + 1];
-        let buf = BufFactory::buf_from_slice(&large_data);
+        let large_data = vec![0xABu8; MAX_DATAGRAM_SIZE + 1];
+        let buf = alloc_packet_buf(&large_data);
         let mut tun_buf = TunBuf::from(buf);
 
         let extra = [0xCDu8; 50];
         tun_rs::ExpandBuffer::buf_extend_from_slice(&mut tun_buf, &extra);
 
         let result = tun_buf.as_ref();
-        assert_eq!(result.len(), BufFactory::MAX_DGRAM_SIZE + 1 + 50);
+        assert_eq!(result.len(), MAX_DATAGRAM_SIZE + 1 + 50);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn tun_buf_expand_no_upgrade_when_below_threshold() {
         let small_data = vec![0xABu8; 100];
-        let buf = BufFactory::buf_from_slice(&small_data);
+        let buf = alloc_packet_buf(&small_data);
         let mut tun_buf = TunBuf::from(buf);
 
         let extra = [0xCDu8; 50];
@@ -1183,13 +1184,13 @@ mod tests {
     #[test]
     fn tun_buf_resize_triggers_upgrade() {
         let small_data = vec![0xABu8; 500];
-        let buf = BufFactory::buf_from_slice(&small_data);
+        let buf = alloc_packet_buf(&small_data);
         let mut tun_buf = TunBuf::from(buf);
 
-        tun_rs::ExpandBuffer::buf_resize(&mut tun_buf, BufFactory::MAX_DGRAM_SIZE + 100, 0xFF);
+        tun_rs::ExpandBuffer::buf_resize(&mut tun_buf, MAX_DATAGRAM_SIZE + 100, 0xFF);
 
         let result = tun_buf.as_ref();
-        assert_eq!(result.len(), BufFactory::MAX_DGRAM_SIZE + 100);
+        assert_eq!(result.len(), MAX_DATAGRAM_SIZE + 100);
         assert_eq!(&result[..500], &small_data[..]);
         assert!(result[500..].iter().all(|&b| b == 0xFF));
     }
@@ -1208,7 +1209,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn tun_buf_prepend_hdr_fallback_without_headroom() {
-        let buf = BufFactory::buf_from_slice(&[5, 6, 7]);
+        let buf = alloc_packet_buf(&[5, 6, 7]);
         let mut tun_buf = TunBuf::from(buf);
         tun_buf.prepend_hdr();
         let data = tun_buf.as_ref();
