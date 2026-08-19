@@ -77,6 +77,14 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      # BoringSSL enables x86_64 assembly and the hosted Windows image does not
+      # include NASM. This installs only the compiler prerequisite, not a cache.
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          choco install nasm --yes --no-progress
+          nasm --version
+
       - name: Build release binary
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin h3llo
 
