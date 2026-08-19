@@ -8,11 +8,9 @@ use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 
-#[cfg(target_os = "windows")]
-use std::ffi::CStr;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::ffi::{CStr, CString};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::num::NonZeroU32;
 #[cfg(target_os = "windows")]
 use std::os::windows::io::AsRawSocket;
@@ -385,18 +383,11 @@ fn bind_to_device_impl(socket: &Socket, domain: Domain, interface: &str) -> io::
     use std::mem::size_of;
 
     use windows_sys::Win32::Networking::WinSock::{
-        if_nametoindex, setsockopt, WSAGetLastError, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF,
-        IP_UNICAST_IF, SOCKET_ERROR,
+        setsockopt, WSAGetLastError, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, IP_UNICAST_IF,
+        SOCKET_ERROR,
     };
 
-    let mut wide: Vec<u16> = interface.encode_utf16().collect();
-    wide.push(0);
-
-    let index = unsafe { if_nametoindex(wide.as_ptr()) };
-    if index == 0 {
-        let code = unsafe { WSAGetLastError() };
-        return Err(io::Error::from_raw_os_error(code));
-    }
+    let index = interface_index(interface)?.get();
 
     let raw = socket.as_raw_socket();
     let (level, optname, value) = match domain {
@@ -576,15 +567,25 @@ pub fn lookup_ifindex(name: &str) -> Option<u32> {
 }
 
 #[cfg(target_os = "windows")]
-/// Looks up an interface index by name using WinSock on Windows.
+/// Resolves an interface name into a non-zero ifindex using Windows IP Helper APIs.
+fn interface_index(interface: &str) -> io::Result<NonZeroU32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::if_nametoindex;
+
+    let name = CString::new(interface).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name contains interior null",
+        )
+    })?;
+    let index = unsafe { if_nametoindex(name.as_ptr().cast()) };
+    NonZeroU32::new(index)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "interface not found"))
+}
+
+#[cfg(target_os = "windows")]
+/// Looks up an interface index by name using Windows IP Helper APIs.
 pub fn lookup_ifindex(name: &str) -> Option<u32> {
-    use windows_sys::Win32::Networking::WinSock::if_nametoindex;
-
-    let mut wide: Vec<u16> = name.encode_utf16().collect();
-    wide.push(0);
-
-    let idx = unsafe { if_nametoindex(wide.as_ptr()) };
-    (idx != 0).then_some(idx)
+    interface_index(name).ok().map(NonZeroU32::get)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -615,13 +616,11 @@ fn ifindex_to_name(ifindex: u32) -> io::Result<String> {
     use windows_sys::Win32::NetworkManagement::Ndis::IF_MAX_STRING_SIZE;
 
     let mut buf = [0u8; IF_MAX_STRING_SIZE as usize + 1];
-    let ptr = buf.as_mut_ptr() as *mut i8;
-
-    let ret = unsafe { if_indextoname(ifindex, ptr) };
-    if ret == 0 {
+    let ret = unsafe { if_indextoname(ifindex, buf.as_mut_ptr()) };
+    if ret.is_null() {
         return Err(io::Error::last_os_error());
     }
-    let cstr = unsafe { CStr::from_ptr(ptr) };
+    let cstr = unsafe { CStr::from_ptr(ret.cast()) };
     cstr.to_str()
         .map(|s| s.to_string())
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))

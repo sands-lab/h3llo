@@ -309,6 +309,8 @@ Use on-the-fly self-signed certificates in tests to exercise TLS without externa
 ## Current Tests
 
 - Linux CI: `cargo fmt -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, Docker integration tests.
+- Windows x64 CI: clean, uncached release build with a static MSVC C runtime; the resulting `h3llo-windows-x64.exe` is published directly to GitHub Releases.
+- macOS ARM64 CI: clean, uncached native release build; the resulting `h3llo-macos-arm64` Apple Silicon executable is checked for non-system dynamic dependencies and published directly to GitHub Releases. Users must run `chmod +x h3llo-macos-arm64` after downloading the raw asset.
 - Unit: `src/config.rs` tests for defaults, H3/API config validation, peer transport exclusivity.
 - Unit: `src/test_support/tokio_quiche_h3.rs` (test-only) tests for datagram encoding, error display, CONNECT-IP header validation, and listener spawn/shutdown.
 - Unit: `src/h3session.rs` tests for QSI encode/decode, ConnectIpDatagramCodec framing (prepend/strip/roundtrip, rejection paths), ConnectFailure actor reason mapping, and CONNECT-IP constant verification.
