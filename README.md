@@ -65,10 +65,10 @@ Multi-architecture images are available for `linux/amd64`, `linux/arm64`, and `l
 
 ## Release Downloads
 
-Release assets include the Linux binaries plus native Windows x64 and macOS ARM64 packages.
+Release assets include Linux binaries plus native Windows x64 and macOS ARM64 binaries.
 
-- Windows x64: `h3llo-windows-x64.zip` contains `h3llo.exe` built with the static MSVC C runtime.
-- macOS ARM64: `h3llo-macos-arm64.tar.gz` contains the Apple Silicon executable. macOS system libraries remain dynamic because macOS does not support fully static system executables.
+- Windows x64: download and run `h3llo-windows-x64.exe`, built with the static MSVC C runtime.
+- macOS ARM64: download `h3llo-macos-arm64`, run `chmod +x h3llo-macos-arm64`, then execute it. macOS system libraries remain dynamic because macOS does not support fully static system executables.
 
 ## Configuration Overview
 

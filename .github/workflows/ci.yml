@@ -113,22 +113,22 @@ jobs:
             throw "Windows release binary depends on a Visual C runtime DLL"
           }
 
-      - name: Package release asset
+      - name: Stage release asset
         shell: pwsh
         run: |
           $binary = Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\h3llo.exe"
           $releaseDir = Join-Path $env:RUNNER_TEMP "release"
-          $asset = Join-Path $releaseDir "h3llo-windows-x64.zip"
+          $asset = Join-Path $releaseDir "h3llo-windows-x64.exe"
           New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-          Compress-Archive -Path $binary -DestinationPath $asset
+          Copy-Item -Path $binary -Destination $asset
 
-      # This artifact transfers the packaged output to the release job; it is
+      # This artifact transfers the staged binary to the release job; it is
       # not a dependency or build cache.
       - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:
           name: binary-windows-x64
-          path: ${{ runner.temp }}/release/h3llo-windows-x64.zip
+          path: ${{ runner.temp }}/release/h3llo-windows-x64.exe
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
@@ -165,22 +165,22 @@ jobs:
             exit 1
           fi
 
-      - name: Package release asset
+      - name: Stage release asset
         run: |
           binary="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/h3llo"
           release_dir="$RUNNER_TEMP/release"
-          package_dir="$release_dir/h3llo-macos-arm64"
-          mkdir -p "$package_dir"
-          cp "$binary" "$package_dir/h3llo"
-          tar -C "$release_dir" -czf "$release_dir/h3llo-macos-arm64.tar.gz" h3llo-macos-arm64
+          asset="$release_dir/h3llo-macos-arm64"
+          mkdir -p "$release_dir"
+          cp "$binary" "$asset"
+          chmod +x "$asset"
 
-      # This artifact transfers the packaged output to the release job; it is
+      # This artifact transfers the staged binary to the release job; it is
       # not a dependency or build cache.
       - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:
           name: binary-macos-arm64
-          path: ${{ runner.temp }}/release/h3llo-macos-arm64.tar.gz
+          path: ${{ runner.temp }}/release/h3llo-macos-arm64
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
