@@ -56,6 +56,120 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # These native release builds deliberately do not use actions/cache or
+  # rust-cache: every run builds its platform artifact from a clean runner.
+  windows-release:
+    name: Build Windows x64 release binary
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: target/release/windows-x64
+      # Select the static MSVC CRT (/MT) for Rust code. The CMake toolchain
+      # below applies the same choice to BoringSSL and other native code.
+      RUSTFLAGS: "-C target-feature=+crt-static"
+      CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/.github/cmake/windows-static-crt.cmake
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release binary
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin h3llo
+
+      - name: Verify static C runtime
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\h3llo.exe"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          if (-not $dumpbin) {
+            throw "dumpbin.exe was not found"
+          }
+          $dependencies = & $dumpbin /DEPENDENTS $binary
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $dependencies
+          if ($dependencies -match '(?im)^\s*(?:api-ms-win-crt-[\w-]+|ucrtbase|vcruntime\d*|msvcp\d*|msvcr\d*)\.dll\s*$') {
+            throw "Windows release binary depends on a Visual C runtime DLL"
+          }
+
+      - name: Package release asset
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\h3llo.exe"
+          $releaseDir = Join-Path $env:RUNNER_TEMP "release"
+          $asset = Join-Path $releaseDir "h3llo-windows-x64.zip"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          Compress-Archive -Path $binary -DestinationPath $asset
+
+      # This artifact transfers the packaged output to the release job; it is
+      # not a dependency or build cache.
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-windows-x64
+          path: ${{ runner.temp }}/release/h3llo-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  macos-release:
+    name: Build macOS ARM64 release binary
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: target/release/macos-arm64
+      # Apple Silicon requires macOS 11 or later. macOS cannot produce a fully
+      # static system executable, so the CI verifies it has no bundled dylibs.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build release binary
+        run: cargo build --locked --release --target aarch64-apple-darwin --bin h3llo
+
+      - name: Verify native architecture and linkage
+        run: |
+          binary="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/h3llo"
+          file "$binary" | grep -q "arm64"
+          dependencies="$(otool -L "$binary" | tail -n +2)"
+          printf '%s\n' "$dependencies"
+          if printf '%s\n' "$dependencies" | grep -Eq '^[[:space:]]*(@rpath|@loader_path|/usr/local|/opt/homebrew)'; then
+            echo "::error::macOS release binary has a non-system dynamic dependency"
+            exit 1
+          fi
+
+      - name: Package release asset
+        run: |
+          binary="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/h3llo"
+          release_dir="$RUNNER_TEMP/release"
+          package_dir="$release_dir/h3llo-macos-arm64"
+          mkdir -p "$package_dir"
+          cp "$binary" "$package_dir/h3llo"
+          tar -C "$release_dir" -czf "$release_dir/h3llo-macos-arm64.tar.gz" h3llo-macos-arm64
+
+      # This artifact transfers the packaged output to the release job; it is
+      # not a dependency or build cache.
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-macos-arm64
+          path: ${{ runner.temp }}/release/h3llo-macos-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
   docker-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -327,12 +441,12 @@ jobs:
           docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
 
   # Create a GitHub release when a version tag is pushed or master is updated.
-  # Gates behind docker-merge, which transitively requires all builds and tests.
+  # Gates behind the Docker release pipeline and the native release builds.
   release:
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    needs: [docker-merge]
+    needs: [docker-merge, windows-release, macos-release]
     permissions:
       contents: write
     steps:
@@ -352,15 +466,15 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            ${{ runner.temp }}/binaries/h3llo-linux-*
+            ${{ runner.temp }}/binaries/h3llo-*
 
       - name: Publish dev release
         if: github.ref == 'refs/heads/master'
         run: |
-          ls ${{ runner.temp }}/binaries/h3llo-linux-* || { echo "::error::No binary artifacts found"; exit 1; }
+          ls ${{ runner.temp }}/binaries/h3llo-* || { echo "::error::No binary artifacts found"; exit 1; }
           gh release delete dev --yes --cleanup-tag || true
           gh release create dev \
-            ${{ runner.temp }}/binaries/h3llo-linux-* \
+            ${{ runner.temp }}/binaries/h3llo-* \
             --prerelease \
             --title "Development Build ($(date -u +%Y-%m-%d))" \
             --generate-notes \

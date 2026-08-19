@@ -63,6 +63,13 @@ docker run -d --name h3llo --restart always --network host --cap-add NET_ADMIN -
 
 Multi-architecture images are available for `linux/amd64`, `linux/arm64`, and `linux/riscv64`. Docker automatically pulls the correct image for your platform.
 
+## Release Downloads
+
+Release assets include the Linux binaries plus native Windows x64 and macOS ARM64 packages.
+
+- Windows x64: `h3llo-windows-x64.zip` contains `h3llo.exe` built with the static MSVC C runtime.
+- macOS ARM64: `h3llo-macos-arm64.tar.gz` contains the Apple Silicon executable. macOS system libraries remain dynamic because macOS does not support fully static system executables.
+
 ## Configuration Overview
 
 High-level connection/auth/routing summary; see [docs/protocol.md](docs/protocol.md) for auth/transport semantics and [docs/internals.md](docs/internals.md) for runtime behavior.
