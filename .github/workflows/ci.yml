@@ -83,7 +83,14 @@ jobs:
         shell: pwsh
         run: |
           choco install nasm --yes --no-progress
-          nasm --version
+          $nasmDir = Join-Path $env:ProgramFiles "NASM"
+          $nasm = Join-Path $nasmDir "nasm.exe"
+          if (-not (Test-Path $nasm)) {
+            throw "NASM executable was not installed at $nasm"
+          }
+          & $nasm --version
+          # The installer does not refresh the current runner's PATH.
+          Add-Content -Path $env:GITHUB_PATH -Value $nasmDir
 
       - name: Build release binary
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin h3llo
