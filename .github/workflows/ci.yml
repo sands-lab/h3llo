@@ -64,6 +64,11 @@ jobs:
     timeout-minutes: 45
     env:
       CARGO_TARGET_DIR: target/release/windows-x64
+      # Wintun distributes the signed driver as a side-by-side DLL. Pin the
+      # official archive and its published SHA-256 for reproducible packaging.
+      WINTUN_VERSION: "0.14.1"
+      WINTUN_URL: https://www.wintun.net/builds/wintun-0.14.1.zip
+      WINTUN_SHA256: 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
       # Select the static MSVC CRT (/MT) for Rust code. The CMake toolchain
       # below applies the same choice to BoringSSL and other native code.
       RUSTFLAGS: "-C target-feature=+crt-static"
@@ -113,22 +118,63 @@ jobs:
             throw "Windows release binary depends on a Visual C runtime DLL"
           }
 
+      - name: Download and verify Wintun
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "wintun-$env:WINTUN_VERSION.zip"
+          $wintunDir = Join-Path $env:RUNNER_TEMP "wintun"
+          Invoke-WebRequest -Uri $env:WINTUN_URL -OutFile $archive
+          $actualHash = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash
+          if ($actualHash -ne $env:WINTUN_SHA256) {
+            throw "Wintun archive SHA-256 mismatch: expected $env:WINTUN_SHA256, got $actualHash"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $wintunDir
+          $requiredFiles = @(
+            (Join-Path $wintunDir "wintun\bin\amd64\wintun.dll"),
+            (Join-Path $wintunDir "wintun\LICENSE.txt")
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Expected Wintun release file was not found: $file"
+            }
+          }
+
       - name: Stage release asset
         shell: pwsh
         run: |
           $binary = Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\h3llo.exe"
           $releaseDir = Join-Path $env:RUNNER_TEMP "release"
-          $asset = Join-Path $releaseDir "h3llo-windows-x64.exe"
-          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-          Copy-Item -Path $binary -Destination $asset
+          $packageDir = Join-Path $releaseDir "h3llo-windows-x64"
+          $asset = Join-Path $releaseDir "h3llo-windows-x64.zip"
+          $wintunDir = Join-Path $env:RUNNER_TEMP "wintun"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item -Path $binary -Destination (Join-Path $packageDir "h3llo.exe")
+          Copy-Item -Path (Join-Path $wintunDir "wintun\bin\amd64\wintun.dll") -Destination (Join-Path $packageDir "wintun.dll")
+          Copy-Item -Path (Join-Path $wintunDir "wintun\LICENSE.txt") -Destination (Join-Path $packageDir "LICENSE-Wintun.txt")
+          $packageFiles = Get-ChildItem -LiteralPath $packageDir -File
+          if ($packageFiles.Count -ne 3) {
+            throw "Windows release package must contain exactly three files"
+          }
+          Compress-Archive -Path $packageFiles.FullName -DestinationPath $asset -CompressionLevel Optimal
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($asset)
+          try {
+            $archiveEntries = @($zip.Entries | ForEach-Object FullName)
+          } finally {
+            $zip.Dispose()
+          }
+          $expectedEntries = @("h3llo.exe", "wintun.dll", "LICENSE-Wintun.txt")
+          if (Compare-Object -ReferenceObject $expectedEntries -DifferenceObject $archiveEntries) {
+            throw "Windows release archive does not contain the expected files"
+          }
 
-      # This artifact transfers the staged binary to the release job; it is
+      # This artifact transfers the staged package to the release job; it is
       # not a dependency or build cache.
       - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:
           name: binary-windows-x64
-          path: ${{ runner.temp }}/release/h3llo-windows-x64.exe
+          path: ${{ runner.temp }}/release/h3llo-windows-x64.zip
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
