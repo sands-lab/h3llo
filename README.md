@@ -67,7 +67,9 @@ Multi-architecture images are available for `linux/amd64`, `linux/arm64`, and `l
 
 Release assets include Linux binaries plus native Windows x64 and macOS ARM64 binaries.
 
-- Windows x64: download and run `h3llo-windows-x64.exe`, built with the static MSVC C runtime.
+- Windows x64: extract `h3llo-windows-x64.zip`, which contains `h3llo.exe`, the official signed
+  `wintun.dll`, and its license. Run `h3llo.exe` as Administrator to create and configure the TUN
+  adapter and routes; no separate TUN-driver or Visual C++ Redistributable installation is required.
 - macOS ARM64: download `h3llo-macos-arm64`, run `chmod +x h3llo-macos-arm64`, then execute it. macOS system libraries remain dynamic because macOS does not support fully static system executables.
 
 ## Configuration Overview
