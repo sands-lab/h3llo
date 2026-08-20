@@ -19,11 +19,31 @@ use buffer_pool::PooledBuf;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+#[cfg(unix)]
+async fn shutdown_signal() -> io::Result<&'static str> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            Ok("SIGINT")
+        }
+        _ = sigterm.recv() => Ok("SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> io::Result<&'static str> {
+    tokio::signal::ctrl_c().await?;
+    Ok("Ctrl+C")
+}
 
 /// A single active connection bound to a peer.
 #[derive(Debug)]
@@ -598,7 +618,7 @@ impl Orchestrator {
     /// Runs the orchestrator message loop until shutdown or task failure.
     ///
     /// Processes events from child actors (including DNS answers), monitors
-    /// child tasks, and handles graceful shutdown on `ctrl_c`.
+    /// child tasks, and handles graceful shutdown signals.
     ///
     /// # Errors
     ///
@@ -608,6 +628,8 @@ impl Orchestrator {
         // attempt reconnection for uncovered IPs.
         let mut reconcile_ticker = make_interval(self.tuning.reconcile_interval);
         let mut metrics_log_ticker = make_interval(self.tuning.metrics_log_interval);
+        let shutdown_signal = shutdown_signal();
+        tokio::pin!(shutdown_signal);
         loop {
             tokio::select! {
                 message = self.ctx.recv() => {
@@ -629,10 +651,10 @@ impl Orchestrator {
                 result = self.actor_bus.drive() => {
                     result.context("drive actor bus")?;
                 }
-                result = tokio::signal::ctrl_c() => {
+                result = &mut shutdown_signal => {
                     match result {
-                        Ok(()) => {
-                            info!("shutdown signal received, stopping...");
+                        Ok(signal) => {
+                            info!(signal, "shutdown signal received, stopping...");
                             break;
                         }
                         Err(e) => {
