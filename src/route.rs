@@ -153,7 +153,8 @@ pub enum RouteSyncError {
 ///
 /// Final semantics:
 /// - Routes derived from `allowed` (default routes expanded into two /1 prefixes)
-///   are actively added/preserved on the TUN interface.
+///   are actively added/preserved on the TUN interface unless a configured TUN
+///   prefix already covers them.
 /// - OS-managed routes from `tun_addrs` are preserved but never added. For each TUN
 ///   address (e.g., `10.0.0.1/24`), the network prefix (`10.0.0.0/24`), host route
 ///   (`10.0.0.1/32`), and IPv4 broadcast routes (`10.0.0.0/32`, `10.0.0.255/32`) are
@@ -181,7 +182,11 @@ pub async fn sync_tun_routes<H: RouteHandle, R: IfIndexResolver>(
         .await
         .map_err(|err| RouteSyncError::ListFailed(err.to_string()))?;
 
-    let desired_routes: HashSet<IpNet> = expand_allowed_prefixes(allowed);
+    let tun_prefixes: Vec<IpNet> = tun_addrs.iter().map(IpNet::trunc).collect();
+    let desired_routes: HashSet<IpNet> = expand_allowed_prefixes(allowed)
+        .into_iter()
+        .filter(|net| !tun_prefixes.iter().any(|prefix| prefix.contains(net)))
+        .collect();
 
     // IPv4 OS-managed routes to preserve (never added, only protected from deletion).
     // For each TUN address (e.g., 192.168.1.2/24), include:
@@ -232,7 +237,8 @@ pub async fn sync_tun_routes<H: RouteHandle, R: IfIndexResolver>(
         }
     }
 
-    // Add missing desired routes. tun_v4_kernel_routes routes are OS-managed, never added by us.
+    // Add missing desired routes. Routes covered by configured TUN prefixes and
+    // tun_v4_kernel_routes are OS-managed, never added by us.
     for net in &desired_routes {
         if existing_routes.contains(net) {
             continue;
@@ -650,6 +656,23 @@ mod tests {
 
         // Only allowed route added; tun_addr routes are OS-managed, not added by us
         assert_eq!(handle.ops(), vec!["add 192.168.1.0/24"]);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    /// Allowed routes covered by a TUN prefix are not added, and stale copies are removed.
+    async fn tun_prefix_covers_allowed_routes() {
+        let resolver = FakeResolver { idx: 10 };
+        let mut handle = FakeHandle::new(vec![
+            route("192.168.1.0/24", Some(10)),
+            route("192.168.1.3/32", Some(10)),
+        ]);
+        let tun_addrs: Vec<IpNet> = vec!["192.168.1.2/24".parse().unwrap()];
+        let allowed: Vec<IpNet> = vec!["192.168.1.3/32".parse().unwrap()];
+
+        sync_test(&tun_addrs, &allowed, &mut handle, &resolver).await;
+
+        assert_eq!(handle.ops(), vec!["del 192.168.1.3/32"]);
     }
 
     #[tokio::test]
