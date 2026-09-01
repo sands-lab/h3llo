@@ -169,26 +169,26 @@ fn yaml_config_response(config: &Config) -> Response<Full<Bytes>> {
 async fn send_and_await<T>(
     ctx: &ActorContext,
     make_event: impl FnOnce(oneshot::Sender<T>) -> Event,
-) -> Result<T, Response<Full<Bytes>>> {
+) -> Result<T, Box<Response<Full<Bytes>>>> {
     let (reply_tx, reply_rx) = oneshot::channel();
     ctx.notify_owner(make_event(reply_tx)).map_err(|_| {
-        response(
+        Box::new(response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "orchestrator unavailable",
-        )
+        ))
     })?;
     reply_rx.await.map_err(|_| {
-        response(
+        Box::new(response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "orchestrator dropped reply",
-        )
+        ))
     })
 }
 
 async fn handle_get_config(ctx: &ActorContext) -> Response<Full<Bytes>> {
     match send_and_await(ctx, |reply_tx| Event::GetConfig { reply_tx }).await {
         Ok(config) => yaml_config_response(&config),
-        Err(err_resp) => err_resp,
+        Err(err_resp) => *err_resp,
     }
 }
 
@@ -207,7 +207,7 @@ async fn handle_post_config(req: Request<Incoming>, ctx: &ActorContext) -> Respo
     match send_and_await(ctx, |reply_tx| Event::PostConfig { peers, reply_tx }).await {
         Ok(Ok(config)) => yaml_config_response(&config),
         Ok(Err(e)) => response(StatusCode::BAD_REQUEST, &e),
-        Err(err_resp) => err_resp,
+        Err(err_resp) => *err_resp,
     }
 }
 
@@ -226,7 +226,7 @@ async fn handle_delete_config(req: Request<Incoming>, ctx: &ActorContext) -> Res
     match send_and_await(ctx, |reply_tx| Event::DeleteConfig { peer_ids, reply_tx }).await {
         Ok(Ok(config)) => yaml_config_response(&config),
         Ok(Err(e)) => response(StatusCode::BAD_REQUEST, &e),
-        Err(err_resp) => err_resp,
+        Err(err_resp) => *err_resp,
     }
 }
 
@@ -247,7 +247,7 @@ async fn handle_get_metrics(ctx: &ActorContext) -> Response<Full<Bytes>> {
                 .body(Full::new(Bytes::from(text)))
                 .expect("infallible: response builder with valid constants")
         }
-        Err(err_resp) => err_resp,
+        Err(err_resp) => *err_resp,
     }
 }
 
