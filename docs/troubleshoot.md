@@ -148,7 +148,7 @@ The drop location tells you where the bottleneck is:
 
 ### DNS Resolution Failure Under Query Load
 
-**Symptom**: Some or all peer endpoints fail to resolve on startup. Logs show `dns: response truncated, will retry` warnings and/or `dns: query timed out, retrying` for multiple hostnames. Affected peers never establish QUIC connections. The issue is intermittent — restarting may resolve a different subset of hostnames each time.
+**Symptom**: Some or all peer endpoints fail to resolve on startup. Logs show `dns: response truncated, will retry` warnings and/or `dns: query failed, scheduling retry` (with `query timed out`) for multiple hostnames. Affected peers never establish QUIC connections. The issue is intermittent — restarting may resolve a different subset of hostnames each time.
 
 **Root cause**: h3llo serializes A and AAAA queries across all peer endpoint hostnames with `dns_query_interval` (default `100ms`). Very large peer sets, a lower configured interval, packet loss, or retries can still create sustained load on the network path or resolver. A truncated (`TC=1`) response confirms that the UDP response was truncated; it does not by itself prove server-side rate limiting. h3llo treats truncated responses as packet loss and retries after `dns_query_timeout` (default `2s`).
 
@@ -189,7 +189,7 @@ tuning:
 
 The local resolver (e.g., systemd-resolved at `127.0.0.53`) can cache answers and handle upstream fallback independently of h3llo.
 
-> **Note**: h3llo's DNS implementation uses plain UDP without EDNS0 and does not fall back to TCP on truncation. Truncated responses are treated as packet loss: the pending query is preserved and retried after `dns_query_timeout` (default `2s`) with a new transaction ID. Use a local caching resolver when TCP fallback or richer resolver behavior is required.
+> **Note**: h3llo's DNS implementation uses plain UDP without EDNS0 and does not fall back to TCP on truncation. Truncated responses are treated as packet loss: the query is retried after `dns_query_timeout` (default `2s`) from a new socket with a new transaction ID. Use a local caching resolver when TCP fallback or richer resolver behavior is required.
 
 ### Silent H3/QUIC Connection Failure on Multi-NIC Hosts
 

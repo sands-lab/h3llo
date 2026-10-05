@@ -5,7 +5,7 @@ use crate::api;
 use crate::bare::{dial_bare_tx, make_bare_rx, spawn_bare_rx};
 use crate::bind::{DefaultRouteProbe, RouteProbe};
 use crate::config::{validate_peers, Config, ConfigError, Local, Peer, PeerTransport, Tuning};
-use crate::dns::{make_dns, spawn_dns};
+use crate::dns::spawn_dns;
 use crate::events::{ConnectedEvent, DialContext, DialFailedEvent, DnsEvent, Endpoint, Event};
 use crate::h3dialer::dial_h3_client;
 use crate::h3listener::{make_h3_dispatcher, spawn_h3_dispatcher};
@@ -551,14 +551,13 @@ impl Orchestrator {
             .map(|p| (p.id.clone(), PeerEntry::new(p.clone())))
             .collect();
 
-        // Create DNS actor state (performs fallible socket binding)
-        let probe = DefaultRouteProbe;
-        let dns_actor = make_dns(&config.local.dns, Some(tun_if.as_str()), tuning, &probe)
-            .await
-            .with_context(|| format!("set up DNS resolver for {}", config.local.dns.server))?;
-
-        // Spawn DNS actor task (infallible)
-        let dns = spawn_dns(dns_actor, &ctx);
+        let dns = spawn_dns(
+            &config.local.dns,
+            Some(tun_if.as_str()),
+            &tuning.dns,
+            DefaultRouteProbe,
+            &ctx,
+        );
 
         // Initialize route sync actor if system route management is enabled.
         // Soft failure: if make_route() fails (e.g., no netlink on BSD), warn and continue.

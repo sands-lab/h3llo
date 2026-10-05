@@ -319,7 +319,7 @@ pub trait RouteProbe {
 ///
 /// # Errors
 /// Returns `UnsupportedPlatform` on unsupported operating systems (BSD placeholder).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultRouteProbe;
 
 impl RouteProbe for DefaultRouteProbe {
