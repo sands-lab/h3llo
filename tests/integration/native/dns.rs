@@ -16,8 +16,8 @@ const RESOLVER_TIMEOUT: Duration = Duration::from_secs(5);
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 use h3llo::actor::{ActorBus, ActorContext, ActorRef};
-use h3llo::config::{DnsTuning, LocalDns, Tuning};
-use h3llo::dns::{make_dns, spawn_dns};
+use h3llo::config::{DnsTuning, LocalDns};
+use h3llo::dns::spawn_dns;
 use h3llo::events::Event;
 use h3llo::test_utils::FakeRouteProbe;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
@@ -86,27 +86,25 @@ async fn spawn_resolver(
     server: SocketAddr,
     timeout: Duration,
 ) -> (ActorRef, ActorContext, ActorBus) {
-    // Build LocalDns config for make_dns (server is pre-parsed SocketAddr)
     let local_dns = LocalDns {
         server,
         bindif: None,
     };
 
-    let probe = FakeRouteProbe::noop();
-    let tuning = Tuning {
-        dns: DnsTuning {
-            dns_query_timeout: timeout,
-            ..DnsTuning::default()
-        },
-        ..Tuning::default()
+    let dns_tuning = DnsTuning {
+        dns_query_timeout: timeout,
+        ..DnsTuning::default()
     };
-    let dns_actor = make_dns(&local_dns, None, &tuning, &probe)
-        .await
-        .expect("make_dns failed");
 
     let actor_bus = ActorBus::on_current_runtime();
     let event_rx = actor_bus.mailbox("test-orchestrator");
-    let dns = spawn_dns(dns_actor, &event_rx);
+    let dns = spawn_dns(
+        &local_dns,
+        None,
+        &dns_tuning,
+        FakeRouteProbe::noop(),
+        &event_rx,
+    );
     (dns, event_rx, actor_bus)
 }
 
