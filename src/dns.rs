@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{debug, info, warn};
 
@@ -77,8 +77,9 @@ struct DnsActor<P> {
     queued_queries: HashSet<DnsQuery>,
     /// In-flight query tasks. Dropping the actor aborts all of them.
     tasks: JoinSet<QueryOutcome>,
-    /// Handles of in-flight tasks keyed by query, for dedup and cancellation.
-    pending_queries: HashMap<DnsQuery, AbortHandle>,
+    /// Queries with an in-flight task; each has exactly one task, whose result
+    /// alone removes the entry.
+    pending_queries: HashSet<DnsQuery>,
     /// True if state changed since the last snapshot emission.
     dirty: bool,
 }
@@ -95,15 +96,16 @@ impl<P: RouteProbe + Clone + Send + Sync + 'static> DnsActor<P> {
             hostnames: HashMap::new(),
             queued_queries: HashSet::new(),
             tasks: JoinSet::new(),
-            pending_queries: HashMap::new(),
+            pending_queries: HashSet::new(),
             dirty: false,
         }
     }
 
     /// Updates the set of registered hostnames.
     ///
-    /// Removes unregistered hostnames (including their IPs, queued queries, and
-    /// in-flight tasks); adds new hostnames with default state.
+    /// Removes unregistered hostnames (including their IPs and queued queries);
+    /// adds new hostnames with default state. In-flight tasks are left to finish
+    /// and their results are discarded if the hostname is still unregistered.
     fn set_hostnames(&mut self, hosts: &HashSet<String>) {
         let removed: Vec<String> = self
             .hostnames
@@ -116,12 +118,6 @@ impl<P: RouteProbe + Clone + Send + Sync + 'static> DnsActor<P> {
         }
         self.queued_queries
             .retain(|query| hosts.contains(&query.hostname));
-        for (_, task) in self
-            .pending_queries
-            .extract_if(|query, _| !hosts.contains(&query.hostname))
-        {
-            task.abort();
-        }
         for host in hosts {
             if !self.hostnames.contains_key(host) {
                 self.dirty = true;
@@ -207,12 +203,9 @@ impl<P: RouteProbe + Clone + Send + Sync + 'static> DnsActor<P> {
                         None => return Ok(()),
                     }
                 }
-                Some(joined) = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
-                    match joined {
-                        Ok((id, (query, result))) => self.handle_query_result(id, query, result),
-                        Err(err) if err.is_cancelled() => {}
-                        Err(err) => return Err(err).context("DNS query task panicked"),
-                    }
+                Some(joined) = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                    let (query, result) = joined.context("DNS query task panicked")?;
+                    self.handle_query_result(query, result);
                 }
                 _ = refresh_ticker.tick() => {
                     self.trigger_refresh();
@@ -271,7 +264,7 @@ impl<P: RouteProbe + Clone + Send + Sync + 'static> DnsActor<P> {
                     hostname: hostname.clone(),
                     record_type,
                 };
-                if !pending_queries.contains_key(&query) {
+                if !pending_queries.contains(&query) {
                     queued_queries.insert(query);
                 }
             }
@@ -289,27 +282,17 @@ impl<P: RouteProbe + Clone + Send + Sync + 'static> DnsActor<P> {
             self.dns_tuning.dns_query_timeout,
         );
         let task_query = query.clone();
-        let task = self.tasks.spawn(async move { (task_query, resolve.await) });
-        self.pending_queries.insert(query, task);
+        self.tasks.spawn(async move { (task_query, resolve.await) });
+        self.pending_queries.insert(query);
     }
 
     /// Applies a finished query task's result, or requeues the query on failure.
-    fn handle_query_result(
-        &mut self,
-        id: tokio::task::Id,
-        query: DnsQuery,
-        result: anyhow::Result<Message>,
-    ) {
-        // A task can finish just before `set_hostnames` aborts it; its result must
-        // not consume the pending entry of a newer task for the same query.
-        if self
-            .pending_queries
-            .get(&query)
-            .is_none_or(|task| task.id() != id)
-        {
+    fn handle_query_result(&mut self, query: DnsQuery, result: anyhow::Result<Message>) {
+        self.pending_queries.remove(&query);
+        if !self.hostnames.contains_key(&query.hostname) {
+            debug!(host = %query.hostname, "dns: dropping result for unregistered hostname");
             return;
         }
-        self.pending_queries.remove(&query);
 
         match result {
             Ok(message) => self.handle_response(&message, &query.hostname, query.record_type),
@@ -1024,7 +1007,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_hostnames_cleans_all_state() {
+    async fn set_hostnames_cleans_state_but_keeps_in_flight_queries() {
         let mut actor = test_dns_actor();
         actor.set_hostnames(&HashSet::from(["example.com".to_string()]));
 
@@ -1043,10 +1026,12 @@ mod tests {
         actor.set_hostnames(&HashSet::new());
         assert!(actor.hostnames.is_empty());
         assert!(actor.queued_queries.is_empty());
-        assert!(actor.pending_queries.is_empty());
-        while let Some(joined) = actor.tasks.join_next().await {
-            assert!(joined.unwrap_err().is_cancelled());
-        }
+        assert_eq!(actor.pending_queries.len(), 2);
+
+        // Re-registering within the timeout reuses the in-flight queries.
+        actor.set_hostnames(&HashSet::from(["example.com".to_string()]));
+        actor.trigger_refresh();
+        assert!(actor.queued_queries.is_empty());
     }
 
     #[tokio::test]
@@ -1089,25 +1074,24 @@ mod tests {
         actor.set_hostnames(&HashSet::from(["example.com".to_string()]));
         let failed = query("example.com", RecordType::A);
         actor.spawn_query(failed.clone());
-        let id = actor.pending_queries[&failed].id();
 
-        actor.handle_query_result(id, failed.clone(), Err(anyhow!("refused")));
+        actor.handle_query_result(failed.clone(), Err(anyhow!("refused")));
 
         assert!(actor.pending_queries.is_empty());
         assert_eq!(actor.queued_queries, HashSet::from([failed]));
     }
 
     #[tokio::test]
-    async fn stale_task_result_is_ignored() {
+    async fn result_for_unregistered_hostname_is_dropped() {
         let mut actor = test_dns_actor();
         actor.set_hostnames(&HashSet::from(["example.com".to_string()]));
-        let pending = query("example.com", RecordType::A);
-        actor.spawn_query(pending.clone());
-        let stale_id = tokio::spawn(async {}).id();
+        let removed = query("example.com", RecordType::A);
+        actor.spawn_query(removed.clone());
+        actor.set_hostnames(&HashSet::new());
 
-        actor.handle_query_result(stale_id, pending.clone(), Err(anyhow!("stale")));
+        actor.handle_query_result(removed, Err(anyhow!("refused")));
 
-        assert!(actor.pending_queries.contains_key(&pending));
+        assert!(actor.pending_queries.is_empty());
         assert!(actor.queued_queries.is_empty());
     }
 
