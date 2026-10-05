@@ -36,7 +36,10 @@ pub enum UdpError {
 ///
 /// # Arguments
 /// - `domain`: Socket domain (IPv4 or IPv6).
-/// - `bind_addr`: Local address to bind, or `None` for ephemeral port.
+/// - `bind_addr`: Local address to bind with `SO_REUSEADDR`, or `None` for an
+///   ephemeral port. Ephemeral sockets never set `SO_REUSEADDR`: on Linux it
+///   lets autobind hand the same port to concurrent sockets, which then steal
+///   each other's datagrams.
 /// - `bind_interface`: Optional interface name for binding.
 /// - `socket_buffer_bytes`: `SO_RCVBUF/SO_SNDBUF` size in bytes; 0 skips configuration.
 ///
@@ -52,7 +55,6 @@ pub(crate) fn make_udp_socket_raw(
     socket_buffer_bytes: usize,
 ) -> io::Result<UdpSocket> {
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
 
     if socket_buffer_bytes > 0 {
@@ -83,6 +85,7 @@ pub(crate) fn make_udp_socket_raw(
     }
 
     if let Some(addr) = bind_addr {
+        socket.set_reuse_address(true)?;
         socket.bind(&addr.into())?;
     }
 
@@ -908,6 +911,22 @@ mod tests {
             socket.peer_addr().unwrap(),
             SocketAddr::from(([127, 0, 0, 1], 54321))
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_client_sockets_never_share_a_port() {
+        // With SO_REUSEADDR, Linux autobind hands out duplicate ports here.
+        let target = SocketAddr::from(([127, 0, 0, 1], 53));
+        let mut sockets = Vec::new();
+        let mut ports = HashSet::new();
+        for _ in 0..500 {
+            let socket = make_client_udp_socket(target, None, None, &FakeRouteProbe::noop(), 0)
+                .await
+                .unwrap();
+            let port = socket.local_addr().unwrap().port();
+            assert!(ports.insert(port), "port {port} shared by live sockets");
+            sockets.push(socket);
+        }
     }
 
     #[tokio::test]

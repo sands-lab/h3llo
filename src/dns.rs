@@ -845,18 +845,18 @@ mod tests {
         queries
     }
 
-    /// Asserts every retry uses a new transaction ID and a new socket.
+    /// Asserts every retry uses a new transaction ID.
+    ///
+    /// Source ports are not compared: a fresh socket may legitimately be
+    /// assigned the port its closed predecessor just released.
     fn assert_fresh_retries(
         first: &HashMap<RecordType, (u16, SocketAddr)>,
         retry: &HashMap<RecordType, (u16, SocketAddr)>,
     ) {
         for record_type in [RecordType::A, RecordType::AAAA] {
-            let (first_id, first_source) = first[&record_type];
-            let (retry_id, retry_source) = retry[&record_type];
-            assert_ne!(first_id, retry_id, "{record_type:?} retry reused txid");
             assert_ne!(
-                first_source, retry_source,
-                "{record_type:?} retry reused source port"
+                first[&record_type].0, retry[&record_type].0,
+                "{record_type:?} retry reused txid"
             );
         }
     }
@@ -905,7 +905,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_with_new_socket_on_timeout() {
+    async fn retries_with_new_txid_on_timeout() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (cmd_tx, _events_rx, _actor_bus) =
             start_resolver(socket.local_addr().unwrap(), &fast_retry_tuning());
@@ -916,6 +916,25 @@ mod tests {
         let first = recv_query_pair(&socket, false).await;
         let retry = recv_query_pair(&socket, false).await;
         assert_fresh_retries(&first, &retry);
+    }
+
+    #[tokio::test]
+    async fn concurrent_queries_use_distinct_sockets() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (cmd_tx, _events_rx, _actor_bus) =
+            start_resolver(socket.local_addr().unwrap(), &DnsTuning::default());
+
+        let hosts = HashSet::from(["example.com".to_string()]);
+        cmd_tx.send(Event::SetHostnames { hosts }).unwrap();
+
+        // Both queries stay in flight for the full timeout, so their sockets are
+        // alive together and a shared port would misroute one response.
+        let queries = recv_query_pair(&socket, false).await;
+        assert_ne!(
+            queries[&RecordType::A].1,
+            queries[&RecordType::AAAA].1,
+            "in-flight queries share a source port"
+        );
     }
 
     #[tokio::test]
